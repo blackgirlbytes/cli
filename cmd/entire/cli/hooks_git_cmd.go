@@ -89,15 +89,15 @@ func newHooksGitCmd() *cobra.Command {
 		Long:   "Commands called by git hooks. These delegate to the current strategy.",
 		Hidden: true, // Internal command, not for direct user use
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
 			// Check if Entire is set up and enabled before doing any work.
 			// This prevents global git hooks from doing anything in repos where
 			// Entire was never enabled or has been disabled.
-			if !settings.IsSetUpAndEnabledFast() {
-
+			if !settings.IsSetUpAndEnabled(ctx) {
 				gitHooksDisabled = true
 				return nil
 			}
-			hookLogCleanup = initHookLogging(cmd.Context())
+			hookLogCleanup = initHookLogging(ctx)
 			return nil
 		},
 		PersistentPostRunE: func(_ *cobra.Command, _ []string) error {

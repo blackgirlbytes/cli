@@ -14,6 +14,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/perf"
 
@@ -53,6 +54,9 @@ func newAgentHooksCmd(agentName types.AgentName, handler agent.HookSupport) *cob
 		Short:  handler.Description() + " hook handlers",
 		Hidden: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			if !settings.IsSetUpAndEnabled(cmd.Context()) {
+				return nil
+			}
 			agentHookLogCleanup = initHookLogging(cmd.Context())
 			return nil
 		},
