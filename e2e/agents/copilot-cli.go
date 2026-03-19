@@ -2,10 +2,12 @@ package agents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -58,6 +60,13 @@ func (c *CopilotCLI) Bootstrap() error {
 }
 
 func (c *CopilotCLI) RunPrompt(ctx context.Context, dir string, prompt string, opts ...Option) (Output, error) {
+	// Copilot CLI v1.0.8+ requires folder trust before loading repo-level
+	// hooks. In non-interactive (-p) mode there is no trust dialog, so we
+	// pre-add the directory to the trusted_folders list.
+	if err := ensureCopilotTrust(dir); err != nil {
+		return Output{}, fmt.Errorf("ensure copilot folder trust: %w", err)
+	}
+
 	cfg := &runConfig{Model: "gpt-4.1"}
 	for _, o := range opts {
 		o(cfg)
@@ -175,4 +184,55 @@ func (c *CopilotCLI) StartSession(ctx context.Context, dir string) (Session, err
 	s.stableAtSend = ""
 
 	return s, nil
+}
+
+// ensureCopilotTrust adds dir to ~/.copilot/config.json trusted_folders if not
+// already present. Copilot CLI v1.0.8+ requires folder trust before loading
+// repo-level hooks; without this, hooks silently don't fire in -p mode.
+func ensureCopilotTrust(dir string) error {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(home, ".copilot", "config.json")
+
+	// Read existing config (or start fresh).
+	var cfg map[string]any
+	data, err := os.ReadFile(configPath)
+	if err == nil {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			cfg = make(map[string]any)
+		}
+	} else {
+		cfg = make(map[string]any)
+	}
+
+	// Check if already trusted.
+	var folders []any
+	if raw, ok := cfg["trusted_folders"]; ok {
+		if arr, ok := raw.([]any); ok {
+			folders = arr
+		}
+	}
+	for _, f := range folders {
+		if s, ok := f.(string); ok && s == absDir {
+			return nil // already trusted
+		}
+	}
+
+	// Add and write back.
+	cfg["trusted_folders"] = append(folders, absDir)
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, out, 0o644)
 }
