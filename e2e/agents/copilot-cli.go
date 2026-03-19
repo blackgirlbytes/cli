@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -186,10 +187,15 @@ func (c *CopilotCLI) StartSession(ctx context.Context, dir string) (Session, err
 	return s, nil
 }
 
+var copilotTrustMu sync.Mutex
+
 // ensureCopilotTrust adds dir to ~/.copilot/config.json trusted_folders if not
 // already present. Copilot CLI v1.0.8+ requires folder trust before loading
 // repo-level hooks; without this, hooks silently don't fire in -p mode.
 func ensureCopilotTrust(dir string) error {
+	copilotTrustMu.Lock()
+	defer copilotTrustMu.Unlock()
+
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		return err
