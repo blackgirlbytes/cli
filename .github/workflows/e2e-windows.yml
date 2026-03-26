@@ -3,13 +3,6 @@ name: E2E Tests (Windows)
 on:
   workflow_dispatch:
     inputs:
-      agent:
-        description: "Agent to test"
-        required: true
-        default: "claude-code"
-        type: choice
-        options:
-          [claude-code, opencode, gemini-cli, cursor-cli, factoryai-droid]
       test:
         description: "Test name filter (regex)"
         required: false
@@ -25,9 +18,6 @@ jobs:
   e2e-windows:
     runs-on: windows-latest
     timeout-minutes: 45
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - name: Checkout repository
@@ -35,43 +25,31 @@ jobs:
 
       - name: Setup mise
         uses: jdx/mise-action@v3
-        env:
-          MISE_DISABLE_TOOLS: tmux,golangci-lint,shellcheck
 
-      - name: Install agent CLI
+      - name: Install Claude Code
         run: |
-          AGENT="${{ inputs.agent || 'claude-code' }}"
-          case "$AGENT" in
-            claude-code) npm install -g @anthropic-ai/claude-code ;;
-            opencode)    curl -fsSL https://opencode.ai/install | bash ;;
-            gemini-cli)  npm install -g @google/gemini-cli ;;
-            cursor-cli)  curl https://cursor.com/install -fsS | bash ;;
-            factoryai-droid) curl -fsSL https://app.factory.ai/cli | sh ;;
-          esac
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          irm https://claude.ai/install.ps1 | iex
+          "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Bootstrap agent
+        shell: bash
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
-        run: go run ./e2e/bootstrap
+        run: go run ./e2e/bootstrap claude-code
 
-      - name: Run E2E tests
+      - name: Run isolated test
+        shell: bash
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
-          E2E_ENTIRE_BIN: ${{ github.workspace }}/entire.exe
-          E2E_AGENT: ${{ inputs.agent || 'claude-code' }}
-        run: mise run test:e2e --agent ${{ inputs.agent || 'claude-code' }} ${{ inputs.test }}
+          E2E_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts
+        run: |
+          mkdir -p "$E2E_ARTIFACT_DIR"
+          mise run test:e2e --agent claude-code "${{ inputs.test }}"
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-artifacts-windows-${{ inputs.agent || 'claude-code' }}
-          path: e2e/artifacts/
+          name: e2e-isolated-claude-code-${{ inputs.test }}
+          path: e2e-artifacts/
           retention-days: 7
