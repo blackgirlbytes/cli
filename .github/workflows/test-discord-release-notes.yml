@@ -1,109 +1,56 @@
-name: Release
+name: Test Discord Release Notes
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g., v0.5.1). Defaults to GITHUB_REF_NAME if empty.'
-        required: false
+        description: 'Release tag to test with (e.g., v0.5.1)'
+        required: true
         type: string
-  push:
-    tags:
-      - "v*"
-
-permissions:
-  contents: write
 
 jobs:
-  release:
+  test-discord:
+    name: Test Discord Post
     runs-on: ubuntu-latest
-    outputs:
-      release_tag: ${{ steps.get-tag.outputs.tag }}
-      release_notes: ${{ steps.extract-notes.outputs.notes }}
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - uses: jdx/mise-action@v4
-
-      - name: Get release tag
-        id: get-tag
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Generate Homebrew Tap token
-        id: app-token
-        uses: actions/create-github-app-token@v3.0.0
-        with:
-          app-id: ${{ secrets.HOMEBREW_TAP_APP_ID }}
-          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: homebrew-tap
 
       - name: Extract release notes from CHANGELOG.md
         id: extract-notes
         run: |
-          TAG="${{ steps.get-tag.outputs.tag }}"
-          VERSION="${TAG#v}"
-          awk -v ver="$VERSION" 'BEGIN{header="^## \\[" ver "\\]"} $0 ~ header{found=1; next} /^## \[/{if(found) exit} found{print}' CHANGELOG.md > "$RUNNER_TEMP/release_notes.md"
-          if [ ! -s "$RUNNER_TEMP/release_notes.md" ]; then
-            echo "::error::No changelog entry found for version ${VERSION} in CHANGELOG.md"
+          VERSION="${{ inputs.tag }}"
+          VERSION="${VERSION#v}"
+          awk -v ver="$VERSION" 'BEGIN{header="^## \\[" ver "\\]"} $0 ~ header{found=1; next} /^## \[/{if(found) exit} found{print}' CHANGELOG.md > /tmp/release_notes.md
+          if [ ! -s /tmp/release_notes.md ]; then
+            echo "::error::No changelog entry found for version ${VERSION}"
             exit 1
           fi
 
-          # Output release notes for downstream jobs
+          echo "::notice::Extracted $(wc -c < /tmp/release_notes.md) chars of release notes"
+          cat /tmp/release_notes.md
+
           DELIMITER="EOF_$(openssl rand -hex 8)"
           echo "notes<<$DELIMITER" >> "$GITHUB_OUTPUT"
-          cat "$RUNNER_TEMP/release_notes.md" >> "$GITHUB_OUTPUT"
+          cat /tmp/release_notes.md >> "$GITHUB_OUTPUT"
           echo "" >> "$GITHUB_OUTPUT"
           echo "$DELIMITER" >> "$GITHUB_OUTPUT"
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          distribution: goreleaser-pro
-          version: latest
-          args: release --clean --release-notes=${{ runner.temp }}/release_notes.md
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAP_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-          POSTHOG_ENDPOINT: ${{ vars.POSTHOG_ENDPOINT }}
-
-  post-to-discord:
-    name: Post to Discord
-    runs-on: ubuntu-latest
-    needs: release
-    steps:
-      - name: Post release announcement
+      - name: Post release announcement to Discord
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
-          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
-          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ needs.release.outputs.release_tag }}
-          RELEASE_NOTES: ${{ needs.release.outputs.release_notes }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ inputs.tag }}
+          RELEASE_NOTES: ${{ steps.extract-notes.outputs.notes }}
         shell: bash
         run: |
-          # Skip if Discord is not configured
           if [ -z "$DISCORD_CHANNEL_ID" ] || [ -z "$DISCORD_BOT_TOKEN" ]; then
-            echo "::notice::Discord not configured, skipping"
-            exit 0
+            echo "::error::DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID secrets must be set"
+            exit 1
           fi
 
           SAFE_LIMIT=1800
 
-          # Send a Discord message via bot API, returns message ID
           send_discord() {
             local content="$1"
             local channel="$2"
@@ -123,7 +70,6 @@ jobs:
             echo "$response" | jq -r '.id // empty'
           }
 
-          # Create a thread from a message
           create_thread() {
             local channel="$1"
             local message_id="$2"
@@ -188,7 +134,6 @@ jobs:
           THREAD_CONTENT=""
           [ -f /tmp/thread_content.txt ] && THREAD_CONTENT=$(cat /tmp/thread_content.txt)
 
-          # Send main message
           MAIN_MESSAGE="${HEADER}
 
           ${MAIN_CONTENT}
@@ -211,7 +156,6 @@ jobs:
           fi
           sleep 1
 
-          # Post thread content in chunks
           if [ -n "$THREAD_CONTENT" ]; then
             THREAD_MSG="${THREAD_CONTENT}
             ${FOOTER}"
@@ -219,7 +163,6 @@ jobs:
             if [ ${#THREAD_MSG} -le "$SAFE_LIMIT" ]; then
               send_discord "$THREAD_MSG" "$THREAD_ID"
             else
-              # Split into multiple chunks by complete lines
               awk -v limit="$SAFE_LIMIT" '
               BEGIN { chunk = ""; chunk_len = 0; chunk_num = 0 }
               {
@@ -249,7 +192,6 @@ jobs:
                 rm -f "$chunk_file"
               done
 
-              # Send footer as final message in thread
               send_discord "See https://docs.entire.io/cli/installation for help installing and updating." "$THREAD_ID"
             fi
           fi
@@ -257,35 +199,3 @@ jobs:
           rm -f /tmp/release_notes_full.txt /tmp/main_content.txt /tmp/thread_content.txt
 
           echo "::notice::Discord notification sent successfully"
-
-  notify-slack:
-    runs-on: ubuntu-latest
-    needs: [release]
-    if: ${{ always() && needs.release.result == 'failure' }}
-    steps:
-      - name: Notify Slack of release failure
-        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
-        with:
-          webhook: ${{ secrets.E2E_SLACK_WEBHOOK_URL }}
-          webhook-type: incoming-webhook
-          payload: |
-            {
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": ":red_circle: *Release Failed* for `${{ github.ref_name }}`\n\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run details>"
-                  }
-                },
-                {
-                  "type": "context",
-                  "elements": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "Tag: `${{ github.ref_name }}` by ${{ github.actor }}"
-                    }
-                  ]
-                }
-              ]
-            }
