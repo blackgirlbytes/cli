@@ -436,25 +436,52 @@ jobs:
         run: |
           TODAY=$(date -u +"%Y-%m-%d")
           FILE_PATH="/tmp/dispatch-notes-${TODAY}.md"
+          FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
+          FILENAME="dispatch-notes-${TODAY}.md"
 
-          # Upload file to Slack using files.upload API
-          RESPONSE=$(curl -s -X POST "https://slack.com/api/files.upload" \
+          echo "::notice::Uploading file: ${FILENAME} (${FILE_SIZE} bytes)"
+
+          # Step 1: Get upload URL from Slack
+          UPLOAD_URL_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.getUploadURLExternal" \
             -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -F "file=@${FILE_PATH}" \
-            -F "channels=${SLACK_CHANNEL_ID}" \
-            -F "thread_ts=${THREAD_TS}" \
-            -F "title=Dispatch Notes ${TODAY}" \
-            -F "filename=dispatch-notes-${TODAY}.md" \
-            -F "filetype=markdown" \
-            -F "initial_comment=📄 *Combined dispatch notes as markdown file*")
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "filename=${FILENAME}" \
+            --data-urlencode "length=${FILE_SIZE}")
 
-          if [ "$(echo "$RESPONSE" | jq -r '.ok')" != "true" ]; then
-            echo "::error::Slack file upload error: $(echo "$RESPONSE" | jq -r '.error')"
+          if [ "$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to get upload URL: $(echo "$UPLOAD_URL_RESPONSE" | jq -r '.error')"
             exit 1
           fi
 
-          FILE_URL=$(echo "$RESPONSE" | jq -r '.file.permalink')
-          echo "::notice::Uploaded markdown file: ${FILE_URL}"
+          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
+          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
+
+          # Step 2: Upload file content to the URL
+          UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
+            -F "file=@${FILE_PATH}")
+
+          # Step 3: Complete the upload and share to channel/thread
+          COMPLETE_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg file_id "$FILE_ID" \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --arg thread_ts "$THREAD_TS" \
+              --arg title "Dispatch Notes ${TODAY}" \
+              '{
+                files: [{id: $file_id, title: $title}],
+                channel_id: $channel,
+                thread_ts: $thread_ts,
+                initial_comment: "📄 *Combined dispatch notes as markdown file*"
+              }')")
+
+          if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to complete upload: $(echo "$COMPLETE_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          echo "::notice::Successfully uploaded ${FILENAME} to Slack thread"
 
   # Generate a draft dispatch post in Marvin's voice
   draft-dispatch:
@@ -624,27 +651,54 @@ jobs:
         run: |
           TODAY=$(date -u +"%Y-%m-%d")
           FILE_PATH="/tmp/dispatch-draft-output.md"
+          FILENAME="dispatch-draft-${TODAY}.md"
 
           if [ ! -f "$FILE_PATH" ]; then
             echo "::error::Dispatch draft not found"
             exit 1
           fi
 
-          # Upload dispatch draft to Slack
-          RESPONSE=$(curl -s -X POST "https://slack.com/api/files.upload" \
-            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -F "file=@${FILE_PATH}" \
-            -F "channels=${SLACK_CHANNEL_ID}" \
-            -F "thread_ts=${THREAD_TS}" \
-            -F "title=Dispatch Draft ${TODAY}" \
-            -F "filename=dispatch-draft-${TODAY}.md" \
-            -F "filetype=markdown" \
-            -F "initial_comment=📝 *Dispatch Draft* _(Marvin's voice, ready for editing)_")
+          FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
+          echo "::notice::Uploading file: ${FILENAME} (${FILE_SIZE} bytes)"
 
-          if [ "$(echo "$RESPONSE" | jq -r '.ok')" != "true" ]; then
-            echo "::error::Slack file upload error: $(echo "$RESPONSE" | jq -r '.error')"
+          # Step 1: Get upload URL from Slack
+          UPLOAD_URL_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.getUploadURLExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "filename=${FILENAME}" \
+            --data-urlencode "length=${FILE_SIZE}")
+
+          if [ "$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to get upload URL: $(echo "$UPLOAD_URL_RESPONSE" | jq -r '.error')"
             exit 1
           fi
 
-          FILE_URL=$(echo "$RESPONSE" | jq -r '.file.permalink')
-          echo "::notice::Uploaded dispatch draft: ${FILE_URL}"
+          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
+          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
+
+          # Step 2: Upload file content to the URL
+          UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
+            -F "file=@${FILE_PATH}")
+
+          # Step 3: Complete the upload and share to channel/thread
+          COMPLETE_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg file_id "$FILE_ID" \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --arg thread_ts "$THREAD_TS" \
+              --arg title "Dispatch Draft ${TODAY}" \
+              '{
+                files: [{id: $file_id, title: $title}],
+                channel_id: $channel,
+                thread_ts: $thread_ts,
+                initial_comment: "📝 *Dispatch Draft* _(Marvins voice, ready for editing)_"
+              }')")
+
+          if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to complete upload: $(echo "$COMPLETE_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          echo "::notice::Successfully uploaded dispatch draft to Slack thread"
