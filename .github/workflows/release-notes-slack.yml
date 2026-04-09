@@ -15,16 +15,17 @@ on:
   workflow_dispatch:
     inputs:
       repo:
-        description: 'Repository to generate notes for'
+        description: 'Repository to generate notes for (or "all")'
         required: true
         type: choice
         options:
+          - all
           - entireio/cli
           - entirehq/entiredb
           - entirehq/entire.io
           - go-git/go-git
       tag:
-        description: 'Release tag (e.g., v1.25.0). Leave empty for latest.'
+        description: 'Release tag (e.g., v1.25.0). Leave empty for latest. Ignored when "all" is selected.'
         required: false
         type: string
 
@@ -35,53 +36,84 @@ permissions:
   contents: read
 
 jobs:
-  check-releases:
-    name: Check for New Releases
+  # Build the matrix of repos to process
+  build-matrix:
+    name: Build Matrix
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
     outputs:
-      matrix: ${{ steps.check.outputs.matrix }}
-      has_releases: ${{ steps.check.outputs.has_releases }}
+      matrix: ${{ steps.build.outputs.matrix }}
+      has_repos: ${{ steps.build.outputs.has_repos }}
 
     steps:
-      - name: Check for releases in last 24 hours
-        id: check
+      - name: Build release matrix
+        id: build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          REPOS="entireio/cli entirehq/entiredb entirehq/entire.io go-git/go-git"
+          ALL_REPOS="entireio/cli entirehq/entiredb entirehq/entire.io go-git/go-git"
           RELEASES=()
-          CUTOFF=$(date -d '24 hours ago' -u +%Y-%m-%dT%H:%M:%SZ)
 
-          for repo in $REPOS; do
-            RELEASE_INFO=$(gh api "repos/${repo}/releases/latest" 2>/dev/null || echo '{}')
-            PUBLISHED=$(echo "$RELEASE_INFO" | jq -r '.published_at // empty')
-            TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name // empty')
-
-            if [ -n "$PUBLISHED" ] && [ -n "$TAG" ]; then
-              if [[ "$PUBLISHED" > "$CUTOFF" ]]; then
-                RELEASES+=("{\"repo\":\"${repo}\",\"tag\":\"${TAG}\"}")
-                echo "::notice::Found new release: ${repo}@${TAG}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$INPUT_REPO" = "all" ]; then
+              # All repos - get latest tag for each
+              for repo in $ALL_REPOS; do
+                TAG=$(gh api "repos/${repo}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' || true)
+                if [ -n "$TAG" ]; then
+                  RELEASES+=("{\"repo\":\"${repo}\",\"tag\":\"${TAG}\"}")
+                  echo "::notice::Adding ${repo}@${TAG}"
+                else
+                  echo "::warning::No release found for ${repo}"
+                fi
+              done
+            else
+              # Single repo
+              if [ -n "$INPUT_TAG" ]; then
+                TAG="$INPUT_TAG"
+              else
+                TAG=$(gh api "repos/${INPUT_REPO}/releases/latest" | jq -r '.tag_name')
               fi
+              RELEASES+=("{\"repo\":\"${INPUT_REPO}\",\"tag\":\"${TAG}\"}")
+              echo "::notice::Adding ${INPUT_REPO}@${TAG}"
             fi
-          done
+          else
+            # Scheduled: check for releases in last 24 hours
+            CUTOFF=$(date -d '24 hours ago' -u +%Y-%m-%dT%H:%M:%SZ)
+
+            for repo in $ALL_REPOS; do
+              RELEASE_INFO=$(gh api "repos/${repo}/releases/latest" 2>/dev/null || echo '{}')
+              PUBLISHED=$(echo "$RELEASE_INFO" | jq -r '.published_at // empty')
+              TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name // empty')
+
+              if [ -n "$PUBLISHED" ] && [ -n "$TAG" ]; then
+                if [[ "$PUBLISHED" > "$CUTOFF" ]]; then
+                  RELEASES+=("{\"repo\":\"${repo}\",\"tag\":\"${TAG}\"}")
+                  echo "::notice::Found new release: ${repo}@${TAG}"
+                fi
+              fi
+            done
+          fi
 
           if [ ${#RELEASES[@]} -eq 0 ]; then
-            echo "has_releases=false" >> $GITHUB_OUTPUT
+            echo "has_repos=false" >> $GITHUB_OUTPUT
             echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+            echo "::notice::No repos to process"
           else
             MATRIX=$(printf '%s\n' "${RELEASES[@]}" | jq -sc '{include: .}')
-            echo "has_releases=true" >> $GITHUB_OUTPUT
+            echo "has_repos=true" >> $GITHUB_OUTPUT
             echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
           fi
 
-  generate-scheduled:
+  # Generate and post release notes for each repo
+  generate:
     name: Generate (${{ matrix.repo }}@${{ matrix.tag }})
     runs-on: ubuntu-latest
-    needs: check-releases
-    if: needs.check-releases.outputs.has_releases == 'true'
+    needs: build-matrix
+    if: needs.build-matrix.outputs.has_repos == 'true'
     strategy:
-      matrix: ${{ fromJson(needs.check-releases.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
       fail-fast: false
 
     container:
@@ -89,13 +121,13 @@ jobs:
       options: --user root
       env:
         GOOSE_PROVIDER: openrouter
-        GOOSE_MODEL: anthropic/claude-opus-4.5
+        GOOSE_MODEL: anthropic/claude-sonnet-4
         OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         HOME: /tmp/goose-home
 
     steps:
       - name: Install dependencies
-        run: apt-get update && apt-get install -y git curl jq gettext
+        run: apt-get update && apt-get install -y git curl jq
 
       - name: Clone repository
         env:
@@ -109,7 +141,6 @@ jobs:
         env:
           REPO: ${{ matrix.repo }}
           RELEASE_TAG: ${{ matrix.tag }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           mkdir -p $HOME/.local/share/goose/sessions
           mkdir -p $HOME/.config/goose
@@ -161,177 +192,6 @@ jobs:
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           REPO: ${{ matrix.repo }}
           RELEASE_TAG: ${{ matrix.tag }}
-        shell: bash
-        run: |
-          set -e
-
-          if [ ! -f /tmp/release_notes.md ]; then
-            echo "::error::Release notes not generated"
-            exit 1
-          fi
-
-          NOTES=$(cat /tmp/release_notes.md)
-          RELEASE_URL="https://github.com/${REPO}/releases/tag/${RELEASE_TAG}"
-          SAFE_LIMIT=2900
-
-          post_message() {
-            local text="$1"
-            local thread_ts="${2:-}"
-
-            local payload
-            if [ -n "$thread_ts" ]; then
-              payload=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$text" --arg ts "$thread_ts" \
-                '{channel: $channel, text: $text, thread_ts: $ts, unfurl_links: false}')
-            else
-              payload=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$text" \
-                '{channel: $channel, text: $text, unfurl_links: false}')
-            fi
-
-            local response
-            response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
-              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "$payload")
-
-            if [ "$(echo "$response" | jq -r '.ok')" != "true" ]; then
-              echo "::error::Slack API error: $(echo "$response" | jq -r '.error')"
-              return 1
-            fi
-
-            echo "$response" | jq -r '.ts'
-          }
-
-          HEADER=$(printf '%s %s %s Released!\n\n%s' "🎉" "*${REPO}*" "\`${RELEASE_TAG}\`" "<${RELEASE_URL}|View Release on GitHub>")
-          FULL_MSG=$(printf '%s\n\n%s' "$HEADER" "$NOTES")
-
-          if [ ${#FULL_MSG} -le $SAFE_LIMIT ]; then
-            post_message "$FULL_MSG"
-            echo "::notice::Posted to Slack successfully (single message)"
-          else
-            MAIN_MSG=$(printf '%s\n\n%s' "$HEADER" "_📝 Full release notes in thread..._")
-            PARENT_TS=$(post_message "$MAIN_MSG")
-
-            if [ -z "$PARENT_TS" ]; then
-              echo "::error::Failed to post main message"
-              exit 1
-            fi
-
-            sleep 1
-
-            if [ ${#NOTES} -le $SAFE_LIMIT ]; then
-              post_message "$NOTES" "$PARENT_TS"
-            else
-              echo "$NOTES" > /tmp/notes_full.txt
-              split -b $SAFE_LIMIT /tmp/notes_full.txt /tmp/chunk_
-
-              for chunk_file in /tmp/chunk_*; do
-                [ -f "$chunk_file" ] || continue
-                CHUNK=$(cat "$chunk_file")
-                [ -n "$CHUNK" ] && post_message "$CHUNK" "$PARENT_TS"
-                sleep 1
-              done
-            fi
-
-            echo "::notice::Posted to Slack successfully (with thread)"
-          fi
-
-  generate-manual:
-    name: Generate (Manual)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-
-    container:
-      image: ghcr.io/block/goose:latest
-      options: --user root
-      env:
-        GOOSE_PROVIDER: openrouter
-        GOOSE_MODEL: anthropic/claude-opus-4.5
-        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        HOME: /tmp/goose-home
-
-    steps:
-      - name: Install dependencies
-        run: apt-get update && apt-get install -y git curl jq gettext gh
-
-      - name: Get release tag
-        id: get-tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INPUT_REPO: ${{ inputs.repo }}
-          INPUT_TAG: ${{ inputs.tag }}
-        run: |
-          if [ -n "$INPUT_TAG" ]; then
-            echo "tag=$INPUT_TAG" >> $GITHUB_OUTPUT
-          else
-            TAG=$(gh api "repos/${INPUT_REPO}/releases/latest" | jq -r '.tag_name')
-            echo "tag=$TAG" >> $GITHUB_OUTPUT
-            echo "::notice::Using latest release: $TAG"
-          fi
-
-      - name: Clone repository
-        env:
-          REPO: ${{ inputs.repo }}
-        run: |
-          git clone --depth 100 "https://github.com/${REPO}.git" /tmp/repo
-          cd /tmp/repo
-          git fetch --tags
-
-      - name: Generate release notes
-        env:
-          REPO: ${{ inputs.repo }}
-          RELEASE_TAG: ${{ steps.get-tag.outputs.tag }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
-          mkdir -p $HOME/.local/share/goose/sessions
-          mkdir -p $HOME/.config/goose
-          cd /tmp/repo
-
-          cat > /tmp/recipe.yaml << 'RECIPE_EOF'
-          version: "1.0.0"
-          title: "Release Notes Generator"
-          description: "Generate release notes for a GitHub release"
-
-          extensions:
-            - type: builtin
-              name: developer
-
-          instructions: |
-            Generate release notes for a GitHub release.
-
-            Context:
-            - Repository: REPO_PLACEHOLDER
-            - Release Tag: TAG_PLACEHOLDER
-            - You are in the cloned repository directory
-
-            Process:
-            1. Get the previous release tag: git describe --tags --abbrev=0 TAG_PLACEHOLDER^
-            2. Get commits between tags: git log PREV_TAG..TAG_PLACEHOLDER --oneline --no-merges
-            3. Analyze and categorize the changes
-
-            Output Format (skip empty sections):
-            - Features - New functionality
-            - Bug Fixes - Bug fixes
-            - Improvements - Enhancements
-            - Documentation - Doc updates
-            - Breaking Changes - Breaking changes (if any)
-
-            Format each item as a bullet with PR link if available.
-            Write ONLY the release notes content to /tmp/release_notes.md
-
-          prompt: |
-            Generate release notes for TAG_PLACEHOLDER in the REPO_PLACEHOLDER repository.
-          RECIPE_EOF
-
-          sed -i "s|REPO_PLACEHOLDER|${REPO}|g" /tmp/recipe.yaml
-          sed -i "s|TAG_PLACEHOLDER|${RELEASE_TAG}|g" /tmp/recipe.yaml
-          goose run --recipe /tmp/recipe.yaml
-
-      - name: Post to Slack
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-          REPO: ${{ inputs.repo }}
-          RELEASE_TAG: ${{ steps.get-tag.outputs.tag }}
         shell: bash
         run: |
           set -e
