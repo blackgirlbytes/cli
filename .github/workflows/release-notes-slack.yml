@@ -428,16 +428,36 @@ jobs:
           echo "::notice::Combined notes file created"
           cat /tmp/dispatch-notes-${TODAY}.md
 
-      - name: Upload markdown file to Slack
+      - name: Install pandoc and convert to PDF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc texlive-latex-base texlive-fonts-recommended texlive-latex-extra
+          
+          TODAY=$(date -u +"%Y-%m-%d")
+          
+          # Convert markdown to PDF with styling
+          pandoc /tmp/dispatch-notes-${TODAY}.md \
+            -o /tmp/dispatch-notes-${TODAY}.pdf \
+            --pdf-engine=pdflatex \
+            -V geometry:margin=1in \
+            -V fontsize=11pt \
+            -V colorlinks=true \
+            -V linkcolor=blue \
+            -V urlcolor=blue \
+            --highlight-style=tango
+          
+          echo "::notice::Converted to PDF: dispatch-notes-${TODAY}.pdf"
+
+      - name: Upload PDF to Slack
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
         run: |
           TODAY=$(date -u +"%Y-%m-%d")
-          FILE_PATH="/tmp/dispatch-notes-${TODAY}.md"
+          FILE_PATH="/tmp/dispatch-notes-${TODAY}.pdf"
           FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
-          FILENAME="dispatch-notes-${TODAY}.md"
+          FILENAME="dispatch-notes-${TODAY}.pdf"
 
           echo "::notice::Uploading file: ${FILENAME} (${FILE_SIZE} bytes)"
 
@@ -473,7 +493,7 @@ jobs:
                 files: [{id: $file_id, title: $title}],
                 channel_id: $channel,
                 thread_ts: $thread_ts,
-                initial_comment: "📄 *Combined dispatch notes as markdown file*"
+                initial_comment: "📄 *Dispatch Notes* — styled PDF with tables"
               }')")
 
           if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
@@ -643,22 +663,43 @@ jobs:
           name: dispatch-draft
           path: /tmp
 
-      - name: Upload draft to Slack
+      - name: Install pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc texlive-latex-base texlive-fonts-recommended texlive-latex-extra
+
+      - name: Convert draft to PDF
+        run: |
+          TODAY=$(date -u +"%Y-%m-%d")
+          
+          if [ ! -f "/tmp/dispatch-draft-output.md" ]; then
+            echo "::error::Dispatch draft not found"
+            exit 1
+          fi
+          
+          pandoc /tmp/dispatch-draft-output.md \
+            -o /tmp/dispatch-draft-${TODAY}.pdf \
+            --pdf-engine=pdflatex \
+            -V geometry:margin=1in \
+            -V fontsize=11pt \
+            -V colorlinks=true \
+            -V linkcolor=blue \
+            -V urlcolor=blue \
+            --highlight-style=tango
+          
+          echo "::notice::Converted draft to PDF"
+
+      - name: Upload draft PDF to Slack
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
         run: |
           TODAY=$(date -u +"%Y-%m-%d")
-          FILE_PATH="/tmp/dispatch-draft-output.md"
-          FILENAME="dispatch-draft-${TODAY}.md"
-
-          if [ ! -f "$FILE_PATH" ]; then
-            echo "::error::Dispatch draft not found"
-            exit 1
-          fi
-
+          FILE_PATH="/tmp/dispatch-draft-${TODAY}.pdf"
+          FILENAME="dispatch-draft-${TODAY}.pdf"
           FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
+
           echo "::notice::Uploading file: ${FILENAME} (${FILE_SIZE} bytes)"
 
           # Step 1: Get upload URL from Slack
@@ -702,3 +743,56 @@ jobs:
           fi
 
           echo "::notice::Successfully uploaded dispatch draft to Slack thread"
+
+      - name: Upload raw markdown for editing
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
+        run: |
+          TODAY=$(date -u +"%Y-%m-%d")
+          FILE_PATH="/tmp/dispatch-draft-output.md"
+          FILENAME="dispatch-draft-${TODAY}.md"
+          FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
+
+          # Step 1: Get upload URL from Slack
+          UPLOAD_URL_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.getUploadURLExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "filename=${FILENAME}" \
+            --data-urlencode "length=${FILE_SIZE}")
+
+          if [ "$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to get upload URL: $(echo "$UPLOAD_URL_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
+          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
+
+          # Step 2: Upload file content to the URL
+          UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
+            -F "file=@${FILE_PATH}")
+
+          # Step 3: Complete the upload and share to channel/thread
+          COMPLETE_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg file_id "$FILE_ID" \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --arg thread_ts "$THREAD_TS" \
+              --arg title "Dispatch Draft (editable) ${TODAY}" \
+              '{
+                files: [{id: $file_id, title: $title}],
+                channel_id: $channel,
+                thread_ts: $thread_ts,
+                initial_comment: "📋 *Raw markdown* — copy-paste for blog"
+              }')")
+
+          if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to complete upload: $(echo "$COMPLETE_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          echo "::notice::Successfully uploaded raw markdown to Slack thread"
