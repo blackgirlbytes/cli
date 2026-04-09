@@ -2,6 +2,7 @@
 #
 # Generates dispatch notes using goose AI agent for multiple repositories.
 # Compares against the last published dispatch to avoid duplicates.
+# Uploads a combined markdown file with tables to Slack.
 #
 # Repositories monitored:
 # - entireio/cli
@@ -160,7 +161,7 @@ jobs:
           echo "thread_ts=$THREAD_TS" >> $GITHUB_OUTPUT
           echo "::notice::Created parent message with ts=$THREAD_TS"
 
-  # Generate and post notes for each repo
+  # Generate notes for each repo
   generate:
     name: Generate (${{ matrix.repo }})
     runs-on: ubuntu-latest
@@ -212,7 +213,7 @@ jobs:
           mkdir -p $HOME/.config/goose
           cd /tmp/repo
 
-          # Check if this is entire.io (needs special handling)
+          # Check if this is entire.io (needs special handling with feature flags)
           if [ "$REPO" = "entirehq/entire.io" ]; then
             cat > /tmp/recipe.yaml << 'RECIPE_EOF'
           version: "1.0.0"
@@ -224,7 +225,7 @@ jobs:
               name: developer
 
           instructions: |
-            Generate dispatch notes for entire.io, showing what's new since the last dispatch.
+            Generate dispatch notes for entire.io in MARKDOWN TABLE format.
             This repo deploys continuously to main, but some features are behind feature flags.
 
             Context:
@@ -239,56 +240,58 @@ jobs:
             1. Read /tmp/last_dispatch.md to see what was already covered - DO NOT include those items
             2. Get all commits/merges to main since DATE_PLACEHOLDER:
                git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
-            3. Read /tmp/posthog_flags.json to get current feature flag states
-            4. Read feature-flags.json in the repo to see which flags are defined
-            5. For each merged PR/commit since DATE_PLACEHOLDER:
+            3. For each commit, get the associated PR number from the commit message or use:
+               git log --since="DATE_PLACEHOLDER" --first-parent main --format="%s" | grep -oE '#[0-9]+'
+            4. Read /tmp/posthog_flags.json to get current feature flag states
+            5. Read feature-flags.json in the repo to see which flags are defined
+            6. For each merged PR/commit since DATE_PLACEHOLDER:
                - Search the codebase for whether this change references a feature flag
-               - Use: grep -r "flag-name" in the changed files or commit diff
                - Look up that flag's status in posthog_flags.json
-            6. Categorize each change:
-               - "Released" = No feature flag OR flag is active with 100% rollout
-               - "Merged but not released" = Behind a flag that is inactive OR < 100% rollout
+            7. Categorize and determine "Public" status:
+               - "Released" + Public=Y: No feature flag OR flag is active with 100% rollout
+               - "Released" + Public=N: Should not happen (if released, it's public)
+               - "Merged but not released" + Public=N: Behind a flag that is inactive OR < 100% rollout
 
             PostHog flag status interpretation (from posthog_flags.json):
-            - "active": true AND rollout_percentage: 100 (or no rollout_percentage) → Released
-            - "active": true AND rollout_percentage < 100 → NOT released (partial rollout)
-            - "active": false → NOT released (disabled)
-            - "active": true with filters (like @entire.io email) → NOT released (internal only)
-            - No flag reference in code → Released (shipped when merged)
+            - "active": true AND rollout_percentage: 100 (or no rollout_percentage) → Public = Y
+            - "active": true AND rollout_percentage < 100 → Public = N (partial rollout)
+            - "active": false → Public = N (disabled)
+            - "active": true with filters (like @entire.io email) → Public = N (internal only)
+            - No flag reference in code → Public = Y (shipped when merged)
 
-            IMPORTANT: Use Slack mrkdwn format:
-            - *bold* (single asterisks)
-            - _italic_ (underscores)
-            - <https://example.com|link text> for links
-            - • for bullet points
+            IMPORTANT: Output must be MARKDOWN TABLES with these exact formats:
 
-            Output Format:
+            ## 📦 Released
 
-            📦 *Released* _(shipped to all users)_
-            • Feature/change description (<https://github.com/entirehq/entire.io/pull/123|#123>)
-            • Another public feature (<https://github.com/entirehq/entire.io/pull/124|#124>)
+            | Change | PR | Public |
+            |--------|-----|--------|
+            | Brief description of the change | [#123](https://github.com/entirehq/entire.io/pull/123) | Y |
+            | Another change description | [#124](https://github.com/entirehq/entire.io/pull/124) | Y |
 
-            🔀 *Merged but not released* _(behind feature flags)_
-            • Feature at 50% rollout (<https://github.com/entirehq/entire.io/pull/125|#125>)
-            • Feature for internal users only (<https://github.com/entirehq/entire.io/pull/126|#126>)
-            • Feature with disabled flag (<https://github.com/entirehq/entire.io/pull/127|#127>)
+            ## 🔀 Merged (not yet released)
+
+            | Change | PR | Public |
+            |--------|-----|--------|
+            | Feature behind partial rollout | [#125](https://github.com/entirehq/entire.io/pull/125) | N |
+            | Internal-only feature | [#126](https://github.com/entirehq/entire.io/pull/126) | N |
 
             Rules:
-            - ALWAYS include BOTH sections - use "_None_" if a section is empty
+            - ALWAYS include BOTH sections with their tables
+            - If a section has no items, include the table header with a single row: | _None this period_ | - | - |
             - DO NOT mention feature flag names or statuses - users don't know about them
-            - Simply categorize as "Released" or "Merged but not released"
-            - Keep descriptions concise and user-focused
+            - Keep change descriptions concise (under 60 chars) and user-focused
             - Exclude anything already mentioned in the last dispatch
+            - PR links must be full markdown links: [#123](url)
+            - Public column: Y = visible to all users, N = not yet visible
 
-            Write ONLY the notes content to /tmp/dispatch_notes.md
+            Write ONLY the markdown tables to /tmp/dispatch_notes.md
 
           prompt: |
             Generate dispatch notes for entirehq/entire.io showing changes since DATE_PLACEHOLDER.
-            Check /tmp/last_dispatch.md to avoid duplicating already-covered items.
-            Use /tmp/posthog_flags.json internally to determine if changes are behind non-public flags.
+            Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
           RECIPE_EOF
           else
-            # Standard recipe for repos with tagged releases
+            # Standard recipe for repos with tagged releases (no Public column)
             cat > /tmp/recipe.yaml << 'RECIPE_EOF'
           version: "1.0.0"
           title: "Dispatch Notes Generator"
@@ -299,7 +302,7 @@ jobs:
               name: developer
 
           instructions: |
-            Generate dispatch notes for a repository, showing what's new since the last dispatch.
+            Generate dispatch notes for a repository in MARKDOWN TABLE format.
 
             Context:
             - Repository: REPO_PLACEHOLDER
@@ -309,39 +312,48 @@ jobs:
 
             Process:
             1. Read /tmp/last_dispatch.md to see what was already covered (releases mentioned, PRs linked)
-            2. Get all releases since DATE_PLACEHOLDER: check git tags and their dates
+            2. Get all releases/tags since DATE_PLACEHOLDER:
+               git tag --sort=-creatordate | head -20
+               git log --tags --simplify-by-decoration --pretty="format:%ai %d" | head -20
             3. Get all merges to main/master since DATE_PLACEHOLDER:
                git log --since="DATE_PLACEHOLDER" --merges --first-parent main --oneline
-               git log --since="DATE_PLACEHOLDER" --no-merges --first-parent main --oneline
-            4. Cross-reference with the last dispatch - exclude anything already mentioned
+               Or for commits:
+               git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
+            4. Extract PR numbers from commit messages (look for #NNN patterns)
+            5. Cross-reference with the last dispatch - exclude anything already mentioned
+            6. Categorize:
+               - "Released": Changes that are part of a tagged release since DATE_PLACEHOLDER
+               - "Merged (not yet released)": Changes merged to main but not in any release tag
 
-            IMPORTANT: Use Slack mrkdwn format:
-            - *bold* (single asterisks)
-            - _italic_ (underscores)
-            - <https://example.com|link text> for links
-            - • for bullet points
+            IMPORTANT: Output must be MARKDOWN TABLES with these exact formats:
 
-            Output Format:
+            ## 📦 Released
 
-            📦 *Released*
-            • `vX.Y.Z` - Brief description of release
-              ◦ Change 1 (<https://github.com/REPO_PLACEHOLDER/pull/123|#123>)
-              ◦ Change 2 (<https://github.com/REPO_PLACEHOLDER/pull/124|#124>)
+            | Change | PR |
+            |--------|----|
+            | `vX.Y.Z` - Brief description | [#123](https://github.com/REPO_PLACEHOLDER/pull/123) |
+            | Another released change | [#124](https://github.com/REPO_PLACEHOLDER/pull/124) |
 
-            🔀 *Merged to main* _(not yet released)_
-            • Change description (<https://github.com/REPO_PLACEHOLDER/pull/125|#125>)
+            ## 🔀 Merged (not yet released)
+
+            | Change | PR |
+            |--------|----|
+            | Feature waiting for next release | [#125](https://github.com/REPO_PLACEHOLDER/pull/125) |
+            | Bug fix in main | [#126](https://github.com/REPO_PLACEHOLDER/pull/126) |
 
             Rules:
-            - ALWAYS include BOTH sections - use "_None_" if a section is empty
-            - Group released items under their release tag
-            - Keep descriptions concise
-            - Extract PR numbers from commit messages
+            - ALWAYS include BOTH sections with their tables
+            - If a section has no items, include the table header with a single row: | _None this period_ | - |
+            - For released items, prefix with the version tag (e.g., `v1.2.3` - description)
+            - Keep change descriptions concise (under 60 chars)
+            - Exclude anything already mentioned in the last dispatch
+            - PR links must be full markdown links: [#123](url)
 
-            Write ONLY the notes content to /tmp/dispatch_notes.md
+            Write ONLY the markdown tables to /tmp/dispatch_notes.md
 
           prompt: |
             Generate dispatch notes for REPO_PLACEHOLDER showing changes since DATE_PLACEHOLDER.
-            Check /tmp/last_dispatch.md to avoid duplicating already-covered items.
+            Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
           RECIPE_EOF
           fi
 
@@ -349,7 +361,7 @@ jobs:
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
           goose run --recipe /tmp/recipe.yaml
 
-      - name: Save notes for dispatch draft
+      - name: Save notes artifact
         env:
           REPO: ${{ matrix.repo }}
         run: |
@@ -364,72 +376,85 @@ jobs:
           path: /tmp/notes-*.md
           retention-days: 1
 
-      - name: Post to Slack thread
+  # Combine all notes and upload as markdown file to Slack
+  upload-combined:
+    name: Upload Combined Notes
+    runs-on: ubuntu-latest
+    needs: [prepare, post-parent, generate]
+
+    steps:
+      - name: Download all repo notes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: notes-*
+          path: /tmp/repo-notes
+          merge-multiple: true
+
+      - name: Combine notes into single markdown file
+        env:
+          LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+        run: |
+          TODAY=$(date -u +"%Y-%m-%d")
+          
+          cat > /tmp/dispatch-notes-${TODAY}.md << EOF
+          # Dispatch Notes — ${TODAY}
+
+          _Changes since last dispatch (${LAST_DISPATCH_DATE})_
+
+          ---
+
+          EOF
+
+          # Add each repo's notes
+          for f in /tmp/repo-notes/notes-*.md; do
+            if [ -f "$f" ]; then
+              # Extract repo name from filename (notes-entireio-cli.md -> entireio/cli)
+              FILENAME=$(basename "$f" .md)
+              REPO_NAME=$(echo "$FILENAME" | sed 's/notes-//' | sed 's/-/\//g')
+              
+              # Handle the special case of entirehq-entire.io -> entirehq/entire.io
+              REPO_NAME=$(echo "$REPO_NAME" | sed 's/entire\/io/entire.io/')
+              
+              cat >> /tmp/dispatch-notes-${TODAY}.md << EOF
+
+          # ${REPO_NAME}
+
+          EOF
+              cat "$f" >> /tmp/dispatch-notes-${TODAY}.md
+              echo -e "\n---\n" >> /tmp/dispatch-notes-${TODAY}.md
+            fi
+          done
+
+          echo "::notice::Combined notes file created"
+          cat /tmp/dispatch-notes-${TODAY}.md
+
+      - name: Upload markdown file to Slack
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
-          REPO: ${{ matrix.repo }}
-        shell: bash
         run: |
-          set -e
+          TODAY=$(date -u +"%Y-%m-%d")
+          FILE_PATH="/tmp/dispatch-notes-${TODAY}.md"
 
-          if [ ! -f /tmp/dispatch_notes.md ]; then
-            echo "::error::Dispatch notes not generated"
+          # Upload file to Slack using files.upload API
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/files.upload" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -F "file=@${FILE_PATH}" \
+            -F "channels=${SLACK_CHANNEL_ID}" \
+            -F "thread_ts=${THREAD_TS}" \
+            -F "title=Dispatch Notes ${TODAY}" \
+            -F "filename=dispatch-notes-${TODAY}.md" \
+            -F "filetype=markdown" \
+            -F "initial_comment=📄 *Combined dispatch notes as markdown file*")
+
+          if [ "$(echo "$RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Slack file upload error: $(echo "$RESPONSE" | jq -r '.error')"
             exit 1
           fi
 
-          NOTES=$(cat /tmp/dispatch_notes.md)
-          SAFE_LIMIT=2900
-
-          post_message() {
-            local text="$1"
-
-            local payload
-            payload=$(jq -n \
-              --arg channel "$SLACK_CHANNEL_ID" \
-              --arg text "$text" \
-              --arg ts "$THREAD_TS" \
-              '{channel: $channel, text: $text, thread_ts: $ts, unfurl_links: false}')
-
-            local response
-            response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
-              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "$payload")
-
-            if [ "$(echo "$response" | jq -r '.ok')" != "true" ]; then
-              echo "::error::Slack API error: $(echo "$response" | jq -r '.error')"
-              return 1
-            fi
-          }
-
-          # Build the message with repo header and divider
-          DIVIDER="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          HEADER=$(printf '%s\n📁 *%s*\n' "$DIVIDER" "$REPO")
-          FULL_MSG=$(printf '%s\n%s' "$HEADER" "$NOTES")
-
-          # Post in chunks if needed
-          if [ ${#FULL_MSG} -le $SAFE_LIMIT ]; then
-            post_message "$FULL_MSG"
-          else
-            # Post header first
-            post_message "$HEADER"
-            sleep 1
-
-            # Chunk the notes
-            echo "$NOTES" > /tmp/notes_full.txt
-            split -b $SAFE_LIMIT /tmp/notes_full.txt /tmp/chunk_
-
-            for chunk_file in /tmp/chunk_*; do
-              [ -f "$chunk_file" ] || continue
-              CHUNK=$(cat "$chunk_file")
-              [ -n "$CHUNK" ] && post_message "$CHUNK"
-              sleep 1
-            done
-          fi
-
-          echo "::notice::Posted dispatch notes to Slack thread"
+          FILE_URL=$(echo "$RESPONSE" | jq -r '.file.permalink')
+          echo "::notice::Uploaded markdown file: ${FILE_URL}"
 
   # Generate a draft dispatch post in Marvin's voice
   draft-dispatch:
@@ -499,24 +524,24 @@ jobs:
             Generate a draft dispatch blog post for the Entire project.
 
             Context:
-            - The collected notes from all repos are in /tmp/all_notes.md
+            - The collected notes from all repos are in /tmp/all_notes.md (in table format)
             - Example dispatches for voice/style reference are in /tmp/*.md (files like 2026-04-06-entire-dispatch-0x0008.md)
             - This dispatch covers changes since DATE_PLACEHOLDER
 
-            IMPORTANT: Only include items that are under "📦 *Released*" sections in the notes.
-            Do NOT include items under "🔀 *Merged to main*" - those are not released yet and
-            should not be in the dispatch. The dispatch only covers what has actually shipped
-            in tagged releases.
+            IMPORTANT: Only include items from the "📦 Released" tables.
+            For entire.io specifically, only include items where Public = Y.
+            Do NOT include items from "🔀 Merged (not yet released)" tables.
 
             Process:
             1. Read the example dispatch files in /tmp/ to understand:
                - The voice (Marvin, a robot with personality - "Beep, boop", dry humor)
                - The structure (frontmatter, intro paragraph, sections with ## headings, closing)
                - How features are described (user-focused, mentions contributors)
-            2. Read /tmp/all_notes.md and extract ONLY the "📦 *Released*" items
-            3. Ignore all "🔀 *Merged to main*" items - they haven't shipped yet
-            4. Determine the next dispatch number (look at the latest example and increment)
-            5. Write a complete dispatch draft covering only released items
+            2. Read /tmp/all_notes.md and parse the markdown tables
+            3. Extract ONLY items from "📦 Released" sections
+            4. For entire.io, only include items where the Public column = Y
+            5. Determine the next dispatch number (look at the latest example and increment)
+            6. Write a complete dispatch draft
 
             Output Format (Markdown for the blog):
 
@@ -547,7 +572,7 @@ jobs:
             [Closing paragraph in Marvin's voice with call to action]
 
             Rules:
-            - ONLY include released items (from "📦 *Released*" sections) - never merged-but-unreleased
+            - ONLY include released items that are public (Public = Y for entire.io)
             - Match Marvin's voice exactly - dry wit, robot references, occasionally sardonic
             - Group related changes into logical sections with ## headings
             - Mention release versions with links: [v0.5.3](https://github.com/entireio/cli/releases/tag/v0.5.3)
@@ -560,82 +585,66 @@ jobs:
           prompt: |
             Generate a dispatch draft covering changes since DATE_PLACEHOLDER.
             Read the example dispatches in /tmp/ for voice and style.
-            Read /tmp/all_notes.md for the content to include.
+            Read /tmp/all_notes.md for the table content to include.
+            Only include Released items (and for entire.io, only Public = Y).
           RECIPE_EOF
 
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
           goose run --recipe /tmp/recipe.yaml
 
-      - name: Post dispatch draft to Slack
+      - name: Save dispatch draft
+        run: |
+          cp /tmp/dispatch_draft.md /tmp/dispatch-draft-output.md
+
+      - name: Upload dispatch draft artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dispatch-draft
+          path: /tmp/dispatch-draft-output.md
+          retention-days: 7
+
+  # Upload the dispatch draft as a separate file
+  upload-draft:
+    name: Upload Draft
+    runs-on: ubuntu-latest
+    needs: [post-parent, draft-dispatch]
+
+    steps:
+      - name: Download dispatch draft
+        uses: actions/download-artifact@v4
+        with:
+          name: dispatch-draft
+          path: /tmp
+
+      - name: Upload draft to Slack
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
-        shell: bash
         run: |
-          set -e
+          TODAY=$(date -u +"%Y-%m-%d")
+          FILE_PATH="/tmp/dispatch-draft-output.md"
 
-          if [ ! -f /tmp/dispatch_draft.md ]; then
-            echo "::error::Dispatch draft not generated"
+          if [ ! -f "$FILE_PATH" ]; then
+            echo "::error::Dispatch draft not found"
             exit 1
           fi
 
-          DRAFT=$(cat /tmp/dispatch_draft.md)
-          SAFE_LIMIT=2900
+          # Upload dispatch draft to Slack
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/files.upload" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -F "file=@${FILE_PATH}" \
+            -F "channels=${SLACK_CHANNEL_ID}" \
+            -F "thread_ts=${THREAD_TS}" \
+            -F "title=Dispatch Draft ${TODAY}" \
+            -F "filename=dispatch-draft-${TODAY}.md" \
+            -F "filetype=markdown" \
+            -F "initial_comment=📝 *Dispatch Draft* _(Marvin's voice, ready for editing)_")
 
-          post_message() {
-            local text="$1"
-
-            local payload
-            payload=$(jq -n \
-              --arg channel "$SLACK_CHANNEL_ID" \
-              --arg text "$text" \
-              --arg ts "$THREAD_TS" \
-              '{channel: $channel, text: $text, thread_ts: $ts, unfurl_links: false}')
-
-            local response
-            response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
-              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "$payload")
-
-            if [ "$(echo "$response" | jq -r '.ok')" != "true" ]; then
-              echo "::error::Slack API error: $(echo "$response" | jq -r '.error')"
-              return 1
-            fi
-          }
-
-          # Post header
-          DIVIDER="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          HEADER_MSG=$(printf '%s\n📝 *Draft Dispatch* _(copy-paste ready)_' "$DIVIDER")
-          post_message "$HEADER_MSG"
-          sleep 1
-
-          # Post draft in code block for easy copying
-          BACKTICKS='```'
-
-          if [ ${#DRAFT} -le 2700 ]; then
-            CODE_MSG=$(printf '%s\n%s\n%s' "$BACKTICKS" "$DRAFT" "$BACKTICKS")
-            post_message "$CODE_MSG"
-          else
-            # Split the draft and post in chunks
-            echo "$DRAFT" > /tmp/draft_full.txt
-            split -b 2600 /tmp/draft_full.txt /tmp/dchunk_
-
-            FIRST=true
-            for chunk_file in /tmp/dchunk_*; do
-              [ -f "$chunk_file" ] || continue
-              CHUNK=$(cat "$chunk_file")
-              if [ "$FIRST" = true ]; then
-                CHUNK_MSG=$(printf '%s\n%s' "$BACKTICKS" "$CHUNK")
-                post_message "$CHUNK_MSG"
-                FIRST=false
-              else
-                post_message "$CHUNK"
-              fi
-              sleep 1
-            done
-            post_message "${BACKTICKS}"
+          if [ "$(echo "$RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Slack file upload error: $(echo "$RESPONSE" | jq -r '.error')"
+            exit 1
           fi
 
-          echo "::notice::Posted dispatch draft to Slack thread"
+          FILE_URL=$(echo "$RESPONSE" | jq -r '.file.permalink')
+          echo "::notice::Uploaded dispatch draft: ${FILE_URL}"
