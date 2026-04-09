@@ -1,117 +1,108 @@
-# Multi-Repo Release Notes Generator for Slack
+# Multi-Repo Dispatch Notes Generator for Slack
 #
-# Generates release notes using goose AI agent for multiple repositories
-# and posts them to Slack in a single thread.
+# Generates dispatch notes using goose AI agent for multiple repositories.
+# Compares against the last published dispatch to avoid duplicates.
 #
 # Repositories monitored:
 # - entireio/cli
 # - entirehq/entiredb
-# - entirehq/entire.io
 # - go-git/go-git
 
-name: Release Notes to Slack
+name: Dispatch Notes to Slack
 
 on:
   workflow_dispatch:
     inputs:
-      repo:
-        description: 'Repository to generate notes for (or "all")'
+      repos:
+        description: 'Repositories to include'
         required: true
         type: choice
         options:
           - all
           - entireio/cli
           - entirehq/entiredb
-          - entirehq/entire.io
           - go-git/go-git
-      tag:
-        description: 'Release tag (e.g., v1.25.0). Leave empty for latest. Ignored when "all" is selected.'
-        required: false
-        type: string
 
   schedule:
-    - cron: '0 9 * * *'
+    # Every Thursday at 9am UTC (start of dispatch collection)
+    - cron: '0 9 * * 4'
 
 permissions:
   contents: read
 
 jobs:
-  # Build the matrix of repos to process
-  build-matrix:
-    name: Build Matrix
+  # Get last dispatch info and build repo matrix
+  prepare:
+    name: Prepare
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.build.outputs.matrix }}
       has_repos: ${{ steps.build.outputs.has_repos }}
+      last_dispatch_date: ${{ steps.dispatch.outputs.date }}
+      last_dispatch_file: ${{ steps.dispatch.outputs.file }}
 
     steps:
-      - name: Build release matrix
+      - name: Clone entire.io for dispatch info
+        run: |
+          git clone --depth 1 https://github.com/entirehq/entire.io.git /tmp/entire-io
+
+      - name: Get last dispatch info
+        id: dispatch
+        run: |
+          DISPATCH_DIR="/tmp/entire-io/website/src/routes/_content/blog/-content"
+          
+          # Get latest dispatch file
+          LATEST_DISPATCH=$(ls -1 "$DISPATCH_DIR"/*dispatch*.md 2>/dev/null | sort | tail -1)
+          
+          if [ -z "$LATEST_DISPATCH" ]; then
+            echo "::error::No dispatch files found"
+            exit 1
+          fi
+          
+          FILENAME=$(basename "$LATEST_DISPATCH")
+          # Extract date from filename (e.g., 2026-04-06-entire-dispatch-0x0008.md -> 2026-04-06)
+          DISPATCH_DATE=$(echo "$FILENAME" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+          
+          echo "file=$LATEST_DISPATCH" >> $GITHUB_OUTPUT
+          echo "date=$DISPATCH_DATE" >> $GITHUB_OUTPUT
+          echo "::notice::Last dispatch: $FILENAME (date: $DISPATCH_DATE)"
+          
+          # Save dispatch content for later use
+          cp "$LATEST_DISPATCH" /tmp/last_dispatch.md
+
+      - name: Upload dispatch content
+        uses: actions/upload-artifact@v4
+        with:
+          name: last-dispatch
+          path: /tmp/last_dispatch.md
+          retention-days: 1
+
+      - name: Build repo matrix
         id: build
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REPOS: ${{ inputs.repos }}
           EVENT_NAME: ${{ github.event_name }}
-          INPUT_REPO: ${{ inputs.repo }}
-          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          ALL_REPOS="entireio/cli entirehq/entiredb entirehq/entire.io go-git/go-git"
-          RELEASES=()
+          ALL_REPOS="entireio/cli entirehq/entiredb go-git/go-git"
+          REPOS=()
 
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ "$INPUT_REPO" = "all" ]; then
-              # All repos - get latest tag for each
-              for repo in $ALL_REPOS; do
-                TAG=$(gh api "repos/${repo}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' || true)
-                if [ -n "$TAG" ]; then
-                  RELEASES+=("{\"repo\":\"${repo}\",\"tag\":\"${TAG}\"}")
-                  echo "::notice::Adding ${repo}@${TAG}"
-                else
-                  echo "::warning::No release found for ${repo}"
-                fi
-              done
-            else
-              # Single repo
-              if [ -n "$INPUT_TAG" ]; then
-                TAG="$INPUT_TAG"
-              else
-                TAG=$(gh api "repos/${INPUT_REPO}/releases/latest" | jq -r '.tag_name')
-              fi
-              RELEASES+=("{\"repo\":\"${INPUT_REPO}\",\"tag\":\"${TAG}\"}")
-              echo "::notice::Adding ${INPUT_REPO}@${TAG}"
-            fi
-          else
-            # Scheduled: check for releases in last 24 hours
-            CUTOFF=$(date -d '24 hours ago' -u +%Y-%m-%dT%H:%M:%SZ)
-
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$INPUT_REPOS" = "all" ]; then
             for repo in $ALL_REPOS; do
-              RELEASE_INFO=$(gh api "repos/${repo}/releases/latest" 2>/dev/null || echo '{}')
-              PUBLISHED=$(echo "$RELEASE_INFO" | jq -r '.published_at // empty')
-              TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name // empty')
-
-              if [ -n "$PUBLISHED" ] && [ -n "$TAG" ]; then
-                if [[ "$PUBLISHED" > "$CUTOFF" ]]; then
-                  RELEASES+=("{\"repo\":\"${repo}\",\"tag\":\"${TAG}\"}")
-                  echo "::notice::Found new release: ${repo}@${TAG}"
-                fi
-              fi
+              REPOS+=("{\"repo\":\"${repo}\"}")
             done
+          else
+            REPOS+=("{\"repo\":\"${INPUT_REPOS}\"}")
           fi
 
-          if [ ${#RELEASES[@]} -eq 0 ]; then
-            echo "has_repos=false" >> $GITHUB_OUTPUT
-            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
-            echo "::notice::No repos to process"
-          else
-            MATRIX=$(printf '%s\n' "${RELEASES[@]}" | jq -sc '{include: .}')
-            echo "has_repos=true" >> $GITHUB_OUTPUT
-            echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          fi
+          MATRIX=$(printf '%s\n' "${REPOS[@]}" | jq -sc '{include: .}')
+          echo "has_repos=true" >> $GITHUB_OUTPUT
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 
   # Post the parent message to start the thread
   post-parent:
     name: Post Parent Message
     runs-on: ubuntu-latest
-    needs: build-matrix
-    if: needs.build-matrix.outputs.has_repos == 'true'
+    needs: prepare
     outputs:
       thread_ts: ${{ steps.post.outputs.thread_ts }}
 
@@ -121,12 +112,14 @@ jobs:
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
         run: |
           TODAY=$(date -u +"%B %d, %Y")
           
           PAYLOAD=$(jq -n \
             --arg channel "$SLACK_CHANNEL_ID" \
-            --arg text "📋 *Dispatch Notes* — ${TODAY}" \
+            --arg text "📋 *Dispatch Notes* — ${TODAY}
+_Changes since last dispatch (${LAST_DISPATCH_DATE})_" \
             '{channel: $channel, text: $text, unfurl_links: false}')
 
           RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
@@ -143,14 +136,13 @@ jobs:
           echo "thread_ts=$THREAD_TS" >> $GITHUB_OUTPUT
           echo "::notice::Created parent message with ts=$THREAD_TS"
 
-  # Generate and post release notes for each repo in the thread
+  # Generate and post notes for each repo
   generate:
     name: Generate (${{ matrix.repo }})
     runs-on: ubuntu-latest
-    needs: [build-matrix, post-parent]
-    if: needs.build-matrix.outputs.has_repos == 'true'
+    needs: [prepare, post-parent]
     strategy:
-      matrix: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
       fail-fast: false
 
     container:
@@ -166,18 +158,24 @@ jobs:
       - name: Install dependencies
         run: apt-get update && apt-get install -y git curl jq
 
+      - name: Download last dispatch
+        uses: actions/download-artifact@v4
+        with:
+          name: last-dispatch
+          path: /tmp
+
       - name: Clone repository
         env:
           REPO: ${{ matrix.repo }}
         run: |
-          git clone --depth 100 "https://github.com/${REPO}.git" /tmp/repo
+          git clone "https://github.com/${REPO}.git" /tmp/repo
           cd /tmp/repo
           git fetch --tags
 
-      - name: Generate release notes
+      - name: Generate dispatch notes
         env:
           REPO: ${{ matrix.repo }}
-          RELEASE_TAG: ${{ matrix.tag }}
+          LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
         run: |
           mkdir -p $HOME/.local/share/goose/sessions
           mkdir -p $HOME/.config/goose
@@ -185,61 +183,62 @@ jobs:
 
           cat > /tmp/recipe.yaml << 'RECIPE_EOF'
           version: "1.0.0"
-          title: "Release Notes Generator"
-          description: "Generate release notes for a GitHub release"
+          title: "Dispatch Notes Generator"
+          description: "Generate dispatch notes for changes since last dispatch"
 
           extensions:
             - type: builtin
               name: developer
 
           instructions: |
-            Generate release notes for a GitHub release.
+            Generate dispatch notes for a repository, showing what's new since the last dispatch.
 
             Context:
             - Repository: REPO_PLACEHOLDER
-            - Release Tag: TAG_PLACEHOLDER
+            - Last Dispatch Date: DATE_PLACEHOLDER
             - You are in the cloned repository directory
+            - The last dispatch content is at /tmp/last_dispatch.md
 
             Process:
-            1. Get the previous release tag: git describe --tags --abbrev=0 TAG_PLACEHOLDER^
-            2. Get commits between tags: git log PREV_TAG..TAG_PLACEHOLDER --oneline --no-merges
-            3. Analyze and categorize the changes
+            1. Read /tmp/last_dispatch.md to see what was already covered (releases mentioned, PRs linked)
+            2. Get all releases since DATE_PLACEHOLDER: check git tags and their dates
+            3. Get all merges to main/master since DATE_PLACEHOLDER: git log --since="DATE_PLACEHOLDER" --merges --first-parent main
+            4. Also get non-merge commits to main since DATE_PLACEHOLDER: git log --since="DATE_PLACEHOLDER" --no-merges --first-parent main
+            5. Cross-reference with the last dispatch - exclude anything already mentioned
 
-            IMPORTANT: Use Slack mrkdwn format (NOT regular Markdown):
-            - *bold* (single asterisks, not double)
+            IMPORTANT: Use Slack mrkdwn format:
+            - *bold* (single asterisks)
             - _italic_ (underscores)
-            - ~strikethrough~
-            - `code`
-            - ```code block```
-            - <https://example.com|link text> (angle brackets for links)
-            - • for bullet points (not -)
-            - No # headings - use *Bold Text* instead
+            - <https://example.com|link text> for links
+            - • for bullet points
 
-            Output Format (skip empty sections):
+            Output Format:
 
-            *✨ Features*
-            • Description of feature (<https://github.com/REPO_PLACEHOLDER/pull/123|#123>)
+            *📦 Released* _(in tagged releases since DATE_PLACEHOLDER)_
+            • `vX.Y.Z` - Brief description of what's in this release
+              ◦ Feature/fix 1 (<https://github.com/REPO_PLACEHOLDER/pull/123|#123>)
+              ◦ Feature/fix 2 (<https://github.com/REPO_PLACEHOLDER/pull/124|#124>)
 
-            *🐛 Bug Fixes*
-            • Description of fix (<https://github.com/REPO_PLACEHOLDER/pull/456|#456>)
+            *🔀 Merged to main* _(not yet released)_
+            • Brief description (<https://github.com/REPO_PLACEHOLDER/pull/125|#125>)
+            • Brief description (<https://github.com/REPO_PLACEHOLDER/pull/126|#126>)
 
-            *🔧 Improvements*
-            • Description of improvement
+            Rules:
+            - Skip sections if empty
+            - If nothing new since last dispatch, write "No new changes since last dispatch."
+            - Extract PR numbers from commit messages or merge commits
+            - Group released items under their release tag
+            - Keep descriptions concise
 
-            *📚 Documentation*
-            • Description of doc change
-
-            *⚠️ Breaking Changes*
-            • Description of breaking change
-
-            Write ONLY the release notes content to /tmp/release_notes.md
+            Write ONLY the notes content to /tmp/dispatch_notes.md
 
           prompt: |
-            Generate release notes for TAG_PLACEHOLDER in the REPO_PLACEHOLDER repository.
+            Generate dispatch notes for REPO_PLACEHOLDER showing changes since DATE_PLACEHOLDER.
+            Check /tmp/last_dispatch.md to avoid duplicating already-covered items.
           RECIPE_EOF
 
           sed -i "s|REPO_PLACEHOLDER|${REPO}|g" /tmp/recipe.yaml
-          sed -i "s|TAG_PLACEHOLDER|${RELEASE_TAG}|g" /tmp/recipe.yaml
+          sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
           goose run --recipe /tmp/recipe.yaml
 
       - name: Post to Slack thread
@@ -248,18 +247,16 @@ jobs:
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
           REPO: ${{ matrix.repo }}
-          RELEASE_TAG: ${{ matrix.tag }}
         shell: bash
         run: |
           set -e
 
-          if [ ! -f /tmp/release_notes.md ]; then
-            echo "::error::Release notes not generated"
+          if [ ! -f /tmp/dispatch_notes.md ]; then
+            echo "::error::Dispatch notes not generated"
             exit 1
           fi
 
-          NOTES=$(cat /tmp/release_notes.md)
-          RELEASE_URL="https://github.com/${REPO}/releases/tag/${RELEASE_TAG}"
+          NOTES=$(cat /tmp/dispatch_notes.md)
           SAFE_LIMIT=2900
 
           post_message() {
@@ -286,7 +283,7 @@ jobs:
 
           # Build the message with repo header
           DIVIDER="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          HEADER=$(printf '%s\n🎉 *%s* `%s`\n<%s|View Release>\n\n' "$DIVIDER" "$REPO" "$RELEASE_TAG" "$RELEASE_URL")
+          HEADER=$(printf '%s\n*%s*\n\n' "$DIVIDER" "$REPO")
           FULL_MSG="${HEADER}${NOTES}"
 
           # Post in chunks if needed
@@ -309,4 +306,4 @@ jobs:
             done
           fi
 
-          echo "::notice::Posted release notes to Slack thread"
+          echo "::notice::Posted dispatch notes to Slack thread"
