@@ -217,7 +217,7 @@ jobs:
             cat > /tmp/recipe.yaml << 'RECIPE_EOF'
           version: "1.0.0"
           title: "Dispatch Notes Generator (entire.io)"
-          description: "Generate dispatch notes for entire.io with feature flag status"
+          description: "Generate dispatch notes for entire.io with feature flag awareness"
 
           extensions:
             - type: builtin
@@ -225,7 +225,7 @@ jobs:
 
           instructions: |
             Generate dispatch notes for entire.io, showing what's new since the last dispatch.
-            This repo deploys continuously, so we use feature flags to determine release status.
+            This repo deploys continuously to main, but some features are behind feature flags.
 
             Context:
             - Repository: entirehq/entire.io
@@ -236,23 +236,25 @@ jobs:
             - The repo's feature flag definitions are in feature-flags.json
 
             Process:
-            1. Read /tmp/last_dispatch.md to see what was already covered
-            2. Read /tmp/posthog_flags.json to understand current feature flag states
-            3. Read feature-flags.json in the repo to see defined flags
-            4. Get all merges to main since DATE_PLACEHOLDER:
-               git log --since="DATE_PLACEHOLDER" --merges --first-parent main --oneline
-               git log --since="DATE_PLACEHOLDER" --no-merges --first-parent main --oneline
-            5. For each merged PR/commit:
-               - Check if the code references a feature flag (grep for flag names like "repo-overview-page")
+            1. Read /tmp/last_dispatch.md to see what was already covered - DO NOT include those items
+            2. Get all commits/merges to main since DATE_PLACEHOLDER:
+               git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
+            3. Read /tmp/posthog_flags.json to get current feature flag states
+            4. Read feature-flags.json in the repo to see which flags are defined
+            5. For each merged PR/commit since DATE_PLACEHOLDER:
+               - Search the codebase for whether this change references a feature flag
+               - Use: grep -r "flag-name" in the changed files or commit diff
                - Look up that flag's status in posthog_flags.json
-            6. Cross-reference with last dispatch - exclude already mentioned items
+            6. Categorize each change:
+               - "Released" = No feature flag OR flag is active with 100% rollout
+               - "Merged but not released" = Behind a flag that is inactive OR < 100% rollout
 
             PostHog flag status interpretation (from posthog_flags.json):
-            - "active": false → 🚫 Not yet enabled
-            - "active": true with no filters and rollout_percentage: 100 → ✅ Public
-            - "active": true with filters containing "@entire.io" → 🔒 Internal only
-            - "active": true with rollout_percentage < 100 → 🚧 Partial rollout (X%)
-            - No flag reference in code → ✅ Public (shipped when merged)
+            - "active": true AND rollout_percentage: 100 (or no rollout_percentage) → Released
+            - "active": true AND rollout_percentage < 100 → NOT released (partial rollout)
+            - "active": false → NOT released (disabled)
+            - "active": true with filters (like @entire.io email) → NOT released (internal only)
+            - No flag reference in code → Released (shipped when merged)
 
             IMPORTANT: Use Slack mrkdwn format:
             - *bold* (single asterisks)
@@ -262,32 +264,28 @@ jobs:
 
             Output Format:
 
-            📦 *Released*
+            📦 *Released* _(shipped to all users)_
             • Feature/change description (<https://github.com/entirehq/entire.io/pull/123|#123>)
-              → ✅ _Public_
-            • Another feature (<https://github.com/entirehq/entire.io/pull/124|#124>)
-              → 🔒 _Internal only (@entire.io)_
-            • Feature with partial rollout (<https://github.com/entirehq/entire.io/pull/125|#125>)
-              → 🚧 _50% rollout_
+            • Another public feature (<https://github.com/entirehq/entire.io/pull/124|#124>)
 
-            🔀 *Merged* _(not yet enabled)_
-            • Feature behind disabled flag (<https://github.com/entirehq/entire.io/pull/126|#126>)
-              → 🚫 _Flag: feature-name (disabled)_
+            🔀 *Merged but not released* _(behind feature flags)_
+            • Feature at 50% rollout (<https://github.com/entirehq/entire.io/pull/125|#125>)
+            • Feature for internal users only (<https://github.com/entirehq/entire.io/pull/126|#126>)
+            • Feature with disabled flag (<https://github.com/entirehq/entire.io/pull/127|#127>)
 
             Rules:
             - ALWAYS include BOTH sections - use "_None_" if a section is empty
-            - Show the flag status indicator on a new line with → prefix
-            - If a PR doesn't reference any flag, assume it's ✅ Public
-            - Group under "Released" if flag is active (any rollout level)
-            - Group under "Merged" only if flag exists but is inactive
-            - Keep descriptions concise
+            - DO NOT mention feature flag names or statuses - users don't know about them
+            - Simply categorize as "Released" or "Merged but not released"
+            - Keep descriptions concise and user-focused
+            - Exclude anything already mentioned in the last dispatch
 
             Write ONLY the notes content to /tmp/dispatch_notes.md
 
           prompt: |
             Generate dispatch notes for entirehq/entire.io showing changes since DATE_PLACEHOLDER.
-            Check /tmp/last_dispatch.md to avoid duplicates.
-            Use /tmp/posthog_flags.json to determine feature flag rollout status.
+            Check /tmp/last_dispatch.md to avoid duplicating already-covered items.
+            Use /tmp/posthog_flags.json internally to determine if changes are behind non-public flags.
           RECIPE_EOF
           else
             # Standard recipe for repos with tagged releases
