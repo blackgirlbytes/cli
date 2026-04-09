@@ -1,7 +1,7 @@
 # Multi-Repo Release Notes Generator for Slack
 #
 # Generates release notes using goose AI agent for multiple repositories
-# and posts them to Slack with thread support for long notes.
+# and posts them to Slack in a single thread.
 #
 # Repositories monitored:
 # - entireio/cli
@@ -106,11 +106,48 @@ jobs:
             echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
           fi
 
-  # Generate and post release notes for each repo
-  generate:
-    name: Generate (${{ matrix.repo }}@${{ matrix.tag }})
+  # Post the parent message to start the thread
+  post-parent:
+    name: Post Parent Message
     runs-on: ubuntu-latest
     needs: build-matrix
+    if: needs.build-matrix.outputs.has_repos == 'true'
+    outputs:
+      thread_ts: ${{ steps.post.outputs.thread_ts }}
+
+    steps:
+      - name: Post parent message
+        id: post
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: |
+          TODAY=$(date -u +"%B %d, %Y")
+          
+          PAYLOAD=$(jq -n \
+            --arg channel "$SLACK_CHANNEL_ID" \
+            --arg text "📋 *Dispatch Notes* — ${TODAY}" \
+            '{channel: $channel, text: $text, unfurl_links: false}')
+
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          if [ "$(echo "$RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Slack API error: $(echo "$RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          THREAD_TS=$(echo "$RESPONSE" | jq -r '.ts')
+          echo "thread_ts=$THREAD_TS" >> $GITHUB_OUTPUT
+          echo "::notice::Created parent message with ts=$THREAD_TS"
+
+  # Generate and post release notes for each repo in the thread
+  generate:
+    name: Generate (${{ matrix.repo }})
+    runs-on: ubuntu-latest
+    needs: [build-matrix, post-parent]
     if: needs.build-matrix.outputs.has_repos == 'true'
     strategy:
       matrix: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
@@ -186,10 +223,11 @@ jobs:
           sed -i "s|TAG_PLACEHOLDER|${RELEASE_TAG}|g" /tmp/recipe.yaml
           goose run --recipe /tmp/recipe.yaml
 
-      - name: Post to Slack
+      - name: Post to Slack thread
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
           REPO: ${{ matrix.repo }}
           RELEASE_TAG: ${{ matrix.tag }}
         shell: bash
@@ -207,16 +245,13 @@ jobs:
 
           post_message() {
             local text="$1"
-            local thread_ts="${2:-}"
 
             local payload
-            if [ -n "$thread_ts" ]; then
-              payload=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$text" --arg ts "$thread_ts" \
-                '{channel: $channel, text: $text, thread_ts: $ts, unfurl_links: false}')
-            else
-              payload=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$text" \
-                '{channel: $channel, text: $text, unfurl_links: false}')
-            fi
+            payload=$(jq -n \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --arg text "$text" \
+              --arg ts "$THREAD_TS" \
+              '{channel: $channel, text: $text, thread_ts: $ts, unfurl_links: false}')
 
             local response
             response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
@@ -228,40 +263,30 @@ jobs:
               echo "::error::Slack API error: $(echo "$response" | jq -r '.error')"
               return 1
             fi
-
-            echo "$response" | jq -r '.ts'
           }
 
-          HEADER=$(printf '%s %s %s Released!\n\n%s' "🎉" "*${REPO}*" "\`${RELEASE_TAG}\`" "<${RELEASE_URL}|View Release on GitHub>")
-          FULL_MSG=$(printf '%s\n\n%s' "$HEADER" "$NOTES")
+          # Build the message with repo header
+          HEADER=$(printf '🎉 *%s* `%s`\n<%s|View Release>\n\n' "$REPO" "$RELEASE_TAG" "$RELEASE_URL")
+          FULL_MSG="${HEADER}${NOTES}"
 
+          # Post in chunks if needed
           if [ ${#FULL_MSG} -le $SAFE_LIMIT ]; then
             post_message "$FULL_MSG"
-            echo "::notice::Posted to Slack successfully (single message)"
           else
-            MAIN_MSG=$(printf '%s\n\n%s' "$HEADER" "_📝 Full release notes in thread..._")
-            PARENT_TS=$(post_message "$MAIN_MSG")
-
-            if [ -z "$PARENT_TS" ]; then
-              echo "::error::Failed to post main message"
-              exit 1
-            fi
-
+            # Post header first
+            post_message "$HEADER"
             sleep 1
 
-            if [ ${#NOTES} -le $SAFE_LIMIT ]; then
-              post_message "$NOTES" "$PARENT_TS"
-            else
-              echo "$NOTES" > /tmp/notes_full.txt
-              split -b $SAFE_LIMIT /tmp/notes_full.txt /tmp/chunk_
+            # Chunk the notes
+            echo "$NOTES" > /tmp/notes_full.txt
+            split -b $SAFE_LIMIT /tmp/notes_full.txt /tmp/chunk_
 
-              for chunk_file in /tmp/chunk_*; do
-                [ -f "$chunk_file" ] || continue
-                CHUNK=$(cat "$chunk_file")
-                [ -n "$CHUNK" ] && post_message "$CHUNK" "$PARENT_TS"
-                sleep 1
-              done
-            fi
-
-            echo "::notice::Posted to Slack successfully (with thread)"
+            for chunk_file in /tmp/chunk_*; do
+              [ -f "$chunk_file" ] || continue
+              CHUNK=$(cat "$chunk_file")
+              [ -n "$CHUNK" ] && post_message "$CHUNK"
+              sleep 1
+            done
           fi
+
+          echo "::notice::Posted release notes to Slack thread"
