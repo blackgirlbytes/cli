@@ -12,7 +12,6 @@
 name: Release Notes to Slack
 
 on:
-  # Manual trigger - specify which repo and tag
   workflow_dispatch:
     inputs:
       repo:
@@ -29,7 +28,6 @@ on:
         required: false
         type: string
 
-  # Scheduled check for new releases (daily at 9am UTC)
   schedule:
     - cron: '0 9 * * *'
 
@@ -37,7 +35,6 @@ permissions:
   contents: read
 
 jobs:
-  # For scheduled runs: detect new releases across all repos
   check-releases:
     name: Check for New Releases
     runs-on: ubuntu-latest
@@ -78,7 +75,6 @@ jobs:
             echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
           fi
 
-  # Generate notes for each detected release (scheduled)
   generate-scheduled:
     name: Generate (${{ matrix.repo }}@${{ matrix.tag }})
     runs-on: ubuntu-latest
@@ -104,7 +100,6 @@ jobs:
       - name: Clone repository
         env:
           REPO: ${{ matrix.repo }}
-          RELEASE_TAG: ${{ matrix.tag }}
         run: |
           git clone --depth 100 "https://github.com/${REPO}.git" /tmp/repo
           cd /tmp/repo
@@ -119,10 +114,9 @@ jobs:
           mkdir -p $HOME/.config/goose
           cd /tmp/repo
 
-          cat > /tmp/recipe.yaml << 'RECIPE'
+          cat > /tmp/recipe.yaml << 'RECIPE_EOF'
           version: "1.0.0"
           title: "Release Notes Generator"
-          description: "Generate release notes for ${REPO}@${RELEASE_TAG}"
 
           extensions:
             - type: builtin
@@ -131,41 +125,33 @@ jobs:
           instructions: |
             Generate release notes for a GitHub release.
 
-            ## Context
-            - Repository: ${REPO}
-            - Release Tag: ${RELEASE_TAG}
+            Context:
+            - Repository: REPO_PLACEHOLDER
+            - Release Tag: TAG_PLACEHOLDER
             - You are in the cloned repository directory
 
-            ## Process
-            1. Get the previous release tag: git describe --tags --abbrev=0 ${RELEASE_TAG}^
-            2. Get commits between tags: git log <previous_tag>..${RELEASE_TAG} --oneline --no-merges
+            Process:
+            1. Get the previous release tag: git describe --tags --abbrev=0 TAG_PLACEHOLDER^
+            2. Get commits between tags: git log PREV_TAG..TAG_PLACEHOLDER --oneline --no-merges
             3. Analyze and categorize the changes
 
-            ## Output Format
-            Use these sections (skip empty ones):
-            - ✨ *Features* - New functionality
-            - 🐛 *Bug Fixes* - Bug fixes
-            - 🔧 *Improvements* - Enhancements
-            - 📚 *Documentation* - Doc updates
-            - ⚠️ *Breaking Changes* - Breaking changes (if any)
+            Output Format (skip empty sections):
+            - Features - New functionality
+            - Bug Fixes - Bug fixes
+            - Improvements - Enhancements
+            - Documentation - Doc updates
+            - Breaking Changes - Breaking changes (if any)
 
-            Format each item as:
-            - Concise description (<https://github.com/${REPO}/pull/XXXX|#XXXX>)
-
-            Rules:
-            - Extract PR numbers from commit messages (look for (#XXXX) pattern)
-            - Keep descriptions concise and user-friendly
-            - Use Slack mrkdwn format (single * for bold, <url|text> for links)
-
-            ## Final Step
+            Format each item as a bullet with PR link if available.
             Write ONLY the release notes content to /tmp/release_notes.md
 
           prompt: |
-            Generate release notes for ${RELEASE_TAG} in the ${REPO} repository.
-          RECIPE
+            Generate release notes for TAG_PLACEHOLDER in the REPO_PLACEHOLDER repository.
+          RECIPE_EOF
 
-          envsubst '$REPO $RELEASE_TAG' < /tmp/recipe.yaml > /tmp/recipe_final.yaml
-          goose run --recipe /tmp/recipe_final.yaml
+          sed -i "s|REPO_PLACEHOLDER|${REPO}|g" /tmp/recipe.yaml
+          sed -i "s|TAG_PLACEHOLDER|${RELEASE_TAG}|g" /tmp/recipe.yaml
+          goose run --recipe /tmp/recipe.yaml
 
       - name: Post to Slack
         env:
@@ -173,7 +159,10 @@ jobs:
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           REPO: ${{ matrix.repo }}
           RELEASE_TAG: ${{ matrix.tag }}
+        shell: bash
         run: |
+          set -e
+
           if [ ! -f /tmp/release_notes.md ]; then
             echo "::error::Release notes not generated"
             exit 1
@@ -181,27 +170,23 @@ jobs:
 
           NOTES=$(cat /tmp/release_notes.md)
           RELEASE_URL="https://github.com/${REPO}/releases/tag/${RELEASE_TAG}"
-
-          # Slack text block limit is 3000 chars
           SAFE_LIMIT=2900
 
-          # Function to post a message, returns ts (timestamp/message ID)
           post_message() {
             local text="$1"
-            local thread_ts="$2"
+            local thread_ts="${2:-}"
 
-            local payload=$(jq -n \
-              --arg channel "$SLACK_CHANNEL_ID" \
-              --arg text "$text" \
-              --arg thread_ts "$thread_ts" \
-              '{
-                channel: $channel,
-                text: $text,
-                unfurl_links: false,
-                unfurl_media: false
-              } + (if $thread_ts != "" then {thread_ts: $thread_ts} else {} end)')
+            local payload
+            if [ -n "$thread_ts" ]; then
+              payload=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$text" --arg ts "$thread_ts" \
+                '{channel: $channel, text: $text, thread_ts: $ts, unfurl_links: false}')
+            else
+              payload=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$text" \
+                '{channel: $channel, text: $text, unfurl_links: false}')
+            fi
 
-            local response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            local response
+            response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
               -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
               -H "Content-Type: application/json" \
               -d "$payload")
@@ -214,27 +199,15 @@ jobs:
             echo "$response" | jq -r '.ts'
           }
 
-          # Build header message
-          HEADER="🎉 *${REPO}* \`${RELEASE_TAG}\` Released!
-
-<${RELEASE_URL}|View Release on GitHub>"
-
-          # Check if everything fits in one message
-          FULL_MSG="${HEADER}
-
-${NOTES}"
+          HEADER=$(printf '%s %s %s Released!\n\n%s' "🎉" "*${REPO}*" "\`${RELEASE_TAG}\`" "<${RELEASE_URL}|View Release on GitHub>")
+          FULL_MSG=$(printf '%s\n\n%s' "$HEADER" "$NOTES")
 
           if [ ${#FULL_MSG} -le $SAFE_LIMIT ]; then
-            # Single message is enough
-            post_message "$FULL_MSG" ""
+            post_message "$FULL_MSG"
             echo "::notice::Posted to Slack successfully (single message)"
           else
-            # Need to split: header in main, notes in thread
-            MAIN_MSG="${HEADER}
-
-_📝 Full release notes in thread..._"
-
-            PARENT_TS=$(post_message "$MAIN_MSG" "")
+            MAIN_MSG=$(printf '%s\n\n%s' "$HEADER" "_📝 Full release notes in thread..._")
+            PARENT_TS=$(post_message "$MAIN_MSG")
 
             if [ -z "$PARENT_TS" ]; then
               echo "::error::Failed to post main message"
@@ -243,47 +216,23 @@ _📝 Full release notes in thread..._"
 
             sleep 1
 
-            # Split notes into chunks if needed
             if [ ${#NOTES} -le $SAFE_LIMIT ]; then
               post_message "$NOTES" "$PARENT_TS"
             else
-              # Chunk by lines, respecting the limit
               echo "$NOTES" > /tmp/notes_full.txt
+              split -b $SAFE_LIMIT /tmp/notes_full.txt /tmp/chunk_
 
-              awk -v limit="$SAFE_LIMIT" '
-              BEGIN { chunk = ""; chunk_len = 0; chunk_num = 0 }
-              {
-                line_len = length($0) + 1
-                if (chunk_len + line_len > limit && chunk_len > 0) {
-                  print chunk > "/tmp/chunk_" chunk_num ".txt"
-                  chunk_num++
-                  chunk = $0 "\n"
-                  chunk_len = line_len
-                } else {
-                  chunk = chunk $0 "\n"
-                  chunk_len += line_len
-                }
-              }
-              END {
-                if (chunk_len > 0) {
-                  print chunk > "/tmp/chunk_" chunk_num ".txt"
-                }
-              }
-              ' /tmp/notes_full.txt
-
-              for chunk_file in /tmp/chunk_*.txt; do
+              for chunk_file in /tmp/chunk_*; do
                 [ -f "$chunk_file" ] || continue
                 CHUNK=$(cat "$chunk_file")
                 [ -n "$CHUNK" ] && post_message "$CHUNK" "$PARENT_TS"
                 sleep 1
-                rm -f "$chunk_file"
               done
             fi
 
             echo "::notice::Posted to Slack successfully (with thread)"
           fi
 
-  # Manual trigger job
   generate-manual:
     name: Generate (Manual)
     runs-on: ubuntu-latest
@@ -300,7 +249,7 @@ _📝 Full release notes in thread..._"
 
     steps:
       - name: Install dependencies
-        run: apt-get update && apt-get install -y git curl jq gettext
+        run: apt-get update && apt-get install -y git curl jq gettext gh
 
       - name: Get release tag
         id: get-tag
@@ -309,8 +258,6 @@ _📝 Full release notes in thread..._"
           INPUT_REPO: ${{ inputs.repo }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          apt-get install -y gh
-
           if [ -n "$INPUT_TAG" ]; then
             echo "tag=$INPUT_TAG" >> $GITHUB_OUTPUT
           else
@@ -336,10 +283,9 @@ _📝 Full release notes in thread..._"
           mkdir -p $HOME/.config/goose
           cd /tmp/repo
 
-          cat > /tmp/recipe.yaml << 'RECIPE'
+          cat > /tmp/recipe.yaml << 'RECIPE_EOF'
           version: "1.0.0"
           title: "Release Notes Generator"
-          description: "Generate release notes for ${REPO}@${RELEASE_TAG}"
 
           extensions:
             - type: builtin
@@ -348,41 +294,33 @@ _📝 Full release notes in thread..._"
           instructions: |
             Generate release notes for a GitHub release.
 
-            ## Context
-            - Repository: ${REPO}
-            - Release Tag: ${RELEASE_TAG}
+            Context:
+            - Repository: REPO_PLACEHOLDER
+            - Release Tag: TAG_PLACEHOLDER
             - You are in the cloned repository directory
 
-            ## Process
-            1. Get the previous release tag: git describe --tags --abbrev=0 ${RELEASE_TAG}^
-            2. Get commits between tags: git log <previous_tag>..${RELEASE_TAG} --oneline --no-merges
+            Process:
+            1. Get the previous release tag: git describe --tags --abbrev=0 TAG_PLACEHOLDER^
+            2. Get commits between tags: git log PREV_TAG..TAG_PLACEHOLDER --oneline --no-merges
             3. Analyze and categorize the changes
 
-            ## Output Format
-            Use these sections (skip empty ones):
-            - ✨ *Features* - New functionality
-            - 🐛 *Bug Fixes* - Bug fixes
-            - 🔧 *Improvements* - Enhancements
-            - 📚 *Documentation* - Doc updates
-            - ⚠️ *Breaking Changes* - Breaking changes (if any)
+            Output Format (skip empty sections):
+            - Features - New functionality
+            - Bug Fixes - Bug fixes
+            - Improvements - Enhancements
+            - Documentation - Doc updates
+            - Breaking Changes - Breaking changes (if any)
 
-            Format each item as:
-            - Concise description (<https://github.com/${REPO}/pull/XXXX|#XXXX>)
-
-            Rules:
-            - Extract PR numbers from commit messages (look for (#XXXX) pattern)
-            - Keep descriptions concise and user-friendly
-            - Use Slack mrkdwn format (single * for bold, <url|text> for links)
-
-            ## Final Step
+            Format each item as a bullet with PR link if available.
             Write ONLY the release notes content to /tmp/release_notes.md
 
           prompt: |
-            Generate release notes for ${RELEASE_TAG} in the ${REPO} repository.
-          RECIPE
+            Generate release notes for TAG_PLACEHOLDER in the REPO_PLACEHOLDER repository.
+          RECIPE_EOF
 
-          envsubst '$REPO $RELEASE_TAG' < /tmp/recipe.yaml > /tmp/recipe_final.yaml
-          goose run --recipe /tmp/recipe_final.yaml
+          sed -i "s|REPO_PLACEHOLDER|${REPO}|g" /tmp/recipe.yaml
+          sed -i "s|TAG_PLACEHOLDER|${RELEASE_TAG}|g" /tmp/recipe.yaml
+          goose run --recipe /tmp/recipe.yaml
 
       - name: Post to Slack
         env:
@@ -390,7 +328,10 @@ _📝 Full release notes in thread..._"
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           REPO: ${{ inputs.repo }}
           RELEASE_TAG: ${{ steps.get-tag.outputs.tag }}
+        shell: bash
         run: |
+          set -e
+
           if [ ! -f /tmp/release_notes.md ]; then
             echo "::error::Release notes not generated"
             exit 1
@@ -398,25 +339,23 @@ _📝 Full release notes in thread..._"
 
           NOTES=$(cat /tmp/release_notes.md)
           RELEASE_URL="https://github.com/${REPO}/releases/tag/${RELEASE_TAG}"
-
           SAFE_LIMIT=2900
 
           post_message() {
             local text="$1"
-            local thread_ts="$2"
+            local thread_ts="${2:-}"
 
-            local payload=$(jq -n \
-              --arg channel "$SLACK_CHANNEL_ID" \
-              --arg text "$text" \
-              --arg thread_ts "$thread_ts" \
-              '{
-                channel: $channel,
-                text: $text,
-                unfurl_links: false,
-                unfurl_media: false
-              } + (if $thread_ts != "" then {thread_ts: $thread_ts} else {} end)')
+            local payload
+            if [ -n "$thread_ts" ]; then
+              payload=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$text" --arg ts "$thread_ts" \
+                '{channel: $channel, text: $text, thread_ts: $ts, unfurl_links: false}')
+            else
+              payload=$(jq -n --arg channel "$SLACK_CHANNEL_ID" --arg text "$text" \
+                '{channel: $channel, text: $text, unfurl_links: false}')
+            fi
 
-            local response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            local response
+            response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
               -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
               -H "Content-Type: application/json" \
               -d "$payload")
@@ -429,23 +368,15 @@ _📝 Full release notes in thread..._"
             echo "$response" | jq -r '.ts'
           }
 
-          HEADER="🎉 *${REPO}* \`${RELEASE_TAG}\` Released!
-
-<${RELEASE_URL}|View Release on GitHub>"
-
-          FULL_MSG="${HEADER}
-
-${NOTES}"
+          HEADER=$(printf '%s %s %s Released!\n\n%s' "🎉" "*${REPO}*" "\`${RELEASE_TAG}\`" "<${RELEASE_URL}|View Release on GitHub>")
+          FULL_MSG=$(printf '%s\n\n%s' "$HEADER" "$NOTES")
 
           if [ ${#FULL_MSG} -le $SAFE_LIMIT ]; then
-            post_message "$FULL_MSG" ""
+            post_message "$FULL_MSG"
             echo "::notice::Posted to Slack successfully (single message)"
           else
-            MAIN_MSG="${HEADER}
-
-_📝 Full release notes in thread..._"
-
-            PARENT_TS=$(post_message "$MAIN_MSG" "")
+            MAIN_MSG=$(printf '%s\n\n%s' "$HEADER" "_📝 Full release notes in thread..._")
+            PARENT_TS=$(post_message "$MAIN_MSG")
 
             if [ -z "$PARENT_TS" ]; then
               echo "::error::Failed to post main message"
@@ -458,34 +389,13 @@ _📝 Full release notes in thread..._"
               post_message "$NOTES" "$PARENT_TS"
             else
               echo "$NOTES" > /tmp/notes_full.txt
+              split -b $SAFE_LIMIT /tmp/notes_full.txt /tmp/chunk_
 
-              awk -v limit="$SAFE_LIMIT" '
-              BEGIN { chunk = ""; chunk_len = 0; chunk_num = 0 }
-              {
-                line_len = length($0) + 1
-                if (chunk_len + line_len > limit && chunk_len > 0) {
-                  print chunk > "/tmp/chunk_" chunk_num ".txt"
-                  chunk_num++
-                  chunk = $0 "\n"
-                  chunk_len = line_len
-                } else {
-                  chunk = chunk $0 "\n"
-                  chunk_len += line_len
-                }
-              }
-              END {
-                if (chunk_len > 0) {
-                  print chunk > "/tmp/chunk_" chunk_num ".txt"
-                }
-              }
-              ' /tmp/notes_full.txt
-
-              for chunk_file in /tmp/chunk_*.txt; do
+              for chunk_file in /tmp/chunk_*; do
                 [ -f "$chunk_file" ] || continue
                 CHUNK=$(cat "$chunk_file")
                 [ -n "$CHUNK" ] && post_message "$CHUNK" "$PARENT_TS"
                 sleep 1
-                rm -f "$chunk_file"
               done
             fi
 
