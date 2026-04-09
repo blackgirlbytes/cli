@@ -181,7 +181,18 @@ jobs:
 
     steps:
       - name: Install dependencies
-        run: apt-get update && apt-get install -y git curl jq
+        env:
+          GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
+        run: |
+          apt-get update && apt-get install -y git curl jq
+          
+          # Install GitHub CLI
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update && apt-get install -y gh
+          
+          # Verify gh is authenticated
+          gh auth status
 
       - name: Download last dispatch
         uses: actions/download-artifact@v4
@@ -259,29 +270,39 @@ jobs:
             - "active": true with filters (like @entire.io email) → Public = N (internal only)
             - No flag reference in code → Public = Y (shipped when merged)
 
+            Determining PR Author and External Contributor Status:
+            For each PR, get the author using:
+              gh pr view <PR_NUMBER> --repo entirehq/entire.io --json author --jq '.author.login'
+            
+            Then check if they are an org member (employee) using:
+              gh api /orgs/entirehq/members/<username> 2>/dev/null
+            - If this returns successfully (exit code 0) → employee
+            - If this returns 404 (exit code non-zero) → external contributor
+
             IMPORTANT: Output must be MARKDOWN TABLES with these exact formats:
 
             ## 📦 Released
 
-            | Change | PR | Public |
-            |--------|-----|--------|
-            | Brief description of the change | [#123](https://github.com/entirehq/entire.io/pull/123) | Y |
-            | Another change description | [#124](https://github.com/entirehq/entire.io/pull/124) | Y |
+            | Change | PR | Author | Public |
+            |--------|-----|--------|--------|
+            | Brief description | [#123](https://github.com/entirehq/entire.io/pull/123) | @employee | Y |
+            | Another change | [#124](https://github.com/entirehq/entire.io/pull/124) | @outsider (external contributor) | Y |
 
             ## 🔀 Merged (not yet released)
 
-            | Change | PR | Public |
-            |--------|-----|--------|
-            | Feature behind partial rollout | [#125](https://github.com/entirehq/entire.io/pull/125) | N |
-            | Internal-only feature | [#126](https://github.com/entirehq/entire.io/pull/126) | N |
+            | Change | PR | Author | Public |
+            |--------|-----|--------|--------|
+            | Feature behind partial rollout | [#125](https://github.com/entirehq/entire.io/pull/125) | @employee | N |
+            | Internal-only feature | [#126](https://github.com/entirehq/entire.io/pull/126) | @outsider (external contributor) | N |
 
             Rules:
             - ALWAYS include BOTH sections with their tables
-            - If a section has no items, include the table header with a single row: | _None this period_ | - | - |
+            - If a section has no items, include the table header with a single row: | _None this period_ | - | - | - |
             - DO NOT mention feature flag names or statuses - users don't know about them
             - Keep change descriptions concise (under 60 chars) and user-focused
             - Exclude anything already mentioned in the last dispatch
             - PR links must be full markdown links: [#123](url)
+            - Author column: @username for employees, @username (external contributor) for non-org members
             - Public column: Y = visible to all users, N = not yet visible
 
             Write ONLY the markdown tables to /tmp/dispatch_notes.md
@@ -289,6 +310,7 @@ jobs:
           prompt: |
             Generate dispatch notes for entirehq/entire.io showing changes since DATE_PLACEHOLDER.
             Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
+            For each PR, look up the author and check if they are an org member.
           RECIPE_EOF
           else
             # Standard recipe for repos with tagged releases (no Public column)
@@ -325,35 +347,48 @@ jobs:
                - "Released": Changes that are part of a tagged release since DATE_PLACEHOLDER
                - "Merged (not yet released)": Changes merged to main but not in any release tag
 
+            Determining PR Author and External Contributor Status:
+            For each PR, get the author using:
+              gh pr view <PR_NUMBER> --repo REPO_PLACEHOLDER --json author --jq '.author.login'
+            
+            Then check if they are an org member (employee) using:
+              gh api /orgs/<ORG>/members/<username> 2>/dev/null
+            Where <ORG> is extracted from REPO_PLACEHOLDER (e.g., "entireio" from "entireio/cli")
+            - If this returns successfully (exit code 0) → employee
+            - If this returns 404 (exit code non-zero) → external contributor
+            - For go-git/go-git, all contributors are external (not your org)
+
             IMPORTANT: Output must be MARKDOWN TABLES with these exact formats:
 
             ## 📦 Released
 
-            | Change | PR |
-            |--------|----|
-            | `vX.Y.Z` - Brief description | [#123](https://github.com/REPO_PLACEHOLDER/pull/123) |
-            | Another released change | [#124](https://github.com/REPO_PLACEHOLDER/pull/124) |
+            | Change | PR | Author |
+            |--------|-----|--------|
+            | `vX.Y.Z` - Brief description | [#123](https://github.com/REPO_PLACEHOLDER/pull/123) | @employee |
+            | Another released change | [#124](https://github.com/REPO_PLACEHOLDER/pull/124) | @outsider (external contributor) |
 
             ## 🔀 Merged (not yet released)
 
-            | Change | PR |
-            |--------|----|
-            | Feature waiting for next release | [#125](https://github.com/REPO_PLACEHOLDER/pull/125) |
-            | Bug fix in main | [#126](https://github.com/REPO_PLACEHOLDER/pull/126) |
+            | Change | PR | Author |
+            |--------|-----|--------|
+            | Feature waiting for next release | [#125](https://github.com/REPO_PLACEHOLDER/pull/125) | @employee |
+            | Bug fix in main | [#126](https://github.com/REPO_PLACEHOLDER/pull/126) | @outsider (external contributor) |
 
             Rules:
             - ALWAYS include BOTH sections with their tables
-            - If a section has no items, include the table header with a single row: | _None this period_ | - |
+            - If a section has no items, include the table header with a single row: | _None this period_ | - | - |
             - For released items, prefix with the version tag (e.g., `v1.2.3` - description)
             - Keep change descriptions concise (under 60 chars)
             - Exclude anything already mentioned in the last dispatch
             - PR links must be full markdown links: [#123](url)
+            - Author column: @username for employees, @username (external contributor) for non-org members
 
             Write ONLY the markdown tables to /tmp/dispatch_notes.md
 
           prompt: |
             Generate dispatch notes for REPO_PLACEHOLDER showing changes since DATE_PLACEHOLDER.
             Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
+            For each PR, look up the author and check if they are an org member.
           RECIPE_EOF
           fi
 
