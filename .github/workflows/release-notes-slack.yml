@@ -351,6 +351,21 @@ jobs:
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
           goose run --recipe /tmp/recipe.yaml
 
+      - name: Save notes for dispatch draft
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          # Create a safe filename from repo name
+          SAFE_NAME=$(echo "$REPO" | tr '/' '-')
+          cp /tmp/dispatch_notes.md "/tmp/notes-${SAFE_NAME}.md"
+
+      - name: Upload repo notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: notes-${{ strategy.job-index }}
+          path: /tmp/notes-*.md
+          retention-days: 1
+
       - name: Post to Slack thread
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -417,3 +432,213 @@ jobs:
           fi
 
           echo "::notice::Posted dispatch notes to Slack thread"
+
+  # Generate a draft dispatch post in Marvin's voice
+  draft-dispatch:
+    name: Draft Dispatch
+    runs-on: ubuntu-latest
+    needs: [prepare, post-parent, generate]
+
+    container:
+      image: ghcr.io/block/goose:latest
+      options: --user root
+      env:
+        GOOSE_PROVIDER: openrouter
+        GOOSE_MODEL: anthropic/claude-sonnet-4
+        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        HOME: /tmp/goose-home
+
+    steps:
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y git curl jq
+
+      - name: Clone entire.io for dispatch examples
+        env:
+          GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/entirehq/entire.io.git" /tmp/entire-io
+          
+          # Copy last 3 dispatches as style examples
+          DISPATCH_DIR="/tmp/entire-io/website/src/routes/_content/blog/-content"
+          ls -1 "$DISPATCH_DIR"/*dispatch*.md | sort | tail -3 | while read f; do
+            cp "$f" /tmp/
+          done
+
+      - name: Download all repo notes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: notes-*
+          path: /tmp/repo-notes
+          merge-multiple: true
+
+      - name: Generate dispatch draft
+        env:
+          LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+        run: |
+          mkdir -p $HOME/.local/share/goose/sessions
+          mkdir -p $HOME/.config/goose
+
+          # Combine all repo notes into one file
+          echo "# Collected Notes from All Repos" > /tmp/all_notes.md
+          for f in /tmp/repo-notes/notes-*.md; do
+            if [ -f "$f" ]; then
+              REPO_NAME=$(basename "$f" .md | sed 's/notes-//' | tr '-' '/')
+              echo -e "\n## ${REPO_NAME}\n" >> /tmp/all_notes.md
+              cat "$f" >> /tmp/all_notes.md
+            fi
+          done
+
+          cat > /tmp/recipe.yaml << 'RECIPE_EOF'
+          version: "1.0.0"
+          title: "Dispatch Draft Generator"
+          description: "Generate a dispatch blog post draft in Marvin's voice"
+
+          extensions:
+            - type: builtin
+              name: developer
+
+          instructions: |
+            Generate a draft dispatch blog post for the Entire project.
+
+            Context:
+            - The collected notes from all repos are in /tmp/all_notes.md
+            - Example dispatches for voice/style reference are in /tmp/*.md (files like 2026-04-06-entire-dispatch-0x0008.md)
+            - This dispatch covers changes since DATE_PLACEHOLDER
+
+            IMPORTANT: Only include items that are under "📦 *Released*" sections in the notes.
+            Do NOT include items under "🔀 *Merged to main*" - those are not released yet and
+            should not be in the dispatch. The dispatch only covers what has actually shipped
+            in tagged releases.
+
+            Process:
+            1. Read the example dispatch files in /tmp/ to understand:
+               - The voice (Marvin, a robot with personality - "Beep, boop", dry humor)
+               - The structure (frontmatter, intro paragraph, sections with ## headings, closing)
+               - How features are described (user-focused, mentions contributors)
+            2. Read /tmp/all_notes.md and extract ONLY the "📦 *Released*" items
+            3. Ignore all "🔀 *Merged to main*" items - they haven't shipped yet
+            4. Determine the next dispatch number (look at the latest example and increment)
+            5. Write a complete dispatch draft covering only released items
+
+            Output Format (Markdown for the blog):
+
+            ---
+            title: Entire Dispatch 0xNNNN
+            description: Brief comma-separated list of highlights
+            category: Dispatch
+            author: Marvin
+            ---
+
+            Beep, boop. [Marvin intro with personality]
+
+            [Intro paragraph summarizing the week's theme and highlights]
+
+            ## [Feature/Section Name]
+
+            - Description of the feature or change
+            - Sub-details if needed
+
+            ## [Another Section]
+
+            ...
+
+            ## Further Improvements
+
+            [Group smaller changes here]
+
+            [Closing paragraph in Marvin's voice with call to action]
+
+            Rules:
+            - ONLY include released items (from "📦 *Released*" sections) - never merged-but-unreleased
+            - Match Marvin's voice exactly - dry wit, robot references, occasionally sardonic
+            - Group related changes into logical sections with ## headings
+            - Mention release versions with links: [v0.5.3](https://github.com/entireio/cli/releases/tag/v0.5.3)
+            - Keep it concise but informative
+            - If nothing was released, write a short dispatch noting it's a quiet week
+            - End with a call to action (Discord, file issues, etc.)
+
+            Write the complete dispatch draft to /tmp/dispatch_draft.md
+
+          prompt: |
+            Generate a dispatch draft covering changes since DATE_PLACEHOLDER.
+            Read the example dispatches in /tmp/ for voice and style.
+            Read /tmp/all_notes.md for the content to include.
+          RECIPE_EOF
+
+          sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
+          goose run --recipe /tmp/recipe.yaml
+
+      - name: Post dispatch draft to Slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -f /tmp/dispatch_draft.md ]; then
+            echo "::error::Dispatch draft not generated"
+            exit 1
+          fi
+
+          DRAFT=$(cat /tmp/dispatch_draft.md)
+          SAFE_LIMIT=2900
+
+          post_message() {
+            local text="$1"
+
+            local payload
+            payload=$(jq -n \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --arg text "$text" \
+              --arg ts "$THREAD_TS" \
+              '{channel: $channel, text: $text, thread_ts: $ts, unfurl_links: false}')
+
+            local response
+            response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$payload")
+
+            if [ "$(echo "$response" | jq -r '.ok')" != "true" ]; then
+              echo "::error::Slack API error: $(echo "$response" | jq -r '.error')"
+              return 1
+            fi
+          }
+
+          # Post header
+          DIVIDER="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          post_message "${DIVIDER}
+📝 *Draft Dispatch* _(copy-paste ready)_"
+          sleep 1
+
+          # Post draft in code block for easy copying
+          BACKTICKS='```'
+
+          if [ ${#DRAFT} -le 2700 ]; then
+            post_message "${BACKTICKS}
+${DRAFT}
+${BACKTICKS}"
+          else
+            # Split the draft and post in chunks
+            echo "$DRAFT" > /tmp/draft_full.txt
+            split -b 2600 /tmp/draft_full.txt /tmp/dchunk_
+
+            FIRST=true
+            for chunk_file in /tmp/dchunk_*; do
+              [ -f "$chunk_file" ] || continue
+              CHUNK=$(cat "$chunk_file")
+              if [ "$FIRST" = true ]; then
+                post_message "${BACKTICKS}
+${CHUNK}"
+                FIRST=false
+              else
+                post_message "${CHUNK}"
+              fi
+              sleep 1
+            done
+            post_message "${BACKTICKS}"
+          fi
+
+          echo "::notice::Posted dispatch draft to Slack thread"
