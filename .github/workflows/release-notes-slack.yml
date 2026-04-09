@@ -469,19 +469,39 @@ jobs:
           sudo apt-get install -y pandoc texlive-xetex fonts-noto-color-emoji
           
           TODAY=$(date -u +"%Y-%m-%d")
+          MD_FILE="/tmp/dispatch-notes-${TODAY}.md"
           
-          # Strip emoji from markdown for PDF compatibility (keep text labels)
-          sed -i 's/📦/[Released]/g; s/🔀/[Merged]/g; s/📄/[File]/g; s/📝/[Draft]/g; s/📋/[Notes]/g; s/📁/[Repo]/g' /tmp/dispatch-notes-${TODAY}.md
+          # Clean up headers - replace emoji+text with just cleaner text
+          # "## 📦 Released" -> "## Released"
+          # "## 🔀 Merged (not yet released)" -> "## Merged (not yet released)"
+          sed -i 's/## 📦 Released/## Released/g' "$MD_FILE"
+          sed -i 's/## 🔀 Merged (not yet released)/## Merged (not yet released)/g' "$MD_FILE"
+          sed -i 's/## 🔀 Merged to main (not yet released)/## Merged to main (not yet released)/g' "$MD_FILE"
           
-          # Convert markdown to PDF with styling using XeLaTeX for better Unicode support
-          pandoc /tmp/dispatch-notes-${TODAY}.md \
+          # Remove any remaining emoji that might cause issues
+          sed -i 's/📦//g; s/🔀//g; s/📄//g; s/📝//g; s/📋//g; s/📁//g' "$MD_FILE"
+          
+          # Create a LaTeX header file for better table styling
+          cat > /tmp/header.tex << 'TEXEOF'
+          \usepackage{booktabs}
+          \usepackage{longtable}
+          \usepackage{array}
+          \usepackage{tabu}
+          \renewcommand{\arraystretch}{1.4}
+          \setlength{\tabcolsep}{8pt}
+          TEXEOF
+          
+          # Convert markdown to PDF with better styling
+          pandoc "$MD_FILE" \
             -o /tmp/dispatch-notes-${TODAY}.pdf \
             --pdf-engine=xelatex \
-            -V geometry:margin=1in \
-            -V fontsize=11pt \
+            -V geometry:margin=0.75in \
+            -V fontsize=10pt \
             -V colorlinks=true \
             -V linkcolor=blue \
             -V urlcolor=blue \
+            -V documentclass=article \
+            -H /tmp/header.tex \
             --highlight-style=tango
           
           echo "::notice::Converted to PDF: dispatch-notes-${TODAY}.pdf"
@@ -709,23 +729,33 @@ jobs:
       - name: Convert draft to PDF
         run: |
           TODAY=$(date -u +"%Y-%m-%d")
+          MD_FILE="/tmp/dispatch-draft-output.md"
           
-          if [ ! -f "/tmp/dispatch-draft-output.md" ]; then
+          if [ ! -f "$MD_FILE" ]; then
             echo "::error::Dispatch draft not found"
             exit 1
           fi
           
-          # Strip emoji for PDF compatibility
-          sed -i 's/📦/[Released]/g; s/🔀/[Merged]/g; s/📄/[File]/g; s/📝/[Draft]/g; s/📋/[Notes]/g; s/📁/[Repo]/g' /tmp/dispatch-draft-output.md
+          # Clean up any emoji that might cause LaTeX issues
+          sed -i 's/📦//g; s/🔀//g; s/📄//g; s/📝//g; s/📋//g; s/📁//g' "$MD_FILE"
           
-          pandoc /tmp/dispatch-draft-output.md \
+          # Create a LaTeX header for consistent styling with the notes PDF
+          cat > /tmp/header.tex << 'TEXEOF'
+          \usepackage{booktabs}
+          \usepackage{longtable}
+          \usepackage{array}
+          \renewcommand{\arraystretch}{1.4}
+          TEXEOF
+          
+          pandoc "$MD_FILE" \
             -o /tmp/dispatch-draft-${TODAY}.pdf \
             --pdf-engine=xelatex \
-            -V geometry:margin=1in \
-            -V fontsize=11pt \
+            -V geometry:margin=0.75in \
+            -V fontsize=10pt \
             -V colorlinks=true \
             -V linkcolor=blue \
             -V urlcolor=blue \
+            -H /tmp/header.tex \
             --highlight-style=tango
           
           echo "::notice::Converted draft to PDF"
