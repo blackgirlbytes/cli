@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"runtime"
@@ -20,10 +21,12 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/settings"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/summarize"
 	"github.com/entireio/cli/cmd/entire/cli/trailers"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
+	transcriptcompact "github.com/entireio/cli/cmd/entire/cli/transcript/compact"
 
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -214,10 +217,12 @@ func runExplainCheckpoint(ctx context.Context, w, errW io.Writer, checkpointIDPr
 		return fmt.Errorf("not a git repository: %w", err)
 	}
 
-	store := checkpoint.NewGitStore(repo)
+	v1Store := checkpoint.NewGitStore(repo)
+	v2Store := checkpoint.NewV2GitStore(repo, strategy.ResolveCheckpointURL(ctx, "origin"))
+	preferCheckpointsV2 := settings.IsCheckpointsV2Enabled(ctx)
 
 	// First, try to find in committed checkpoints by checkpoint ID prefix
-	committed, err := store.ListCommitted(ctx)
+	committed, err := listCommittedForExplain(ctx, v1Store, v2Store, preferCheckpointsV2)
 	if err != nil {
 		return fmt.Errorf("failed to list checkpoints: %w", err)
 	}
@@ -237,7 +242,7 @@ func runExplainCheckpoint(ctx context.Context, w, errW io.Writer, checkpointIDPr
 		if generate {
 			return fmt.Errorf("cannot generate summary for temporary checkpoint %s (only committed checkpoints supported)", checkpointIDPrefix)
 		}
-		output, found := explainTemporaryCheckpoint(ctx, w, repo, store, checkpointIDPrefix, verbose, full, rawTranscript)
+		output, found := explainTemporaryCheckpoint(ctx, w, repo, v1Store, checkpointIDPrefix, verbose, full, rawTranscript)
 		if found {
 			outputExplainContent(w, output, noPager)
 			return nil
@@ -258,28 +263,44 @@ func runExplainCheckpoint(ctx context.Context, w, errW io.Writer, checkpointIDPr
 		return fmt.Errorf("ambiguous checkpoint prefix %q matches %d checkpoints: %s", checkpointIDPrefix, len(matches), strings.Join(examples, ", "))
 	}
 
-	// Load checkpoint summary
-	summary, err := store.ReadCommitted(ctx, fullCheckpointID)
+	// Resolve store and load checkpoint summary with v2 -> v1 fallback.
+	resolvedReader, summary, err := checkpoint.ResolveCommittedReaderForCheckpoint(ctx, fullCheckpointID, v1Store, v2Store, preferCheckpointsV2)
 	if err != nil {
 		return fmt.Errorf("failed to read checkpoint: %w", err)
 	}
-	if summary == nil {
-		return fmt.Errorf("checkpoint not found: %s", fullCheckpointID)
+
+	// For v2 checkpoints in default display modes (not --full, --generate, or
+	// --raw-transcript), read only from /main — metadata, prompts, and the
+	// compact transcript.jsonl. The raw transcript on /full/* is never needed
+	// for human-readable output and may be unavailable (rotated, not fetched).
+	needsRawTranscript := full || generate || rawTranscript
+	v2Reader, isCheckpointsV2 := resolvedReader.(*checkpoint.V2GitStore)
+
+	var content *checkpoint.SessionContent
+	if isCheckpointsV2 && !needsRawTranscript {
+		content, err = readV2ContentFromMain(ctx, v2Reader, fullCheckpointID, summary)
+		if err != nil {
+			return fmt.Errorf("failed to read checkpoint content: %w", err)
+		}
+	} else {
+		content, err = readLatestSessionContentForExplain(ctx, resolvedReader, fullCheckpointID, summary)
+		if err != nil {
+			return fmt.Errorf("failed to read checkpoint content: %w", err)
+		}
 	}
 
-	// Load latest session content (needed for transcript and metadata)
-	content, err := store.ReadLatestSessionContent(ctx, fullCheckpointID)
-	if err != nil {
-		return fmt.Errorf("failed to read checkpoint content: %w", err)
-	}
-
-	// Handle summary generation
+	// Handle summary generation — uses raw transcript.
 	if generate {
-		if err := generateCheckpointSummary(ctx, w, errW, store, fullCheckpointID, summary, content, force); err != nil {
+		if err := generateCheckpointSummary(ctx, w, errW, v1Store, v2Store, fullCheckpointID, summary, content, force); err != nil {
 			return err
 		}
-		// Reload the content to get the updated summary
-		content, err = store.ReadLatestSessionContent(ctx, fullCheckpointID)
+		// Reload to get the updated summary. After generation we only need
+		// /main data for display, so use the /main-only path for v2.
+		if isCheckpointsV2 {
+			content, err = readV2ContentFromMain(ctx, v2Reader, fullCheckpointID, summary)
+		} else {
+			content, err = readLatestSessionContentForExplain(ctx, resolvedReader, fullCheckpointID, summary)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to reload checkpoint: %w", err)
 		}
@@ -287,11 +308,15 @@ func runExplainCheckpoint(ctx context.Context, w, errW io.Writer, checkpointIDPr
 
 	// Handle raw transcript output
 	if rawTranscript {
-		if len(content.Transcript) == 0 {
+		rawLog, _, rawErr := checkpoint.ResolveRawSessionLogForCheckpoint(ctx, fullCheckpointID, v1Store, v2Store, preferCheckpointsV2)
+		if rawErr != nil {
+			return fmt.Errorf("failed to read raw transcript: %w", rawErr)
+		}
+		if len(rawLog) == 0 {
 			return fmt.Errorf("checkpoint %s has no transcript", fullCheckpointID)
 		}
 		// Output raw transcript directly (no pager, no formatting)
-		if _, err = w.Write(content.Transcript); err != nil {
+		if _, err = w.Write(rawLog); err != nil {
 			return fmt.Errorf("failed to write transcript: %w", err)
 		}
 		return nil
@@ -310,7 +335,7 @@ func runExplainCheckpoint(ctx context.Context, w, errW io.Writer, checkpointIDPr
 			Email: associatedCommits[0].Email,
 		}
 	} else {
-		author, _ = store.GetCheckpointAuthor(ctx, fullCheckpointID) //nolint:errcheck // Author is optional
+		author, _ = v1Store.GetCheckpointAuthor(ctx, fullCheckpointID) //nolint:errcheck // Author is optional
 	}
 
 	// Format and output
@@ -319,10 +344,114 @@ func runExplainCheckpoint(ctx context.Context, w, errW io.Writer, checkpointIDPr
 	return nil
 }
 
+func listCommittedForExplain(ctx context.Context, v1Store *checkpoint.GitStore, v2Store *checkpoint.V2GitStore, preferCheckpointsV2 bool) ([]checkpoint.CommittedInfo, error) {
+	v1Committed, v1Err := v1Store.ListCommitted(ctx)
+
+	if !preferCheckpointsV2 {
+		if v1Err != nil {
+			return nil, fmt.Errorf("listing v1 checkpoints: %w", v1Err)
+		}
+		return v1Committed, nil
+	}
+
+	v2Committed, v2Err := v2Store.ListCommitted(ctx)
+	if v2Err != nil {
+		logging.Debug(ctx, "v2 ListCommitted failed, using v1 only",
+			slog.String("error", v2Err.Error()),
+		)
+		if v1Err != nil {
+			return nil, fmt.Errorf("listing checkpoints: %w", v1Err)
+		}
+		return v1Committed, nil
+	}
+
+	if v1Err != nil {
+		logging.Debug(ctx, "v1 ListCommitted failed, returning v2 only",
+			slog.String("error", v1Err.Error()),
+		)
+		return v2Committed, nil
+	}
+
+	// Merge v2 and v1 results so pre-v2 checkpoints remain visible during transition.
+	seen := make(map[id.CheckpointID]struct{}, len(v2Committed))
+	for _, c := range v2Committed {
+		seen[c.CheckpointID] = struct{}{}
+	}
+	committedCheckpoints := make([]checkpoint.CommittedInfo, 0, len(v2Committed)+len(v1Committed))
+	committedCheckpoints = append(committedCheckpoints, v2Committed...)
+	for _, c := range v1Committed {
+		if _, ok := seen[c.CheckpointID]; !ok {
+			committedCheckpoints = append(committedCheckpoints, c)
+		}
+	}
+	return committedCheckpoints, nil
+}
+
+func readLatestSessionContentForExplain(ctx context.Context, reader checkpoint.CommittedReader, checkpointID id.CheckpointID, summary *checkpoint.CheckpointSummary) (*checkpoint.SessionContent, error) {
+	if summary == nil || len(summary.Sessions) == 0 {
+		return nil, checkpoint.ErrCheckpointNotFound
+	}
+
+	latestIndex := len(summary.Sessions) - 1
+	content, err := reader.ReadSessionContent(ctx, checkpointID, latestIndex)
+	if err != nil {
+		return nil, fmt.Errorf("reading session %d content: %w", latestIndex, err)
+	}
+	return content, nil
+}
+
+// resolvePromptTree picks the best metadata tree for reading session prompts.
+// Prefers v2 when enabled (same sharded layout as v1), falls back to v1.
+func resolvePromptTree(v1Tree, v2Tree *object.Tree, preferV2 bool) *object.Tree {
+	if preferV2 && v2Tree != nil {
+		return v2Tree
+	}
+	if v1Tree != nil {
+		return v1Tree
+	}
+	return v2Tree // Last resort: use v2 even if not preferred
+}
+
+// readV2ContentFromMain reads session content from the v2 /main ref only —
+// metadata, prompts, and the compact transcript (transcript.jsonl). This is the
+// primary read path for default display modes that don't need the raw transcript
+// stored on /full/* refs.
+func readV2ContentFromMain(ctx context.Context, v2Reader *checkpoint.V2GitStore, checkpointID id.CheckpointID, summary *checkpoint.CheckpointSummary) (*checkpoint.SessionContent, error) {
+	if summary == nil || len(summary.Sessions) == 0 {
+		return nil, checkpoint.ErrCheckpointNotFound
+	}
+
+	latestIndex := len(summary.Sessions) - 1
+
+	content, err := v2Reader.ReadSessionMetadataAndPrompts(ctx, checkpointID, latestIndex)
+	if err != nil {
+		return nil, fmt.Errorf("reading session %d metadata: %w", latestIndex, err)
+	}
+
+	// ReadSessionMetadataAndPrompts reads the compact transcript from the same
+	// session tree. Reset transcript offsets when compact data is present.
+	if len(content.Transcript) > 0 {
+		content.Metadata.CheckpointTranscriptStart = 0
+		content.Metadata.TranscriptLinesAtStart = 0 //nolint:staticcheck // Set for backward compat with older CLI readers
+		return content, nil
+	}
+
+	// No compact transcript on /main — fall back to the raw transcript on
+	// /full/current for the most accurate display before resorting to prompt.txt.
+	fullContent, fullErr := v2Reader.ReadSessionContent(ctx, checkpointID, latestIndex)
+	if fullErr == nil && len(fullContent.Transcript) > 0 {
+		content.Transcript = fullContent.Transcript
+		return content, nil
+	}
+
+	// Last resort: return metadata + prompts without transcript.
+	return content, nil
+}
+
 // generateCheckpointSummary generates an AI summary for a checkpoint and persists it.
 // The summary is generated from the scoped transcript (only this checkpoint's portion),
 // not the entire session transcript.
-func generateCheckpointSummary(ctx context.Context, w, _ io.Writer, store *checkpoint.GitStore, checkpointID id.CheckpointID, cpSummary *checkpoint.CheckpointSummary, content *checkpoint.SessionContent, force bool) error {
+func generateCheckpointSummary(ctx context.Context, w, _ io.Writer, v1Store *checkpoint.GitStore, v2Store *checkpoint.V2GitStore, checkpointID id.CheckpointID, cpSummary *checkpoint.CheckpointSummary, content *checkpoint.SessionContent, force bool) error {
 	// Check if summary already exists
 	if content.Metadata.Summary != nil && !force {
 		return fmt.Errorf("checkpoint %s already has a summary (use --force to regenerate)", checkpointID)
@@ -347,9 +476,30 @@ func generateCheckpointSummary(ctx context.Context, w, _ io.Writer, store *check
 		return fmt.Errorf("failed to generate summary: %w", err)
 	}
 
-	// Persist the summary
-	if err := store.UpdateSummary(ctx, checkpointID, summary); err != nil {
-		return fmt.Errorf("failed to save summary: %w", err)
+	// Persist to both stores; at least one must succeed.
+	v1Err := v1Store.UpdateSummary(ctx, checkpointID, summary)
+	var v2Err error
+	if v2Store != nil {
+		v2Err = v2Store.UpdateSummary(ctx, checkpointID, summary)
+	}
+
+	switch {
+	case v1Err != nil && (v2Store == nil || v2Err != nil):
+		// No store succeeded — hard error.
+		if v2Err != nil {
+			return fmt.Errorf("failed to save summary: v1: %w, v2: %w", v1Err, v2Err)
+		}
+		return fmt.Errorf("failed to save summary: %w", v1Err)
+	case v1Err != nil:
+		logging.Debug(ctx, "v1 UpdateSummary failed (v2 succeeded)",
+			slog.String("checkpoint_id", checkpointID.String()),
+			slog.String("error", v1Err.Error()),
+		)
+	case v2Err != nil:
+		logging.Debug(ctx, "v2 UpdateSummary failed (v1 succeeded)",
+			slog.String("checkpoint_id", checkpointID.String()),
+			slog.String("error", v2Err.Error()),
+		)
 	}
 
 	fmt.Fprintln(w, "✓ Summary generated and saved")
@@ -586,7 +736,10 @@ func extractPromptsFromTranscript(transcriptBytes []byte, agentType types.AgentT
 	}
 
 	condensed, err := summarize.BuildCondensedTranscriptFromBytes(transcriptBytes, agentType)
-	if err != nil {
+	if err != nil || len(condensed) == 0 {
+		condensed, err = buildCondensedCompactTranscriptEntries(transcriptBytes)
+	}
+	if err != nil || len(condensed) == 0 {
 		return nil
 	}
 
@@ -735,6 +888,9 @@ func formatTranscriptBytes(transcriptBytes []byte, fallback string, agentType ty
 
 	condensed, err := summarize.BuildCondensedTranscriptFromBytes(transcriptBytes, agentType)
 	if err != nil || len(condensed) == 0 {
+		condensed, err = buildCondensedCompactTranscriptEntries(transcriptBytes)
+	}
+	if err != nil || len(condensed) == 0 {
 		if fallback != "" {
 			return fallback + "\n"
 		}
@@ -743,6 +899,31 @@ func formatTranscriptBytes(transcriptBytes []byte, fallback string, agentType ty
 
 	input := summarize.Input{Transcript: condensed}
 	return summarize.FormatCondensedTranscript(input)
+}
+
+func buildCondensedCompactTranscriptEntries(transcriptBytes []byte) ([]summarize.Entry, error) {
+	compactEntries, err := transcriptcompact.BuildCondensedEntries(transcriptBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parsing compact transcript: %w", err)
+	}
+
+	entries := make([]summarize.Entry, 0, len(compactEntries))
+	for _, entry := range compactEntries {
+		switch entry.Type {
+		case "user":
+			entries = append(entries, summarize.Entry{Type: summarize.EntryTypeUser, Content: entry.Content})
+		case "assistant":
+			entries = append(entries, summarize.Entry{Type: summarize.EntryTypeAssistant, Content: entry.Content})
+		case "tool":
+			entries = append(entries, summarize.Entry{Type: summarize.EntryTypeTool, ToolName: entry.ToolName, ToolDetail: entry.ToolDetail})
+		}
+	}
+
+	if len(entries) == 0 {
+		return nil, errors.New("no parseable compact transcript entries")
+	}
+
+	return entries, nil
 }
 
 // formatSummaryDetails formats the detailed sections of an AI summary.
@@ -918,10 +1099,12 @@ func getBranchCheckpoints(ctx context.Context, repo *git.Repository, limit int) 
 	// Warn (once per process) if metadata branches are disconnected
 	strategy.WarnIfMetadataDisconnected()
 
-	store := checkpoint.NewGitStore(repo)
+	v1Store := checkpoint.NewGitStore(repo)
+	v2Store := checkpoint.NewV2GitStore(repo, strategy.ResolveCheckpointURL(ctx, "origin"))
+	preferCheckpointsV2 := settings.IsCheckpointsV2Enabled(ctx)
 
-	// Get all committed checkpoints for lookup
-	committedInfos, err := store.ListCommitted(ctx)
+	// Get all committed checkpoints for lookup (v2-aware with v1 fallback).
+	committedInfos, err := listCommittedForExplain(ctx, v1Store, v2Store, preferCheckpointsV2)
 	if err != nil {
 		committedInfos = nil // Continue without committed checkpoints
 	}
@@ -946,10 +1129,11 @@ func getBranchCheckpoints(ctx context.Context, repo *git.Repository, limit int) 
 	// Check if we're on the default branch (needed for getReachableTemporaryCheckpoints)
 	isOnDefault, _ := strategy.IsOnDefaultBranch(repo)
 
-	// Fetch metadata branch tree once for reading session prompts (cheap tree lookups).
-	// This avoids calling ReadLatestSessionContent per checkpoint which reads+parses
-	// the full JSONL transcript — extremely slow with hundreds of checkpoints.
-	metadataTree, _ := strategy.GetMetadataBranchTree(repo) //nolint:errcheck // Best-effort, continue without prompts
+	// Fetch metadata trees for reading session prompts (cheap tree lookups).
+	// Try v2 /main first, fall back to v1 metadata branch.
+	v1MetadataTree, _ := strategy.GetMetadataBranchTree(repo)   //nolint:errcheck // Best-effort
+	v2MetadataTree, _ := strategy.GetV2MetadataBranchTree(repo) //nolint:errcheck // Best-effort
+	promptTree := resolvePromptTree(v1MetadataTree, v2MetadataTree, preferCheckpointsV2)
 
 	var points []strategy.RewindPoint
 
@@ -975,11 +1159,11 @@ func getBranchCheckpoints(ctx context.Context, repo *git.Repository, limit int) 
 			ToolUseID:        cpInfo.ToolUseID,
 			Agent:            cpInfo.Agent,
 		}
-		// Read session prompt from metadata branch tree (best-effort).
+		// Read session prompt from metadata tree (best-effort).
 		// Read prompt.txt directly from the latest session subdirectory instead of
 		// parsing the full transcript — prompt.txt is tiny vs multi-MB transcripts.
-		if metadataTree != nil {
-			point.SessionPrompt = strategy.ReadLatestSessionPromptFromCommittedTree(metadataTree, cpID, cpInfo.SessionCount)
+		if promptTree != nil {
+			point.SessionPrompt = strategy.ReadLatestSessionPromptFromCommittedTree(promptTree, cpID, cpInfo.SessionCount)
 		}
 
 		points = append(points, point)
@@ -1030,7 +1214,7 @@ func getBranchCheckpoints(ctx context.Context, repo *git.Repository, limit int) 
 	}
 
 	// Get temporary checkpoints from ALL shadow branches whose base commit is reachable from HEAD.
-	tempPoints := getReachableTemporaryCheckpoints(ctx, repo, store, head.Hash(), isOnDefault, limit)
+	tempPoints := getReachableTemporaryCheckpoints(ctx, repo, v1Store, head.Hash(), isOnDefault, limit)
 	points = append(points, tempPoints...)
 
 	// Sort by date, most recent first

@@ -627,6 +627,28 @@ func GetMetadataBranchTree(repo *git.Repository) (*object.Tree, error) {
 	return tree, nil
 }
 
+// GetV2MetadataBranchTree returns the tree object at the tip of the v2 /main ref.
+// The v2 /main ref uses the same sharded checkpoint layout as v1, so
+// ReadLatestSessionPromptFromCommittedTree works with either tree.
+func GetV2MetadataBranchTree(repo *git.Repository) (*object.Tree, error) {
+	refName := plumbing.ReferenceName(paths.V2MainRefName)
+	ref, err := repo.Reference(refName, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get v2 /main reference: %w", err)
+	}
+
+	commit, err := repo.CommitObject(ref.Hash())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get v2 /main commit: %w", err)
+	}
+
+	tree, err := commit.Tree()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get v2 /main tree: %w", err)
+	}
+	return tree, nil
+}
+
 // ExtractFirstPrompt extracts and truncates the first meaningful prompt from prompt content.
 // Prompts are separated by "\n\n---\n\n". Skips empty prompts and separator-only content.
 // Returns empty string if no valid prompt is found.

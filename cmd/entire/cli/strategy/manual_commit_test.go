@@ -4126,6 +4126,73 @@ func TestCommittedFilesExcludingMetadata(t *testing.T) {
 	require.Len(t, result, 3)
 }
 
+func TestMarshalPromptAttributionsIncludingPending_IncludesPending(t *testing.T) {
+	t.Parallel()
+
+	state := &SessionState{
+		PromptAttributions: []PromptAttribution{
+			{CheckpointNumber: 1, UserLinesAdded: 3},
+		},
+		PendingPromptAttribution: &PromptAttribution{
+			CheckpointNumber: 2, UserLinesAdded: 5,
+		},
+	}
+
+	raw := marshalPromptAttributionsIncludingPending(state)
+	require.NotNil(t, raw)
+
+	var result []PromptAttribution
+	require.NoError(t, json.Unmarshal(raw, &result))
+	require.Len(t, result, 2, "should include both committed and pending attributions")
+	require.Equal(t, 1, result[0].CheckpointNumber)
+	require.Equal(t, 3, result[0].UserLinesAdded)
+	require.Equal(t, 2, result[1].CheckpointNumber)
+	require.Equal(t, 5, result[1].UserLinesAdded)
+}
+
+func TestMarshalPromptAttributionsIncludingPending_NoPending(t *testing.T) {
+	t.Parallel()
+
+	state := &SessionState{
+		PromptAttributions: []PromptAttribution{
+			{CheckpointNumber: 1, UserLinesAdded: 3},
+		},
+	}
+
+	raw := marshalPromptAttributionsIncludingPending(state)
+	require.NotNil(t, raw)
+
+	var result []PromptAttribution
+	require.NoError(t, json.Unmarshal(raw, &result))
+	require.Len(t, result, 1)
+}
+
+func TestMarshalPromptAttributionsIncludingPending_Empty(t *testing.T) {
+	t.Parallel()
+
+	state := &SessionState{}
+	raw := marshalPromptAttributionsIncludingPending(state)
+	require.Nil(t, raw, "empty state should return nil")
+}
+
+func TestMarshalPromptAttributionsIncludingPending_OnlyPending(t *testing.T) {
+	t.Parallel()
+
+	state := &SessionState{
+		PendingPromptAttribution: &PromptAttribution{
+			CheckpointNumber: 1, UserLinesAdded: 7,
+		},
+	}
+
+	raw := marshalPromptAttributionsIncludingPending(state)
+	require.NotNil(t, raw, "pending-only should still produce output")
+
+	var result []PromptAttribution
+	require.NoError(t, json.Unmarshal(raw, &result))
+	require.Len(t, result, 1)
+	require.Equal(t, 7, result[0].UserLinesAdded)
+}
+
 func TestCommittedFilesExcludingMetadata_AllMetadata(t *testing.T) {
 	t.Parallel()
 

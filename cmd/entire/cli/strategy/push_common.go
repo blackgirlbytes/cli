@@ -155,8 +155,11 @@ func fetchAndRebaseSessionsCommon(ctx context.Context, target, branchName string
 		fetchedRefName = plumbing.NewRemoteReferenceName(target, branchName)
 	}
 
-	// Use git CLI for fetch (go-git's fetch can be tricky with auth)
-	fetchCmd := CheckpointGitCommand(ctx, target, "fetch", target, refSpec)
+	// Use git CLI for fetch (go-git's fetch can be tricky with auth).
+	// Use --filter=blob:none for a partial fetch that downloads only commits
+	// and trees, skipping blobs. The merge only needs the tree structure to
+	// combine entries; blobs are already local or fetched on demand.
+	fetchCmd := CheckpointGitCommand(ctx, target, "fetch", "--no-tags", "--filter=blob:none", target, refSpec)
 	if output, err := fetchCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("fetch failed: %s", output)
 	}

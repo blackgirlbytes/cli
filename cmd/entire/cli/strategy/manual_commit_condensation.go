@@ -235,7 +235,7 @@ func (s *ManualCommitStrategy) CondenseSession(ctx context.Context, repo *git.Re
 		TokenUsage:                  sessionData.TokenUsage,
 		SessionMetrics:              buildSessionMetrics(state),
 		InitialAttribution:          attribution,
-		PromptAttributionsJSON:      marshalPromptAttributions(state.PromptAttributions),
+		PromptAttributionsJSON:      marshalPromptAttributionsIncludingPending(state),
 		Summary:                     summary,
 	}
 
@@ -312,11 +312,16 @@ func generateSummary(ctx context.Context, sessionData *ExtractedSessionData, sta
 	return summary
 }
 
-// buildSessionMetrics creates a SessionMetrics from session state if any metrics are available.
-// Returns nil if no hook-provided metrics exist (e.g., for agents that don't report them).
-// marshalPromptAttributions encodes PromptAttributions to JSON for diagnostic persistence.
-// Returns nil if there are no attributions to persist.
-func marshalPromptAttributions(pas []PromptAttribution) json.RawMessage {
+// marshalPromptAttributionsIncludingPending builds the complete prompt attribution slice
+// (including PendingPromptAttribution for mid-turn commits) and encodes it to JSON.
+// This must stay consistent with the slice used by calculateSessionAttributions so the
+// persisted diagnostics match the computed InitialAttribution.
+func marshalPromptAttributionsIncludingPending(state *SessionState) json.RawMessage {
+	pas := make([]PromptAttribution, len(state.PromptAttributions), len(state.PromptAttributions)+1)
+	copy(pas, state.PromptAttributions)
+	if state.PendingPromptAttribution != nil {
+		pas = append(pas, *state.PendingPromptAttribution)
+	}
 	if len(pas) == 0 {
 		return nil
 	}
@@ -327,6 +332,8 @@ func marshalPromptAttributions(pas []PromptAttribution) json.RawMessage {
 	return data
 }
 
+// buildSessionMetrics creates a SessionMetrics from session state if any metrics are available.
+// Returns nil if no hook-provided metrics exist (e.g., for agents that don't report them).
 func buildSessionMetrics(state *SessionState) *cpkg.SessionMetrics {
 	if state.SessionDurationMs == 0 && state.SessionTurnCount == 0 && state.ContextTokens == 0 && state.ContextWindowSize == 0 {
 		return nil

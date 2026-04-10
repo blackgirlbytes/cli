@@ -387,8 +387,9 @@ type CommittedMetadata struct {
 	// Agent identifies the agent that created this checkpoint (e.g., "Claude Code", "Cursor")
 	Agent types.AgentType `json:"agent,omitempty"`
 
-	// Model is the LLM model used during the session (e.g., "claude-sonnet-4-20250514")
-	Model string `json:"model,omitempty"`
+	// Model is the LLM model used during the session (e.g., "claude-sonnet-4-20250514").
+	// Always written to metadata (empty string when unknown) so consumers can rely on the field's presence.
+	Model string `json:"model"`
 
 	// TurnID correlates checkpoints from the same agent turn.
 	// When a turn's work spans multiple commits, each gets its own checkpoint
