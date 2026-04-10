@@ -292,7 +292,7 @@ func generateSummary(ctx context.Context, sessionData *ExtractedSessionData, sta
 				slog.String("error", sliceErr.Error()))
 		}
 		scopedTranscript = scoped
-	case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeFactoryAIDroid, agent.AgentTypeUnknown:
+	case agent.AgentTypeCodex, agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeFactoryAIDroid, agent.AgentTypeUnknown:
 		scopedTranscript = transcript.SliceFromLine(sessionData.Transcript, state.CheckpointTranscriptStart)
 	}
 
