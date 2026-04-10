@@ -1,0 +1,900 @@
+# Multi-Repo Dispatch Notes Generator for Slack
+#
+# Generates dispatch notes using goose AI agent for multiple repositories.
+# Compares against the last published dispatch to avoid duplicates.
+# Uploads a combined markdown file with tables to Slack.
+#
+# Repositories monitored:
+# - entireio/cli
+# - entirehq/entiredb
+# - entirehq/entire.io (uses PostHog for feature flag status)
+# - go-git/go-git
+
+name: Dispatch Notes to Slack
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: 'Repositories to include'
+        required: true
+        type: choice
+        options:
+          - all
+          - entireio/cli
+          - entirehq/entiredb
+          - entirehq/entire.io
+          - go-git/go-git
+
+  schedule:
+    # Daily at 7am ET (11am UTC) - accumulates changes since last published dispatch
+    - cron: '0 14 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  # Get last dispatch info and build repo matrix
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      has_repos: ${{ steps.build.outputs.has_repos }}
+      last_dispatch_date: ${{ steps.dispatch.outputs.date }}
+      last_dispatch_file: ${{ steps.dispatch.outputs.file }}
+
+    steps:
+      - name: Clone entire.io for dispatch info
+        env:
+          GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/entirehq/entire.io.git" /tmp/entire-io
+
+      - name: Get last dispatch info
+        id: dispatch
+        run: |
+          DISPATCH_DIR="/tmp/entire-io/website/src/routes/_content/blog/-content"
+          
+          # Get latest dispatch file
+          LATEST_DISPATCH=$(ls -1 "$DISPATCH_DIR"/*dispatch*.md 2>/dev/null | sort | tail -1)
+          
+          if [ -z "$LATEST_DISPATCH" ]; then
+            echo "::error::No dispatch files found"
+            exit 1
+          fi
+          
+          FILENAME=$(basename "$LATEST_DISPATCH")
+          # Extract date from filename (e.g., 2026-04-06-entire-dispatch-0x0008.md -> 2026-04-06)
+          DISPATCH_DATE=$(echo "$FILENAME" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+          
+          echo "file=$LATEST_DISPATCH" >> $GITHUB_OUTPUT
+          echo "date=$DISPATCH_DATE" >> $GITHUB_OUTPUT
+          echo "::notice::Last dispatch: $FILENAME (date: $DISPATCH_DATE)"
+          
+          # Save dispatch content for later use
+          cp "$LATEST_DISPATCH" /tmp/last_dispatch.md
+
+      - name: Upload dispatch content
+        uses: actions/upload-artifact@v4
+        with:
+          name: last-dispatch
+          path: /tmp/last_dispatch.md
+          retention-days: 1
+
+      - name: Fetch PostHog feature flags
+        env:
+          POSTHOG_PERSONAL_API_KEY: ${{ secrets.POSTHOG_PERSONAL_API_KEY }}
+          POSTHOG_PROJECT_ID: ${{ secrets.POSTHOG_PROJECT_ID }}
+        run: |
+          # Fetch all feature flags from PostHog
+          curl -s -H "Authorization: Bearer ${POSTHOG_PERSONAL_API_KEY}" \
+            "https://us.posthog.com/api/projects/${POSTHOG_PROJECT_ID}/feature_flags/?limit=100" \
+            > /tmp/posthog_flags.json
+          
+          echo "::notice::Fetched $(jq '.results | length' /tmp/posthog_flags.json) feature flags from PostHog"
+
+      - name: Upload PostHog flags
+        uses: actions/upload-artifact@v4
+        with:
+          name: posthog-flags
+          path: /tmp/posthog_flags.json
+          retention-days: 1
+
+      - name: Build repo matrix
+        id: build
+        env:
+          INPUT_REPOS: ${{ inputs.repos }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          ALL_REPOS="entireio/cli entirehq/entiredb entirehq/entire.io go-git/go-git"
+          REPOS=()
+
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$INPUT_REPOS" = "all" ]; then
+            for repo in $ALL_REPOS; do
+              REPOS+=("{\"repo\":\"${repo}\"}")
+            done
+          else
+            REPOS+=("{\"repo\":\"${INPUT_REPOS}\"}")
+          fi
+
+          MATRIX=$(printf '%s\n' "${REPOS[@]}" | jq -sc '{include: .}')
+          echo "has_repos=true" >> $GITHUB_OUTPUT
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  # Post the parent message to start the thread
+  post-parent:
+    name: Post Parent Message
+    runs-on: ubuntu-latest
+    needs: prepare
+    outputs:
+      thread_ts: ${{ steps.post.outputs.thread_ts }}
+
+    steps:
+      - name: Post parent message
+        id: post
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+        run: |
+          # Use Eastern Time for display (UTC-4 during EDT)
+          TODAY=$(date -u -d '4 hours ago' +"%B %-d, %Y")
+          
+          TEXT=$(printf "📋 *Today's Daily Dispatch* — %s\n_Changes since last dispatch (%s)_\n\nEngineers, please review the notes in thread for accuracy. :pray:" "$TODAY" "$LAST_DISPATCH_DATE")
+          
+          PAYLOAD=$(jq -n \
+            --arg channel "$SLACK_CHANNEL_ID" \
+            --arg text "$TEXT" \
+            '{channel: $channel, text: $text, unfurl_links: false}')
+
+          RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          if [ "$(echo "$RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Slack API error: $(echo "$RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          THREAD_TS=$(echo "$RESPONSE" | jq -r '.ts')
+          echo "thread_ts=$THREAD_TS" >> $GITHUB_OUTPUT
+          echo "::notice::Created parent message with ts=$THREAD_TS"
+
+  # Generate notes for each repo
+  generate:
+    name: Generate (${{ matrix.repo }})
+    runs-on: ubuntu-latest
+    needs: [prepare, post-parent]
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+
+    container:
+      image: ghcr.io/block/goose:latest
+      options: --user root
+      env:
+        GOOSE_PROVIDER: openrouter
+        GOOSE_MODEL: anthropic/claude-sonnet-4
+        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        HOME: /tmp/goose-home
+
+    steps:
+      - name: Install dependencies
+        env:
+          GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
+        run: |
+          apt-get update && apt-get install -y git curl jq
+          
+          # Install GitHub CLI
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update && apt-get install -y gh
+          
+          # Verify gh is authenticated
+          gh auth status
+
+      - name: Download last dispatch
+        uses: actions/download-artifact@v4
+        with:
+          name: last-dispatch
+          path: /tmp
+
+      - name: Download PostHog flags
+        uses: actions/download-artifact@v4
+        with:
+          name: posthog-flags
+          path: /tmp
+
+      - name: Clone repository
+        env:
+          REPO: ${{ matrix.repo }}
+          GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" /tmp/repo
+          cd /tmp/repo
+          git fetch --tags
+
+      - name: Generate dispatch notes
+        env:
+          REPO: ${{ matrix.repo }}
+          LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+        run: |
+          mkdir -p $HOME/.local/share/goose/sessions
+          mkdir -p $HOME/.config/goose
+          cd /tmp/repo
+
+          # Check if this is entire.io (needs special handling with feature flags)
+          if [ "$REPO" = "entirehq/entire.io" ]; then
+            cat > /tmp/recipe.yaml << 'RECIPE_EOF'
+          version: "1.0.0"
+          title: "Dispatch Notes Generator (entire.io)"
+          description: "Generate dispatch notes for entire.io with feature flag awareness"
+
+          extensions:
+            - type: builtin
+              name: developer
+
+          instructions: |
+            Generate dispatch notes for entire.io in MARKDOWN TABLE format.
+            This repo deploys continuously to main, but some features are behind feature flags.
+
+            Context:
+            - Repository: entirehq/entire.io
+            - Last Dispatch Date: DATE_PLACEHOLDER
+            - You are in the cloned repository directory
+            - The last dispatch content is at /tmp/last_dispatch.md
+            - PostHog feature flags data is at /tmp/posthog_flags.json
+            - The repo's feature flag definitions are in feature-flags.json
+
+            Process:
+            1. Read /tmp/last_dispatch.md to see what was already covered - DO NOT include those items
+            2. Get all commits/merges to main since DATE_PLACEHOLDER:
+               git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
+            3. For each commit, get the associated PR number from the commit message or use:
+               git log --since="DATE_PLACEHOLDER" --first-parent main --format="%s" | grep -oE '#[0-9]+'
+            4. Read /tmp/posthog_flags.json to get current feature flag states
+            5. Read feature-flags.json in the repo to see which flags are defined
+            6. For each merged PR/commit since DATE_PLACEHOLDER:
+               - Search the codebase for whether this change references a feature flag
+               - Look up that flag's status in posthog_flags.json
+            7. Categorize and determine "Public" status:
+               - "Released" + Public=Y: No feature flag OR flag is active with 100% rollout
+               - "Released" + Public=N: Should not happen (if released, it's public)
+               - "Merged but not released" + Public=N: Behind a flag that is inactive OR < 100% rollout
+
+            PostHog flag status interpretation (from posthog_flags.json):
+            - "active": true AND rollout_percentage: 100 (or no rollout_percentage) → Public = Y
+            - "active": true AND rollout_percentage < 100 → Public = N (partial rollout)
+            - "active": false → Public = N (disabled)
+            - "active": true with filters (like @entire.io email) → Public = N (internal only)
+            - No flag reference in code → Public = Y (shipped when merged)
+
+            Determining PR Author and External Contributor Status:
+            For each PR, get the author and their email using:
+              gh pr view <PR_NUMBER> --repo entirehq/entire.io --json author --jq '.author.login'
+              gh api /users/<username> --jq '.email'
+            
+            Someone is an EMPLOYEE if ANY of these are true:
+            1. They are a member of the GitHub org: gh api /orgs/entirehq/members/<username> returns success
+            2. Their GitHub email ends with @entire.io
+            
+            Only mark as "(external contributor)" if BOTH checks fail (not in org AND email doesn't end with @entire.io)
+
+            IMPORTANT: Output must be MARKDOWN TABLES with these exact formats:
+
+            ## 📦 Released
+
+            | Change | PR | Author | Public |
+            |--------|-----|--------|--------|
+            | Brief description | [#123](https://github.com/entirehq/entire.io/pull/123) | @employee | Y |
+            | Another change | [#124](https://github.com/entirehq/entire.io/pull/124) | @outsider (external contributor) | Y |
+
+            ## 🔀 Merged (not yet released)
+
+            | Change | PR | Author | Public |
+            |--------|-----|--------|--------|
+            | Feature behind partial rollout | [#125](https://github.com/entirehq/entire.io/pull/125) | @employee | N |
+            | Internal-only feature | [#126](https://github.com/entirehq/entire.io/pull/126) | @outsider (external contributor) | N |
+
+            Rules:
+            - ALWAYS include BOTH sections with their tables
+            - If a section has no items, include the table header with a single row: | _None this period_ | - | - | - |
+            - DO NOT mention feature flag names or statuses - users don't know about them
+            - Keep change descriptions concise (under 60 chars) and user-focused
+            - Exclude anything already mentioned in the last dispatch
+            - PR links must be full markdown links: [#123](url)
+            - Author column: @username for employees, @username (external contributor) for non-org members
+            - Public column: Y = visible to all users, N = not yet visible
+
+            Write ONLY the markdown tables to /tmp/dispatch_notes.md
+
+          prompt: |
+            Generate dispatch notes for entirehq/entire.io showing changes since DATE_PLACEHOLDER.
+            Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
+            For each PR, look up the author and check if they are an org member.
+          RECIPE_EOF
+          else
+            # Standard recipe for repos with tagged releases (no Public column)
+            cat > /tmp/recipe.yaml << 'RECIPE_EOF'
+          version: "1.0.0"
+          title: "Dispatch Notes Generator"
+          description: "Generate dispatch notes for changes since last dispatch"
+
+          extensions:
+            - type: builtin
+              name: developer
+
+          instructions: |
+            Generate dispatch notes for a repository in MARKDOWN TABLE format.
+
+            Context:
+            - Repository: REPO_PLACEHOLDER
+            - Last Dispatch Date: DATE_PLACEHOLDER
+            - You are in the cloned repository directory
+            - The last dispatch content is at /tmp/last_dispatch.md
+
+            Process:
+            1. Read /tmp/last_dispatch.md to see what was already covered (releases mentioned, PRs linked)
+            2. Get all releases/tags since DATE_PLACEHOLDER:
+               git tag --sort=-creatordate | head -20
+               git log --tags --simplify-by-decoration --pretty="format:%ai %d" | head -20
+            3. Get all merges to main/master since DATE_PLACEHOLDER:
+               git log --since="DATE_PLACEHOLDER" --merges --first-parent main --oneline
+               Or for commits:
+               git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
+            4. Extract PR numbers from commit messages (look for #NNN patterns)
+            5. Cross-reference with the last dispatch - exclude anything already mentioned
+            6. Categorize:
+               - "Released": Changes that are part of a tagged release since DATE_PLACEHOLDER
+               - "Merged (not yet released)": Changes merged to main but not in any release tag
+
+            Determining PR Author and External Contributor Status:
+            For each PR, get the author and their email using:
+              gh pr view <PR_NUMBER> --repo REPO_PLACEHOLDER --json author --jq '.author.login'
+              gh api /users/<username> --jq '.email'
+            
+            Where <ORG> is extracted from REPO_PLACEHOLDER (e.g., "entireio" from "entireio/cli")
+            
+            Someone is an EMPLOYEE if ANY of these are true:
+            1. They are a member of the GitHub org: gh api /orgs/<ORG>/members/<username> returns success
+            2. Their GitHub email ends with @entire.io
+            
+            Only mark as "(external contributor)" if BOTH checks fail (not in org AND email doesn't end with @entire.io)
+            
+            For go-git/go-git, all contributors are external (not your org)
+
+            IMPORTANT: Output must be MARKDOWN TABLES with these exact formats:
+
+            ## 📦 Released
+
+            | Change | PR | Author |
+            |--------|-----|--------|
+            | `v5.13.0` - Add shallow clone support | [#123](https://github.com/REPO_PLACEHOLDER/pull/123) | @employee |
+            | `v5.13.0` - Fix memory leak in fetch | [#124](https://github.com/REPO_PLACEHOLDER/pull/124) | @outsider (external contributor) |
+            | `v5.12.1` - Hotfix for auth issue | [#125](https://github.com/REPO_PLACEHOLDER/pull/125) | @employee |
+
+            ## 🔀 Merged (not yet released)
+
+            | Change | PR | Author |
+            |--------|-----|--------|
+            | Feature waiting for next release | [#126](https://github.com/REPO_PLACEHOLDER/pull/126) | @employee |
+            | Bug fix in main | [#127](https://github.com/REPO_PLACEHOLDER/pull/127) | @outsider (external contributor) |
+
+            Rules:
+            - ALWAYS include BOTH sections with their tables
+            - If a section has no items, include the table header with a single row: | _None this period_ | - | - |
+            - EVERY item in "Released" MUST start with the release tag (e.g., `v5.13.0` - description)
+            - Group released items by their release tag version
+            - Keep change descriptions concise (under 60 chars)
+            - Exclude anything already mentioned in the last dispatch
+            - PR links must be full markdown links: [#123](url)
+            - Author column: @username for employees, @username (external contributor) for non-org members
+
+            Write ONLY the markdown tables to /tmp/dispatch_notes.md
+
+          prompt: |
+            Generate dispatch notes for REPO_PLACEHOLDER showing changes since DATE_PLACEHOLDER.
+            Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
+            For each PR, look up the author and check if they are an org member.
+          RECIPE_EOF
+          fi
+
+          sed -i "s|REPO_PLACEHOLDER|${REPO}|g" /tmp/recipe.yaml
+          sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
+          goose run --recipe /tmp/recipe.yaml
+
+      - name: Save notes artifact
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          # Create a safe filename from repo name
+          SAFE_NAME=$(echo "$REPO" | tr '/' '-')
+          cp /tmp/dispatch_notes.md "/tmp/notes-${SAFE_NAME}.md"
+
+      - name: Upload repo notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: notes-${{ strategy.job-index }}
+          path: /tmp/notes-*.md
+          retention-days: 1
+
+  # Combine all notes and upload as markdown file to Slack
+  upload-combined:
+    name: Upload Combined Notes
+    runs-on: ubuntu-latest
+    needs: [prepare, post-parent, generate]
+
+    steps:
+      - name: Download all repo notes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: notes-*
+          path: /tmp/repo-notes
+          merge-multiple: true
+
+      - name: Combine notes into single markdown file
+        id: combine
+        env:
+          LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+        run: |
+          TODAY=$(date -u +"%Y-%m-%d")
+          echo "today=$TODAY" >> $GITHUB_OUTPUT
+          
+          # Calculate work week range (Monday to Friday)
+          WEEK_START=$(date -d "${LAST_DISPATCH_DATE}" +"%B %-d, %Y")
+          WEEK_END=$(date -d "${LAST_DISPATCH_DATE} + 4 days" +"%B %-d, %Y")
+          
+          cat > /tmp/dispatch-notes-${TODAY}.md << EOF
+          # Dispatch Notes
+
+          _For the week of ${WEEK_START} – ${WEEK_END}_
+
+          ---
+
+          EOF
+
+          # Add each repo's notes
+          for f in /tmp/repo-notes/notes-*.md; do
+            if [ -f "$f" ]; then
+              # Extract repo name from filename
+              FILENAME=$(basename "$f" .md)
+              SAFE_NAME=$(echo "$FILENAME" | sed 's/notes-//')
+              
+              # Map safe names back to repo names
+              case "$SAFE_NAME" in
+                "entireio-cli") REPO_NAME="entireio/cli" ;;
+                "entirehq-entiredb") REPO_NAME="entirehq/entiredb" ;;
+                "entirehq-entire.io") REPO_NAME="entirehq/entire.io" ;;
+                "go-git-go-git") REPO_NAME="go-git/go-git" ;;
+                *) REPO_NAME=$(echo "$SAFE_NAME" | sed 's/-/\//') ;;
+              esac
+              
+              cat >> /tmp/dispatch-notes-${TODAY}.md << EOF
+
+          # ${REPO_NAME}
+
+          EOF
+              cat "$f" >> /tmp/dispatch-notes-${TODAY}.md
+              echo -e "\n---\n" >> /tmp/dispatch-notes-${TODAY}.md
+            fi
+          done
+
+          echo "::notice::Combined notes file created"
+          cat /tmp/dispatch-notes-${TODAY}.md
+
+      - name: Install pandoc and convert to PDF
+        env:
+          TODAY: ${{ steps.combine.outputs.today }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc texlive-xetex fonts-noto-color-emoji
+          MD_FILE="/tmp/dispatch-notes-${TODAY}.md"
+          
+          # Clean up headers - replace emoji+text with just cleaner text
+          # "## 📦 Released" -> "## Released"
+          # "## 🔀 Merged (not yet released)" -> "## Merged (not yet released)"
+          sed -i 's/## 📦 Released/## Released/g' "$MD_FILE"
+          sed -i 's/## 🔀 Merged (not yet released)/## Merged (not yet released)/g' "$MD_FILE"
+          sed -i 's/## 🔀 Merged to main (not yet released)/## Merged to main (not yet released)/g' "$MD_FILE"
+          
+          # Remove any remaining emoji that might cause issues
+          sed -i 's/📦//g; s/🔀//g; s/📄//g; s/📝//g; s/📋//g; s/📁//g' "$MD_FILE"
+          
+          # Create a LaTeX header file for better table styling
+          cat > /tmp/header.tex << 'TEXEOF'
+          \usepackage{booktabs}
+          \usepackage{longtable}
+          \usepackage{array}
+          \usepackage{tabu}
+          \renewcommand{\arraystretch}{1.4}
+          \setlength{\tabcolsep}{8pt}
+          TEXEOF
+          
+          # Convert markdown to PDF with better styling
+          pandoc "$MD_FILE" \
+            -o /tmp/dispatch-notes-${TODAY}.pdf \
+            --pdf-engine=xelatex \
+            -V geometry:margin=0.75in \
+            -V fontsize=10pt \
+            -V colorlinks=true \
+            -V linkcolor=blue \
+            -V urlcolor=blue \
+            -V documentclass=article \
+            -H /tmp/header.tex \
+            --highlight-style=tango
+          
+          echo "::notice::Converted to PDF: dispatch-notes-${TODAY}.pdf"
+
+      - name: Upload PDF to Slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
+          TODAY: ${{ steps.combine.outputs.today }}
+        run: |
+          FILE_PATH="/tmp/dispatch-notes-${TODAY}.pdf"
+          FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
+          FILENAME="dispatch-notes-${TODAY}.pdf"
+
+          echo "::notice::Uploading file: ${FILENAME} (${FILE_SIZE} bytes)"
+
+          # Step 1: Get upload URL from Slack
+          UPLOAD_URL_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.getUploadURLExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "filename=${FILENAME}" \
+            --data-urlencode "length=${FILE_SIZE}")
+
+          if [ "$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to get upload URL: $(echo "$UPLOAD_URL_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
+          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
+
+          # Step 2: Upload file content to the URL
+          UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
+            -F "file=@${FILE_PATH}")
+
+          # Step 3: Complete the upload and share to channel/thread
+          COMPLETE_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg file_id "$FILE_ID" \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --arg thread_ts "$THREAD_TS" \
+              --arg title "Dispatch Notes ${TODAY}" \
+              '{
+                files: [{id: $file_id, title: $title}],
+                channel_id: $channel,
+                thread_ts: $thread_ts,
+                initial_comment: "📄 *Dispatch Notes* — styled PDF with tables"
+              }')")
+
+          if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to complete upload: $(echo "$COMPLETE_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          echo "::notice::Successfully uploaded ${FILENAME} to Slack thread"
+
+  # Generate a draft dispatch post in Marvin's voice
+  draft-dispatch:
+    name: Draft Dispatch
+    runs-on: ubuntu-latest
+    needs: [prepare, post-parent, generate]
+
+    container:
+      image: ghcr.io/block/goose:latest
+      options: --user root
+      env:
+        GOOSE_PROVIDER: openrouter
+        GOOSE_MODEL: anthropic/claude-sonnet-4
+        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        HOME: /tmp/goose-home
+
+    steps:
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y git curl jq
+
+      - name: Clone entire.io for dispatch examples
+        env:
+          GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/entirehq/entire.io.git" /tmp/entire-io
+          
+          # Copy last 3 dispatches as style examples
+          DISPATCH_DIR="/tmp/entire-io/website/src/routes/_content/blog/-content"
+          ls -1 "$DISPATCH_DIR"/*dispatch*.md | sort | tail -3 | while read f; do
+            cp "$f" /tmp/
+          done
+
+      - name: Download all repo notes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: notes-*
+          path: /tmp/repo-notes
+          merge-multiple: true
+
+      - name: Generate dispatch draft
+        env:
+          LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+        run: |
+          mkdir -p $HOME/.local/share/goose/sessions
+          mkdir -p $HOME/.config/goose
+
+          # Combine all repo notes into one file
+          echo "# Collected Notes from All Repos" > /tmp/all_notes.md
+          for f in /tmp/repo-notes/notes-*.md; do
+            if [ -f "$f" ]; then
+              SAFE_NAME=$(basename "$f" .md | sed 's/notes-//')
+              
+              # Map safe names back to repo names
+              case "$SAFE_NAME" in
+                "entireio-cli") REPO_NAME="entireio/cli" ;;
+                "entirehq-entiredb") REPO_NAME="entirehq/entiredb" ;;
+                "entirehq-entire.io") REPO_NAME="entirehq/entire.io" ;;
+                "go-git-go-git") REPO_NAME="go-git/go-git" ;;
+                *) REPO_NAME=$(echo "$SAFE_NAME" | sed 's/-/\//') ;;
+              esac
+              
+              echo -e "\n## ${REPO_NAME}\n" >> /tmp/all_notes.md
+              cat "$f" >> /tmp/all_notes.md
+            fi
+          done
+
+          cat > /tmp/recipe.yaml << 'RECIPE_EOF'
+          version: "1.0.0"
+          title: "Dispatch Draft Generator"
+          description: "Generate a dispatch blog post draft in Marvin's voice"
+
+          extensions:
+            - type: builtin
+              name: developer
+
+          instructions: |
+            Generate a draft dispatch blog post for the Entire project.
+
+            Context:
+            - The collected notes from all repos are in /tmp/all_notes.md (in table format)
+            - Example dispatches for voice/style reference are in /tmp/*.md (files like 2026-04-06-entire-dispatch-0x0008.md)
+            - This dispatch covers changes since DATE_PLACEHOLDER
+
+            IMPORTANT: Only include items from the "📦 Released" tables.
+            For entire.io specifically, only include items where Public = Y.
+            Do NOT include items from "🔀 Merged (not yet released)" tables.
+
+            Process:
+            1. Read the example dispatch files in /tmp/ to understand:
+               - The voice (Marvin, a robot with personality - "Beep, boop", dry humor)
+               - The structure (frontmatter, intro paragraph, sections with ## headings, closing)
+               - How features are described (user-focused, mentions contributors)
+            2. Read /tmp/all_notes.md and parse the markdown tables
+            3. Extract ONLY items from "📦 Released" sections
+            4. For entire.io, only include items where the Public column = Y
+            5. Determine the next dispatch number (look at the latest example and increment)
+            6. Write a complete dispatch draft
+
+            Output Format (Markdown for the blog):
+
+            ---
+            title: Entire Dispatch 0xNNNN
+            description: Brief comma-separated list of highlights
+            category: Dispatch
+            author: Marvin
+            ---
+
+            Beep, boop. [Marvin intro with personality]
+
+            [Intro paragraph summarizing the week's theme and highlights]
+
+            ## [Feature/Section Name]
+
+            - Description of the feature or change
+            - Sub-details if needed
+
+            ## [Another Section]
+
+            ...
+
+            ## Further Improvements
+
+            [Group smaller changes here]
+
+            [Closing paragraph in Marvin's voice with call to action]
+
+            Rules:
+            - ONLY include released items that are public (Public = Y for entire.io)
+            - Match Marvin's voice exactly - dry wit, robot references, occasionally sardonic
+            - Group related changes into logical sections with ## headings
+            - Mention release versions with links: [v0.5.3](https://github.com/entireio/cli/releases/tag/v0.5.3)
+            - Keep it concise but informative
+            - If nothing was released, write a short dispatch noting it's a quiet week
+            - End with a call to action (Discord, file issues, etc.)
+
+            Write the complete dispatch draft to /tmp/dispatch_draft.md
+
+          prompt: |
+            Generate a dispatch draft covering changes since DATE_PLACEHOLDER.
+            Read the example dispatches in /tmp/ for voice and style.
+            Read /tmp/all_notes.md for the table content to include.
+            Only include Released items (and for entire.io, only Public = Y).
+          RECIPE_EOF
+
+          sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
+          goose run --recipe /tmp/recipe.yaml
+
+      - name: Save dispatch draft
+        run: |
+          cp /tmp/dispatch_draft.md /tmp/dispatch-draft-output.md
+
+      - name: Upload dispatch draft artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dispatch-draft
+          path: /tmp/dispatch-draft-output.md
+          retention-days: 7
+
+  # Upload the dispatch draft as a separate file
+  upload-draft:
+    name: Upload Draft
+    runs-on: ubuntu-latest
+    needs: [post-parent, draft-dispatch]
+
+    steps:
+      - name: Download dispatch draft
+        uses: actions/download-artifact@v4
+        with:
+          name: dispatch-draft
+          path: /tmp
+
+      - name: Install pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc texlive-xetex
+
+      - name: Convert draft to PDF
+        run: |
+          TODAY=$(date -u +"%Y-%m-%d")
+          MD_FILE="/tmp/dispatch-draft-output.md"
+          
+          if [ ! -f "$MD_FILE" ]; then
+            echo "::error::Dispatch draft not found"
+            exit 1
+          fi
+          
+          # Clean up any emoji that might cause LaTeX issues
+          sed -i 's/📦//g; s/🔀//g; s/📄//g; s/📝//g; s/📋//g; s/📁//g' "$MD_FILE"
+          
+          # Create a LaTeX header for consistent styling with the notes PDF
+          cat > /tmp/header.tex << 'TEXEOF'
+          \usepackage{booktabs}
+          \usepackage{longtable}
+          \usepackage{array}
+          \renewcommand{\arraystretch}{1.4}
+          TEXEOF
+          
+          pandoc "$MD_FILE" \
+            -o /tmp/dispatch-draft-${TODAY}.pdf \
+            --pdf-engine=xelatex \
+            -V geometry:margin=0.75in \
+            -V fontsize=10pt \
+            -V colorlinks=true \
+            -V linkcolor=blue \
+            -V urlcolor=blue \
+            -H /tmp/header.tex \
+            --highlight-style=tango
+          
+          echo "::notice::Converted draft to PDF"
+
+      - name: Upload draft PDF to Slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
+        run: |
+          TODAY=$(date -u +"%Y-%m-%d")
+          FILE_PATH="/tmp/dispatch-draft-${TODAY}.pdf"
+          FILENAME="dispatch-draft-${TODAY}.pdf"
+          FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
+
+          echo "::notice::Uploading file: ${FILENAME} (${FILE_SIZE} bytes)"
+
+          # Step 1: Get upload URL from Slack
+          UPLOAD_URL_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.getUploadURLExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "filename=${FILENAME}" \
+            --data-urlencode "length=${FILE_SIZE}")
+
+          if [ "$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to get upload URL: $(echo "$UPLOAD_URL_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
+          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
+
+          # Step 2: Upload file content to the URL
+          UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
+            -F "file=@${FILE_PATH}")
+
+          # Step 3: Complete the upload and share to channel/thread
+          COMPLETE_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg file_id "$FILE_ID" \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --arg thread_ts "$THREAD_TS" \
+              --arg title "Dispatch Draft ${TODAY}" \
+              '{
+                files: [{id: $file_id, title: $title}],
+                channel_id: $channel,
+                thread_ts: $thread_ts,
+                initial_comment: "📝 *Dispatch Draft* _(Marvins voice, ready for editing)_"
+              }')")
+
+          if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to complete upload: $(echo "$COMPLETE_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          echo "::notice::Successfully uploaded dispatch draft to Slack thread"
+
+      - name: Upload raw markdown for editing
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
+        run: |
+          TODAY=$(date -u +"%Y-%m-%d")
+          FILE_PATH="/tmp/dispatch-draft-output.md"
+          FILENAME="dispatch-draft-${TODAY}.md"
+          FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
+
+          # Step 1: Get upload URL from Slack
+          UPLOAD_URL_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.getUploadURLExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "filename=${FILENAME}" \
+            --data-urlencode "length=${FILE_SIZE}")
+
+          if [ "$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to get upload URL: $(echo "$UPLOAD_URL_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
+          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
+
+          # Step 2: Upload file content to the URL
+          UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
+            -F "file=@${FILE_PATH}")
+
+          # Step 3: Complete the upload and share to channel/thread
+          COMPLETE_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg file_id "$FILE_ID" \
+              --arg channel "$SLACK_CHANNEL_ID" \
+              --arg thread_ts "$THREAD_TS" \
+              --arg title "Dispatch Draft (editable) ${TODAY}" \
+              '{
+                files: [{id: $file_id, title: $title}],
+                channel_id: $channel,
+                thread_ts: $thread_ts,
+                initial_comment: "📋 *Raw markdown* — copy-paste for blog"
+              }')")
+
+          if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Failed to complete upload: $(echo "$COMPLETE_RESPONSE" | jq -r '.error')"
+            exit 1
+          fi
+
+          echo "::notice::Successfully uploaded raw markdown to Slack thread"
