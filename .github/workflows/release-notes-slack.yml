@@ -432,10 +432,12 @@ jobs:
           merge-multiple: true
 
       - name: Combine notes into single markdown file
+        id: combine
         env:
           LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
         run: |
           TODAY=$(date -u +"%Y-%m-%d")
+          echo "today=$TODAY" >> $GITHUB_OUTPUT
           
           # Calculate work week range (Monday to Friday)
           WEEK_START=$(date -d "${LAST_DISPATCH_DATE}" +"%B %-d, %Y")
@@ -480,11 +482,11 @@ jobs:
           cat /tmp/dispatch-notes-${TODAY}.md
 
       - name: Install pandoc and convert to PDF
+        env:
+          TODAY: ${{ steps.combine.outputs.today }}
         run: |
           sudo apt-get update
           sudo apt-get install -y pandoc texlive-xetex fonts-noto-color-emoji
-          
-          TODAY=$(date -u +"%Y-%m-%d")
           MD_FILE="/tmp/dispatch-notes-${TODAY}.md"
           
           # Clean up headers - replace emoji+text with just cleaner text
@@ -527,8 +529,8 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
+          TODAY: ${{ steps.combine.outputs.today }}
         run: |
-          TODAY=$(date -u +"%Y-%m-%d")
           FILE_PATH="/tmp/dispatch-notes-${TODAY}.pdf"
           FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
           FILENAME="dispatch-notes-${TODAY}.pdf"
