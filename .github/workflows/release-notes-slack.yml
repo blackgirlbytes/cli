@@ -2,7 +2,7 @@
 #
 # Generates dispatch notes using goose AI agent for multiple repositories.
 # Compares against the last published dispatch to avoid duplicates.
-# Uploads a combined markdown file with tables to Slack.
+# Posts combined markdown notes directly to Slack.
 #
 # Repositories monitored:
 # - entireio/cli
@@ -122,51 +122,11 @@ jobs:
           echo "has_repos=true" >> $GITHUB_OUTPUT
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 
-  # Post the parent message to start the thread
-  post-parent:
-    name: Post Parent Message
-    runs-on: ubuntu-latest
-    needs: prepare
-    outputs:
-      thread_ts: ${{ steps.post.outputs.thread_ts }}
-
-    steps:
-      - name: Post parent message
-        id: post
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-          LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
-        run: |
-          # Use Eastern Time for display (UTC-4 during EDT)
-          TODAY=$(date -u -d '4 hours ago' +"%B %-d, %Y")
-          
-          TEXT=$(printf "📋 *Today's Daily Dispatch* — %s\n_Changes since last dispatch (%s)_\n\nEngineers, please review the notes in thread for accuracy. :pray:" "$TODAY" "$LAST_DISPATCH_DATE")
-          
-          PAYLOAD=$(jq -n \
-            --arg channel "$SLACK_CHANNEL_ID" \
-            --arg text "$TEXT" \
-            '{channel: $channel, text: $text, unfurl_links: false}')
-
-          RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
-            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
-
-          if [ "$(echo "$RESPONSE" | jq -r '.ok')" != "true" ]; then
-            echo "::error::Slack API error: $(echo "$RESPONSE" | jq -r '.error')"
-            exit 1
-          fi
-
-          THREAD_TS=$(echo "$RESPONSE" | jq -r '.ts')
-          echo "thread_ts=$THREAD_TS" >> $GITHUB_OUTPUT
-          echo "::notice::Created parent message with ts=$THREAD_TS"
-
   # Generate notes for each repo
   generate:
     name: Generate (${{ matrix.repo }})
     runs-on: ubuntu-latest
-    needs: [prepare, post-parent]
+    needs: prepare
     strategy:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
       fail-fast: false
@@ -420,11 +380,11 @@ jobs:
           path: /tmp/notes-*.md
           retention-days: 1
 
-  # Combine all notes and upload as markdown file to Slack
-  upload-combined:
-    name: Upload Combined Notes
+  # Combine all notes and post as markdown to Slack
+  post-combined:
+    name: Post Combined Notes
     runs-on: ubuntu-latest
-    needs: [prepare, post-parent, generate]
+    needs: [prepare, generate]
 
     steps:
       - name: Download all repo notes
@@ -438,15 +398,27 @@ jobs:
         id: combine
         env:
           LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           TODAY=$(date -u +"%Y-%m-%d")
           echo "today=$TODAY" >> $GITHUB_OUTPUT
+          DISPLAY_TODAY=$(date -u -d '4 hours ago' +"%B %-d, %Y")
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            INTRO_TITLE="📋 *Test Daily Dispatch* — ${DISPLAY_TODAY}"
+          else
+            INTRO_TITLE="📋 *Today's Daily Dispatch* — ${DISPLAY_TODAY}"
+          fi
           
           # Calculate work week range (Monday to Friday)
           WEEK_START=$(date -d "${LAST_DISPATCH_DATE}" +"%B %-d, %Y")
           WEEK_END=$(date -d "${LAST_DISPATCH_DATE} + 4 days" +"%B %-d, %Y")
           
           cat > /tmp/dispatch-notes-${TODAY}.md << EOF
+          ${INTRO_TITLE}
+          _Changes since last dispatch (${LAST_DISPATCH_DATE})_
+
+          Engineers, please review these notes for accuracy. :pray:
+
           # Dispatch Notes
 
           _For the week of ${WEEK_START} – ${WEEK_END}_
@@ -484,109 +456,82 @@ jobs:
           echo "::notice::Combined notes file created"
           cat /tmp/dispatch-notes-${TODAY}.md
 
-      - name: Install pandoc and convert to PDF
-        env:
-          TODAY: ${{ steps.combine.outputs.today }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pandoc texlive-xetex fonts-noto-color-emoji
-          MD_FILE="/tmp/dispatch-notes-${TODAY}.md"
-          
-          # Clean up headers - replace emoji+text with just cleaner text
-          # "## 📦 Released" -> "## Released"
-          # "## 🔀 Merged (not yet released)" -> "## Merged (not yet released)"
-          sed -i 's/## 📦 Released/## Released/g' "$MD_FILE"
-          sed -i 's/## 🔀 Merged (not yet released)/## Merged (not yet released)/g' "$MD_FILE"
-          sed -i 's/## 🔀 Merged to main (not yet released)/## Merged to main (not yet released)/g' "$MD_FILE"
-          
-          # Remove any remaining emoji that might cause issues
-          sed -i 's/📦//g; s/🔀//g; s/📄//g; s/📝//g; s/📋//g; s/📁//g' "$MD_FILE"
-          
-          # Create a LaTeX header file for better table styling
-          cat > /tmp/header.tex << 'TEXEOF'
-          \usepackage{booktabs}
-          \usepackage{longtable}
-          \usepackage{array}
-          \usepackage{tabu}
-          \renewcommand{\arraystretch}{1.4}
-          \setlength{\tabcolsep}{8pt}
-          TEXEOF
-          
-          # Convert markdown to PDF with better styling
-          pandoc "$MD_FILE" \
-            -o /tmp/dispatch-notes-${TODAY}.pdf \
-            --pdf-engine=xelatex \
-            -V geometry:margin=0.75in \
-            -V fontsize=10pt \
-            -V colorlinks=true \
-            -V linkcolor=blue \
-            -V urlcolor=blue \
-            -V documentclass=article \
-            -H /tmp/header.tex \
-            --highlight-style=tango
-          
-          echo "::notice::Converted to PDF: dispatch-notes-${TODAY}.pdf"
-
-      - name: Upload PDF to Slack
+      - name: Post combined notes to Slack
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-          THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
           TODAY: ${{ steps.combine.outputs.today }}
         run: |
-          FILE_PATH="/tmp/dispatch-notes-${TODAY}.pdf"
-          FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
-          FILENAME="dispatch-notes-${TODAY}.pdf"
+          MD_FILE="/tmp/dispatch-notes-${TODAY}.md"
+          MAX_CHARS=3800
+          export MD_FILE MAX_CHARS
 
-          echo "::notice::Uploading file: ${FILENAME} (${FILE_SIZE} bytes)"
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.request
 
-          # Step 1: Get upload URL from Slack
-          UPLOAD_URL_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.getUploadURLExternal" \
-            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            --data-urlencode "filename=${FILENAME}" \
-            --data-urlencode "length=${FILE_SIZE}")
+          token = os.environ["SLACK_BOT_TOKEN"]
+          channel = os.environ["SLACK_CHANNEL_ID"]
+          path = pathlib.Path(os.environ["MD_FILE"])
+          max_chars = int(os.environ["MAX_CHARS"])
+          text = path.read_text()
 
-          if [ "$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.ok')" != "true" ]; then
-            echo "::error::Failed to get upload URL: $(echo "$UPLOAD_URL_RESPONSE" | jq -r '.error')"
-            exit 1
-          fi
+          chunks = []
+          remaining = text
+          while remaining:
+              if len(remaining) <= max_chars:
+                  chunks.append(remaining)
+                  break
+              split_at = remaining.rfind("\n\n", 0, max_chars)
+              if split_at == -1:
+                  split_at = remaining.rfind("\n", 0, max_chars)
+              if split_at == -1:
+                  split_at = max_chars
+              chunk = remaining[:split_at].rstrip()
+              if not chunk:
+                  chunk = remaining[:max_chars]
+                  split_at = len(chunk)
+              chunks.append(chunk)
+              remaining = remaining[split_at:].lstrip()
 
-          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
-          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
+          for idx, chunk in enumerate(chunks, start=1):
+              if len(chunks) > 1:
+                  header = f"*Dispatch Notes ({idx}/{len(chunks)})*\n\n"
+                  body = header + chunk
+              else:
+                  body = chunk
 
-          # Step 2: Upload file content to the URL
-          UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
-            -F "file=@${FILE_PATH}")
+              payload = json.dumps({
+                  "channel": channel,
+                  "text": body,
+                  "unfurl_links": False,
+                  "unfurl_media": False,
+              }).encode()
 
-          # Step 3: Complete the upload and share to channel/thread
-          COMPLETE_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" \
-            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg file_id "$FILE_ID" \
-              --arg channel "$SLACK_CHANNEL_ID" \
-              --arg thread_ts "$THREAD_TS" \
-              --arg title "Dispatch Notes ${TODAY}" \
-              '{
-                files: [{id: $file_id, title: $title}],
-                channel_id: $channel,
-                thread_ts: $thread_ts,
-                initial_comment: "📄 *Dispatch Notes* — styled PDF with tables"
-              }')")
-
-          if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
-            echo "::error::Failed to complete upload: $(echo "$COMPLETE_RESPONSE" | jq -r '.error')"
-            exit 1
-          fi
-
-          echo "::notice::Successfully uploaded ${FILENAME} to Slack thread"
+              req = urllib.request.Request(
+                  "https://slack.com/api/chat.postMessage",
+                  data=payload,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json; charset=utf-8",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req) as resp:
+                  response = json.loads(resp.read().decode())
+              if not response.get("ok"):
+                  raise SystemExit(f"Slack API error: {response.get('error')}")
+              time.sleep(1.1)
+          PY
 
   # Generate a draft dispatch post in Marvin's voice
   draft-dispatch:
     name: Draft Dispatch
     runs-on: ubuntu-latest
-    needs: [prepare, post-parent, generate]
+    needs: [prepare, generate]
 
     container:
       image: ghcr.io/block/goose:latest
@@ -663,21 +608,36 @@ jobs:
             - The collected notes from all repos are in /tmp/all_notes.md (in table format)
             - Example dispatches for voice/style reference are in /tmp/*.md (files like 2026-04-06-entire-dispatch-0x0008.md)
             - This dispatch covers changes since DATE_PLACEHOLDER
+            - Past dispatch intros usually open with momentum, a product/theme, or the strongest visible ships
+            - They do NOT open by saying a repo/team "didn't ship" or by contrasting one team shipping against another not shipping
 
             IMPORTANT: Only include items from the "📦 Released" tables.
             For entire.io specifically, only include items where Public = Y.
             Do NOT include items from "🔀 Merged (not yet released)" tables.
+
+            Repository context:
+            - entireio/cli: the user-facing Entire CLI, agent integrations, Checkpoints, session tooling, and developer workflow
+            - entirehq/entire.io: the web platform, repo insights, transcript viewing, auth, navigation, and shipped user-facing product polish
+            - go-git/go-git: foundational git engine work that powers the broader stack; mention it when there is a meaningful aligned release
+            - entirehq/entiredb: supporting platform/infrastructure work for the broader Entire system; if it appears in released items, frame it as infrastructure that unlocks product capabilities
 
             Process:
             1. Read the example dispatch files in /tmp/ to understand:
                - The voice (Marvin, a robot with personality - "Beep, boop", dry humor)
                - The structure (frontmatter, intro paragraph, sections with ## headings, closing)
                - How features are described (user-focused, mentions contributors)
+               - How the intro frames the week around what shipped, not what failed to ship
             2. Read /tmp/all_notes.md and parse the markdown tables
             3. Extract ONLY items from "📦 Released" sections
             4. For entire.io, only include items where the Public column = Y
-            5. Determine the next dispatch number (look at the latest example and increment)
-            6. Write a complete dispatch draft
+            5. Translate technical implementation details into user-facing product language:
+               - Explain what changed in terms a non-engineer product user can understand
+               - Lead with the visible benefit, behavior change, or workflow improvement
+               - If a source item uses internal jargon, code names, storage terms, or vendor names, rewrite or briefly explain it
+               - Avoid assuming the reader knows internal architecture or engineering terminology
+            6. Determine the next dispatch number (look at the latest example and increment)
+            7. Identify the strongest visible theme across the released items
+            8. Write a complete dispatch draft
 
             Output Format (Markdown for the blog):
 
@@ -692,7 +652,7 @@ jobs:
 
             [Intro paragraph summarizing the week's theme and highlights]
 
-            ## [Feature/Section Name]
+            ## [User-facing Section Name]
 
             - Description of the feature or change
             - Sub-details if needed
@@ -710,11 +670,30 @@ jobs:
             Rules:
             - ONLY include released items that are public (Public = Y for entire.io)
             - Match Marvin's voice exactly - dry wit, robot references, occasionally sardonic
+            - The intro must lead with what moved forward this week: the main theme, strongest shipped work, or the clearest product momentum
+            - NEVER say that a repo, team, or group "didn't ship", "hasn't shipped yet", "was quiet", or similar
+            - NEVER frame the intro as "repo A shipped while repo B did not"
+            - If some repos only have merged-but-not-released work, simply omit that from the intro; do not call attention to the absence
+            - If the visible releases are concentrated in one repo, frame that positively, e.g. "this week's visible ships centered on..." or "the web platform led this week's releases..."
+            - Prefer a confident, product-forward intro over a release accounting intro
             - Group related changes into logical sections with ## headings
+            - Section headings must be understandable to a non-engineer at a glance
+            - Prefer benefit-oriented headings like "Faster Commit Pages", "Smoother Navigation", or "More Reliable Session History"
+            - Avoid internal labels like "Checkpoints V2 Format" or implementation/vendor names unless they are essential to user understanding
+            - Every bullet must describe the user-visible change first, then optionally mention the implementation detail
+            - Rewrite vague or technical source notes into concrete product language
+            - Avoid unexplained jargon such as "storage architecture", "session parsing", "Modal", "token support", or similar internal phrasing
+            - If a change is mostly infrastructure, explain the user impact such as better reliability, speed, security, or fewer glitches
             - Mention release versions with links: [v0.5.3](https://github.com/entireio/cli/releases/tag/v0.5.3)
             - Keep it concise but informative
             - If nothing was released, write a short dispatch noting it's a quiet week
             - End with a call to action (Discord, file issues, etc.)
+
+            Examples of stronger rewrites:
+            - Instead of "Checkpoints V2 Format", write "Better Agent History and Context"
+            - Instead of "Improved transcript storage architecture", write "Session history is now more reliable and scales better"
+            - Instead of "Modal agent connect token support", write "Hosted agents can now connect more securely"
+            - Instead of "Improved transcript parsing for Codex sessions", write "Session logs and code snippets now load more accurately"
 
             Write the complete dispatch draft to /tmp/dispatch_draft.md
 
@@ -739,11 +718,11 @@ jobs:
           path: /tmp/dispatch-draft-output.md
           retention-days: 7
 
-  # Upload the dispatch draft as a separate file
-  upload-draft:
-    name: Upload Draft
+  # Post the dispatch draft as markdown to Slack
+  post-draft:
+    name: Post Draft
     runs-on: ubuntu-latest
-    needs: [post-parent, draft-dispatch]
+    needs: draft-dispatch
 
     steps:
       - name: Download dispatch draft
@@ -752,149 +731,77 @@ jobs:
           name: dispatch-draft
           path: /tmp
 
-      - name: Install pandoc
+      - name: Post dispatch draft to Slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pandoc texlive-xetex
-
-      - name: Convert draft to PDF
-        run: |
-          TODAY=$(date -u +"%Y-%m-%d")
           MD_FILE="/tmp/dispatch-draft-output.md"
-          
+          MAX_CHARS=3800
+          export MD_FILE MAX_CHARS
+
           if [ ! -f "$MD_FILE" ]; then
             echo "::error::Dispatch draft not found"
             exit 1
           fi
-          
-          # Clean up any emoji that might cause LaTeX issues
-          sed -i 's/📦//g; s/🔀//g; s/📄//g; s/📝//g; s/📋//g; s/📁//g' "$MD_FILE"
-          
-          # Create a LaTeX header for consistent styling with the notes PDF
-          cat > /tmp/header.tex << 'TEXEOF'
-          \usepackage{booktabs}
-          \usepackage{longtable}
-          \usepackage{array}
-          \renewcommand{\arraystretch}{1.4}
-          TEXEOF
-          
-          pandoc "$MD_FILE" \
-            -o /tmp/dispatch-draft-${TODAY}.pdf \
-            --pdf-engine=xelatex \
-            -V geometry:margin=0.75in \
-            -V fontsize=10pt \
-            -V colorlinks=true \
-            -V linkcolor=blue \
-            -V urlcolor=blue \
-            -H /tmp/header.tex \
-            --highlight-style=tango
-          
-          echo "::notice::Converted draft to PDF"
 
-      - name: Upload draft PDF to Slack
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-          THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
-        run: |
-          TODAY=$(date -u +"%Y-%m-%d")
-          FILE_PATH="/tmp/dispatch-draft-${TODAY}.pdf"
-          FILENAME="dispatch-draft-${TODAY}.pdf"
-          FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.request
 
-          echo "::notice::Uploading file: ${FILENAME} (${FILE_SIZE} bytes)"
+          token = os.environ["SLACK_BOT_TOKEN"]
+          channel = os.environ["SLACK_CHANNEL_ID"]
+          path = pathlib.Path(os.environ["MD_FILE"])
+          max_chars = int(os.environ["MAX_CHARS"])
+          text = path.read_text()
 
-          # Step 1: Get upload URL from Slack
-          UPLOAD_URL_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.getUploadURLExternal" \
-            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            --data-urlencode "filename=${FILENAME}" \
-            --data-urlencode "length=${FILE_SIZE}")
+          chunks = []
+          remaining = text
+          while remaining:
+              if len(remaining) <= max_chars:
+                  chunks.append(remaining)
+                  break
+              split_at = remaining.rfind("\n\n", 0, max_chars)
+              if split_at == -1:
+                  split_at = remaining.rfind("\n", 0, max_chars)
+              if split_at == -1:
+                  split_at = max_chars
+              chunk = remaining[:split_at].rstrip()
+              if not chunk:
+                  chunk = remaining[:max_chars]
+                  split_at = len(chunk)
+              chunks.append(chunk)
+              remaining = remaining[split_at:].lstrip()
 
-          if [ "$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.ok')" != "true" ]; then
-            echo "::error::Failed to get upload URL: $(echo "$UPLOAD_URL_RESPONSE" | jq -r '.error')"
-            exit 1
-          fi
+          for idx, chunk in enumerate(chunks, start=1):
+              if len(chunks) > 1:
+                  header = f"*Dispatch Draft ({idx}/{len(chunks)})*\n\n"
+                  body = header + chunk
+              else:
+                  body = chunk
 
-          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
-          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
+              payload = json.dumps({
+                  "channel": channel,
+                  "text": body,
+                  "unfurl_links": False,
+                  "unfurl_media": False,
+              }).encode()
 
-          # Step 2: Upload file content to the URL
-          UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
-            -F "file=@${FILE_PATH}")
-
-          # Step 3: Complete the upload and share to channel/thread
-          COMPLETE_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" \
-            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg file_id "$FILE_ID" \
-              --arg channel "$SLACK_CHANNEL_ID" \
-              --arg thread_ts "$THREAD_TS" \
-              --arg title "Dispatch Draft ${TODAY}" \
-              '{
-                files: [{id: $file_id, title: $title}],
-                channel_id: $channel,
-                thread_ts: $thread_ts,
-                initial_comment: "📝 *Dispatch Draft* _(Marvins voice, ready for editing)_"
-              }')")
-
-          if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
-            echo "::error::Failed to complete upload: $(echo "$COMPLETE_RESPONSE" | jq -r '.error')"
-            exit 1
-          fi
-
-          echo "::notice::Successfully uploaded dispatch draft to Slack thread"
-
-      - name: Upload raw markdown for editing
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-          THREAD_TS: ${{ needs.post-parent.outputs.thread_ts }}
-        run: |
-          TODAY=$(date -u +"%Y-%m-%d")
-          FILE_PATH="/tmp/dispatch-draft-output.md"
-          FILENAME="dispatch-draft-${TODAY}.md"
-          FILE_SIZE=$(stat -c%s "$FILE_PATH" 2>/dev/null || stat -f%z "$FILE_PATH")
-
-          # Step 1: Get upload URL from Slack
-          UPLOAD_URL_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.getUploadURLExternal" \
-            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            --data-urlencode "filename=${FILENAME}" \
-            --data-urlencode "length=${FILE_SIZE}")
-
-          if [ "$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.ok')" != "true" ]; then
-            echo "::error::Failed to get upload URL: $(echo "$UPLOAD_URL_RESPONSE" | jq -r '.error')"
-            exit 1
-          fi
-
-          UPLOAD_URL=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.upload_url')
-          FILE_ID=$(echo "$UPLOAD_URL_RESPONSE" | jq -r '.file_id')
-
-          # Step 2: Upload file content to the URL
-          UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
-            -F "file=@${FILE_PATH}")
-
-          # Step 3: Complete the upload and share to channel/thread
-          COMPLETE_RESPONSE=$(curl -s -X POST "https://slack.com/api/files.completeUploadExternal" \
-            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg file_id "$FILE_ID" \
-              --arg channel "$SLACK_CHANNEL_ID" \
-              --arg thread_ts "$THREAD_TS" \
-              --arg title "Dispatch Draft (editable) ${TODAY}" \
-              '{
-                files: [{id: $file_id, title: $title}],
-                channel_id: $channel,
-                thread_ts: $thread_ts,
-                initial_comment: "📋 *Raw markdown* — copy-paste for blog"
-              }')")
-
-          if [ "$(echo "$COMPLETE_RESPONSE" | jq -r '.ok')" != "true" ]; then
-            echo "::error::Failed to complete upload: $(echo "$COMPLETE_RESPONSE" | jq -r '.error')"
-            exit 1
-          fi
-
-          echo "::notice::Successfully uploaded raw markdown to Slack thread"
+              req = urllib.request.Request(
+                  "https://slack.com/api/chat.postMessage",
+                  data=payload,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json; charset=utf-8",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req) as resp:
+                  response = json.loads(resp.read().decode())
+              if not response.get("ok"):
+                  raise SystemExit(f"Slack API error: {response.get('error')}")
+              time.sleep(1.1)
+          PY
