@@ -297,21 +297,29 @@ jobs:
 
             Process:
             1. Read /tmp/last_dispatch.md to see what was already covered (releases mentioned, PRs linked)
-            2. Get all releases/tags since DATE_PLACEHOLDER:
+            2. Get all releases/tags since DATE_PLACEHOLDER, including stable, prerelease, and nightly tags:
                git tag --sort=-creatordate | head -20
                git log --tags --simplify-by-decoration --pretty="format:%ai %d" | head -20
-            3. Get all merges to main/master since DATE_PLACEHOLDER:
+               gh release list --limit 30
+            3. Separate release tags into:
+               - "Released": stable tags only (for example v0.5.5)
+               - "Nightly release": nightly/prerelease tags (for example v0.5.6-nightly.202604170646.96867cdc)
+            4. Get all merges to main/master since DATE_PLACEHOLDER:
                git log --since="DATE_PLACEHOLDER" --merges --first-parent main --oneline
                Or for commits:
                git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
-            4. Extract PR numbers from commit messages (look for #NNN patterns)
-            5. Cross-reference with the last dispatch - exclude anything already mentioned
-            6. Categorize:
-               - "Released": Changes that are part of a tagged release since DATE_PLACEHOLDER
-               - "Merged (not yet released)": Changes merged to main but not in any release tag
+            5. Extract PR numbers from commit messages (look for #NNN patterns)
+            6. Get open PRs that are candidates for "Not merged yet":
+               gh pr list --repo REPO_PLACEHOLDER --state open --limit 50 --json number,title,author,updatedAt,url
+            7. Cross-reference with the last dispatch - exclude anything already mentioned
+            8. Categorize:
+               - "Released": Changes that are part of stable release tags since DATE_PLACEHOLDER
+               - "Nightly release": Changes that are part of nightly/prerelease tags since DATE_PLACEHOLDER
+               - "Not merged yet": Open PRs that are not represented in either the Released or Nightly release sections
+            9. For "Not merged yet", prefer open PRs updated since DATE_PLACEHOLDER and keep only the most relevant, user-facing items
 
             Determining PR Author and External Contributor Status:
-            For each PR, get the author and their email using:
+            For each PR or open PR candidate, get the author and their email using:
               gh pr view <PR_NUMBER> --repo REPO_PLACEHOLDER --json author --jq '.author.login'
               gh api /users/<username> --jq '.email'
             
@@ -332,10 +340,16 @@ jobs:
             | Change | PR | Author |
             |--------|-----|--------|
             | `v5.13.0` - Add shallow clone support | [#123](https://github.com/REPO_PLACEHOLDER/pull/123) | @employee |
-            | `v5.13.0` - Fix memory leak in fetch | [#124](https://github.com/REPO_PLACEHOLDER/pull/124) | @outsider (external contributor) |
             | `v5.12.1` - Hotfix for auth issue | [#125](https://github.com/REPO_PLACEHOLDER/pull/125) | @employee |
 
-            ## 🔀 Merged (not yet released)
+            ## 🌙 Nightly release
+
+            | Change | PR | Author |
+            |--------|-----|--------|
+            | `v0.5.6-nightly.202604170646.96867cdc` - Improve release detection | [#124](https://github.com/REPO_PLACEHOLDER/pull/124) | @employee |
+            | `v0.5.6-nightly.202604170646.96867cdc` - Fix memory leak in fetch | [#124](https://github.com/REPO_PLACEHOLDER/pull/124) | @outsider (external contributor) |
+
+            ## 🚧 Not merged yet
 
             | Change | PR | Author |
             |--------|-----|--------|
@@ -343,12 +357,15 @@ jobs:
             | Bug fix in main | [#127](https://github.com/REPO_PLACEHOLDER/pull/127) | @outsider (external contributor) |
 
             Rules:
-            - ALWAYS include BOTH sections with their tables
+            - ALWAYS include ALL THREE sections with their tables
             - If a section has no items, include the table header with a single row: | _None this period_ | - | - |
-            - EVERY item in "Released" MUST start with the release tag (e.g., `v5.13.0` - description)
-            - Group released items by their release tag version
+            - EVERY item in "Released" MUST start with a stable release tag (e.g., `v5.13.0` - description)
+            - EVERY item in "Nightly release" MUST start with a nightly/prerelease tag (e.g., `v0.5.6-nightly.202604170646.96867cdc` - description)
+            - Group Released and Nightly release items by their release tag version
             - Keep change descriptions concise (under 60 chars)
             - Exclude anything already mentioned in the last dispatch
+            - Do NOT put an item in "Not merged yet" if that PR already appears in Released or Nightly release
+            - "Not merged yet" should contain open PRs only, not already-merged commits
             - PR links must be full markdown links: [#123](url)
             - Author column: @username for employees, @username (external contributor) for non-org members
 
@@ -613,7 +630,7 @@ jobs:
 
             IMPORTANT: Only include items from the "📦 Released" tables.
             For entire.io specifically, only include items where Public = Y.
-            Do NOT include items from "🔀 Merged (not yet released)" tables.
+            Do NOT include items from "🌙 Nightly release" or "🚧 Not merged yet" tables.
 
             Repository context:
             - entireio/cli: the user-facing Entire CLI, agent integrations, Checkpoints, session tooling, and developer workflow
@@ -673,7 +690,7 @@ jobs:
             - The intro must lead with what moved forward this week: the main theme, strongest shipped work, or the clearest product momentum
             - NEVER say that a repo, team, or group "didn't ship", "hasn't shipped yet", "was quiet", or similar
             - NEVER frame the intro as "repo A shipped while repo B did not"
-            - If some repos only have merged-but-not-released work, simply omit that from the intro; do not call attention to the absence
+            - If some repos only have nightly or not-merged-yet work, simply omit that from the intro; do not call attention to the absence
             - If the visible releases are concentrated in one repo, frame that positively, e.g. "this week's visible ships centered on..." or "the web platform led this week's releases..."
             - Prefer a confident, product-forward intro over a release accounting intro
             - Group related changes into logical sections with ## headings
