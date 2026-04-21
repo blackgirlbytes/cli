@@ -107,15 +107,36 @@ jobs:
           INPUT_REPOS: ${{ inputs.repos }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          build_repo_json() {
+            case "$1" in
+              "entireio/cli")
+                printf '{"repo":"%s","recipe_type":"standard"}\n' "$1"
+                ;;
+              "entirehq/entiredb")
+                printf '{"repo":"%s","recipe_type":"standard"}\n' "$1"
+                ;;
+              "entirehq/entire.io")
+                printf '{"repo":"%s","recipe_type":"entire_io"}\n' "$1"
+                ;;
+              "go-git/go-git")
+                printf '{"repo":"%s","recipe_type":"go_git"}\n' "$1"
+                ;;
+              *)
+                echo "::error::Unsupported repo: $1"
+                exit 1
+                ;;
+            esac
+          }
+
           ALL_REPOS="entireio/cli entirehq/entiredb entirehq/entire.io go-git/go-git"
           REPOS=()
 
           if [ "$EVENT_NAME" = "schedule" ] || [ "$INPUT_REPOS" = "all" ]; then
             for repo in $ALL_REPOS; do
-              REPOS+=("{\"repo\":\"${repo}\"}")
+              REPOS+=("$(build_repo_json "$repo")")
             done
           else
-            REPOS+=("{\"repo\":\"${INPUT_REPOS}\"}")
+            REPOS+=("$(build_repo_json "$INPUT_REPOS")")
           fi
 
           MATRIX=$(printf '%s\n' "${REPOS[@]}" | jq -sc '{include: .}')
@@ -179,6 +200,7 @@ jobs:
       - name: Generate dispatch notes
         env:
           REPO: ${{ matrix.repo }}
+          RECIPE_TYPE: ${{ matrix.recipe_type }}
           LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
           GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
         run: |
@@ -186,8 +208,8 @@ jobs:
           mkdir -p $HOME/.config/goose
           cd /tmp/repo
 
-          # Check if this is entire.io (needs special handling with feature flags)
-          if [ "$REPO" = "entirehq/entire.io" ]; then
+          case "$RECIPE_TYPE" in
+            entire_io)
             cat > /tmp/recipe.yaml << 'RECIPE_EOF'
           version: "1.0.0"
           title: "Dispatch Notes Generator (entire.io)"
@@ -276,12 +298,12 @@ jobs:
             Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
             For each PR, look up the author and check if they are an org member.
           RECIPE_EOF
-          else
-            # Standard recipe for repos with tagged releases (no Public column)
+            ;;
+            standard)
             cat > /tmp/recipe.yaml << 'RECIPE_EOF'
           version: "1.0.0"
-          title: "Dispatch Notes Generator"
-          description: "Generate dispatch notes for changes since last dispatch"
+          title: "Dispatch Notes Generator (standard)"
+          description: "Generate dispatch notes for internal repos with tagged releases"
 
           extensions:
             - type: builtin
@@ -377,7 +399,100 @@ jobs:
             Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
             For each PR, look up the author and check if they are an org member.
           RECIPE_EOF
-          fi
+            ;;
+            go_git)
+            cat > /tmp/recipe.yaml << 'RECIPE_EOF'
+          version: "1.0.0"
+          title: "Dispatch Notes Generator (go-git)"
+          description: "Generate dispatch notes for go-git with tagged releases and external contributors"
+
+          extensions:
+            - type: builtin
+              name: developer
+
+          instructions: |
+            Generate dispatch notes for go-git/go-git in MARKDOWN TABLE format.
+
+            Context:
+            - Repository: go-git/go-git
+            - Last Dispatch Date: DATE_PLACEHOLDER
+            - You are in the cloned repository directory
+            - The last dispatch content is at /tmp/last_dispatch.md
+
+            Process:
+            1. Read /tmp/last_dispatch.md to see what was already covered (releases mentioned, PRs linked)
+            2. Get all releases/tags since DATE_PLACEHOLDER, including stable, prerelease, and nightly tags:
+               git tag --sort=-creatordate | head -20
+               git log --tags --simplify-by-decoration --pretty="format:%ai %d" | head -20
+               gh release list --limit 30
+            3. Separate release tags into:
+               - "Released": stable tags only
+               - "Nightly release": nightly/prerelease tags
+            4. Get all merges to main/master since DATE_PLACEHOLDER:
+               git log --since="DATE_PLACEHOLDER" --merges --first-parent main --oneline
+               Or for commits:
+               git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
+            5. Extract PR numbers from commit messages (look for #NNN patterns)
+            6. Get open PRs that are candidates for "Not merged yet":
+               gh pr list --repo go-git/go-git --state open --limit 50 --json number,title,author,updatedAt,url
+            7. Cross-reference with the last dispatch - exclude anything already mentioned
+            8. Categorize:
+               - "Released": Changes that are part of stable release tags since DATE_PLACEHOLDER
+               - "Nightly release": Changes that are part of nightly/prerelease tags since DATE_PLACEHOLDER
+               - "Not merged yet": Open PRs that are not represented in either the Released or Nightly release sections
+            9. For "Not merged yet", prefer open PRs updated since DATE_PLACEHOLDER and keep only the most relevant, user-facing items
+
+            Determining PR Author Status:
+            - For go-git/go-git, treat all contributors as external contributors
+            - For each PR or open PR candidate, get the author using:
+              gh pr view <PR_NUMBER> --repo go-git/go-git --json author --jq '.author.login'
+
+            IMPORTANT: Output must be MARKDOWN TABLES with these exact formats:
+
+            ## 📦 Released
+
+            | Change | PR | Author |
+            |--------|-----|--------|
+            | `v5.13.0` - Add shallow clone support | [#123](https://github.com/go-git/go-git/pull/123) | @contributor (external contributor) |
+
+            ## 🌙 Nightly release
+
+            | Change | PR | Author |
+            |--------|-----|--------|
+            | `nightly-tag` - Improve release detection | [#124](https://github.com/go-git/go-git/pull/124) | @contributor (external contributor) |
+
+            ## 🚧 Not merged yet
+
+            | Change | PR | Author |
+            |--------|-----|--------|
+            | Feature waiting for next release | [#126](https://github.com/go-git/go-git/pull/126) | @contributor (external contributor) |
+
+            Rules:
+            - ALWAYS include ALL THREE sections with their tables
+            - If a section has no items, include the table header with a single row: | _None this period_ | - | - |
+            - EVERY item in "Released" MUST start with a stable release tag
+            - EVERY item in "Nightly release" MUST start with a nightly/prerelease tag
+            - Group Released and Nightly release items by their release tag version
+            - Keep change descriptions concise (under 60 chars)
+            - Exclude anything already mentioned in the last dispatch
+            - Do NOT put an item in "Not merged yet" if that PR already appears in Released or Nightly release
+            - "Not merged yet" should contain open PRs only, not already-merged commits
+            - PR links must be full markdown links: [#123](url)
+            - Author column must always be: @username (external contributor)
+
+            Write ONLY the markdown tables to /tmp/dispatch_notes.md
+
+          prompt: |
+            Generate dispatch notes for go-git/go-git showing changes since DATE_PLACEHOLDER.
+            Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
+            Treat all contributors as external contributors.
+          RECIPE_EOF
+            ;;
+            *)
+            echo "::error::Unsupported recipe type: ${RECIPE_TYPE}"
+            exit 1
+            ;;
+          esac
 
           sed -i "s|REPO_PLACEHOLDER|${REPO}|g" /tmp/recipe.yaml
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
@@ -387,6 +502,17 @@ jobs:
         env:
           REPO: ${{ matrix.repo }}
         run: |
+          if [ ! -f /tmp/dispatch_notes.md ]; then
+            echo "::error::Goose did not create /tmp/dispatch_notes.md for ${REPO}"
+            echo "::group::Goose session files"
+            find "$HOME/.local/share/goose/sessions" -maxdepth 3 -type f 2>/dev/null | sort || true
+            echo "::endgroup::"
+            echo "::group::Temporary files"
+            ls -la /tmp || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
           # Create a safe filename from repo name
           SAFE_NAME=$(echo "$REPO" | tr '/' '-')
           cp /tmp/dispatch_notes.md "/tmp/notes-${SAFE_NAME}.md"
