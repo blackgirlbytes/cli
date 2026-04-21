@@ -526,10 +526,16 @@ jobs:
 
           sed -i "s|REPO_PLACEHOLDER|${REPO}|g" /tmp/recipe.yaml
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
-          goose run --recipe /tmp/recipe.yaml > /tmp/goose_response.json
+          goose run --recipe /tmp/recipe.yaml 2>&1 | tee /tmp/goose_output.log
+
+          GOOSE_RESULT=$(awk 'NF { line = $0 } END { print line }' /tmp/goose_output.log)
+          printf '%s\n' "$GOOSE_RESULT" > /tmp/goose_response.json
 
           if ! jq -e '.markdown | type == "string" and length > 0' /tmp/goose_response.json > /dev/null; then
             echo "::error::Goose did not return a valid markdown payload for ${REPO}"
+            echo "::group::Goose raw output"
+            cat /tmp/goose_output.log || true
+            echo "::endgroup::"
             echo "::group::Goose response"
             cat /tmp/goose_response.json || true
             echo "::endgroup::"
@@ -550,6 +556,11 @@ jobs:
             echo "::group::Temporary files"
             ls -la /tmp || true
             echo "::endgroup::"
+            if [ -f /tmp/goose_output.log ]; then
+              echo "::group::Goose raw output"
+              cat /tmp/goose_output.log || true
+              echo "::endgroup::"
+            fi
             if [ -f /tmp/goose_response.json ]; then
               echo "::group::Goose response"
               cat /tmp/goose_response.json || true
