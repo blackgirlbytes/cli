@@ -219,6 +219,16 @@ jobs:
             - type: builtin
               name: developer
 
+          response:
+            json_schema:
+              type: object
+              properties:
+                markdown:
+                  type: string
+                  description: "Markdown tables for the dispatch notes"
+              required:
+                - markdown
+
           instructions: |
             Generate dispatch notes for entire.io in MARKDOWN TABLE format.
             This repo deploys continuously to main, but some features are behind feature flags.
@@ -290,12 +300,12 @@ jobs:
             - PR links must be full markdown links: [#123](url)
             - Author column: @username for employees, @username (external contributor) for non-org members
             - Public column: Y = visible to all users, N = not yet visible
-
-            Write ONLY the markdown tables to /tmp/dispatch_notes.md
+            - Return the final result as JSON with a single "markdown" field containing ONLY the markdown tables
 
           prompt: |
             Generate dispatch notes for entirehq/entire.io showing changes since DATE_PLACEHOLDER.
-            Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
+            Return JSON with a single "markdown" field whose value is the markdown tables.
+            Check /tmp/last_dispatch.md to avoid duplicates.
             For each PR, look up the author and check if they are an org member.
           RECIPE_EOF
             ;;
@@ -308,6 +318,16 @@ jobs:
           extensions:
             - type: builtin
               name: developer
+
+          response:
+            json_schema:
+              type: object
+              properties:
+                markdown:
+                  type: string
+                  description: "Markdown tables for the dispatch notes"
+              required:
+                - markdown
 
           instructions: |
             Generate dispatch notes for a repository in MARKDOWN TABLE format.
@@ -391,12 +411,12 @@ jobs:
             - "Not merged yet" should contain open PRs only, not already-merged commits
             - PR links must be full markdown links: [#123](url)
             - Author column: @username for employees, @username (external contributor) for non-org members
-
-            Write ONLY the markdown tables to /tmp/dispatch_notes.md
+            - Return the final result as JSON with a single "markdown" field containing ONLY the markdown tables
 
           prompt: |
             Generate dispatch notes for REPO_PLACEHOLDER showing changes since DATE_PLACEHOLDER.
-            Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
+            Return JSON with a single "markdown" field whose value is the markdown tables.
+            Check /tmp/last_dispatch.md to avoid duplicates.
             For each PR, look up the author and check if they are an org member.
           RECIPE_EOF
             ;;
@@ -409,6 +429,16 @@ jobs:
           extensions:
             - type: builtin
               name: developer
+
+          response:
+            json_schema:
+              type: object
+              properties:
+                markdown:
+                  type: string
+                  description: "Markdown tables for the dispatch notes"
+              required:
+                - markdown
 
           instructions: |
             Generate dispatch notes for go-git/go-git in MARKDOWN TABLE format.
@@ -479,12 +509,12 @@ jobs:
             - "Not merged yet" should contain open PRs only, not already-merged commits
             - PR links must be full markdown links: [#123](url)
             - Author column must always be: @username (external contributor)
-
-            Write ONLY the markdown tables to /tmp/dispatch_notes.md
+            - Return the final result as JSON with a single "markdown" field containing ONLY the markdown tables
 
           prompt: |
             Generate dispatch notes for go-git/go-git showing changes since DATE_PLACEHOLDER.
-            Output as markdown tables. Check /tmp/last_dispatch.md to avoid duplicates.
+            Return JSON with a single "markdown" field whose value is the markdown tables.
+            Check /tmp/last_dispatch.md to avoid duplicates.
             Treat all contributors as external contributors.
           RECIPE_EOF
             ;;
@@ -496,7 +526,17 @@ jobs:
 
           sed -i "s|REPO_PLACEHOLDER|${REPO}|g" /tmp/recipe.yaml
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
-          goose run --recipe /tmp/recipe.yaml
+          goose run --recipe /tmp/recipe.yaml > /tmp/goose_response.json
+
+          if ! jq -e '.markdown | type == "string" and length > 0' /tmp/goose_response.json > /dev/null; then
+            echo "::error::Goose did not return a valid markdown payload for ${REPO}"
+            echo "::group::Goose response"
+            cat /tmp/goose_response.json || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          jq -r '.markdown' /tmp/goose_response.json > /tmp/dispatch_notes.md
 
       - name: Save notes artifact
         env:
@@ -510,6 +550,11 @@ jobs:
             echo "::group::Temporary files"
             ls -la /tmp || true
             echo "::endgroup::"
+            if [ -f /tmp/goose_response.json ]; then
+              echo "::group::Goose response"
+              cat /tmp/goose_response.json || true
+              echo "::endgroup::"
+            fi
             exit 1
           fi
 
