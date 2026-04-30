@@ -84,13 +84,45 @@ jobs:
 
       - name: Fetch PostHog feature flags
         env:
-          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-          POSTHOG_PROJECT_ID: ${{ secrets.POSTHOG_PROJECT_ID }}
+          POSTHOG_PERSONAL_API_KEY: ${{ secrets.POSTHOG_PERSONAL_API_KEY || secrets.POSTHOG_API_KEY }}
+          POSTHOG_PROJECT_ID: ${{ vars.POSTHOG_PROJECT_ID || secrets.POSTHOG_PROJECT_ID }}
+          POSTHOG_API_HOST: ${{ vars.POSTHOG_API_HOST || vars.POSTHOG_HOST || vars.POSTHOG_ENDPOINT || 'https://eu.posthog.com' }}
         run: |
-          # Fetch all feature flags from PostHog
-          curl -s -H "Authorization: Bearer ${POSTHOG_API_KEY}" \
-            "https://us.posthog.com/api/projects/${POSTHOG_PROJECT_ID}/feature_flags/?limit=100" \
-            > /tmp/posthog_flags.json
+          if [ -z "${POSTHOG_PERSONAL_API_KEY}" ]; then
+            echo "::error::Missing PostHog personal API key. Set the POSTHOG_PERSONAL_API_KEY secret."
+            exit 1
+          fi
+
+          if [ -z "${POSTHOG_PROJECT_ID}" ]; then
+            echo "::error::Missing PostHog project ID. Set POSTHOG_PROJECT_ID as a repository variable or secret."
+            exit 1
+          fi
+
+          if [[ "${POSTHOG_PERSONAL_API_KEY}" == phc_* ]]; then
+            echo "::error::POSTHOG_PERSONAL_API_KEY appears to be a PostHog project token. Feature flag listing requires a personal API key."
+            exit 1
+          fi
+
+          POSTHOG_API_HOST="${POSTHOG_API_HOST%/}"
+          POSTHOG_API_HOST="${POSTHOG_API_HOST/\/\/us.i.posthog.com/\/\/us.posthog.com}"
+          POSTHOG_API_HOST="${POSTHOG_API_HOST/\/\/eu.i.posthog.com/\/\/eu.posthog.com}"
+          STATUS=$(curl -sS -w "%{http_code}" -o /tmp/posthog_flags_response.json \
+            -H "Authorization: Bearer ${POSTHOG_PERSONAL_API_KEY}" \
+            "${POSTHOG_API_HOST}/api/projects/${POSTHOG_PROJECT_ID}/feature_flags/?limit=100")
+
+          if [ "${STATUS}" -lt 200 ] || [ "${STATUS}" -ge 300 ]; then
+            echo "::error::PostHog feature flag fetch failed with HTTP ${STATUS}"
+            jq -r '.detail // .error // .' /tmp/posthog_flags_response.json
+            exit 1
+          fi
+
+          if ! jq -e '.results | type == "array"' /tmp/posthog_flags_response.json >/dev/null; then
+            echo "::error::PostHog feature flag response did not include a results array"
+            cat /tmp/posthog_flags_response.json
+            exit 1
+          fi
+
+          mv /tmp/posthog_flags_response.json /tmp/posthog_flags.json
           
           echo "::notice::Fetched $(jq '.results | length' /tmp/posthog_flags.json) feature flags from PostHog"
 
