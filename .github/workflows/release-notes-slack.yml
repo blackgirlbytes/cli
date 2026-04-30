@@ -288,13 +288,14 @@ jobs:
                - "Released" + Public=Y: No feature flag OR flag is active with 100% rollout
                - "Released" + Public=N: Should not happen (if released, it's public)
                - "Merged but not released" + Public=N: Behind a flag that is inactive OR < 100% rollout
+               - Add a visibility reason for Public=N items: "Feature flagged", "Partial rollout", "Internal only", or "Disabled"
 
             PostHog flag status interpretation (from posthog_flags.json):
-            - "active": true AND rollout_percentage: 100 (or no rollout_percentage) → Public = Y
-            - "active": true AND rollout_percentage < 100 → Public = N (partial rollout)
-            - "active": false → Public = N (disabled)
-            - "active": true with filters (like @entire.io email) → Public = N (internal only)
-            - No flag reference in code → Public = Y (shipped when merged)
+            - "active": true AND rollout_percentage: 100 (or no rollout_percentage) → Public = Y, Visibility = Public
+            - "active": true AND rollout_percentage < 100 → Public = N, Visibility = Partial rollout
+            - "active": false → Public = N, Visibility = Disabled
+            - "active": true with filters (like @entire.io email) → Public = N, Visibility = Internal only
+            - No flag reference in code → Public = Y, Visibility = Public
 
             Determining PR Author and External Contributor Status:
             For each PR, get the author and their email using:
@@ -311,27 +312,28 @@ jobs:
 
             ## 📦 Released
 
-            | Change | PR | Author | Public |
-            |--------|-----|--------|--------|
-            | Brief description | [#123](https://github.com/entirehq/entire.io/pull/123) | @employee | Y |
-            | Another change | [#124](https://github.com/entirehq/entire.io/pull/124) | @outsider (external contributor) | Y |
+            | Change | PR | Author | Public | Visibility |
+            |--------|-----|--------|--------|------------|
+            | Brief description | [#123](https://github.com/entirehq/entire.io/pull/123) | @employee | Y | Public |
+            | Another change | [#124](https://github.com/entirehq/entire.io/pull/124) | @outsider (external contributor) | Y | Public |
 
             ## 🔀 Merged (not yet released)
 
-            | Change | PR | Author | Public |
-            |--------|-----|--------|--------|
-            | Feature behind partial rollout | [#125](https://github.com/entirehq/entire.io/pull/125) | @employee | N |
-            | Internal-only feature | [#126](https://github.com/entirehq/entire.io/pull/126) | @outsider (external contributor) | N |
+            | Change | PR | Author | Public | Visibility |
+            |--------|-----|--------|--------|------------|
+            | Feature behind partial rollout | [#125](https://github.com/entirehq/entire.io/pull/125) | @employee | N | Partial rollout |
+            | Internal-only feature | [#126](https://github.com/entirehq/entire.io/pull/126) | @outsider (external contributor) | N | Internal only |
 
             Rules:
             - ALWAYS include BOTH sections with their tables
-            - If a section has no items, include the table header with a single row: | _None this period_ | - | - | - |
-            - DO NOT mention feature flag names or statuses - users don't know about them
+            - If a section has no items, include the table header with a single row: | _None this period_ | - | - | - | - |
+            - DO NOT mention feature flag names - users don't know about them
             - Keep change descriptions concise (under 60 chars) and user-focused
             - Exclude anything already mentioned in the last dispatch
             - PR links must be full markdown links: [#123](url)
             - Author column: @username for employees, @username (external contributor) for non-org members
             - Public column: Y = visible to all users, N = not yet visible
+            - Visibility column: use Public, Feature flagged, Partial rollout, Internal only, or Disabled
             - Return the final result as JSON with a single "markdown" field containing ONLY the markdown tables
 
           prompt: |
@@ -847,8 +849,9 @@ jobs:
             IMPORTANT:
             - For entireio/cli, include items from both the "📦 Released" and "🌙 Nightly release" tables
             - For entirehq/entire.io, entirehq/entiredb, and go-git/go-git, include items only from the "📦 Released" tables
-            - For entire.io specifically, only include released items where Public = Y
+            - For entire.io specifically, only include released items where Public = Y; exclude all Public = N rows, including feature flagged, partial rollout, internal-only, and disabled items
             - Do NOT include items from any "🚧 Not merged yet" table
+            - Preserve source PR links in the draft. Every bullet derived from one or more PR-backed source rows must include the relevant PR link(s).
             The dispatch structure should be organized first by repository, then by subheading categories within that repository section.
 
             Repository context:
@@ -871,10 +874,11 @@ jobs:
             2. Read /tmp/all_notes.md and parse the markdown tables
             3. Extract eligible items from the source tables using these repository-specific rules:
                - entireio/cli: include items from both "📦 Released" and "🌙 Nightly release"
-               - entirehq/entire.io: include only "📦 Released" items where Public = Y
+               - entirehq/entire.io: include only "📦 Released" items where Public = Y; exclude rows where Public = N or Visibility is Feature flagged, Partial rollout, Internal only, or Disabled
                - entirehq/entiredb: include only "📦 Released" items
                - go-git/go-git: include only "📦 Released" items
                - Exclude all "🚧 Not merged yet" items for every repository
+               - Keep each eligible item's PR markdown link attached to the rewritten bullet
             4. Preserve strong coverage of the eligible items across repositories:
                - Try to include every meaningful eligible item from the source notes
                - Do not collapse multiple distinct releases into one vague bullet if they represent different user-visible changes
@@ -938,10 +942,12 @@ jobs:
             Rules:
             - Use repository-specific inclusion rules:
               - entireio/cli: include Released and Nightly release items
-              - entirehq/entire.io: include only Released items with Public = Y
+              - entirehq/entire.io: include only Released items with Public = Y; never include feature flagged, partial rollout, internal-only, disabled, or other Public = N items
               - entirehq/entiredb: include only Released items
               - go-git/go-git: include only Released items
             - Never include Not merged yet items
+            - Every included item that came from a PR row must keep the PR link in the final bullet, using the source markdown link exactly, such as [#123](https://github.com/org/repo/pull/123)
+            - If one bullet combines multiple source rows, include all relevant PR links at the end of that bullet
             - Exclude internal-only implementation work unless there is a clear user-facing benefit
             - Exclude Checkpoints v2-only configuration, storage, transcript compaction, schema, indexing, and migration plumbing unless the note can be framed as a user-visible improvement
             - Exclude dependency bumps, cleanup-only PRs, removed legacy calls, and security/library updates unless they materially affect users
@@ -1002,9 +1008,10 @@ jobs:
             Generate a dispatch draft covering changes since DATE_PLACEHOLDER.
             Read the example dispatches in /tmp/ for voice and style.
             Read /tmp/all_notes.md for the table content to include.
-            Include Released items for all repositories, and also include Nightly release items for entireio/cli only. For entire.io, only include Released items where Public = Y. Never include Not merged yet items.
+            Include Released items for all repositories, and also include Nightly release items for entireio/cli only. For entire.io, only include Released items where Public = Y; exclude Public = N, feature flagged, partial rollout, internal-only, and disabled rows. Never include Not merged yet items.
             Structure the body by repository sections first using this exact mapping: entireio/cli = Entire CLI, entirehq/entire.io = Entire Web, entirehq/entiredb = Entire DB, go-git/go-git = Go Git. Use ### category subheadings inside each repository section, and for Entire CLI separate stable versus nightly when useful.
             Preserve strong coverage of the eligible items and avoid compressing several distinct shipped changes into one vague bullet.
+            Preserve the source PR markdown links in the final draft bullets.
           RECIPE_EOF
 
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
