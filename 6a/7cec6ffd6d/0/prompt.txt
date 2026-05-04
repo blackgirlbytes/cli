@@ -1,0 +1,250 @@
+/pr-feedback
+
+---
+
+Yes
+
+---
+
+buildFinalizeCompactTranscript already expects an already redacted transcript. Isn't the additional redactSessionJSONLBytes redundant?
+
+---
+
+I was about to suggest the same: The structure of this code is very confusing as well.
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a948374330d383e6d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-external-agent-protocol/e0b06b70-1ba8-45c1-8785-bb1805ce7cee/tasks/a948374330d383e6d.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>Good -- both functions are new in this branch. Now I have everything I need to produce the findings.
+
+---
+
+Here are the code reuse findings for the changes on `feat/checkpoints-v2-external-agent-protocol`:
+
+**1. Duplicated external compact transcript flow between `buildExternalCompactTranscript` and `finalizeExternalCompactTranscript`**
+
+Both functions implement the same three-step sequence:
+
+1. `CapabilityDeclarer` guard (identical logic)
+2. `compactTranscriptForExternalAgent(ctx, compactor, state.SessionID, state.TranscriptPath)` call (identical)
+3. `redactSessionJSONLBytes(compacted.Transcript)` call (identical)
+
+Locations:
+- `manual_commit_condensation.go` lines 440-469 (`buildExternalCompactTranscript`)
+- `manual_commit_hooks.go` lines 2835-2861 (`finalizeExternalCompactTranscript`)
+
+The core logic -- "resolve compactor, call external agent, redact result" -- is the same in both. The differences are:
+- `buildExternalCompactTranscript` has a `settings.IsCheckpointsV2Enabled` guard at the top (its caller in hooks.go already has `v2Store != nil` guard, so the finalize variant omits it).
+- `buildExternalCompactTranscript` wraps the result in `compactTranscriptResult` with `StartLine` and `Duration` fields; `finalizeExternalCompactTranscript` returns raw `[]byte`.
+- `buildExternalCompactTranscript` performs offset validation (`fullLines &lt; startLine` reset); `finalizeExternalCompactTranscript` does not (finalization always writes the full cumulative transcript with offset 0).
+
+A shared helper extracting the common "compactAndRedactExternalTranscript" sequence could eliminate the duplication. Something like:
+
+```
+func compactAndRedactExternalTranscript(ctx, compactor, sessionID, transcriptPath) ([]byte, error)
+```
+
+This would consolidate the `compactTranscriptForExternalAgent` call, nil check, `redactSessionJSONLBytes` call, and error-to-warning conversion into one place. Both callers would then add their own wrapping (offset validation in condensation, direct return in finalization).
+
+**2. Duplicated `CapabilityDeclarer` guard pattern**
+
+The identical pattern appears at:
+- `manual_commit_condensation.go` lines 440-449
+- `manual_commit_hooks.go` lines 2835-2844
+
+```go
+compactor, ok := agent.AsTranscriptCompactor(ag)
+if !ok {
+    if _, isCap := ag.(agent.CapabilityDeclarer); isCap {
+        logging.Warn(ctx, "external transcript compaction unavailable, ...")
+        return &lt;empty sentinel&gt;
+    }
+    return nil
+}
+```
+
+This is a two-level dispatch: first check `AsTranscriptCompactor` (which already checks `CapabilityDeclarer` internally), then if that fails, check `CapabilityDeclarer` directly to distinguish "external agent without the capability" from "built-in agent." This pattern is semantically "is this an external agent that lacks compact_transcript support?" -- there is already `external.IsExternal(ag)` in `cmd/entire/cli/agent/external/capabilities.go:153` that does exactly this check without the type-assertion indirection. However, using `external.IsExternal` would introduce an import from `strategy` to `agent/external`, which may or may not be acceptable (worth checking for import cycles).
+
+Alternatively, a helper like `agent.IsCapabilityDeclarer(ag) bool` could be added to the `agent` package to avoid the raw type assertion in two places.
+
+**3. No other duplication of `compactTranscriptForExternalAgent` outside these two call sites**
+
+The function `compactTranscriptForExternalAgent` (defined at `manual_commit_condensation.go:517`) is called from exactly two production sites (condensation.go:456 and hooks.go:2847) and two test sites. It is a well-factored leaf function; the duplication is in the calling pattern around it, not in the function itself.
+
+**4. `redactSessionJSONLBytes` usage is consistent, no missed reuse**
+
+The variable `redactSessionJSONLBytes` (condensation.go:107) is used in three production call sites:
+- `redactSessionTranscript` (condensation.go:338) -- for full session transcripts
+- `buildExternalCompactTranscript` (condensation.go:461) -- for external compact transcripts
+- `finalizeExternalCompactTranscript` (hooks.go:2852) -- for external compact transcripts during finalization
+
+The latter two are the duplicated pair identified in finding #1.
+
+**Summary of actionable finding:**
+
+The primary reuse opportunity is extracting the shared "call external compactor, redact result" sequence from `buildExternalCompactTranscript` (condensation.go:456-469) and `finalizeExternalCompactTranscript` (hooks.go:2847-2861) into a single helper function. This would also naturally consolidate the `CapabilityDeclarer` guard pattern (finding #2). The offset validation logic in `buildExternalCompactTranscript` (lines 472-482) is specific to the condensation path and would remain in the caller.</result>
+<usage><total_tokens>68510</total_tokens><tool_uses>19</tool_uses><duration_ms>96977</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a70d4b6594b5ea572</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-external-agent-protocol/e0b06b70-1ba8-45c1-8785-bb1805ce7cee/tasks/a70d4b6594b5ea572.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Now I have a complete picture. Let me compile the findings.
+
+Here are the efficiency findings:
+
+---
+
+**1. External compact transcript is invoked per-checkpoint inside the finalize loop (subprocess called N times)**
+
+File: `manual_commit_hooks.go`, lines 2778-2785
+
+`finalizeExternalCompactTranscript` is called **inside** the `for _, cpIDStr := range state.TurnCheckpointIDs` loop (line 2758). For external agents, this calls `compactor.CompactTranscript()` which spawns an external subprocess (`e.run(ctx, nil, "compact-transcript", ...)` in `external/external.go:126`). The transcript does not change between iterations -- the same `state.SessionID` and `state.TranscriptPath` are passed each time. Additionally, `agent.GetByAgentType` (line 2780) iterates the registry to allocate a fresh agent object on every loop iteration.
+
+The compact transcript result and the agent lookup should be hoisted above the loop. For a turn with, say, 3 checkpoint IDs, this currently spawns 3 identical subprocesses and performs 3 registry scans instead of 1.
+
+**2. Double `IsCheckpointsV2Enabled` settings load in the CondenseSession path**
+
+File: `manual_commit_condensation.go`, lines 254/436 and 262/494
+
+`buildExternalCompactTranscript` (line 436) and `buildInternalCompactTranscript` (line 494) each call `settings.IsCheckpointsV2Enabled(ctx)` as their first gate. `IsCheckpointsV2Enabled` calls `settings.Load(ctx)` which reads and parses two JSON files from disk (`settings.json` and `settings.local.json`). Two lines later (line 262), the caller also calls `settings.IsCheckpointsV2OnlyEnabled(ctx)` which does another `settings.Load`. That is 2-3 `Load` calls (disk reads) within the same function for the same immutable settings. The finalize path (line 2751) does this correctly: it evaluates `IsCheckpointsV2Enabled` once before the loop. The CondenseSession path does not.
+
+Severity: moderate on the hot path. Each `Load` reads two files; during `post-commit` hook this adds measurable latency. Loading settings once and threading the result through would eliminate the redundancy.
+
+**3. Double redaction for external agents in CondenseSession**
+
+File: `manual_commit_condensation.go`, lines 182 and 461
+
+In `CondenseSession`, the full session transcript is redacted at line 182 via `redactSessionTranscript` (which calls `redactSessionJSONLBytes`). Then, `buildExternalCompactTranscript` (line 254 -&gt; 461) calls `redactSessionJSONLBytes` **again** on the compacted transcript. This second redaction is on different data (the compact transcript returned by the external agent, not the full transcript), so it is not strictly redundant from a correctness standpoint -- the external agent could return different content. However, it is worth noting that for external agents, the full-transcript redaction at line 182 produces `redactedTranscript` that is never used for compact purposes (it is only written to v1). The full-transcript redaction could potentially be skipped for external-only v2 paths, though this would require knowing the write target in advance.
+
+Severity: low. The two redactions operate on different byte slices. This is more of an "overly broad operation" -- the full transcript redaction is unconditionally performed even when only the compact transcript (from the external agent) will be written.
+
+**4. `countCompactLines` called twice on the same data in `buildExternalCompactTranscript`**
+
+File: `manual_commit_condensation.go`, lines 471-473 and then again at lines 310-311
+
+At line 473, `countCompactLines(transcript)` is called on the external compact transcript. The result is stored in `fullLines` and used for a sanity check. The caller at line 310 calls `countCompactLines(compactResult.Transcript)` again on the exact same byte slice. The first call's result is not surfaced in `compactTranscriptResult`; only `StartLine` is returned, so the caller has to re-count.
+
+Severity: low. `countCompactLines` is a `bytes.Count` over newlines which is fast, but it is a redundant scan over the same data. Adding a `FullLines` field to `compactTranscriptResult` would eliminate it.
+
+**5. No concurrency between external compact transcript and attribution/summary**
+
+File: `manual_commit_condensation.go`, lines 207-260
+
+In `CondenseSession`, the following operations are performed sequentially:
+- `calculateSessionAttributions` (line 209) -- walks git trees
+- `generateSummary` (line 226) -- calls an LLM
+- `buildExternalCompactTranscript` (line 254) -- spawns an external subprocess
+
+For external agents, the compact transcript operation is independent of attribution and summary (it reads from the agent's own transcript file, not from the redacted transcript or git trees). These three could run concurrently. The summary generation in particular may involve an LLM call, making it the slowest operation. Running the external subprocess in parallel would reduce wall-clock time.
+
+Severity: moderate. These are all on the post-commit hook hot path. The actual impact depends on how long `CompactTranscript` takes for external agents (subprocess spawn + transcript conversion).
+
+**6. `finalizeExternalCompactTranscript` vs `buildExternalCompactTranscript` -- duplicated logic without shared structure**
+
+File: `manual_commit_hooks.go` lines 2834-2862 vs `manual_commit_condensation.go` lines 435-489
+
+`finalizeExternalCompactTranscript` and `buildExternalCompactTranscript` contain nearly identical logic: type-assert to `TranscriptCompactor`, call `compactTranscriptForExternalAgent`, call `redactSessionJSONLBytes`, handle errors with logging and fallback. The main difference is that `buildExternalCompactTranscript` also computes `StartLine` and wraps in `compactTranscriptResult`, while `finalizeExternalCompactTranscript` returns `[]byte`. This duplication means any future change to external compaction logic (e.g., adding caching, changing error handling) must be applied in two places.
+
+Severity: low for runtime efficiency, but a maintenance/correctness hazard.</result>
+<usage><total_tokens>42656</total_tokens><tool_uses>22</tool_uses><duration_ms>95335</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a7e775bfd7829379e</task-id>
+<tool-use-id>toolu_01WsHiHP1BXQsKVaXWy5fou5</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-external-agent-protocol/e0b06b70-1ba8-45c1-8785-bb1805ce7cee/tasks/a7e775bfd7829379e.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Now I have a thorough understanding of all the changed code. Let me compile my findings.
+
+---
+
+Here are the code quality findings:
+
+**1. Copy-paste duplication between `buildExternalCompactTranscript` and `finalizeExternalCompactTranscript`**
+
+- `manual_commit_condensation.go:435-489` vs `manual_commit_hooks.go:2834-2862`
+- These two functions share the same three-step pipeline: (a) `CapabilityDeclarer` guard with `AsTranscriptCompactor`, (b) `compactTranscriptForExternalAgent` call, (c) `redactSessionJSONLBytes` call. The hooks version is exactly the condensation version minus offset tracking and timing. The core logic (lines 2835-2861) is a strict subset of lines 440-471. This is the most significant quality issue in the diff. A shared helper that returns `(transcript []byte, err error)` -- handling the guard, compaction, and redaction -- could be called by both, with `buildExternalCompactTranscript` wrapping it to add offset tracking and `Duration`. The three-way nil/empty/error return convention is identical in both, making extraction straightforward.
+
+**2. Inconsistent nil-vs-empty-slice signaling across the two functions**
+
+- `manual_commit_condensation.go:447` returns `&amp;compactTranscriptResult{}` (non-nil result with nil Transcript)
+- `manual_commit_hooks.go:2842` returns `[]byte{}` (non-nil empty slice)
+- Both represent "skip this transcript" but use different representations. The condensation path uses nil `Transcript` to mean "skip" (documented in the struct comment on line 426), while the hooks path uses empty `[]byte{}`. The caller at line 2781-2784 treats any non-nil return as "use this", so `[]byte{}` and `nil` transcript have different downstream semantics (empty bytes get written vs skipped). The CapabilityDeclarer-but-no-compactor case at line 2842 returns `[]byte{}` which would write an empty compact transcript rather than skipping it. Compare with line 447 which returns a `compactTranscriptResult` with nil Transcript, meaning "skip". This inconsistency may be intentional (finalization always writes something) or a subtle bug.
+
+**3. `compactTranscriptResult.Duration` is redundant state when only one call site reads it**
+
+- `manual_commit_condensation.go:428` -- `Duration` field
+- `manual_commit_condensation.go:298` -- only consumer
+- The `Duration` field exists solely to shuttle a timing value from the builder to a single log statement 40 lines later in `CondenseSession`. The caller could just as easily capture `time.Now()` before/after the `buildExternal/buildInternal` calls and compute the duration externally. The `buildInternalCompactTranscript` function has to call `time.Now()` twice internally to populate this field. This isn't a serious issue but it couples timing concerns into a data-transport struct.
+
+**4. Comment describes WHAT not WHY**
+
+- `manual_commit_condensation.go:424` -- `// compactTranscriptResult holds the output of compact transcript generation.`
+- This is a pure restatement of the struct name. The useful information is already in the field comments (line 426: "Nil means skip"). The struct-level comment adds no insight. A more useful comment would explain why this struct exists (to unify the return shape of external vs internal compact transcript paths, enabling the nil-pointer dispatch pattern at lines 254-258).
+
+**5. Unnecessary comment: `// Entire Transcript Format (JSONL), redacted.`**
+
+- `manual_commit_condensation.go:426`
+- "Entire Transcript Format (JSONL)" describes format details that belong in the type definition or package docs, not inline on a `[]byte` field. The useful part is "Nil means skip" -- the rest is noise that will go stale if the format evolves.
+
+**6. Test boilerplate duplication: settings setup repeated in every test**
+
+- `manual_commit_condensation_test.go` lines 105-108, 133-136, 162-165, 190-193, 216-219, 248-251
+- Every test that calls `buildExternalCompactTranscript` repeats the same 4-line block: `t.TempDir()`, `t.Chdir(dir)`, `os.MkdirAll`, `os.WriteFile(settings.json)`. This is a textbook case for a test helper (e.g., `setupCheckpointsV2Dir(t *testing.T) string`). Six copies of the same setup code is not load-bearing variation -- they're identical.
+
+**7. `finalizeExternalCompactTranscript` has no test coverage**
+
+- `manual_commit_hooks.go:2834-2862`
+- The test file adds tests only for `buildExternalCompactTranscript`. The `finalizeExternalCompactTranscript` function in hooks.go has the same guard logic, error paths, and nil-handling but zero direct tests. Given that it's a near-duplicate with subtly different return semantics (see finding 2), this is a coverage gap that matters.</result>
+<usage><total_tokens>53937</total_tokens><tool_uses>19</tool_uses><duration_ms>104283</duration_ms></usage>
+</task-notification>
+
+---
+
+It looks like you've removed the performance trancing code. Can you put that back in a way that uses the same event names etc. as before?
+
+---
+
+commit and continue. Respond and resolve to the comments you've addressed.
+
+---
+
+Can you ensure all lint steps and tests are passing?
+
+---
+
+I've just pulled in main and some recent refactorings around ResolveCheckpointURL broke our code. Can you address this?
+
+---
+
+commit and push
+
+---
+
+/pr-feedback
+
+---
+
+Yes
+
+---
+
+Can you pull in main and fix the merge conflicts?
