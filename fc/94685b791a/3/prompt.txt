@@ -1,0 +1,428 @@
+Implement the following plan:
+
+# Backfill Script: Index Checkpoints into Turbopuffer
+
+## Context
+
+The frontend currently has client-side string matching over checkpoint prompts, commit messages, and authors. We want to add full-text + semantic search over checkpoints, sessions, and transcripts using Turbopuffer. This plan covers **Part 1 only**: a one-time backfill script that reads existing checkpoint data from PlanetScale (and optionally transcript content from GitHub) and upserts it into Turbopuffer with embeddings.
+
+## Script Location & Pattern
+
+**File**: `entire.io/api/scripts/backfill-search.ts`
+
+Follows the existing script pattern (`scripts/migrate.ts`, `scripts/reset.ts`):
+- Standalone TypeScript script run via `npx tsx scripts/backfill-search.ts`
+- Reads `DATABASE_URL` from env (defaults to local Docker MySQL)
+- Direct PlanetScale connection via `mysql2` + `kysely` (not Hyperdrive)
+- Reads `TURBOPUFFER_API_KEY` and `OPENAI_API_KEY` from env
+- Optional `GITHUB_TOKEN` for transcript fetching
+
+## New Dependencies
+
+Add to `entire.io/api/package.json`:
+```
+"@turbopuffer/turbopuffer": "^0.2.x"
+"openai": "^4.x"
+```
+
+These are used by the script only (not the Worker). They're devDependencies since the Worker doesn't need them at runtime yet (real-time indexing will add them to dependencies later).
+
+## Document Schema in Turbopuffer
+
+One namespace per repo: `checkpoints-{repo_id}`
+
+Each document:
+```
+id:               uint   (auto-incrementing, derived from row order)
+checkpoint_id:    string (12-hex-char, for linking back to frontend route)
+branch:           string (for filtering)
+agent:            string (for filtering)
+author:           string (commit_author_username, for filtering)
+created_at:       string (ISO timestamp, for sorting/filtering)
+commit_sha:       string (for display)
+commit_message:   string (stored for FTS)
+prompt:           string (stored for FTS)
+files_touched:    string (comma-joined paths, for FTS)
+text:             string (concatenated searchable text, for FTS + vector)
+```
+
+The `text` field is what gets embedded. It's a concatenation of:
+```
+Prompt: {prompt}
+Commit: {commit_message}
+Files: {files_touched joined by ", "}
+Transcript: {first user message + first assistant response, if available}
+```
+
+## Embedding Model
+
+OpenAI `text-embedding-3-small` (1536 dimensions). Cheap, fast, good enough for POC. ~$0.02 per 1M tokens.
+
+## Script Flow
+
+```
+1. Connect to PlanetScale
+2. Query all repos with checkpoint_count > 0
+3. For each repo:
+   a. Create/get Turbopuffer namespace `checkpoints-{repo_id}`
+   b. Query all checkpoints + commits for this repo (joined)
+   c. Optionally fetch transcript excerpts from GitHub (--with-transcripts)
+   d. Construct text field for each checkpoint
+   e. Generate embeddings in batches (OpenAI batch API, 50 at a time)
+   f. Upsert to Turbopuffer in batches
+   g. Log progress
+4. Print summary stats
+```
+
+### CLI Arguments
+
+```
+npx tsx scripts/backfill-search.ts [options]
+
+Options:
+  --repo <full_name>     Only backfill a specific repo (e.g., "entireio/cli")
+  --with-transcripts     Fetch transcript excerpts from GitHub (slower, needs GITHUB_TOKEN)
+  --dry-run              Show what would be indexed without writing to Turbopuffer
+  --limit <n>            Max checkpoints per repo (for testing)
+```
+
+### Transcript Fetching (--with-transcripts)
+
+When enabled, for each checkpoint:
+1. Compute folder path: `{checkpoint_id[:2]}/{checkpoint_id[2:]}`
+2. Fetch `{folder}/0/full.jsonl` from `entire/checkpoints/v1` branch via GitHub API
+3. Parse with the appropriate agent transcript parser (reuse `getParserForAgent()`)
+4. Extract first user message content + first assistant message content
+5. Truncate to ~2000 chars combined to stay within embedding token limits
+6. Append to the `text` field
+
+This uses `GITHUB_TOKEN` (a PAT with repo read access). Rate limited to ~5000 req/hr. For repos with many checkpoints, this is the bottleneck — add a small delay between requests.
+
+## Files to Create/Modify
+
+| File | Action | Description |
+|------|--------|-------------|
+| `api/scripts/backfill-search.ts` | **Create** | Main backfill script (~200 lines) |
+| `api/package.json` | **Modify** | Add `@turbopuffer/turbopuffer` and `openai` to devDependencies |
+
+### `backfill-search.ts` Structure
+
+```typescript
+// 1. Imports & config
+// 2. parseArgs() - CLI argument parsing
+// 3. buildSearchText(checkpoint, transcriptExcerpt?) - construct text for embedding
+// 4. generateEmbeddings(texts[]) - batch call to OpenAI
+// 5. fetchTranscriptExcerpt(repoFullName, checkpointId, token) - GitHub API + parser
+// 6. processRepo(db, repoId, repoFullName, options) - main per-repo logic
+// 7. main() - orchestrator
+```
+
+Key implementation details:
+
+- **DB query**: Join `repo_checkpoints` + `repo_checkpoint_commits` grouped by checkpoint_id (same pattern as `getCheckpointsForBranch` in `src/lib/planetscale/checkpoints.ts`)
+- **Embedding batching**: OpenAI allows up to 2048 embeddings per request, but we batch at 50 to limit memory and provide progress feedback
+- **Turbopuffer upsert**: Batch upsert with vectors + attributes. Turbopuffer's `upsert()` handles create-or-update automatically
+- **Transcript parsers**: Import and reuse `getParserForAgent()` from `src/lib/transcript-parsers/`
+- **GitHub API**: Reuse the same raw fetch pattern as `fetchFileAtCommit()` in `src/lib/github.ts`
+- **Progress logging**: Log per-repo progress (checkpoints indexed, time taken)
+- **Error handling**: Skip individual checkpoints on error (log warning), don't abort the whole repo
+
+## Example Usage
+
+```bash
+# Backfill a single repo (quick test)
+DATABASE_URL=mysql://... TURBOPUFFER_API_KEY=... OPENAI_API_KEY=... \
+  npx tsx scripts/backfill-search.ts --repo entireio/cli --limit 10
+
+# Backfill all repos, metadata only (no transcripts)
+DATABASE_URL=mysql://... TURBOPUFFER_API_KEY=... OPENAI_API_KEY=... \
+  npx tsx scripts/backfill-search.ts
+
+# Backfill all repos with transcript excerpts
+DATABASE_URL=mysql://... TURBOPUFFER_API_KEY=... OPENAI_API_KEY=... GITHUB_TOKEN=... \
+  npx tsx scripts/backfill-search.ts --with-transcripts
+
+# Dry run to see what would be indexed
+DATABASE_URL=mysql://... TURBOPUFFER_API_KEY=... OPENAI_API_KEY=... \
+  npx tsx scripts/backfill-search.ts --dry-run
+```
+
+## Verification
+
+1. Run with `--dry-run --repo <your-test-repo>` to verify data extraction looks correct
+2. Run with `--repo <your-test-repo> --limit 5` to index a small batch
+3. Verify in Turbopuffer dashboard that the namespace exists with correct document count
+4. Test search manually via Turbopuffer API/dashboard to confirm FTS + vector results return relevant checkpoints
+5. Run full backfill once satisfied
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/e05e064a-a0b3-4f07-8427-2a941448a239.jsonl
+
+---
+
+lets run it and start the backfill for the entireio/cli repo
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+give me the command with placeholders for auth to run this (im going to use our staging db first)
+
+---
+
+ran into this error: 
+
+[2026-03-03 15:47] ~/code/entire/devenv/entire.io (tp_poc)%   npx tsx scripts/backfill-search.ts --repo entireio/cli --li
+mit 10 --with-transcripts
+Need to install the following packages:
+tsx@4.21.0
+Ok to proceed? (y) y
+
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/Users/evisdrenova/code/entire/devenv/entire.io/scripts/backfill-search.ts' imported from /Users/evisdrenova/code/entire/devenv/entire.io/
+    at finalizeResolution (node:internal/modules/esm/resolve:275:11)
+    at moduleResolve (node:internal/modules/esm/resolve:865:10)
+    at defaultResolve (node:internal/modules/esm/resolve:991:11)
+    at nextResolve (node:internal/modules/esm/hooks:769:28)
+    at resolveBase (file:///Users/evisdrenova/.npm/_npx/fd45a72a545557e9/node_modules/tsx/dist/esm/index.mjs?1772581696544:2:3744)
+    at resolveDirectory (file:///Users/evisdrenova/.npm/_npx/fd45a72a545557e9/node_modules/tsx/dist/esm/index.mjs?1772581696544:2:4243)
+    at resolveTsPaths (file:///Users/evisdrenova/.npm/_npx/fd45a72a545557e9/node_modules/tsx/dist/esm/index.mjs?1772581696544:2:4984)
+    at resolve (file:///Users/evisdrenova/.npm/_npx/fd45a72a545557e9/node_modules/tsx/dist/esm/index.mjs?1772581696544:2:5361)
+    at nextResolve (node:internal/modules/esm/hooks:769:28)
+    at AsyncLoaderHooksOnLoaderHookWorker.resolve (node:internal/modules/esm/hooks:265:30) {
+  code: 'ERR_MODULE_NOT_FOUND',
+  url: 'file:///Users/evisdrenova/code/entire/devenv/entire.io/scripts/backfill-search.ts'
+}
+
+Node.js v25.6.1
+
+---
+
+it worked with 10 just fine but terminated with 1227, 
+
+
+2026-03-03 15:55] ~/code/entire/devenv/entire.io/api (tp_poc)% npx tsx scripts/backfill-search.ts --repo entireio/cli --limit 10 --with-transcripts 
+Backfill Search Index
+=====================
+Repo filter: entireio/cli
+Limit: 10 checkpoints per repo
+Transcript fetching: enabled
+
+Found 1 repo(s) with checkpoints.
+
+Processing entireio/cli (1031 checkpoints)...
+  Fetched 10 checkpoint rows from DB.
+  Generating embeddings for 10 checkpoints...
+  Upserting to Turbopuffer namespace checkpoints-5be1c302-97d2-4cf4-8436-b001efe227e0...
+  Done: 10 indexed, 0 skipped (12.4s)
+
+=====================
+Summary:
+  Repos processed: 1
+  Checkpoints indexed: 10
+  Checkpoints skipped: 0
+[2026-03-03 15:55] ~/code/entire/devenv/entire.io/api (tp_poc)% npx tsx scripts/backfill-search.ts --repo entireio/cli --with-transcripts 
+Backfill Search Index
+=====================
+Repo filter: entireio/cli
+Transcript fetching: enabled
+
+Found 1 repo(s) with checkpoints.
+
+Processing entireio/cli (1031 checkpoints)...
+  Fetched 1227 checkpoint rows from DB.
+'
+Error processing entireio/cli: TypeError: terminated
+    at Fetch.onAborted (node:internal/deps/undici/undici:12826:53)
+    at Fetch.emit (node:events:508:20)
+    at Fetch.terminate (node:internal/deps/undici/undici:11963:14)
+    at Object.onError (node:internal/deps/undici/undici:12950:38)
+    at Request.onError (node:internal/deps/undici/undici:3015:31)
+    at Object.errorRequest (node:internal/deps/undici/undici:1887:17)
+    at TLSSocket.onHttpSocketClose (node:internal/deps/undici/undici:7661:14)
+    at TLSSocket.emit (node:events:520:22)
+    at node:net:347:12
+    at TCP.done (node:internal/tls/wrap:666:7) {
+  [cause]: SocketError: other side closed
+      at TLSSocket.onHttpSocketEnd (node:internal/deps/undici/undici:7635:26)
+      at TLSSocket.emit (node:events:520:22)
+      at endReadableNT (node:internal/streams/readable:1729:12)
+      at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+    code: 'UND_ERR_SOCKET',
+    socket: {
+      localAddress: '192.168.1.6',
+      localPort: 63799,
+      remoteAddress: '140.82.116.6',
+      remotePort: 443,
+      remoteFamily: 'IPv4',
+      timeout: undefined,
+      bytesWritten: 434140,
+      bytesRead: 2313521410
+    }
+  }
+}
+Continuing with next repo...
+
+=====================
+Summary:
+  Repos processed: 1
+  Checkpoints indexed: 0
+
+can we batch this better and print conssitent udpates
+
+---
+
+so it made some progresss and then hit an error in the files_touched field:
+
+2026-03-03 16:41] ~/code/entire/devenv/entire.io/api (tp_poc)% npx tsx scripts/backfill-search.ts --repo entireio/cli --with-transcripts
+Backfill Search Index
+=====================
+Repo filter: entireio/cli
+Transcript fetching: enabled
+
+Found 1 repo(s) with checkpoints.
+
+--- entireio/cli (1035 checkpoints) ---
+  Fetched 1231 checkpoint rows from DB.
+  [1/25] Processing checkpoints 1-50 of 1231 (0s)
+    Transcripts: 50/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (50 total)
+  [2/25] Processing checkpoints 51-100 of 1231 (1m35s)
+    Transcripts: 49/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (100 total)
+  [3/25] Processing checkpoints 101-150 of 1231 (2m55s)
+    Transcripts: 46/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (150 total)
+  [4/25] Processing checkpoints 151-200 of 1231 (4m4s)
+    Transcripts: 40/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (200 total)
+  [5/25] Processing checkpoints 201-250 of 1231 (5m57s)
+    Transcripts: 38/50 found
+    Embedded 50 checkpoints
+
+Error processing entireio/cli: TurbopufferError: {"error":"💔 Attribute `files_touched` value too large for filtering, limit is currently 4096 bytes, was: 4 KiB. For arrays their filterable size is determined by their largest element.","status":"error"}
+    at Turbopuffer.doRequest (/Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/@turbopuffer/turbopuffer/src/turbopuffer.ts:149:13)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async Namespace.upsert (/Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/@turbopuffer/turbopuffer/src/turbopuffer.ts:224:5)
+    at async processRepo (/Users/evisdrenova/code/entire/devenv/entire.io/api/scripts/backfill-search.ts:451:5)
+    at async main (/Users/evisdrenova/code/entire/devenv/entire.io/api/scripts/backfill-search.ts:531:22) {
+  error: '{"error":"💔 Attribute `files_touched` value too large for filtering, limit is currently 4096 bytes, was: 4 KiB. For arrays their filterable size is determined by their largest element.","status":"error"}',
+  status: 400
+}
+Continuing with next repo...
+
+=====================
+Summary:
+  Repos processed: 1
+  Checkpoints indexed: 0
+  Checkpoints skipped: 0
+
+what do you think is the right way t handle this?
+
+---
+
+got a little more than halfway and then failed with a context length problem. which imsurprised it took that long? since it's openai it must be the embedding model? 
+
+What do you think?
+
+--- entireio/cli (1041 checkpoints) ---
+  Fetched 1237 checkpoint rows from DB.
+  [1/25] Processing checkpoints 1-50 of 1237 (0s)
+    Transcripts: 50/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (50 total)
+  [2/25] Processing checkpoints 51-100 of 1237 (1m12s)
+    Transcripts: 49/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (100 total)
+  [3/25] Processing checkpoints 101-150 of 1237 (2m15s)
+    Transcripts: 46/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (150 total)
+  [4/25] Processing checkpoints 151-200 of 1237 (3m2s)
+    Transcripts: 40/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (200 total)
+  [5/25] Processing checkpoints 201-250 of 1237 (4m26s)
+    Transcripts: 38/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (250 total)
+  [6/25] Processing checkpoints 251-300 of 1237 (5m20s)
+    Transcripts: 37/50 found
+    Embedded 50 checkpoints
+    Upserted 50 to Turbopuffer (300 total)
+  [7/25] Processing checkpoints 301-350 of 1237 (6m14s)
+    Transcripts: 29/50 found
+
+Error processing entireio/cli: BadRequestError: 400 This model's maximum context length is 8192 tokens, however you requested 30244 tokens (30244 in your prompt; 0 for the completion). Please reduce your prompt; or completion length.
+    at APIError.generate (/Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/openai/src/error.ts:72:14)
+    at OpenAI.makeStatusError (/Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/openai/src/core.ts:462:21)
+    at OpenAI.makeRequest (/Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/openai/src/core.ts:526:24)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async generateEmbeddings (/Users/evisdrenova/code/entire/devenv/entire.io/api/scripts/backfill-search.ts:142:20)
+    at async processRepo (/Users/evisdrenova/code/entire/devenv/entire.io/api/scripts/backfill-search.ts:443:24)
+    at async main (/Users/evisdrenova/code/entire/devenv/entire.io/api/scripts/backfill-search.ts:554:22) {
+  status: 400,
+  headers: {
+    'access-control-allow-origin': '*',
+    'access-control-expose-headers': 'X-Request-ID',
+    'alt-svc': 'h3=":443"; ma=86400',
+    'cf-cache-status': 'DYNAMIC',
+    'cf-ray': '9d6d0791cab78bdb-SJC',
+    connection: 'keep-alive',
+    'content-length': '294',
+    'content-type': 'application/json',
+    date: 'Wed, 04 Mar 2026 01:15:24 GMT',
+    'openai-model': 'text-embedding-3-small',
+    'openai-organization': 'user-z5sjhjxsteitxx5oppt5s37s',
+    'openai-processing-ms': '228',
+    'openai-project': 'proj_8PNncTmftfZSLfS9w5ScOzG3',
+    'openai-version': '2020-10-01',
+    server: 'cloudflare',
+    'set-cookie': 'REDACTED.8065023-1.0.1.REDACTED.REDACTED.qBAiFME1TRrYTUBNTJkfu; HttpOnly; Secure; Path=/; Domain=api.openai.com; Expires=Wed, 04 Mar 2026 01:45:24 GMT',
+    'strict-transport-security': 'max-age=31536000; includeSubDomains; preload',
+    via: 'envoy-router-canary-6cdbcdbbf6-m2bnm',
+    'x-content-type-options': 'nosniff',
+    'x-openai-proxy-wasm': 'v0.1',
+    'x-ratelimit-limit-requests': '3000',
+    'x-ratelimit-limit-tokens': '1000000',
+    'x-ratelimit-remaining-requests': '2999',
+    'x-ratelimit-remaining-tokens': '963255',
+    'x-ratelimit-reset-requests': '20ms',
+    'x-ratelimit-reset-tokens': '2.204s',
+    'x-request-id': 'req_3e22f7dbbbfd49e2998e422f3a8de551'
+  },
+  request_id: 'req_3e22f7dbbbfd49e2998e422f3a8de551',
+  error: {
+    message: "This model's maximum context length is 8192 tokens, however you requested 30244 tokens (30244 in your prompt; 0 for the completion). Please reduce your prompt; or completion length.",
+    type: 'invalid_request_error',
+    param: null,
+    code: null
+  },
+  code: null,
+  param: null,
+  type: 'invalid_request_error'
+}
+Continuing with next repo...
+
+=====================
+Summary:
+  Repos processed: 1
+  Checkpoints indexed: 0
+  Checkpoints skipped: 0
+
+---
+
+okay nice thats working and it's backfilled. next, let's wire up the frontend so we can just query what we have. we can come back and do the on-goign ones later.
+
+---
+
+[Request interrupted by user for tool use]
