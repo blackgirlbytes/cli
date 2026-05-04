@@ -1,0 +1,224 @@
+Base directory for this skill: /Users/alex/workspace/cli/.claude/skills/debug-e2e
+
+# Debug Entire CLI via E2E Artifacts
+
+Diagnose Entire CLI bugs using captured artifacts from the E2E test suite. Artifacts are written to `e2e/artifacts/` locally or downloaded from CI via GitHub Actions.
+
+## Inputs
+
+The user provides either:
+- **A test run directory:** `e2e/artifacts/{timestamp}/` — triage all failures
+- **A specific test directory:** `e2e/artifacts/{timestamp}/{TestName}-{agent}/` — debug one test
+
+## Artifact Layout
+
+```
+e2e/artifacts/{timestamp}/
+├── report.nocolor.txt          # Pass/fail/skip summary with error lines
+├── test-events.json            # Raw Go test events (NDJSON)
+├── entire-version.txt          # CLI version under test
+└── {TestName}-{agent}/
+    ├── PASS or FAIL            # Status marker
+    ├── console.log             # Full operation transcript
+    ├── git-log.txt             # git log --decorate --graph --all
+    ├── git-tree.txt            # ls-tree HEAD + checkpoint branch
+    ├── entire-logs/entire.log  # CLI structured JSON logs
+    ├── checkpoint-metadata/    # Checkpoint + session metadata
+    └── repo -> /tmp/...        # Symlink to preserved repo (E2E_KEEP_REPOS=1 only)
+```
+
+## Preserved Repo
+
+When the test run was executed with `E2E_KEEP_REPOS=1`, each test's artifact directory contains a `repo` symlink pointing to the preserved temporary git repository. This is the actual repo the test operated on — you can inspect it directly.
+
+**Navigate via the symlink** (e.g., `{artifact-dir}/repo/`) rather than resolving the `/tmp/...` path. The symlink lives inside the artifact directory so permissions and paths stay consistent.
+
+The preserved repo contains:
+- Full git history with all branches (main, `entire/checkpoints/v1`)
+- The `.entire/` directory with CLI state, config, and raw logs
+- The `.claude/` directory (if Claude Code was the agent)
+- All files the agent created or modified, in their final state
+
+This is the most powerful debugging tool — you can run `git log`, `git diff`, `git show`, inspect `.entire/` internals, and see exactly what the CLI left behind.
+
+## Debugging Workflow
+
+### 1. Triage (if given a run directory)
+
+Read `report.nocolor.txt` to identify failures and their error messages. Each entry shows the test name, agent, duration, and failure output with file:line references.
+
+### 2. Read console.log (most important)
+
+Full transcript of every operation:
+- `> claude -p "..." ...` — agent prompts with stdout/stderr
+- `> git add/commit/...` — git commands
+- `> send: ...` — interactive session inputs
+
+This tells you what happened chronologically.
+
+### 3. Read test source code
+
+Use the file:line from the report to find the test in `e2e/tests/`. Understand what the test expected to happen vs what console.log shows actually happened.
+
+### 4. Diagnose the CLI behavior
+
+Cross-reference console.log (what happened) with the test (what should have happened). Focus on CLI-level issues:
+
+| Symptom | CLI Investigation |
+|---------|-------------------|
+| Checkpoint not created / timeout | Check `entire-logs/entire.log` for hook invocations, phase transitions, errors |
+| Wrong checkpoint content | Check `git-tree.txt` for checkpoint branch files, `checkpoint-metadata/` for session info |
+| Hooks didn't fire | Check `entire.log` for missing hook entries (session-start, user-prompt-submit, stop, post-commit) |
+| Stash/unstash problems | Check `entire.log` for stash-related log lines, `git-log.txt` for commit ordering |
+| Attribution issues | Check `checkpoint-metadata/` for `files_touched`, session metadata for attribution data |
+| Strategy mismatch | Check `entire.log` for `strategy` field, verify auto-commit vs manual-commit behavior |
+
+### 5. Deep dive files
+
+- **entire-logs/entire.log**: Structured JSON logs — hook lifecycle, session phases (`active` → `idle` → `ended`), warnings, errors. Key fields: `component`, `hook`, `strategy`, `session_id`.
+- **git-log.txt**: Commit graph showing main branch, `entire/checkpoints/v1`, checkpoint initialization.
+- **git-tree.txt**: Files at HEAD vs checkpoint branch (separated by `--- entire/checkpoints/v1 ---`).
+- **checkpoint-metadata/**: `metadata.json` has `checkpoint_id`, `strategy`, `files_touched`, `token_usage`, and `sessions` array. Session subdirs have per-session details.
+
+### 6. Report findings
+
+Identify whether the issue is in:
+- **CLI hooks** (prepare-commit-msg, commit-msg, post-commit)
+- **Session management** (phase transitions, session tracking)
+- **Checkpoint creation** (branch management, metadata writing)
+- **Attribution** (file tracking, prompt correlation)
+- **Strategy logic** (auto-commit vs manual-commit behavior)
+
+
+ARGUMENTS: /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T11-45-27 - this had failures (main branch)
+
+and it seems like subsquent runs are fine /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T12-02-11
+
+non-deterministic agent behaviour? or something else?
+
+---
+
+is the claude invocation in the e2e's picking up user settings? we shouldn't be, right?
+
+---
+
+could we enable sandboxing? https://code.claude.com/docs/en/settings#sandbox-settings
+
+---
+
+the 'auth' fixes we did yesterday to use keychain based auth - do we even need the claude dir to copy anything?
+
+---
+
+let's try it
+
+---
+
+Base directory for this skill: /Users/alex/.claude/skills/tdd-dev
+
+# TDD Developer
+
+Implement features using Test-Driven Development and Clean Code principles.
+
+## TDD Cycle
+
+1. **Red** - Write failing test first
+2. **Green** - Minimal code to pass
+3. **Refactor** - Clean up, tests stay green
+
+## Clean Code Standards
+
+- **Names reveal intent** - Variables, functions, classes
+- **Small functions** - One responsibility each
+- **DRY** - Extract duplication
+- **SOLID** - Single responsibility, Open/closed, Liskov, Interface segregation, Dependency inversion
+- **Self-documenting** - Comments explain "why", not "what"
+
+Always consider: edge cases, input validation, security, performance, concurrency.
+
+## Development Workflow
+
+### 1. Understand Requirements
+
+Read `docs/requirements/[feature]/README.md` for specifications.
+
+### 2. Check for Review Feedback
+
+Look for `review-NN.md` files in the requirements folder:
+
+```markdown
+# In review-NN.md, update status line:
+> Status: pending    → when review is new
+> Status: in-progress → when addressing
+> Status: addressed   → when complete
+```
+
+Address each issue before proceeding.
+
+### 3. Plan Tasks
+
+Break work into testable increments. Create task files in `docs/requirements/[feature]/`:
+
+```markdown
+# Task NN: [Short Description]
+
+> Status: todo
+
+## Goal
+What this accomplishes.
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Notes
+Implementation notes, decisions, blockers.
+```
+
+Update status: `todo` → `in-progress` → `done`
+
+### 4. Implement (TDD)
+
+For each task:
+
+1. Write failing test
+2. Run test (confirm red)
+3. Write minimal implementation
+4. Run test (confirm green)
+5. Refactor if needed
+6. Run full validation
+
+### 5. Validate After Each Step
+
+Run after every change:
+
+```bash
+# Linting/formatting (adjust to project)
+mise run list
+
+# Tests
+mise run test
+```
+
+Fix failures immediately before proceeding.
+
+## Final Report
+
+When complete, summarize:
+
+- What was implemented
+- Tests added
+- Design decisions and trade-offs
+- Issues encountered
+- Suggested next steps
+
+
+ARGUMENTS: Fix E2E test isolation: Claude Code invocations in E2E tests are picking up user settings (~/.claude/CLAUDE.md, projects/, plugins/, etc.) when running locally. The fix: always set CLAUDE_CONFIG_DIR to an empty temp dir (both locally and on CI), and on CI only symlink .claude.json into it for API key auth. Delete the broad isolatedConfigDir() function. File to modify: e2e/agents/claude.go
+
+---
+
+but keep the comment for DISABLE_NONESSENTIAL
+
+---
+
+commit this, then let's have a look at the latest test failures /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T12-25-30
