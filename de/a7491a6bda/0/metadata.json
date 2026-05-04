@@ -1,0 +1,103 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "dea7491a6bda",
+  "session_id": "af734be5-6421-4df4-a91c-5ad790462491",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-25T23:52:01.607403Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "cmd/entire/cli/agent/capabilities.go",
+    "cmd/entire/cli/improve_cmd.go",
+    "cmd/entire/cli/insights/insights.go",
+    "cmd/entire/cli/insights/scorer.go",
+    "cmd/entire/cli/insights/scorer_test.go",
+    "cmd/entire/cli/insights_cmd.go",
+    "cmd/entire/cli/insightsdb/cache.go",
+    "cmd/entire/cli/insightsdb/db.go",
+    "cmd/entire/cli/insightsdb/queries.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "7ac0066e25f8",
+  "checkpoint_transcript_start": 176,
+  "token_usage": {
+    "input_tokens": 155,
+    "cache_creation_tokens": 100974,
+    "cache_read_tokens": 24824764,
+    "output_tokens": 39455,
+    "api_call_count": 123
+  },
+  "session_metrics": {
+    "turn_count": 16
+  },
+  "summary": {
+    "intent": "Fix `entire insights` and `entire improve` commands which were showing all-zero scores and no friction data, then improve the quality of the scoring formulas.",
+    "outcome": "Implemented on-demand summary backfill so sessions without summaries get generated at query time, fixed the nullableFloat bug, computed partial scores from always-available metadata, and recalibrated scoring formulas to produce meaningful variance across dimensions.",
+    "learnings": {
+      "repo": [
+        "The `entire` tool stores session summaries (intent, outcome, friction, learnings) in checkpoint metadata on the `entire/checkpoints/v1` branch, populated by a post-commit summarize hook.",
+        "The SQLite cache (`insights.db`) is the query layer — it must be refreshed from checkpoint metadata and will be empty/stale if summarization was never enabled.",
+        "Scoring was gated entirely behind `if meta.Summary != nil`, causing all zeros for unsummarized sessions rather than partial scores from always-available metadata.",
+        "Token efficiency formula assumed ~8k tokens/file but real sessions use 300k–6M tokens/file, making the score mathematically broken and always zero.",
+        "Friction strings from summaries are full natural-language sentences, so exact-match grouping in `QueryRecurringFriction` never finds duplicates without semantic clustering.",
+        "The `capabilities.go` file had `ireturn` lint issues that were previously suppressed with nolint comments — those comments were stripped at some point and needed to be re-added.",
+        "`gofmt -s` was stripping `//nolint:ireturn` comments from `capabilities.go` during fmt runs, causing recurring lint failures."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/insightsdb/db.go",
+          "finding": "Schema version bumped; added `has_summary INTEGER DEFAULT 0` column to sessions table to distinguish sessions with computed summaries from those without."
+        },
+        {
+          "path": "cmd/entire/cli/insightsdb/cache.go",
+          "finding": "Removed `nullableFloat` helper — scores of exactly 0.0 were being stored as NULL, making them indistinguishable from uncomputed scores. Added `UpdateSessionSummary` method for backfill writes."
+        },
+        {
+          "path": "cmd/entire/cli/insights/scorer.go",
+          "finding": "Token efficiency recalibrated to use turns instead of files (turns scale linearly with work done). Focus score switched to a gaussian curve. Friction penalty changed from 20 to 15 per friction point."
+        },
+        {
+          "path": "cmd/entire/cli/insights_cmd.go",
+          "finding": "Added `backfillSummaries` function: queries sessions with `has_summary=false`, calls the summarize pipeline for each, updates cache. Wired into both `runInsights` and `runImprove` before scoring."
+        },
+        {
+          "path": "cmd/entire/cli/insights/insights.go",
+          "finding": "Added `HasSummary bool` to `SessionScore` struct to allow the renderer to show a dim `(no summary)` tag for unsummarized sessions."
+        }
+      ],
+      "workflow": [
+        "Run `mise run lint` without `mise run fmt` first when nolint comments are present — `gofmt` strips inline nolint directives.",
+        "Delete `insights.db` between manual test runs to force a full cache refresh and verify backfill logic end-to-end.",
+        "The `--dry-run` flag on `entire improve` is useful for testing the friction pipeline without triggering an LLM call.",
+        "Settings for a specific worktree go in `.entire/settings.json` within that worktree directory."
+      ]
+    },
+    "friction": [
+      "All scores showed as 0.0 because scoring was gated behind summary existence — root cause took significant investigation including sqlite introspection to confirm.",
+      "`gofmt` stripped `//nolint:ireturn` comments from `capabilities.go` during fmt pass, causing repeated lint failures that required re-adding comments after every fmt run.",
+      "The `nullableFloat` pattern caused 0.0 scores to be stored as NULL, making legitimate zero scores indistinguishable from missing data.",
+      "The user interrupted the AskUserQuestion flow twice before settling on the scoring recalibration approach — required multiple rounds of clarification.",
+      "Background task output required an extra read step to retrieve results since the task notification didn't include the content inline."
+    ],
+    "open_items": [
+      "Token Efficiency score is still not ideal — sessions with very high token counts (46M+) score appropriately low, but the formula may need further tuning as more session data accumulates.",
+      "Friction pattern detection in `entire improve` requires semantic/theme-based grouping rather than exact string matching to be useful — currently never surfaces recurring patterns.",
+      "Learnings stored in the cache (code, repo, workflow) are not surfaced anywhere in `entire insights` output.",
+      "Friction text strings are stored but invisible in `entire insights` — showing top friction items per session would make the output more actionable.",
+      "Trend analysis compares halved windows (e.g., 2 vs 3 sessions) which is statistically noisy — needs a minimum sample threshold.",
+      "The summarize pipeline cost (Claude API tokens) is not tracked or reported when backfilling summaries during insights/improve runs."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-25T23:51:26.603641Z",
+    "agent_lines": 33,
+    "agent_removed": 0,
+    "human_added": 139,
+    "human_modified": 47,
+    "human_removed": 0,
+    "total_committed": 219,
+    "total_lines_changed": 0,
+    "agent_percentage": 15.068493150684931
+  }
+}
