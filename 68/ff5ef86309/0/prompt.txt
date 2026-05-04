@@ -1,0 +1,166 @@
+Implement the following plan:
+
+# Fix Droid E2E Hang: Content-Settling + Simplification
+
+## Context
+
+After switching droid's `PromptPattern()` from `[│|] >` to `ENTER to send`, E2E tests hang locally. Root cause: **`ENTER to send` only appears in droid's splash screen**, NOT in a persistent status bar. Once conversation scrolls the splash off-screen, the pattern vanishes from `tmux capture-pane` and `WaitFor` blocks until timeout (180s).
+
+**Fundamental problem**: Droid has no reliable idle-state prompt glyph capturable by `tmux capture-pane` across both local and CI:
+- `│ >` — works locally, not in CI (Unicode rendering)
+- `ENTER to send` — splash-only, scrolls away after first prompt
+
+## Approach: Settle-Only Mode + Remove Handshake
+
+Use **content settling** for post-response readiness (wait for content to change and stabilize, no pattern required). Remove the handshake entirely — it was needed to verify prompt-pattern responsiveness, which we're eliminating. The existing startup markers + test-level retry (`ForEachAgent`) provide sufficient resilience.
+
+### Changes
+
+#### 1. `e2e/agents/tmux.go` — Handle `pattern == ""` in WaitFor
+Make the regex compilation and pattern-match check conditional. When pattern is empty, skip to the settle logic directly:
+
+```go
+var re *regexp.Regexp
+if pattern != "" {
+    re, err = regexp.Compile(pattern)
+    ...
+}
+...
+if re != nil && !re.MatchString(content) {
+    // Pattern lost — reset (only for pattern-based waits)
+    ...
+    continue
+}
+// settle logic unchanged
+```
+
+#### 2. `e2e/agents/droid.go` — Simplify heavily
+
+**Remove:**
+- `performHandshake()`, `droidHandshakeToken()`, `droidHandshakePrompt()`
+- Handshake config fields: `handshakeTimeout`, `handshakeAttempts`, `handshakeRestarts`
+- All handshake env var parsing (`E2E_DROID_HANDSHAKE_*`)
+- Handshake retry/restart logic in `StartSession` (~40 lines)
+
+**Change:**
+- `PromptPattern()` → return `""` (empty = settle-only mode)
+- `StartSession()` → just: create tmux session, resize, wait for startup markers, set `stableAtSend=""`, return. Simple retry on startup failure.
+- `droidStartupConfig` → only `attempts`, `timeout`, `warmup`
+- Keep `droidStartupReadyPattern()`, `droidPromptReady()`, `droidStartupMarkersReady()` — used for startup detection and diagnostics
+
+#### 3. `e2e/testutil/repo.go` — Remove recovery handshake
+
+**Remove:**
+- `shouldUseDroidHandshakeRecovery()`
+- `recoverDroidPromptTimeoutWithHandshake()`
+- Recovery logic in `WaitFor` (the `if s.shouldUseDroidHandshakeRecovery(pattern)` block)
+
+With settle-only mode, there's no prompt pattern to "recover" — WaitFor either settles or times out.
+
+#### 4. `e2e/agents/droid_test.go` — Simplify tests
+
+**Remove:**
+- `TestDroidPromptPattern_DoesNotMatchAssistantMarker` — no prompt pattern to test
+- Handshake config tests for removed fields
+
+**Update:**
+- `TestDroidStartupReadyPattern` — keep as-is (startup markers still used)
+- `TestDroidStartupConfigFromEnv_*` — remove handshake fields from expectations
+
+#### 5. `e2e/testutil/repo_test.go` — Remove handshake recovery tests
+
+**Remove:**
+- `TestShouldUseDroidHandshakeRecovery`
+- `TestRecoverDroidPromptTimeoutWithHandshake`
+- `TestRecoverDroidPromptTimeoutWithHandshake_HandshakeFailure`
+
+**Update:**
+- `fakeAgent` prompt: `""` for droid agent
+
+### Files
+- `e2e/agents/tmux.go` — conditional pattern check in WaitFor
+- `e2e/agents/droid.go` — simplified startup, no handshake
+- `e2e/agents/droid_test.go` — remove handshake/prompt-pattern tests
+- `e2e/testutil/repo.go` — remove recovery handshake
+- `e2e/testutil/repo_test.go` — remove recovery tests
+
+### Verification
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. If requested: `mise run test:e2e --agent factoryai-droid TestAttributionOnAgentCommit`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-droid-e2e-fix/244e8e66-9431-4487-bb38-4c351e4a33bb.jsonl
+
+---
+
+commit and push
+
+---
+
+Run mkdir -p "$E2E_ARTIFACT_DIR"
+artifacts: /home/runner/work/cli/cli/e2e-artifacts
+[e2e/tests]✖✖
+=== Failed
+=== FAIL: e2e/tests TestAttributionOnAgentCommit/factoryai-droid (196.61s)
+    attribution_test.go:62: WaitFor(""): timed out waiting for "" after 3m0s
+        --- pane content ---
+        
+        
+                                                                                █████████    █████████     ████████    ███   █████████
+                                                                                ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                                                                ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                                                                ███    ███   █████████    ███    ███   ███   ███    ███
+                                                                                ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                                                                ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                                                                █████████    ███    ███    ████████    ███   █████████
+        
+                                                                                                         v0.66.0
+        
+        
+                                                                            You are standing in an open terminal. An AI awaits your commands.
+        
+                                                                              ENTER to send • \ + ENTER for a new line • @ to mention files
+        
+                                                                                          Current folder: /tmp/e2e-repo-99159103
+        
+        >  Powered by Entire:
+             This conversation will be linked to your next commit.
+        
+        >  create a file called hello.txt containing 'hello world', then commit it. Do not ask for confirmation.
+        --- end pane content ---
+=== FAIL: e2e/tests TestAttributionOnAgentCommit (196.61s)
+DONE 2 tests, 2 failures in 196.622s
+E2E Test Report
+═══════════════
+Total: 1  Passed: 0  Failed: 1  Skipped: 0
+✗ TestAttributionOnAgentCommit (196.6s)
+  ✗ factoryai-droid      196.6s
+      attribution_test.go:62: WaitFor(""): timed out waiting for "" after 3m0s
+      --- pane content ---
+      █████████    █████████     ████████    ███   █████████
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   █████████    ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      █████████    ███    ███    ████████    ███   █████████
+      v0.66.0
+      You are standing in an open terminal. An AI awaits your commands.
+      ENTER to send • \ + ENTER for a new line • @ to mention files
+      Current folder: /tmp/e2e-repo-99159103
+      >  Powered by Entire:
+      This conversation will be linked to your next commit.
+      >  create a file called hello.txt containing 'hello world', then commit it. Do not ask for confirmation.
+      --- end pane content ---
+💥 FAILED (0/1 passed) 💥
+entire binary:  /usr/local/bin/entire
+entire version: Entire CLI dev (unknown)
+Go version: go1.26.0
+OS/Arch: linux/amd64
+artifacts: /home/runner/work/cli/cli/e2e-artifacts
+[test:e2e] ERROR task failed
+Error: Process completed with exit code 1.
+
+---
+
+[Request interrupted by user for tool use]
