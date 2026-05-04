@@ -1,0 +1,70 @@
+Implement the following plan:
+
+# Fix: `secrets` not allowed in step `if` expressions
+
+## Context
+Steps 1-3 from the previous plan are already applied. The `gh workflow run` dispatch fails because GitHub Actions doesn't allow `secrets` context in step-level `if` conditions — it's only available in `env`, `with`, and `run` blocks. The three Slack steps (lines 52, 96, 123) use `secrets.E2E_SLACK_WEBHOOK_URL` in their `if` conditions, causing the validation error.
+
+## Changes
+
+**File: `.github/workflows/e2e-triage.yml`**
+
+### 1. Add job-level `env` block
+After `timeout-minutes: 60`, before `steps:`, add:
+```yaml
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.E2E_SLACK_WEBHOOK_URL }}
+```
+This exposes the secret as a job-level environment variable that `if` conditions can reference.
+
+### 2. Replace `secrets` references in step `if` conditions
+
+| Line | Old | New |
+|------|-----|-----|
+| 52 | `secrets.E2E_SLACK_WEBHOOK_URL != ''` | `env.SLACK_WEBHOOK_URL != ''` |
+| 96 | `always() && secrets.E2E_SLACK_WEBHOOK_URL != ''` | `always() && env.SLACK_WEBHOOK_URL != ''` |
+| 123 | `always() && secrets.E2E_SLACK_WEBHOOK_URL != ''` | `always() && env.SLACK_WEBHOOK_URL != ''` |
+
+### 3. Update `webhook:` in Slack action `with` blocks
+Lines 58 and 126 pass `${{ secrets.E2E_SLACK_WEBHOOK_URL }}` — update to `${{ env.SLACK_WEBHOOK_URL }}` for consistency (both work, but avoids mixing patterns).
+
+## Verification
+```bash
+git push
+gh workflow run e2e-triage.yml --ref alisha/e2e-triage -f run_id=22772950740
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/32e568b2-e0d4-4cac-8574-8d90c9cb28dc.jsonl
+
+---
+
+Tool loaded.
+
+---
+
+explain what this will do when I run it? will it ping slack?
+
+---
+
+Tool loaded.
+
+---
+
+I commented out slack portion for now so I don't repeatly ping slack while testing. Can you figure out what the issue is with the triage on this test run https://github.com/entireio/cli/actions/runs/22785888536/job/66102478638
+
+---
+
+Tool loaded.
+
+---
+
+Tool loaded.
+
+---
+
+Tool loaded.
+
+---
+
+[Request interrupted by user for tool use]
