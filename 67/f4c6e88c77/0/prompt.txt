@@ -1,0 +1,162 @@
+/brainstorming we currently have a gap in the visible remote checkpoints:
+
+- start turn
+- agent makes changes
+- agent commits, and pushes (checkpoints sync'd)
+- agent ends turn (trailing conversation is added to checkpoint - please confirm this)
+- remote checkpoint state is 'behind'
+
+how might we remedy this situation?
+
+---
+
+both really, the user may never return to that session (note: also check the endSession flow in that case)
+
+the web UI has stale data and the trailing conversation _really_ belongs to the checkpoint that has just gone, not the next checkpoint - which is what I assume would happen in the next postcommit?
+
+---
+
+it wouldn't be ENDED, just IDLE
+
+---
+
+yes, this should only happen if there's been a commit within the same turn.
+
+we previously had an ACTIVE_COMMITTED state to track this but it got very messy. We also need to keep the multi-session semantics in mind.
+
+---
+
+I _thought_ we had already added the checkpoint amendments 😅 that's why I asked specifically 🤣
+
+just reading through the code now... we don't know for sure that we've pushed in-turn - correct?
+
+so we could get to turn end and:
+1. commits happened
+  a) push happened - we are behind
+  b) no push happened - we are 'ok'
+2. no commits happened - we are 'ok'
+
+
+with the remote discovery - how does pre-push resolve the remote?
+
+---
+
+I think we need to respect the user intention, they may not _want_ to push the checkpoints yet - there might be different reasons for this.
+
+2. is there a way to do something similar to `git branch -vv` -> `entire/checkpoints/v1                        fdae8cf9 [origin/entire/checkpoints/v1: ahead 1, behind 1] Finalize transcript for Checkpoint: 14de2d5fee4a`
+
+---
+
+won't an unrelated remote update also trigger in Option A?
+
+---
+
+let's think about this, and we're getting into pretty weird multi-session in the same worktree territory...
+
+Scenario 1:
+if there is an IDLE session A, which had committed on its prior turn, it has contributed a checkpoint.
+
+two other ACTIVE sessions 
+- B is doing research
+- C is making changes - commits and pushes on that turn - A+C checkpoints are pushed
+- C ends turn, makes commit C' to complete the checkpoint, and triggers another push
+  - B is irrelevant
+  - C' is now pushed
+
+I think this is fine
+
+Scenario 2:
+two sessions ACTIVE, both making changes
+- A commits
+- B commits, pushes - both A+B checkpoints are pushed
+- A is still going (checkpoint A pushed but incomplete)
+- B ends turn, creates B', pushes B'
+- A ends turn, creates A', pushes A'
+
+? does it make sense for each session to handle its own commit amendments and pushes on end-turn? is this what happens today on turn end?
+
+---
+
+let's think about this, and we're getting into pretty weird multi-session in the same worktree territory...
+
+Scenario 1:
+if there is an IDLE session A, which had committed on its prior turn, it has contributed a checkpoint.
+
+two other ACTIVE sessions 
+- B is doing research
+- C is making changes - commits and pushes on that turn - A+C checkpoints are pushed
+- C ends turn, makes commit C' to complete the checkpoint, and triggers another push
+  - B is irrelevant
+  - C' is now pushed
+
+I think this is fine
+
+Scenario 2:
+two sessions ACTIVE, both making changes
+- A commits
+- B commits, pushes - both A+B checkpoints are pushed
+- A is still going (checkpoint A pushed but incomplete)
+- B ends turn, creates B', pushes B' due to detection of B push
+- A ends turn, creates A', A was pushed so we must now push A'
+
+? does it make sense for each session to handle its own commit amendments and pushes on end-turn? is this what happens today on turn end? so yes to updating push state on all ACTIVE sessions with TurnCheckpointIDs?
+
+---
+
+🤯
+
+in that edge case... if A1 and A2 are the two code-side commits...
+
+A1+cpA1 is pushed (by B's push), but A2+cpA2 is not...and at turn end if we are trying to maintain the checkpoint integrity as well as _intent_, then we should only commit cpA1' and push it...while leaving A2+cpA2' local?
+
+this is diabolical
+
+---
+
+if we take 1, we potentially get situations where A2 is still local and cpA2' is pushed
+
+which maybe isn't the end of the world, but it does mean it could be retained as an unattached checkpoint in the corpus if A2 is ever thrown away
+
+---
+
+B leaves us where we are in that complex case but might be okay?
+
+but pragmatically I think A is okay, we just need to be pretty transparent about when people's transcripts are going up to the cloud 😅
+
+---
+
+yep, let's do it
+
+---
+
+did you write the original design doc? can we put that next to the plan too?
+
+---
+
+proceed, subagents please
+
+---
+
+why gitutil vs the existing gitops package?
+
+---
+
+let's clear out anything that's not related to our work please
+
+---
+
+commit
+
+---
+
+push and draft pr
+
+---
+
+/github-pr-review
+
+---
+
+yes, we shouldn't mark it as pushed if it didn't happen.
+
+trails lives on a different lifecycle, let's not complicate it right now
