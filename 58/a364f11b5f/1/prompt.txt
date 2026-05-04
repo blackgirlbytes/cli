@@ -1,0 +1,102 @@
+Can you take a look at /Users/soph/Work/entire/research/gmeta and give me an overview, also in comparision to checkpoints and checkpoints v2
+
+---
+
+> Entire could store agent session data as gmeta tuples on commit targets
+
+How does this work with rebase, cherry-pick...
+
+---
+
+but isn't jj change-id basically the same as Entire-Checkpoint?
+
+---
+
+What could be the best approach to do a POC here, would we need to add support for this on go-git first? or handle it completely in entire?
+
+---
+
+how good can we abstract this and have this as a 3rd option? we already have a v2 option in the works...
+
+---
+
+it's not really option a and option b it's first step and second step, right?
+
+---
+
+ok, can you write this into a temporary plan doc?
+
+---
+
+can you take a look: 
+
+  1. High: The plan treats a checkpoint as a single session, but the current storage model allows multiple sessions to share one checkpoint ID. The proposed
+     gmeta layout stores singleton fields like agent/session-id, agent/model, and agent/transcript, then leaves multi-session handling as an “open question”.
+     That is already a required invariant today, not a follow-up. Current writes reuse or append a per-session slot under the same checkpoint ID, and entire
+     attach can also add data to an existing checkpoint. Without a concrete per-session encoding up front, this design will either overwrite earlier sessions
+     or make them unreadable. See docs/gmeta-poc-plan.md:35, docs/gmeta-poc-plan.md:116, cmd/entire/cli/checkpoint/committed.go:289, and cmd/entire/cli/
+     attach.go:124.
+  2. High: “Write-only initially” is incompatible with the existing checkpoint lifecycle. The current system does not just write once during condensation; it
+     later finalizes checkpoints by replacing transcript and prompt content at turn end via UpdateCommitted. The plan acknowledges this only as an open
+     question, but if gmeta is wired only into condensation, gmeta data will immediately diverge from v1/v2 for mid-turn commits. Also, condensation is not the
+     only write path: attach and migrate write committed checkpoints directly. See docs/gmeta-poc-plan.md:70, docs/gmeta-poc-plan.md:88, docs/gmeta-poc-
+     plan.md:124, cmd/entire/cli/checkpoint/checkpoint.go:306, cmd/entire/cli/checkpoint/committed.go:1207, cmd/entire/cli/checkpoint/v2_committed.go:52, cmd/
+     entire/cli/attach.go:127, and cmd/entire/cli/migrate.go:148.
+  3. Medium: The plan omits redaction/privacy handling for the new ref, but permanent checkpoint storage is documented to redact secrets before writing git
+     objects. As written, GmetaStore just “maps fields to tree paths”; if that uses raw Transcript/Prompts, it creates a new permanent ref that can leak
+     sensitive data even when v1/v2 are safe. That needs to be an explicit requirement, not an implementation detail left implied. See docs/gmeta-poc-
+     plan.md:70, cmd/entire/cli/checkpoint/committed.go:352, cmd/entire/cli/checkpoint/committed.go:628, and docs/security-and-privacy.md:17.
+  4. Medium: The shard/fanout rule is internally inconsistent. The proposed tree path shows change-id/<id[:2]>/<checkpoint-id>/, then the implementation notes
+     say the target path is change-id/<checkpoint-id[:2]>/<checkpoint-id>/, but the next bullet says the fanout should be the first 2 hex chars of
+     sha1(checkpoint-id). Those are different layouts. If the document does not pin this down, the write path and Rust CLI validation can easily test against
+     different trees. See docs/gmeta-poc-plan.md:37 and docs/gmeta-poc-plan.md:80.
+
+---
+
+how does gmeta handle the id sharding? or do they think it's not ncecessary?
+
+---
+
+but with only
+   one directory level of indirection instead of two.
+
+---
+
+should we hash then too?
+
+---
+
+is the file updated?
+
+---
+
+1. Medium: The plan now says GmetaStore must be wired into all committed-checkpoint write paths, but it still explicitly defers task checkpoint encoding.
+     That leaves a mismatch for any checkpoint that carries subagent/task metadata: current committed storage can persist tasks/<tool-use-id>/checkpoint.json,
+     incremental task checkpoint files, and subagent transcripts, while the proposed gmeta layout has no equivalent yet. If you wire gmeta into migrate or any
+     checkpoint write that includes task data, the gmeta copy will be incomplete by design. Either narrow the POC scope to “session checkpoints only” and say
+     task-bearing checkpoints are skipped, or add a provisional session/<id>/tasks/<tool-use-id>/... mapping now. See docs/gmeta-poc-plan.md:92, docs/gmeta-
+     poc-plan.md:176, and cmd/entire/cli/checkpoint/committed.go:178.
+
+what do you recommend?
+
+---
+
+no, let's do them too
+
+---
+
+1. Medium: The doc now includes task checkpoint encoding, but the migrate plan still understates what’s needed for task-bearing checkpoints. In current code,
+     migrate does not reconstruct full task data from WriteCommittedOptions; it writes the session checkpoint first, then separately splices the existing
+     tasks/ tree because buildMigrateWriteOpts only carries IsTask and ToolUseID, not AgentID, CheckpointUUID, subagent transcript content/path, or incremental
+     payloads. So “wire into migrate” is still incomplete unless the plan explicitly adds a gmeta equivalent of copyTaskMetadataToV2 or says task metadata is
+     skipped during migrate. See docs/gmeta-poc-plan.md:92, docs/gmeta-poc-plan.md:101, cmd/entire/cli/migrate.go:384, cmd/entire/cli/migrate.go:449, and cmd/
+     entire/cli/checkpoint/checkpoint.go:241.
+
+---
+
+1. Medium: The task-checkpoint layout now claims final task checkpoints write subagent-type and description, but those fields are not available in the
+     committed-checkpoint write API and are not part of current committed task metadata. WriteCommittedOptions carries ToolUseID, AgentID, CheckpointUUID,
+     subagent transcript paths, and incremental payloads, but not task description or subagent type; the existing committed task writer only persists
+     session_id, tool_use_id, checkpoint_uuid, agent_id, and transcript artifacts. So this part of the plan currently describes data that the implementation
+     cannot produce from the existing write path. Either remove those keys from the POC layout or explicitly add new inputs/plumbing for them. See docs/gmeta-
+     poc-plan.md:109, cmd/entire/cli/checkpoint/checkpoint.go:241, and cmd/entire/cli/checkpoint/committed.go:219.
