@@ -1,0 +1,899 @@
+/pr-review-toolkit:review-pr
+
+---
+
+/pr-review-toolkit:review-pr https://github.com/entireio/cli/pull/688
+
+---
+
+<task-notification>
+<task-id>a27c2d76eb701ad06</task-id>
+<tool-use-id>toolu_018x9PqqnVXyWiaD5a8okwAa</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/a27c2d76eb701ad06.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review for PR #688" completed</summary>
+<result>Here is my review of the PR #688 changes on the `attach-session-id` branch.
+
+---
+
+## Files Reviewed
+
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go` (new)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach_test.go` (new)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go` (modified)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/root.go` (modified)
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/trail_cmd.go` (modified)
+- Documentation and go.mod changes (minor)
+
+---
+
+## Critical (90-100)
+
+### 1. `searchTranscriptInAllProjects` hardcodes Claude Code path for all agents (Confidence: 92)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go`, lines 48-49
+
+The function hardcodes `filepath.Join(homeDir, ".claude", "projects")` as the search path, but it is called from `attach.go` with any agent (gemini, opencode, cursor, copilot-cli, etc.). For non-Claude agents, this will always fail silently (returning "not found"), which is harmless but misleading. More importantly, if another agent also stores transcripts in per-project directories, this function will not find them.
+
+The function comment even says "Claude Code uses cwd for its project directory" -- it should either be gated to only run for Claude Code, or the projects directory should come from the agent interface.
+
+**Fix:** Either guard the call in `attach.go` line 100 to only search when the agent is Claude Code, or add a method to the agent interface that returns alternative search directories:
+
+```go
+// In attach.go, around line 99:
+if _, statErr := os.Stat(transcriptPath); os.IsNotExist(statErr) {
+    if agentName == agent.AgentNameClaudeCode {
+        if found, searchErr := searchTranscriptInAllProjects(ctx, sessionID, ag); searchErr == nil {
+            transcriptPath = found
+        }
+    }
+}
+```
+
+### 2. Tests missing `t.Parallel()` -- explicit CLAUDE.md violation (Confidence: 95)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach_test.go`
+
+CLAUDE.md states: "**Always use `t.Parallel()` in tests.** Every top-level test function and subtest should call `t.Parallel()` unless it modifies process-global state."
+
+`TestAttach_MissingSessionID` (line 19) does not modify global state (no `t.Chdir`, no `t.Setenv`) and is missing `t.Parallel()`.
+
+The other three tests (`TestAttach_TranscriptNotFound`, `TestAttach_Success`, `TestAttach_SessionAlreadyTracked`, `TestAttach_OutputContainsCheckpointID`) use `t.Chdir()` and `t.Setenv()`, so they correctly cannot be parallel. However, they are also missing the standard comment explaining why they are not parallel, per the CLAUDE.md exception pattern.
+
+**Fix:** Add `t.Parallel()` to `TestAttach_MissingSessionID`:
+
+```go
+func TestAttach_MissingSessionID(t *testing.T) {
+    t.Parallel()
+    // ...
+}
+```
+
+---
+
+## Important (80-89)
+
+### 3. `git commit --amend` passes user-controlled commit message via `-m` flag without `--no-gpg-sign` (Confidence: 85)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, line 311
+
+The `promptAmendCommit` function runs `git commit --amend -m <message>` but does not pass `--no-gpg-sign`. CLAUDE.md states in the "Git in Tests" section that GPG signing should be disabled, and the `testutil.InitRepo` helper does this. While this is production code (not test code), in CI or environments without GPG keys configured, this `git commit --amend` will fail. Other git CLI invocations in the codebase (e.g., `HardResetWithProtection`) don't need this because they don't create commits, but this one does.
+
+**Fix:** Add `--no-gpg-sign` to the amend command:
+
+```go
+cmd := exec.CommandContext(ctx, "git", "commit", "--amend", "--no-gpg-sign", "-m", newMessage)
+```
+
+### 4. Error from `not a git repository` does not use `SilentError` pattern (Confidence: 82)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 67-69
+
+CLAUDE.md's error handling section shows that "not a git repository" errors should use the `SilentError` pattern with a user-friendly message printed to stderr, plus `cmd.SilenceUsage = true`. The current code returns a raw wrapped error:
+
+```go
+return fmt.Errorf("not a git repository: %w", err)
+```
+
+Compare with the CLAUDE.md example:
+```go
+if _, err := paths.WorktreeRoot(); err != nil {
+    cmd.SilenceUsage = true
+    fmt.Fprintln(cmd.ErrOrStderr(), "Not a git repository. ...")
+    return NewSilentError(errors.New("not a git repository"))
+}
+```
+
+However, note that `runAttach` does not have access to `cmd` (it receives `io.Writer`), so implementing the full pattern would require passing the cobra command or stderr writer. The current approach is functional but inconsistent with the documented pattern.
+
+**Fix:** Either pass `cmd *cobra.Command` to `runAttach` and use the `SilentError` pattern, or pass `cmd.ErrOrStderr()` as a separate writer for error output.
+
+### 5. `newMessage` in `promptAmendCommit` may produce double-trailer if commit already has trailers (Confidence: 80)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, line 309
+
+The trailer is appended as:
+```go
+newMessage := fmt.Sprintf("%s\n\n%s: %s\n", strings.TrimRight(headCommit.Message, "\n"), trailers.CheckpointTrailerKey, checkpointIDStr)
+```
+
+If the commit message already has a trailer block (e.g., `Signed-off-by`), this adds a blank line before the new trailer, which makes git treat them as separate paragraphs rather than a single trailer block. The `Entire-Checkpoint` trailer would not be recognized as a proper git trailer by tools like `git log --format='%(trailers)'`.
+
+**Fix:** Check if the message already ends with trailers (no blank line separation needed) or use `git interpret-trailers` to add it properly:
+
+```go
+cmd := exec.CommandContext(ctx, "git", "interpret-trailers",
+    "--trailer", fmt.Sprintf("%s: %s", trailers.CheckpointTrailerKey, checkpointIDStr))
+cmd.Stdin = strings.NewReader(headCommit.Message)
+newMessageBytes, err := cmd.Output()
+```
+
+---
+
+## Summary
+
+The `attach` command implementation is well-structured overall. It correctly uses `paths.WorktreeRoot` for repo-relative paths, uses `NewAccessibleForm` for the interactive prompt, validates the session ID to prevent path traversal, and properly reuses existing strategy/session infrastructure. The `trail_cmd.go` fix to push after update is straightforward and correct.
+
+The main issues are: (1) the Claude-specific project search being called for all agents, (2) missing `t.Parallel()` on one test which is an explicit CLAUDE.md rule, (3) the `--no-gpg-sign` gap on `git commit --amend`, (4) inconsistent error handling for the "not a git repo" case, and (5) potential trailer formatting issues when amending commits that already have trailers.</result>
+<usage><total_tokens>47310</total_tokens><tool_uses>22</tool_uses><duration_ms>82790</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/a27c2d76eb701ad06.output
+
+---
+
+<task-notification>
+<task-id>a35dc0311d4cdfb56</task-id>
+<tool-use-id>toolu_01FnXTTMXXAjmKiMNbouatzQ</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/a35dc0311d4cdfb56.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review PR #688" completed</summary>
+<result>Now I have a comprehensive picture. Let me compile the analysis.
+
+---
+
+## Test Coverage Analysis for PR #688: `entire attach <session-id>`
+
+### 1. Summary
+
+The PR adds a new `entire attach` command with 363 lines of implementation in `attach.go`, 31 lines of new functionality in `transcript.go` (`searchTranscriptInAllProjects`), and 205 lines of tests in `attach_test.go`. The tests cover the happy path, missing session ID, transcript-not-found, and duplicate session detection. However, there are several critical and important gaps, particularly around the new `searchTranscriptInAllProjects` function (completely untested), the `extractFirstPromptFromTranscript`/`extractTextFromMessage` helpers (completely untested), the `promptAmendCommit` flow, and the `condenseAndFinalizeSession` helper. Additionally, most tests do not call `t.Parallel()` despite the project's CLAUDE.md requiring it.
+
+---
+
+### 2. Critical Gaps (Rated 8-10)
+
+**2a. `searchTranscriptInAllProjects` has zero test coverage -- Criticality: 9/10**
+
+This function at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go` lines 43-66 is a fallback path that searches `~/.claude/projects/` for transcript files when the primary path does not exist. It is called from `runAttach` when the initial `os.Stat` fails. It has no tests at all. Failures here would silently prevent attach from working when sessions were started from a different directory -- which is the primary use case this function exists to support.
+
+Tests needed:
+- Transcript found in a subdirectory project folder
+- No matching transcript in any project directory (returns error)
+- Projects directory does not exist (returns error gracefully)
+- Non-directory entries in projects dir are skipped
+
+This function is also hardcoded to `~/.claude/projects/` which is Claude Code-specific. If a different agent is passed, the search will look in the wrong place. This may be intentional (the caller only invokes it as a fallback), but a test would document and lock in that behavior.
+
+**2b. `extractFirstPromptFromTranscript` and `extractTextFromMessage` have zero test coverage -- Criticality: 8/10**
+
+These functions at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go` lines 297-363 parse transcript bytes to extract the first user prompt. They handle two JSON formats (simple string content and array content with text blocks). If these fail silently (returning empty string), the checkpoint commit message will be generic rather than descriptive. More importantly, malformed input could cause unexpected behavior.
+
+Tests needed:
+- Simple string content format (`{"content": "hello"}`)
+- Array content format with text blocks (`{"content": [{"type": "text", "text": "hello"}]}`)
+- Empty transcript bytes
+- Transcript with no user messages
+- Malformed JSON (should return empty string, not panic)
+- Transcript where first user message has array content without any "text" type blocks
+
+---
+
+### 3. Important Improvements (Rated 5-7)
+
+**3a. Missing `t.Parallel()` on 4 of 5 tests -- Criticality: 7/10**
+
+Per CLAUDE.md: "Always use `t.Parallel()` in tests." Only `TestAttach_MissingSessionID` calls `t.Parallel()`. The other four tests (`TestAttach_TranscriptNotFound`, `TestAttach_Success`, `TestAttach_SessionAlreadyTracked`, `TestAttach_OutputContainsCheckpointID`) do not. These tests use `t.Chdir()` and `t.Setenv()` which the CLAUDE.md notes as exceptions -- but the tests should still be consistent with the project pattern. Since `t.Chdir()` and `t.Setenv()` are used, the omission of `t.Parallel()` is actually correct behavior per the exception clause. However, it would be clearer to add a comment explaining why `t.Parallel()` is omitted, as other tests in the codebase do.
+
+Actually, re-reading CLAUDE.md more carefully: "Go's test framework will panic if these are used after `t.Parallel()`." So the omission is correct. Downgrading this to a minor documentation suggestion. **Revised Criticality: 3/10**.
+
+**3b. `promptAmendCommit` flow is untested -- Criticality: 7/10**
+
+This function at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go` lines 221-280 handles:
+- Reading HEAD commit
+- Checking if checkpoint trailer already exists
+- Running `git commit --amend` with the trailer
+- The `--force` flag bypass of the interactive prompt
+- The user-declining path (printing the trailer for manual copy)
+
+The `--force` flag is particularly important to test since it runs `git commit --amend` which modifies git history. A test should verify:
+- Force mode amends the commit correctly with the trailer
+- Already-has-trailer case prints a message and returns nil
+- The amend produces a valid commit message with the trailer
+
+**3c. Invalid agent name is not tested -- Criticality: 5/10**
+
+`runAttach` calls `agent.Get(agentName)` which can return an error for unknown agents. There is no test for passing an invalid agent name like `"nonexistent-agent"`. This would verify the error message is user-friendly.
+
+**3d. `condenseAndFinalizeSession` error paths are untested -- Criticality: 5/10**
+
+This helper at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go` lines 200-219 has multiple `logging.Warn` paths for failures (condensation failure, transition failure, save failure). While these are non-fatal (they log warnings), a test verifying the function returns empty string on condensation failure would document the degraded behavior.
+
+**3e. No test for the `--force` flag at the command level -- Criticality: 6/10**
+
+The `newAttachCmd()` function registers `--force` and `--agent` flags but no test verifies that flag parsing works correctly. A test calling `cmd.SetArgs([]string{"session-id", "--force", "--agent", "gemini"})` would catch flag registration regressions.
+
+---
+
+### 4. Test Quality Issues
+
+**4a. `TestAttach_Success` and `TestAttach_OutputContainsCheckpointID` are near-duplicates**
+
+Both tests set up the same scenario (fake Claude transcript with a Write tool use and a hello.txt file), run `runAttach`, and check output. They differ only in what they assert. These could be consolidated into a single test with multiple assertions, reducing setup duplication and making the test suite faster.
+
+**4b. Transcript content in tests embeds `tmpDir` path directly**
+
+In `TestAttach_Success` and `TestAttach_OutputContainsCheckpointID`, the transcript JSON embeds `tmpDir` in the `file_path` field via string concatenation. This couples the test to the transcript parsing implementation. If the path extraction logic changes (e.g., to use relative paths), these tests would need updating. This is acceptable for now but worth noting.
+
+---
+
+### 5. Positive Observations
+
+- **Session validation is well-tested**: The `ValidateSessionID` function in the validation package has thorough coverage including path traversal attempts, which is security-critical since session IDs are used in file paths.
+- **Already-tracked session guard is tested**: `TestAttach_SessionAlreadyTracked` correctly pre-creates session state and verifies the duplicate detection.
+- **Proper test isolation**: Tests use `t.TempDir()`, `testutil.InitRepo`, and `t.Chdir()` to avoid polluting the real repo -- following the project's testing patterns.
+- **Output verification**: `TestAttach_OutputContainsCheckpointID` uses a regex to verify the 12-hex-char checkpoint ID format, which is a good behavioral assertion.
+- **Pre-existing transcript helper tests are solid**: The `transcript_test.go` file has good coverage of `FindCheckpointUUID`, `TruncateTranscriptAtUUID`, and `GetTranscriptPosition` including edge cases like malformed JSON, empty files, and summary-only transcripts.
+
+---
+
+### Priority Summary
+
+| Gap | Criticality | Effort |
+|-----|------------|--------|
+| Test `searchTranscriptInAllProjects` | 9/10 | Medium -- needs mock filesystem with `.claude/projects/` structure |
+| Test `extractFirstPromptFromTranscript` / `extractTextFromMessage` | 8/10 | Low -- pure functions, easy table-driven tests |
+| Test `promptAmendCommit` with `--force` flag | 7/10 | Medium -- needs git repo setup with a commit |
+| Test invalid agent name error path | 5/10 | Low |
+| Test `condenseAndFinalizeSession` degraded behavior | 5/10 | Medium |</result>
+<usage><total_tokens>39205</total_tokens><tool_uses>20</tool_uses><duration_ms>87734</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/a35dc0311d4cdfb56.output
+
+---
+
+<task-notification>
+<task-id>ab232152912de0a7a</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/ab232152912de0a7a.output</output-file>
+<status>completed</status>
+<summary>Agent "Error handling review PR #688" completed</summary>
+<result>I now have a thorough understanding of the code. Here is my audit.
+
+---
+
+## Error Handling Audit: PR #688 (`entire attach <session-id>`)
+
+### Issue 1: Silent transcript search fallback hides real errors
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 99-103
+
+**Severity:** HIGH
+
+**Issue Description:** When the initial transcript path does not exist, `searchTranscriptInAllProjects` is called as a fallback. If the fallback succeeds, the user is never told that the transcript was found in a *different* project directory than expected. If the fallback fails, its error is silently discarded (`searchErr == nil` branch only).
+
+```go
+if _, statErr := os.Stat(transcriptPath); os.IsNotExist(statErr) {
+    if found, searchErr := searchTranscriptInAllProjects(ctx, sessionID, ag); searchErr == nil {
+        transcriptPath = found
+    }
+}
+```
+
+**Hidden Errors:**
+- Permission errors from `os.ReadDir` on `~/.claude/projects` are silently swallowed
+- `os.UserHomeDir()` failures are silently swallowed
+- The user has no idea the transcript was found in an unexpected location, which could mean they are attaching a session from a completely different project
+
+**User Impact:** If the fallback finds a transcript from an *unrelated* project that happens to share the same session ID format, the user silently attaches the wrong session. If the fallback fails due to permissions, the user sees "transcript not found" with no hint that a broader search was attempted and why it failed.
+
+**Recommendation:** Log the fallback attempt and its result. When the fallback succeeds, log which directory the transcript was found in so users can verify it is the right one. When it fails, log the search error to aid debugging.
+
+```go
+if _, statErr := os.Stat(transcriptPath); os.IsNotExist(statErr) {
+    logging.Debug(logCtx, "transcript not found at primary path, searching all project directories",
+        "primary_path", transcriptPath)
+    if found, searchErr := searchTranscriptInAllProjects(ctx, sessionID, ag); searchErr == nil {
+        logging.Info(logCtx, "found transcript in alternative project directory",
+            "path", found)
+        transcriptPath = found
+    } else {
+        logging.Debug(logCtx, "fallback transcript search failed", "error", searchErr)
+    }
+}
+```
+
+---
+
+### Issue 2: `searchTranscriptInAllProjects` is hardcoded to Claude Code's directory structure
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go`, lines 43-66
+
+**Severity:** HIGH
+
+**Issue Description:** The function hardcodes `~/.claude/projects` as the search path, but the `attach` command supports six different agents. For any non-Claude agent, this function will always fail silently (no matching directory), and the caller silently discards that failure. This is a misleading fallback -- it creates the illusion of a cross-project search but only works for one agent.
+
+**User Impact:** Users of Gemini CLI, OpenCode, Cursor, etc. get no benefit from this fallback search. Worse, if they started a session from a subdirectory, they will see "transcript not found" with no guidance that the search only covers Claude Code.
+
+**Recommendation:** Either (a) make the function agent-aware by delegating to the agent interface for its project directories, or (b) clearly document and guard the function to only be called for Claude Code sessions, and log a warning for other agents explaining why the search is not available.
+
+---
+
+### Issue 3: `os.Stat` only checks for `os.IsNotExist` -- other stat errors are silently ignored
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 99 and 104
+
+**Severity:** MEDIUM
+
+**Issue Description:** Both `os.Stat` calls only check `os.IsNotExist(statErr)`. If `os.Stat` returns a different error (permission denied, symlink loop, etc.), the code falls through silently. On line 99, a permission error means the fallback search is skipped. On line 104, a permission error means the function proceeds as if the file exists, only to fail later at `ReadTranscript` with a confusing error.
+
+**Hidden Errors:** `os.ErrPermission`, symlink resolution errors, filesystem-level I/O errors.
+
+**Recommendation:** Check for any non-nil stat error on line 104, not just `IsNotExist`:
+
+```go
+if _, statErr := os.Stat(transcriptPath); statErr != nil {
+    return fmt.Errorf("transcript not accessible at %s: %w\nIs the session ID correct?", transcriptPath, statErr)
+}
+```
+
+---
+
+### Issue 4: `condenseAndFinalizeSession` swallows multiple errors with only Warn-level logging
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 235-257
+
+**Severity:** CRITICAL
+
+**Issue Description:** This function has **four** error paths, all handled with `logging.Warn` and silent continuation. None of the errors include the actual error value in the log (except the condensation message, which also omits the error). The function's callers have no visibility into what went wrong.
+
+Specific problems:
+1. **Line 238:** `CondenseSessionByID` failure is logged without the error value. The user is told "checkpoint saved on shadow branch only" but gets zero diagnostic information about *why* condensation failed.
+2. **Line 240:** `LoadSessionState` failure after successful condensation is silently ignored -- `checkpointIDStr` stays empty, and the user never gets the checkpoint ID or the amend prompt. The attach appears to succeed but is only half-done.
+3. **Line 245:** A second `LoadSessionState` failure means the session is never transitioned to IDLE. The session stays in ACTIVE phase permanently, which could cause wrong behavior on future interactions.
+4. **Lines 248-252:** Transition and save errors are logged without the error values.
+
+**User Impact:** The user sees "Attached session X" with no checkpoint ID and no amend prompt, but has no idea that condensation failed and their checkpoint is only on the ephemeral shadow branch. If the shadow branch is cleaned up later, their checkpoint is lost. This is the worst kind of silent failure -- the user thinks everything succeeded.
+
+**Recommendation:** At minimum, include error values in all log messages. Consider returning the errors that actually matter (condensation failure should probably be surfaced to the user, not silently downgraded):
+
+```go
+func condenseAndFinalizeSession(ctx context.Context, strat *strategy.ManualCommitStrategy, sessionID string) (string, error) {
+    var checkpointIDStr string
+    if err := strat.CondenseSessionByID(ctx, sessionID); err != nil {
+        logging.Error(ctx, "failed to condense session", "error", err, "session_id", sessionID)
+        return "", fmt.Errorf("failed to condense session to permanent storage: %w", err)
+    }
+
+    condensedState, loadErr := strategy.LoadSessionState(ctx, sessionID)
+    if loadErr != nil {
+        logging.Error(ctx, "failed to load session state after condensation", "error", loadErr, "session_id", sessionID)
+    } else if condensedState != nil {
+        checkpointIDStr = condensedState.LastCheckpointID.String()
+    }
+    // ... transition logic with error values in logs ...
+    return checkpointIDStr, nil
+}
+```
+
+And the caller should handle the error:
+
+```go
+checkpointIDStr, condenseErr := condenseAndFinalizeSession(logCtx, strat, sessionID)
+// Print confirmation, but warn user if condensation failed
+if condenseErr != nil {
+    fmt.Fprintf(w, "  Warning: checkpoint saved on shadow branch only (condensation failed)\n")
+    fmt.Fprintf(w, "  Run 'entire attach %s' again after resolving the issue\n", sessionID)
+}
+```
+
+---
+
+### Issue 5: `extractFirstPromptFromTranscript` silently returns empty string on parse error
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 321-335
+
+**Severity:** MEDIUM
+
+**Issue Description:** If `transcript.ParseFromBytes(data)` fails (corrupt transcript, wrong format, encoding issues), the function returns an empty string with no logging. The caller uses this to build a commit message, so the user gets a generic "Checkpoint from <agent>" message instead of their actual prompt. No one is informed that the transcript was unparseable.
+
+**Hidden Errors:** JSON parse errors, encoding issues, truncated files, wrong transcript format for the specified agent.
+
+**User Impact:** The checkpoint commit message is generic and unhelpful. The user does not know their transcript may be corrupt or in the wrong format.
+
+**Recommendation:** Log transcript parse failures:
+
+```go
+func extractFirstPromptFromTranscript(ctx context.Context, data []byte) string {
+    lines, err := transcript.ParseFromBytes(data)
+    if err != nil {
+        logging.Warn(ctx, "failed to parse transcript for prompt extraction", "error", err)
+        return ""
+    }
+    // ...
+}
+```
+
+---
+
+### Issue 6: `AbsPath` failure silently falls back to relative path
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 149-152
+
+**Severity:** MEDIUM
+
+**Issue Description:** When `paths.AbsPath` fails, the code silently falls back to using the relative `sessionDir` as `sessionDirAbs`. This is misleading because the variable is named `sessionDirAbs` but may contain a relative path. Subsequent operations (`os.MkdirAll`, `filepath.Join`) will use CWD-relative paths, which could create directories in the wrong location.
+
+```go
+sessionDirAbs, err := paths.AbsPath(ctx, sessionDir)
+if err != nil {
+    sessionDirAbs = sessionDir  // silently use relative path
+}
+```
+
+**Hidden Errors:** Any error from `AbsPath` (missing git common dir, etc.).
+
+**User Impact:** Session metadata could be written to the wrong directory. The user sees success but the checkpoint data is in an unexpected location and may not be found later.
+
+**Recommendation:** This should be a hard error, not a silent fallback:
+
+```go
+sessionDirAbs, err := paths.AbsPath(ctx, sessionDir)
+if err != nil {
+    return fmt.Errorf("failed to resolve session directory path: %w", err)
+}
+```
+
+---
+
+### Issue 7: `strategy.EnsureSetup` failure is silently swallowed
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 143-145
+
+**Severity:** HIGH
+
+**Issue Description:** If `strategy.EnsureSetup` fails, the code logs a warning and continues. But `EnsureSetup` presumably sets up the strategy infrastructure needed for `SaveStep` and `CondenseSessionByID` to work. If setup fails, subsequent operations will likely fail too, but with confusing errors that do not point back to the root cause (missing setup).
+
+```go
+if err := strategy.EnsureSetup(ctx); err != nil {
+    logging.Warn(logCtx, "failed to ensure strategy setup")
+}
+```
+
+Note the error value is not included in the log message either.
+
+**User Impact:** The user hits a cascade of confusing errors from `SaveStep` or `CondenseSessionByID`, when the real problem was that strategy setup failed.
+
+**Recommendation:** Either return the error (preferred) or at minimum include the error value in the log:
+
+```go
+if err := strategy.EnsureSetup(ctx); err != nil {
+    return fmt.Errorf("failed to set up strategy: %w", err)
+}
+```
+
+---
+
+### Issue 8: `DetectFileChanges` failure is silently downgraded
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 125-128
+
+**Severity:** MEDIUM
+
+**Issue Description:** If `DetectFileChanges` fails, the code logs a warning (without the error value) and continues with `changes == nil`. This means the checkpoint will only contain transcript-extracted files, missing any actual git status changes. The user is told "Checkpoint saved (transcript only, no uncommitted file changes detected)" which is misleading -- it is not that no changes were detected, it is that detection failed.
+
+**User Impact:** The user thinks there are no uncommitted changes when in reality the detection failed. The checkpoint may be incomplete.
+
+**Recommendation:** Include the error in the log and consider whether this should be a hard failure or at least a user-visible warning:
+
+```go
+changes, err := DetectFileChanges(ctx, nil)
+if err != nil {
+    logging.Warn(logCtx, "failed to detect file changes, checkpoint may be incomplete", "error", err)
+}
+```
+
+---
+
+### Issue 9: Missing error value in `logging.Warn` calls throughout
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 118, 127, 144, 238, 249, 252
+
+**Severity:** HIGH (cumulative)
+
+**Issue Description:** Six `logging.Warn` calls omit the actual error value. The log messages describe what failed but provide zero diagnostic information about *why*. Compare line 225 which correctly includes `"error", err` with lines 118, 127, 144, 238, 249, and 252 which do not.
+
+**Affected lines:**
+- Line 118: `logging.Warn(logCtx, "failed to extract modified files from transcript")` -- missing `"error", fileErr`
+- Line 127: `logging.Warn(logCtx, "failed to detect file changes")` -- missing `"error", err`
+- Line 144: `logging.Warn(logCtx, "failed to ensure strategy setup")` -- missing `"error", err`
+- Line 238: `logging.Warn(ctx, "failed to condense session — checkpoint saved on shadow branch only")` -- missing `"error", err`
+- Line 249: `logging.Warn(ctx, "failed to transition session to idle")` -- missing `"error", transErr`
+- Line 252: `logging.Warn(ctx, "failed to save session state after transition")` -- missing `"error", saveErr`
+
+**User Impact:** When debugging issues in production, the log files will show *that* something failed but not *why*. This makes debugging significantly harder, especially for the condensation and session state errors which are already silently swallowed.
+
+**Recommendation:** Add `"error", <err_variable>` to every `logging.Warn` call.
+
+---
+
+### Issue 10: `state != nil` check after `LoadSessionState` succeeds without error -- silent no-op if nil
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 178-188
+
+**Severity:** MEDIUM
+
+**Issue Description:** After `InitializeSession` succeeds, the code loads the session state and checks `if state != nil`. If the session was just initialized but `LoadSessionState` returns nil (no error, but nil state), the attach-specific metadata update is silently skipped. The user gets no indication that their `CLIVersion` and `TranscriptPath` were not saved.
+
+```go
+state, err := strategy.LoadSessionState(ctx, sessionID)
+if err != nil {
+    return fmt.Errorf("failed to load session state: %w", err)
+}
+if state != nil {  // What if state is nil here? Silent skip.
+    state.CLIVersion = versioninfo.Version
+    // ...
+}
+```
+
+**User Impact:** Session metadata may be incomplete without any indication.
+
+**Recommendation:** If state is nil immediately after initialization, that is a bug and should be treated as an error:
+
+```go
+if state == nil {
+    return fmt.Errorf("session state not found after initialization (session_id=%s)", sessionID)
+}
+```
+
+---
+
+### Issue 11: `promptAmendCommit` failure shows fallback but logging.Warn omits user-facing context
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, lines 224-227
+
+**Severity:** LOW (well handled, minor improvement possible)
+
+**Issue Description:** This is actually one of the better-handled error paths. When `promptAmendCommit` fails, the error is logged and the user gets a manual fallback with the checkpoint ID. However, the user does not know *why* the amend failed. Was it a git hook? A permission issue? A detached HEAD?
+
+**Recommendation:** Print a brief reason to the user:
+
+```go
+if err := promptAmendCommit(ctx, w, checkpointIDStr, force); err != nil {
+    logging.Warn(logCtx, "failed to amend commit", "error", err)
+    fmt.Fprintf(w, "\nCould not amend commit automatically: %v\n", err)
+    fmt.Fprintf(w, "Copy to your commit message to attach:\n\n  Entire-Checkpoint: %s\n", checkpointIDStr)
+}
+```
+
+---
+
+### Summary
+
+| # | Location | Severity | Issue |
+|---|----------|----------|-------|
+| 1 | attach.go:99-103 | HIGH | Silent transcript search fallback discards errors |
+| 2 | transcript.go:43-66 | HIGH | Fallback search hardcoded to Claude Code only |
+| 3 | attach.go:99,104 | MEDIUM | `os.Stat` only checks `IsNotExist`, ignores other errors |
+| 4 | attach.go:235-257 | CRITICAL | `condenseAndFinalizeSession` swallows 4 errors silently |
+| 5 | attach.go:321-335 | MEDIUM | Transcript parse failure returns empty string with no logging |
+| 6 | attach.go:149-152 | MEDIUM | `AbsPath` failure silently falls back to relative path |
+| 7 | attach.go:143-145 | HIGH | `EnsureSetup` failure swallowed, causes cascading errors |
+| 8 | attach.go:125-128 | MEDIUM | `DetectFileChanges` failure misleads user about changes |
+| 9 | attach.go (6 lines) | HIGH | Six `logging.Warn` calls omit actual error values |
+| 10 | attach.go:178-188 | MEDIUM | Nil state after init silently skips metadata update |
+| 11 | attach.go:224-227 | LOW | Amend failure does not tell user why it failed |
+
+The most critical fix is **Issue 4** (`condenseAndFinalizeSession`). This function is the heart of the attach operation -- it moves the checkpoint from the ephemeral shadow branch to permanent storage. When it fails silently, the user believes the attach succeeded, but their checkpoint is at risk of being lost when the shadow branch is cleaned up. The user must be informed when condensation fails.
+
+The second priority is **Issue 9** (missing error values in logs). Every single `logging.Warn` call in this PR (except one on line 225) omits the error value. This makes production debugging nearly impossible and should be a mechanical fix across all six locations.</result>
+<usage><total_tokens>36320</total_tokens><tool_uses>10</tool_uses><duration_ms>106730</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/ab232152912de0a7a.output
+
+---
+
+<task-notification>
+<task-id>a6d4f79413728431c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/a6d4f79413728431c.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment analysis PR #688" completed</summary>
+<result>Good. The agent list matches the registry. Now let me check whether the `Long` help mentions "cursor" but the registry uses `cursor` -- yes both match. Let me also look at the `--agent` flag help text which duplicates the agent list (line 54 vs line 43). Now let me also verify what happens with the unused `_` context in `searchTranscriptInAllProjects`.
+
+I have all the information needed for a thorough analysis.
+
+---
+
+**Summary**
+
+I reviewed all comments in the three key files introduced by this PR: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`, `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach_test.go`, and `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go`. The analysis covers doc comments, inline comments, and the command help text. Overall, most comments are reasonable, but there are several accuracy issues ranging from a stale/misleading comment about Claude Code-specific behavior on a generic function, to a doc comment on `CondenseSessionByID` that does not reflect its new caller.
+
+---
+
+**Critical Issues**
+
+1. **Location**: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go:38-42`
+   - **Issue**: The `searchTranscriptInAllProjects` doc comment says it searches "all agent project directories" but the implementation hardcodes `~/.claude/projects` (line 49). This path is Claude Code-specific. If any other agent is passed (gemini, opencode, cursor, copilot-cli, factoryai-droid), the function will search Claude Code's directory structure using the other agent's `ResolveSessionFile` -- which is semantically wrong and will never find anything useful. The function name and comment both claim generality ("all agent project directories") that the code does not deliver.
+   - **Suggestion**: Either (a) rename the function to `searchTranscriptInClaudeProjects` and document that this is a Claude Code-specific fallback, or (b) make the function actually agent-generic by having each agent expose its own project-discovery directory. The comment should match whichever approach is chosen.
+
+2. **Location**: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go:41`
+   - **Issue**: The comment mentions "sessions started from subdirectories, parent directories, or entirely different paths are stored under different project directory names." The commit `424e1075` ("Look for session id in any folder - not just subdirs") was specifically about broadening beyond subdirectories, but the comment still leads with the "subdirectories" framing. While it does also mention "parent directories, or entirely different paths," the emphasis on subdirectories as the primary case is a residual artifact of the pre-424e1075 version. The function now searches ALL project directories indiscriminately, so the more accurate framing is simply: "the session may be stored under any project directory, not just the one matching the current repo root."
+   - **Suggestion**: Rewrite to: "This handles cases where the session was started from a different working directory than the current repo root. Claude Code uses the cwd-based project directory, so the transcript may be stored under any project directory name."
+
+---
+
+**Improvement Opportunities**
+
+1. **Location**: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:233-234`
+   - **Current state**: The doc comment says "condenses the session to permanent storage and transitions it to IDLE." This is accurate for the IDLE transition, but it omits that it also sets `LastInteractionTime`. More importantly, the function returns the checkpoint ID as a side effect, which the doc comment does mention via "Returns the checkpoint ID string."
+   - **Suggestion**: Consider noting that this function also sets `LastInteractionTime` to `time.Now()`, since that is a meaningful side effect that affects session timeout behavior.
+
+2. **Location**: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:96-98`
+   - **Current state**: The inline comment says "Claude Code uses cwd (not repo root) for its project directory, so if the session was started from a different directory, the repo-root-based path won't exist. Search across all project directories to find the transcript." This is a duplicate of the doc comment on `searchTranscriptInAllProjects` itself. Having the same explanation in two places increases comment maintenance burden.
+   - **Suggestion**: Shorten the call-site comment to something like: "Fallback: search all Claude project directories if repo-root-based path doesn't exist." Let the function's own doc comment carry the detailed explanation.
+
+3. **Location**: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:53`
+   - **Current state**: The `--force` flag description says "Amend the last commit with the checkpoint trailer" but this undersells what `--force` actually does -- it skips the interactive confirmation prompt. The description reads as if `--force` is the only way to amend, when in fact the default behavior is to interactively ask whether to amend.
+   - **Suggestion**: Change to "Amend the last commit with the checkpoint trailer without prompting" or "Skip confirmation and amend the last commit with the checkpoint trailer."
+
+4. **Location**: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:124`
+   - **Current state**: Comment says "no pre-untracked filter since we don't know pre-state" which explains why `nil` is passed to `DetectFileChanges`. This is good "why" documentation, but the parenthetical is somewhat cryptic for someone unfamiliar with the `DetectFileChanges` API.
+   - **Suggestion**: Slightly expand: "Pass nil for previouslyUntracked since attach has no pre-session snapshot of untracked files."
+
+5. **Location**: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:171`
+   - **Current state**: The comment says "Initialize session state BEFORE SaveStep so it exists when SaveStep loads it." This is valuable ordering documentation.
+   - **Suggestion**: No change needed -- this is a good example of documenting a non-obvious ordering constraint. Mentioned here as a positive finding.
+
+6. **Location**: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go:18-20`
+   - **Current state**: The constant alias comment says "aliases to transcript package for local use" but only `transcriptTypeUser` is defined. If only one constant is aliased, the `const ( )` block with a comment about "aliases" (plural) is slightly misleading.
+   - **Suggestion**: Either add the other type constants that are used locally, or simplify to a single `const transcriptTypeUser = transcript.TypeUser` with a comment like "Alias for local use."
+
+---
+
+**Recommended Removals**
+
+1. **Location**: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:59-60`
+   - **Comment**: `// Validate session ID format`
+   - **Rationale**: The next line is `validation.ValidateSessionID(sessionID)`. The comment restates what the code already says clearly. Similarly, lines 62 (`// Ensure we're in a git repo`), 66 (`// Check session isn't already tracked`), 79 (`// Resolve agent and transcript path`), 102 (`// Read transcript data`), and 136 (`// Ensure strategy setup`) all restate the immediately following code. These "section header" comments have marginal value -- the code is already self-documenting.
+   - **Note**: This is a style preference; some teams prefer section headers for scanability. If that is the project convention, these are fine to keep.
+
+---
+
+**Positive Findings**
+
+1. `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:171` -- "Initialize session state BEFORE SaveStep so it exists when SaveStep loads it" documents a critical ordering dependency that is not obvious from the code alone. This is exactly the kind of "why" comment that prevents future bugs.
+
+2. `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:259-260` -- The `promptAmendCommit` doc comment accurately describes both the normal behavior (interactive prompt) and the force behavior (amend without prompting). The function signature and behavior match.
+
+3. `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:320` -- "extractFirstPromptFromTranscript reads transcript bytes and returns the first user prompt" is accurate -- the function parses bytes via `transcript.ParseFromBytes`, iterates lines filtering on `Type == "user"`, and returns the first text content found.
+
+4. `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:337-339` -- The inline comments "Try string content first (simple user messages)" and "Try array content (messages with tool results, text blocks, etc.)" in `extractTextFromMessage` accurately describe the two JSON shapes being attempted and help a reader understand the dual-format transcript structure.
+
+5. `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach_test.go:194` -- The `enableEntire` helper has a clear, accurate doc comment explaining what it does and why.
+
+---
+
+**Additional Observation (Not a Comment Issue)**
+
+The `CondenseSessionByID` function at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go:760-761` has a doc comment saying "This is used by 'entire doctor' to salvage stuck sessions." With this PR, `entire attach` is now also a caller. While updating that doc comment is outside the strict scope of these three files, it will become stale/incomplete once this PR merges. Consider adding "Also used by 'entire attach' to condense newly attached sessions."</result>
+<usage><total_tokens>53965</total_tokens><tool_uses>25</tool_uses><duration_ms>125947</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/a6d4f79413728431c.output
+
+---
+
+Fix the issues found for this PR as listed above
+
+---
+
+claude plugin install code-simplifier@claude-plugins-official
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>ad80d75761b014317</task-id>
+<tool-use-id>toolu_01D2gd2iKDGhd2nSdigdg4cZ</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/ad80d75761b014317.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Here are my efficiency findings for the changed files:
+
+## Efficiency Review: attach.go and transcript.go
+
+### 1. Double `LoadSessionState` in `condenseAndFinalizeSession` (attach.go:249, 256)
+
+**Severity: Important**
+
+`condenseAndFinalizeSession` calls `strategy.LoadSessionState(ctx, sessionID)` twice in succession -- once after condensation to extract the checkpoint ID (line 249), and again immediately after to do the finalization/transition (line 256). These two calls both read the same file from `.git/entire-sessions/`. The second load could reuse the state from the first:
+
+```go
+// Current: two separate file reads
+condensedState, loadErr := strategy.LoadSessionState(ctx, sessionID)  // read 1
+// ... extract checkpointIDStr ...
+
+finalState, loadErr := strategy.LoadSessionState(ctx, sessionID)       // read 2 (same file)
+```
+
+The state loaded at line 249 (in the success path) is the same object that would be loaded at line 256. The second load is only needed independently when condensation *fails* (since the first load is inside the `else` branch). A single load after the condense attempt would suffice for both purposes.
+
+### 2. Double `os.Stat` on `transcriptPath` (attach.go:98, 108)
+
+**Severity: Minor (acceptable)**
+
+When the initial `os.Stat` fails and the Claude Code fallback search also fails (or agent is not Claude Code), the code does a second `os.Stat` on the same unchanged `transcriptPath`. This is a cheap syscall and provides clean control flow, so this is acceptable -- just noting it for completeness.
+
+### 3. `searchTranscriptInClaudeProjects` linear scan (transcript.go:54-62)
+
+**Severity: Suggestion**
+
+The function iterates all directories under `~/.claude/projects/` and stats a candidate path in each one. For users with many projects this could be slow, though in practice the number of project directories is typically small. No action needed, but worth noting that if this ever becomes a hot path, a direct path computation (encoding the cwd into the expected project directory name) would be O(1) instead of O(n).
+
+### 4. `resolveTranscriptPath` calls `paths.WorktreeRoot` redundantly (transcript.go:26)
+
+**Severity: Minor**
+
+The caller `runAttach` already calls `paths.WorktreeRoot(ctx)` at line 67 and has `repoRoot` available. Then `resolveTranscriptPath` calls it again internally. The repo root could be passed as a parameter to avoid the duplicate call. This is a minor filesystem/git operation repeated unnecessarily.
+
+### Summary
+
+The only finding worth acting on is **item 1** -- the double `LoadSessionState` in `condenseAndFinalizeSession`. The fix is straightforward: load the session state once after the condense attempt, then use that single loaded state for both extracting the checkpoint ID and performing the finalization transition. The other items are minor or acceptable as-is.</result>
+<usage><total_tokens>27281</total_tokens><tool_uses>2</tool_uses><duration_ms>23418</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/ad80d75761b014317.output
+
+---
+
+<task-notification>
+<task-id>ae7541ff431ca9f42</task-id>
+<tool-use-id>toolu_01FGGrkHmGpL36QyvyKyK5x5</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/ae7541ff431ca9f42.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>Good. Now I have enough context to report my findings.
+
+---
+
+## Code Reuse Review Findings
+
+### Files Analyzed
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go`
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go`
+
+### Finding 1: `searchTranscriptInClaudeProjects` duplicates path logic from `claudecode.GetSessionDir`
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/transcript.go:48`
+
+The function hardcodes `filepath.Join(homeDir, ".claude", "projects")` to locate Claude's projects directory. The `claudecode.ClaudeCodeAgent.GetSessionDir` method at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/agent/claudecode/claude.go:104` constructs the same base path (`filepath.Join(homeDir, ".claude", "projects", projectDir)`). Similarly, `paths.ClaudeProjectDir` at `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/paths/paths.go:165` also builds this path.
+
+If Claude Code ever changes its storage location (or the test override logic via `ENTIRE_TEST_CLAUDE_PROJECT_DIR` changes), this hardcoded path in `searchTranscriptInClaudeProjects` would silently diverge. The function also bypasses the test environment override that `GetSessionDir` respects.
+
+**Suggestion:** Extract the Claude projects base directory as a shared constant or helper in the `claudecode` or `paths` package, and have `searchTranscriptInClaudeProjects` use it. This also makes the function testable without touching the real filesystem.
+
+### Finding 2: Transcript fallback search only used in `attach.go` -- other callers may need it
+
+**Files:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go:97-106`, `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/resume.go:530`, `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/rewind.go:641-759`
+
+The `resolveTranscriptPath` + fallback `searchTranscriptInClaudeProjects` pattern is only applied in `attach.go`. However, `resume.go` (line 530) and `rewind.go` (lines 641, 675, 716, 759) also call `resolveTranscriptPath` without any Claude-specific fallback. If the same cwd-mismatch problem can occur in those flows, they would fail where `attach` now succeeds.
+
+**Suggestion:** Consider moving the fallback logic into `resolveTranscriptPath` itself (or a wrapper like `resolveTranscriptPathWithFallback`) so all callers benefit. The agent-type check (`agentName == agent.AgentNameClaudeCode`) could be handled by checking if the agent implements a specific interface or by always trying the fallback for agents whose `GetSessionDir` is cwd-dependent.
+
+### Finding 3: No duplication concern with `condenseAndFinalizeSession`
+
+The `condenseAndFinalizeSession` function in `attach.go` orchestrates condense + state load + phase transition + state save. While `doctor.go` (lines 126, 153) also calls `CondenseSessionByID`, it does not perform the transition-to-idle step. The `lifecycle.go` stop handler (line 767) does a `TurnEnd` transition but in a completely different context. The `attach.go` function is sufficiently unique in its composition that extracting a shared helper would not reduce complexity.
+
+**No action needed.**
+
+### Finding 4: No duplication in the improved error handling
+
+The changes to error propagation (returning errors instead of swallowing them, adding `"error"` attributes to logging calls) are straightforward improvements with no existing utility to reuse. These are clean.
+
+**No action needed.**
+
+### Summary
+
+- **1 moderate reuse concern**: Hardcoded `~/.claude/projects` path in `searchTranscriptInClaudeProjects` duplicates knowledge from `claudecode.GetSessionDir` and `paths.ClaudeProjectDir`, bypassing the test override.
+- **1 broader reuse opportunity**: The Claude-specific transcript fallback search benefits only `attach.go` callers, while `resume.go` and `rewind.go` face the same potential failure mode without it.
+- **No duplication** found in `condenseAndFinalizeSession` or the error-handling improvements.</result>
+<usage><total_tokens>32234</total_tokens><tool_uses>16</tool_uses><duration_ms>64960</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/ae7541ff431ca9f42.output
+
+---
+
+<task-notification>
+<task-id>a6583ba3012d102a0</task-id>
+<tool-use-id>toolu_012v695C9HyhVVbVKtC1NYtF</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/a6583ba3012d102a0.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Here are my findings on the five code quality dimensions you asked about.
+
+---
+
+## Findings
+
+### 1. Redundant State / Duplicate Loads
+
+**`condenseAndFinalizeSession` loads session state twice in the success path (lines 249 and 256).**
+
+When `CondenseSessionByID` succeeds, `LoadSessionState` is called at line 249 to read `LastCheckpointID`, and then called again immediately at line 256 to set `LastInteractionTime` and transition to IDLE. These are back-to-back loads of the same session ID with no intervening mutation by another caller. The state loaded at line 249 could simply be reused for the finalization block, eliminating one filesystem round-trip.
+
+Additionally, in `runAttach`, `LoadSessionState` is called at line 181 right after `InitializeSession` (line 176). Then `condenseAndFinalizeSession` loads it again (up to two more times). That is three to four loads of the same session state within a single `runAttach` call. The session ID is the same throughout; passing the state object downstream would remove redundant I/O.
+
+**Severity:** Minor (correctness is fine, but wasteful and obscures data flow).
+
+---
+
+### 2. Parameter Sprawl
+
+No significant parameter sprawl issues in the changed code. `runAttach` has five parameters which is reasonable for a command entry point. `condenseAndFinalizeSession` has three parameters. No concerns here.
+
+---
+
+### 3. Copy-Paste with Slight Variation
+
+**The error-handling pattern in `condenseAndFinalizeSession` (lines 245-267) is repetitive.**
+
+The function has two nearly identical blocks:
+
+```go
+if state, err := strategy.LoadSessionState(ctx, sessionID); err != nil {
+    logging.Warn(ctx, "failed to load session state ...", "error", err, "session_id", sessionID)
+} else if state != nil {
+    // do something with state
+}
+```
+
+This pattern appears twice with only the "do something" body differing. As noted in finding 1, these could be collapsed into a single load.
+
+---
+
+### 4. Leaky Abstractions
+
+**`searchTranscriptInClaudeProjects` hardcodes `~/.claude/projects` path structure (line 48 of transcript.go).**
+
+The function knows the internal directory layout of Claude Code's session storage (`homeDir/.claude/projects`). This knowledge should arguably live in the Claude Code agent implementation, not in the `cli` package. The agent interface has `GetSessionDir` and `ResolveSessionFile` but no method like `SearchAllSessionDirs`. If another agent later uses a similar cwd-based project directory scheme, this function cannot be reused without modification -- yet its previous name (`searchTranscriptInAllProjects`) already hit this exact problem and was narrowed.
+
+The caller in `attach.go` line 99 also checks `agentName == agent.AgentNameClaudeCode` directly, coupling the attach logic to a specific agent identity. A cleaner approach would be an optional interface method (e.g., `TranscriptSearcher`) that agents can implement if they support multi-directory search, avoiding the type check entirely.
+
+**Severity:** Moderate. The current approach works but will need refactoring if additional agents have similar behavior.
+
+---
+
+### 5. Stringly-Typed Code
+
+**`extractFirstPromptFromTranscript` uses `line.Type == "user"` (line 340 of attach.go) while the same file defines `transcriptTypeUser` as a constant (line 20 of transcript.go).**
+
+The constant `transcriptTypeUser` (aliased from `transcript.TypeUser`) exists specifically for this purpose, yet `extractFirstPromptFromTranscript` compares against the raw string `"user"` instead of using the constant. This is inconsistent with `FindCheckpointUUID` in the same file which correctly uses `transcriptTypeUser`.
+
+Similarly, `block.Type == "text"` on line 369 and `block.Type == "tool_result"` on line 101 are bare strings. If constants exist for these content block types in the transcript package, they should be used; if they don't exist, they should be introduced.
+
+**Severity:** Low but a consistency issue within the same file.
+
+---
+
+## Summary
+
+| Category | Issue | Severity |
+|---|---|---|
+| Redundant state | `LoadSessionState` called 3-4 times for same session in single `runAttach` flow | Minor |
+| Copy-paste variation | Two near-identical load-and-handle blocks in `condenseAndFinalizeSession` | Minor |
+| Leaky abstraction | Claude-specific path knowledge in `cli` package; agent identity check in attach logic | Moderate |
+| Stringly-typed | `"user"` string literal used instead of `transcriptTypeUser` constant | Low |
+| Parameter sprawl | No issues found | N/A |</result>
+<usage><total_tokens>29626</total_tokens><tool_uses>6</tool_uses><duration_ms>43132</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/043d5e84-d945-425a-8479-8fccab0a38c3/tasks/a6583ba3012d102a0.output
