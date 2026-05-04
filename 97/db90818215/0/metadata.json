@@ -1,0 +1,141 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "97db90818215",
+  "session_id": "019dbe83-f950-7480-a143-6872760439b2",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-24T08:33:20.157182Z",
+  "branch": "fix/codex-token-counts",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "cmd/entire/cli/agent/codex/transcript.go",
+    "cmd/entire/cli/agent/codex/transcript_test.go"
+  ],
+  "agent": "Codex",
+  "model": "gpt-5.5",
+  "turn_id": "7d9a2d14e5e7",
+  "token_usage": {
+    "input_tokens": 293362,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 8748928,
+    "output_tokens": 23327,
+    "api_call_count": 79
+  },
+  "session_metrics": {
+    "turn_count": 5
+  },
+  "summary": {
+    "intent": "Investigate and fix miscounted Codex token usage totals being displayed/stored by the Entire CLI.",
+    "outcome": "Identified that Codex reports cached_input_tokens as a subset of input_tokens (and reasoning_output_tokens as a subset of output_tokens), while the code was treating them as additive. Fixed the normalization in the Codex transcript parser, added regression tests, and committed the change on branch fix/codex-token-counts. The PR push was not shown in the transcript.",
+    "learnings": {
+      "repo": [
+        "The shared agent.TokenUsage model is additive (InputTokens + CacheCreationTokens + CacheReadTokens + OutputTokens = total) and has no TotalTokens field; display/reporting sums the components.",
+        "Codex uses inclusive fields (cached_input_tokens ⊂ input_tokens, reasoning_output_tokens ⊂ output_tokens, total_tokens = input_tokens + output_tokens), requiring a normalization step before entering the shared model — unlike Claude which uses separate additive buckets.",
+        "TestGroupCommitsByDay_SortsNewestFirst is a pre-existing timezone-sensitive test that fails under Australia/Melbourne local time because UTC timestamps straddle midnight differently; it passes under TZ=UTC.",
+        "mise run check runs gofmt, golangci-lint, integration/race tests, and deterministic E2E canaries (Vogon agent); mise run test is the unit-only path.",
+        "Codex transcript token_count events include both cumulative and per-step (last_token_usage) fields; checkpoint-scoped deltas require subtracting a baseline."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/agent/codex/transcript.go",
+          "line": 240,
+          "end_line": 262,
+          "finding": "Normalization of Codex inclusive token fields into Entire's additive model: InputTokens = input_tokens_delta - cached_input_tokens_delta, CacheReadTokens = cached_input_tokens_delta, OutputTokens = output_tokens_delta."
+        },
+        {
+          "path": "cmd/entire/cli/agent/codex/transcript_test.go",
+          "line": 96,
+          "end_line": 128,
+          "finding": "New regression tests assert that summed Entire fields equal Codex's total_tokens, including the checkpoint-offset (delta) case."
+        },
+        {
+          "path": "cmd/entire/cli/agent/token_usage.go",
+          "finding": "Shared TokenUsage struct has no TotalTokens field; total is always computed by summing component fields, so any agent feeding this model must use additive (non-overlapping) buckets."
+        }
+      ],
+      "workflow": [
+        "TDD was used: failing tests encoding the correct invariant were written before touching production code, confirming the overcount before fixing it.",
+        "Codex's own total_tokens field serves as a useful test oracle to validate normalization correctness.",
+        "Sandbox permission issues blocking Go build cache required re-running commands with escalation; this was a recurring pattern across multiple mise runs.",
+        "Staged only the two relevant files (transcript.go, transcript_test.go) explicitly to avoid including the pre-existing unrelated .opencode/package-lock.json change."
+      ]
+    },
+    "friction": [
+      "Sandbox blocked Go build cache writes multiple times, requiring escalated reruns of mise run check and mise run test.",
+      "Pre-existing timezone-sensitive test failure (TestGroupCommitsByDay_SortsNewestFirst) polluted full suite runs in Melbourne local time, requiring TZ=UTC workaround.",
+      "Unrelated gofmt issue in .worktrees/2/.../common_test.go caused mise run lint to fail even though golangci-lint itself reported 0 issues.",
+      "Two competing Codex transcript token formats exist in-tree (payload-level fields vs info.total_token_usage), requiring careful investigation to determine which the current CLI version (0.124.0) actually emits."
+    ],
+    "open_items": [
+      "Pre-existing bug: TestGroupCommitsByDay_SortsNewestFirst uses t.Local() and fails in non-UTC timezones (e.g. Australia/Melbourne); needs fix to use UTC timestamps in test fixtures.",
+      "Unrelated .opencode/package-lock.json modification left uncommitted in the worktree.",
+      "Unrelated gofmt violation in .worktrees/2/.../common_test.go needs formatting.",
+      "PR was not pushed or opened — the transcript ends at the commit step."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-24T08:32:44.369989Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 19,
+    "total_committed": 0,
+    "total_lines_changed": 19,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 36,
+      "user_lines_removed": 27,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".opencode/package-lock.json": 8,
+        "cmd/entire/cli/agent/codex/transcript.go": 17,
+        "cmd/entire/cli/agent/codex/transcript_test.go": 11
+      },
+      "user_removed_per_file": {
+        ".opencode/package-lock.json": 8,
+        "cmd/entire/cli/agent/codex/transcript.go": 10,
+        "cmd/entire/cli/agent/codex/transcript_test.go": 9
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 36,
+      "agent_lines_removed": 27
+    },
+    {
+      "checkpoint_number": 3,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 36,
+      "agent_lines_removed": 27
+    },
+    {
+      "checkpoint_number": 4,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 36,
+      "agent_lines_removed": 27
+    },
+    {
+      "checkpoint_number": 5,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 36,
+      "agent_lines_removed": 27
+    },
+    {
+      "checkpoint_number": 6,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 36,
+      "agent_lines_removed": 27
+    }
+  ]
+}
