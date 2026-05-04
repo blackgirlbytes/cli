@@ -1,0 +1,83 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "9872a596d85e",
+  "session_id": "46b6f0ad-8975-4306-94a6-56bf49f213dd",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-26T23:18:49.440241Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 2,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "7ca9246b0f1f",
+  "token_usage": {
+    "input_tokens": 6468,
+    "cache_creation_tokens": 215392,
+    "cache_read_tokens": 19014663,
+    "output_tokens": 82445,
+    "api_call_count": 139
+  },
+  "session_metrics": {
+    "turn_count": 18
+  },
+  "summary": {
+    "intent": "Build a full interactive TUI dashboard for the memory-loop system using Charmbracelet/bubbletea libraries, replacing plain text output with a tab-based interface for browsing, managing, and configuring memory records.",
+    "outcome": "A bubbletea TUI was scaffolded and iteratively improved across multiple fix cycles. Core structure with 4 tabs (Memories, Injection, History, Settings) was built, but the session ended mid-fix with ongoing issues around border visibility, settings key handling, and injection tab overflow.",
+    "learnings": {
+      "repo": [
+        "The project uses a `termstyle` package for ANSI 256 colors with NO_COLOR support — new TUI components should integrate with this rather than using raw lipgloss colors directly.",
+        "ACCESSIBLE=1 env var is used as a feature flag to fall back to plain-text output for screen readers; the TUI respects this by skipping bubbletea and delegating to existing show/status subcommands.",
+        "Memory loop state lives in `.entire/memory-loop.json`; the TUI requires `entire memory-loop refresh` to have been run first to have data.",
+        "The project uses `memoryloop.TransitionRecordLifecycle`, `memoryloop.SelectRelevant`, `memoryloop.AddManualRecord`, `memoryloop.PruneRecords`, and `memoryloop.SaveState` as the core API for mutations.",
+        "The docs/superpowers directory is gitignored — brainstorm artifacts and specs written there won't appear in git history."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memorylooptui/styles.go",
+          "finding": "Border color '8' (dark gray) is invisible on dark terminals; use '245' (light gray) instead. Accent color was changed from cyan ('6') to orange ('214') per user preference."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_memories.go",
+          "finding": "Lipgloss bordered card width must be set to `width - 2` unconditionally (not conditionally on width > 0) to ensure it always renders. Detail pane should default to shown (showDetail: true) rather than requiring an Enter keypress."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_settings.go",
+          "finding": "Settings key handling was unreliable when using tea.Cmd closures with pointer fields for settingsChangedMsg. Switching to synchronous inline state mutations (no tea.Cmd) was more reliable for simple toggle operations."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_injection.go",
+          "finding": "Log table height calculated as `h - 10` was insufficient when detail card (~10 lines) + prompt tester (~3 lines) + labels (~3 lines) are all present, causing content to overflow and push the tab bar off-screen."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/root.go",
+          "finding": "Key delegation in the root model's Update function: after global key handling, the remaining msg is passed to active tab — but the typed tea.KeyMsg from the type switch must be correctly forwarded, not the original untyped tea.Msg."
+        }
+      ],
+      "workflow": [
+        "The brainstorming skill's visual companion (local HTTP server) is effective for getting user approval on layout/design decisions before writing code — interactive HTML mockups let users click to select preferences.",
+        "Subagent-driven development works well for sequential implementation tasks but requires explicit commit discipline — subagents may complete work without committing, leaving changes that appear as uncommitted diffs.",
+        "Iterative screenshot-driven feedback cycles (user shares screenshots, assistant diagnoses diffs from mockup) are effective but slow; many small fix commits accumulated rather than one clean implementation.",
+        "For bubbletea TUIs, test with an actual terminal early — lipgloss styling issues (border colors, width calculations) are not detectable from code review alone and require visual verification.",
+        "The writing-plans + subagent-driven-development skill combination provides a structured workflow: brainstorm → spec → plan → implement → review, with each phase gating the next."
+      ]
+    },
+    "friction": [
+      "Lipgloss border color '8' (dark gray) was invisibly dark on the user's terminal — this caused multiple rounds of 'borders not showing' feedback before the root cause (color value too dark) was identified.",
+      "The maxWidth=80 cap made the layout feel cramped on a wider terminal; this required an explicit fix pass.",
+      "Settings tab key handling required multiple fix attempts — the tea.Cmd closure approach didn't work reliably, requiring a switch to synchronous mutations.",
+      "Injection tab content overflow (tab bar pushed off-screen) required careful height arithmetic that wasn't obvious from the initial implementation.",
+      "The brainstorm visual companion server shuts down between sessions and must be manually restarted with content re-written.",
+      "The docs/superpowers gitignore meant design artifacts (spec, plan HTML mockups) couldn't be committed alongside the code, reducing traceability.",
+      "Multiple subagent dispatches for fix cycles added latency and created fragmented commit history rather than clean logical commits."
+    ],
+    "open_items": [
+      "Settings tab key handling and visual design were still being fixed at session end — final state unknown.",
+      "Injection tab overflow fix was applied but not verified in a screenshot.",
+      "History tab 'R' refresh trigger is a placeholder — async refresh wiring to the actual memoryloop.Refresh function is not implemented.",
+      "Unit tests for the TUI package are explicitly deferred — the design spec noted 'manual verification' focus only.",
+      "The Add Memory form (Task 8) was implemented but not visually verified against the mockup.",
+      "lipgloss v1 API compatibility should be verified — context7 docs were consulted mid-session suggesting potential API differences.",
+      "Injection prompt tester scoring/matching logic needs end-to-end verification that SelectRelevant is actually being called correctly with the input prompt."
+    ]
+  }
+}
