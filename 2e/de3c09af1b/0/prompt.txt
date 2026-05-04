@@ -1,0 +1,157 @@
+let's review this PR, https://github.com/entireio/cli/pull/1009 on top of 993, which improves a few things, most notably adding a prompt to review. In 993, we did add message which lets the user know what was being reviewed, which by default is everything on branch since review started agent session. Now user can input prompt and is stored. There are a few other problems. 1. picker doens't prompt installatation if the skill isn't installed, so we have barrier here. we could either only include skills that are installe with the agent, parse subdirectory and lists all skills you have and everything that has review in it, or something else, 2. if you have both codex, cluade, or any other agents installed, onyl claude starts, we need a way to make this better UI so user can either select which agent to use, verify agent flag, (but also better UI), 2b. user also needs to be able to spawn both/multiple agents simultaneously, so user can see all agents at the same time. sort of like how the pr-review-toolkit does when it spawns its subagents you see each one, spinning, you can also have the option to cntrl + o to open and see more details, then at the end maybe take everything and aggregate and summarize everything to user then could also attach. - use /superpowers:brainstorming and take your time with these two from 1009 which are improvements to 993. So first evaluate 1009 and then these, with what is most updated on cli main
+
+---
+
+yes
+
+---
+
+we can start with fixing the picker then we'll fix the multi-agent spawn task
+
+---
+
+for c, this part is unclear, "then "Other installed skills matching 'review'" (discovered,  
+  tagged so users know they weren't vetted)", just the not vetted part. what makes a skill vetted or not
+
+---
+
+but these skills,  Curated = hardcoded in curatedReviewSkills (review.go:126). Someone on the entire side     
+  explicitly wrote it down with a description because we know it's a review skill:
+  /pr-review-toolkit:review-pr, /codex:adversarial-review, etc.                                - the issue is, most people won't have these installed, vs. ones that are by default installed, is what we should change these to, and then the discover installed related to review on disk would be where these show up is what i was thinking
+
+---
+
+but when you search `/review` in claude or codex for example there is not only review but related like simplify, which is built in, so this is where it would be more substantial than just the one list and where you can do more reserach i guess
+
+---
+
+<task-notification>
+<task-id>a1f87d708689a2e7f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-entire-review/32ff705a-db92-4346-a9c8-70b631ba581d/tasks/a1f87d708689a2e7f.output</output-file>
+<status>completed</status>
+<summary>Agent "Claude Code built-in slash commands" completed</summary>
+<result>Perfect. Now I have the complete command reference. Let me compile the answer focusing on built-in commands and bundled skills, with emphasis on review-adjacent commands.
+
+## Built-in Slash Commands (Claude Code Out-of-Box)
+
+**Review-Adjacent Commands** (assess/improve existing code):
+- `/review [PR]` — Review a pull request locally in current session. Built-in command (not a skill). `/ultrareview` exists but requires cloud infrastructure; `/review` is pure CLI.
+- `/simplify [focus]` — Bundled skill. Reviews recent changes for code quality and reuse issues; fixes them with parallel agents.
+- `/security-review` — Built-in command. Analyzes pending git diff for security vulnerabilities.
+- `/debug [description]` — Bundled skill. Enables debug logging; helps diagnose/troubleshoot issues.
+
+**Meta/Session Commands** (CLI control, not code-focused):
+- `/help`, `/clear`, `/compact`, `/cost`, `/model`, `/config`, `/effort`, `/context`, `/status`, `/exit`, `/login`, `/logout`, `/copy`, `/export`, `/diff`, `/rewind`, `/recap`
+
+**Workflow Commands** (project initialization, task automation, scheduling):
+- `/init` — Initialize CLAUDE.md
+- `/batch &lt;instruction&gt;` — Bundled skill. Parallel large-scale changes across codebase
+- `/loop [interval] [prompt]` — Bundled skill. Run prompts repeatedly on schedule
+- `/schedule [description]` — Bundled skill. Create/run routines with cron scheduling
+- `/plan [description]` — Enter plan mode
+
+**Developer Reference/Learning:**
+- `/claude-api` — Bundled skill. Loads Claude API reference material (tool use, streaming, batches, structured outputs)
+
+**Documentation:**
+- `/canonical source`: https://code.claude.com/docs/en/commands.md
+
+**Key findings:**
+- `/review` is a **first-party built-in** (not from a bundled skill)
+- `/simplify`, `/debug`, `/batch`, `/loop`, `/schedule`, `/claude-api`, `/fewer-permission-prompts` are **bundled skills** (prompt-based; no plugins required)
+- **No gating** — all commands listed above are available to all Claude Code users regardless of plan level
+- `/ultrareview` exists but requires cloud infrastructure + extra usage; the local `/review` is the out-of-box option
+
+**For your review feature:** Recommend surface only `[/review]` as the core built-in; treat `/simplify`, `/security-review`, and `/debug` as optional adjacent commands if the user's session has them available.</result>
+<usage><total_tokens>44397</total_tokens><tool_uses>4</tool_uses><duration_ms>491740</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3f541f119a9b48c9</task-id>
+<tool-use-id>toolu_01QDTiwCfDAtRSR1rotC8SE2</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-entire-review/32ff705a-db92-4346-a9c8-70b631ba581d/tasks/a3f541f119a9b48c9.output</output-file>
+<status>completed</status>
+<summary>Agent "Codex CLI built-in slash commands" completed</summary>
+<result>No existing reference to Codex built-in slash commands. I'm blocked from the web, so I cannot produce a *definitive* verified list without guessing. I'll report what I know with source locations, and clearly flag what I couldn't verify.
+
+---
+
+## Report: Codex CLI Built-In Slash Commands
+
+**Critical caveat:** Web access (WebFetch, WebSearch) and outbound HTTP (curl via Bash) were denied in this environment, so I could not verify the slash-command list against the live `openai/codex` source. The Codex repo is not checked out or vendored in this worktree. The following is what I can confirm from this repo's research artifacts plus what I cannot confirm.
+
+**Confirmed from this repo** (`cmd/entire/cli/agent/codex/AGENT.md`, versions as of Codex CLI 0.116.0):
+- Codex CLI exists, installs via `npm install -g @openai/codex`, binary is `codex`.
+- Config lives in `~/.codex/` (overridable via `CODEX_HOME`); hooks config is `hooks.json`; main config is `config.toml`.
+- Non-interactive invocation: `codex exec "&lt;prompt&gt;"`. Interactive: `codex` or `codex "&lt;prompt&gt;"`. Resume: `codex resume &lt;session-id&gt;`.
+- JSON schemas published at `codex-rs/hooks/schema/generated/` in the `openai/codex` repo; hook engine config at `codex-rs/hooks/src/engine/config.rs`.
+
+**Could NOT verify without web access:**
+1. Full built-in slash-command list. Canonical source is the Codex TUI crate — look at `codex-rs/tui/src/slash_command.rs` (and/or `codex-rs/tui/src/bottom_pane/command_popup.rs`) in `https://github.com/openai/codex`. I cannot enumerate commands or descriptions from here.
+2. Whether `/review` ships built-in. I cannot confirm or deny. The Claude Code plugin `codex:review` in this environment is an Entire wrapper that shells out to `codex exec` — it is not evidence that Codex itself has a `/review` slash command.
+3. Review-adjacent vs. meta vs. workflow categorization — depends on (1).
+4. Extensibility model. I cannot confirm from local sources whether Codex has a plugin/skill loader analogous to Claude Code's `~/.claude/plugins/...`. The only extension surface documented in this repo is `hooks.json` (lifecycle hooks) and `config.toml` — neither is a slash-command/skill registry. Codex does support custom prompts/prompt packs in some docs, but I cannot verify the current shape.
+5. Canonical docs URL for slash commands. Best starting points to check manually:
+   - `https://github.com/openai/codex/blob/main/codex-rs/tui/src/slash_command.rs`
+   - `https://github.com/openai/codex/tree/main/docs`
+   - `https://github.com/openai/codex#readme`
+
+**Recommendation:** Re-run this task in an environment where WebFetch/WebSearch or `gh api` is permitted, or paste the contents of `codex-rs/tui/src/slash_command.rs` into the conversation and I can categorize it definitively. I did not want to fabricate a list from training-data memory, because your feature depends on this being accurate across Codex versions (your repo already pins against 0.116.0).
+
+**Relevant local files:**
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/entire-review/cmd/entire/cli/agent/codex/AGENT.md` — integration one-pager with verified Codex 0.116.0 facts.
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/entire-review/cmd/entire/cli/agent/codex/codex.go` — agent implementation, confirms launch via `exec.LookPath("codex")` with the prompt as a positional arg.
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/entire-review/cmd/entire/cli/review.go` — current `entire review` command; does not currently hardcode any Codex slash commands.</result>
+<usage><total_tokens>41560</total_tokens><tool_uses>13</tool_uses><duration_ms>521557</duration_ms></usage>
+</task-notification>
+
+---
+
+q4: i still think we'd want it one per agent, but the problem is when the agent runs, right now, it only runs claude code, not codex, unless you run with the agent flag, but even this needs verification/more testing and is not the best user flow. so picker is I guess fine. was it changed in 1009 to be unified picker, i don't think so. the issue with unified picker is it can probably get unruly/very long. q5. codex brings up good point and i just looked that gemini doesn't have a built in review command but they do have a public one to install, which isn't a heavy lift to i guess offer to install and/or lookup on disk if user has it installed
+
+---
+
+"thin built-ins + install hint," + lookup review installs on disk too
+
+---
+
+the only thing i change is that you're displaying all three of these despite any being empty, you show all
+
+---
+
+yes just make sure you're not repeating skills like suggesting to install a skill that's already installed
+
+---
+
+yes looks good
+
+---
+
+yes looks good
+
+---
+
+yes looks good
+
+---
+
+sure you can aslo show me in localhost too, but i think looks good
+
+---
+
+looks good
+
+---
+
+don't need to commit design doc
+
+---
+
+go ahead, which branch are you doing this on 1009?
+
+---
+
+instead of branching off of this, we'd just add commits on top of tihs branch. we also want to limit the number of commits, like make changes, test the changes in local build, etc. each chunk can be commit, so 5, but not each task
