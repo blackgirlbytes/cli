@@ -1,0 +1,423 @@
+the current implementation for 876, timeout for summary generation does not give users actionable insight and quits. I'd like to investigate whether the timeout is actually a good fix and if the summary fails, I want to tell the user why this happened instead of fail. I'm also wondering if the 30s is practical or not. When implemented, I thought the summary had already failed and prior, there was no timeout so user would endlessly wait on hanging summary generation, but not know why. I thought because claude cli API failed, and no summary would be created. PLease check current code path for summary generation. I have done some exlporation and have this potential plan with codex, take a look and let me know what you think, if you agree, how we can improve, so users have actionable, accurate erroring, if the summary generation does fail and we don't have just an ambiguous timeout Implementation Plan
+
+  1. Clean up scope before coding.
+     Do not build on my earlier ad hoc edits in cmd/entire/cli/explain.go and cmd/entire/cli/
+     explain_test.go without reworking them.
+     The new work should be driven by the investigation results, not the previous guess.
+  2. Add Claude result/error parsing in cmd/entire/cli/summarize/claude.go.
+     Expand the Claude response envelope to capture:
+      - type
+      - subtype
+      - is_error
+      - result
+      - maybe duration_ms for debugging only
+        On non-zero exit:
+      - first try to parse stdout as Claude JSON
+      - if is_error is true and result is non-empty, return a typed Claude error using that
+        message
+      - only if parsing fails or there is no structured error, fall back to current stderr
+        handling
+  3. Introduce a typed summary-generation error model in cmd/entire/cli/summarize/claude.go.
+     Add an internal error type with fields like:
+      - Kind
+      - Message
+      - ExitCode
+      - Cause
+        Proposed kinds:
+      - auth
+      - config
+      - rate_limit
+      - connection
+      - cli_missing
+      - timeout
+      - unknown
+  4. Add timeout diagnostics collection only for explain --generate.
+     In cmd/entire/cli/explain.go, make the generateCheckpointAISummary path invoke Claude
+     summarization with a temporary debug file.
+     Requirements:
+      - use a temp file
+      - delete it after classification
+      - never print raw log contents to the user
+  5. Add a timeout-log classifier in summarize/claude.go or a nearby helper.
+     Only classify stable patterns already observed:
+      - repeated /v1/messages plus repeated Connection error or ECONNREFUSED
+      - maybe repeated retry loops tied to API requests
+        Do not classify login/auth from debug logs.
+        Auth should come only from structured Claude stdout.
+  6. Keep the hard timeout, but redefine its role.
+     Leave the 30s guard in place for now as the anti-hang stop.
+     On timeout:
+      - if timeout diagnostics show repeated Anthropic/API connection failures, return a typed
+        connection timeout error
+      - otherwise return a generic typed timeout error
+        Do not say “summary needed more time.”
+  7. Improve waiting visibility in explain --generate.
+     In cmd/entire/cli/explain.go:
+      - keep Generating checkpoint summary...
+      - add one delayed status message after about 5s or 10s:
+        Still waiting for Claude summary response...
+        Only print it once.
+  8. Map typed errors to final user-facing messages in cmd/entire/cli/explain.go.
+     Proposed messages:
+      - auth:
+        Claude is not logged in. Run claude login and retry.
+      - config:
+        Claude configuration is invalid. Check your Claude CLI config and selected model, then
+        retry.
+      - rate_limit:
+        Claude rejected the summary request due to rate limits or quota. Wait and retry.
+      - connection from timeout diagnostics:
+        Claude started the summary request but hit repeated connection errors talking to
+        Anthropic. Check network/VPN/firewall/API access and retry.
+      - cli_missing:
+        Claude CLI is not installed or not on PATH.
+      - generic timeout:
+        Claude did not return a response for the summary request within 30s. Check Claude login/
+        config and network connection, then retry.
+  9. Add focused tests.
+     In cmd/entire/cli/summarize/claude_test.go:
+      - non-zero exit with structured stdout login error
+        In cmd/entire/cli/explain_test.go:
+      - user-facing auth message
+      - user-facing timeout connection message
+      - generic timeout fallback
+      - single delayed “still waiting” status behavior
+  10. Verify in layers.
+     Run:
+
+  - focused summarize tests
+  - focused explain tests
+  - go test ./cmd/entire/cli
+    Then reassess whether 30s should remain or be increased.
+    I would not change the threshold until the improved diagnostics are in place.
+
+  Expected outcome
+
+  - Fast real failures stop being masked.
+  - Hangs still stop after 30s.
+ timeout cases become specifically actionable instead of generic.
+  - Remaining unknown timeout cases still degrade cleanly.
+
+Implementation Plan
+
+  1. Clean up scope before coding.
+     Do not build on my earlier ad hoc edits in cmd/entire/cli/explain.go and cmd/entire/cli/
+     explain_test.go without reworking them.
+     The new work should be driven by the investigation results, not the previous guess.
+  2. Add Claude result/error parsing in cmd/entire/cli/summarize/claude.go.
+     Expand the Claude response envelope to capture:
+      - type
+      - subtype
+      - is_error
+      - result
+      - maybe duration_ms for debugging only
+        On non-zero exit:
+      - first try to parse stdout as Claude JSON
+      - if is_error is true and result is non-empty, return a typed Claude error using that
+        message
+      - only if parsing fails or there is no structured error, fall back to current stderr
+        handling
+  3. Introduce a typed summary-generation error model in cmd/entire/cli/summarize/claude.go.
+     Add an internal error type with fields like:
+      - Kind
+      - Message
+      - ExitCode
+      - Cause
+        Proposed kinds:
+      - auth
+      - config
+      - rate_limit
+      - connection
+      - cli_missing
+      - timeout
+      - unknown
+  4. Add timeout diagnostics collection only for explain --generate.
+     In cmd/entire/cli/explain.go, make the generateCheckpointAISummary path invoke Claude
+     summarization with a temporary debug file.
+     Requirements:
+      - use a temp file
+      - delete it after classification
+      - never print raw log contents to the user
+  5. Add a timeout-log classifier in summarize/claude.go or a nearby helper.
+     Only classify stable patterns already observed:
+      - repeated /v1/messages plus repeated Connection error or ECONNREFUSED
+      - maybe repeated retry loops tied to API requests
+        Do not classify login/auth from debug logs.
+        Auth should come only from structured Claude stdout.
+  6. Keep the hard timeout, but redefine its role.
+     Leave the 30s guard in place for now as the anti-hang stop.
+     On timeout:
+      - if timeout diagnostics show repeated Anthropic/API connection failures, return a typed
+        connection timeout error
+      - otherwise return a generic typed timeout error
+        Do not say “summary needed more time.”
+  7. Improve waiting visibility in explain --generate.
+     In cmd/entire/cli/explain.go:
+      - keep Generating checkpoint summary...
+      - add one delayed status message after about 5s or 10s:
+        Still waiting for Claude summary response...
+        Only print it once.
+  8. Map typed errors to final user-facing messages in cmd/entire/cli/explain.go.
+     Proposed messages:
+      - auth:
+        Claude is not logged in. Run claude login and retry.
+      - config:
+        Claude configuration is invalid. Check your Claude CLI config and selected model, then
+        retry.
+      - rate_limit:
+        Claude rejected the summary request due to rate limits or quota. Wait and retry.
+      - cction from timeout diagnostics:
+        Claude started the summary request but hit repeated connection errors talking to
+        Anthropic. Check network/VPN/firewall/API access and retry.
+      - cli_missing:
+        Claude CLI is not installed or not on PATH.
+      - generic timeout:
+        Claude did not return a response for the summary request within 30s. Check Claude login/
+        config and network connection, then retry.
+  9. Add focused tests.
+     In cmd/entire/cli/summarize/claude_test.go:
+      - non-zero exit with structured stdout login error
+        In cmd/entire/cli/explain_test.go:
+      - user-facing auth message
+      - user-facing timeout connection message
+      - generic timeout fallback
+      - single delayed “still waiting” status behavior
+  10. Verify in layers.
+     Run:
+
+  - focused summarize tests
+  - focused explain tests
+  - go test ./cmd/entire/cli
+    Then reassess whether 30s should remain or be increased.
+    I would not change the threshold until the improved diagnos are in place.
+
+  Expected outcome
+
+  - Fast real failures stop being masked.
+  - Hangs still stop after 30s.
+  - Some timeout cases become specifically actionable instead of generic.
+  - Remaining unknown timeout cases still degrade cleanly.
+
+  If you want, I can next convert this into a concrete execution order with exact helper names
+  and write boundaries before touching code.
+
+
+
+
+› yes please concrete execution order with exact helper names
+    and write boundaries
+
+
+• Execution Order
+
+  1. Rework the summarizer error boundary in cmd/entire/cli/summarize/
+     claude.go.
+     This is the primary write scope.
+     Goal: make Claude subprocess failures observable before explain.go
+     formats them.
+  2. Add focused unit coverage in cmd/entire/cli/summarize/claude_test.go.
+     Keep this limited to subprocess parsing and timeout-log
+     classification.
+  3. Update the explain-layer formatting and waiting UX in cmd/entire/cli/
+     explain.go.
+     This is the second write scope.
+     Goal: map typedors to user-facing messages and add the delayed
+     waiting line.
+  4. Add explain-layer tests in cmd/entire/cli/explain_test.go.
+     Keep this limited to formatting and status-message behavior.
+
+  Write Boundaries
+
+  - cmd/entire/cli/summarize/claude.go
+      - owns:
+          - Claude subprocess invocation
+          - Claude stdout/stderr parsing
+          - typed summary-generation errors
+          - timeout debug-log classification
+          - temp debug-file handling support
+      - should not own:
+          - final user-facing command text for entire explain
+  - cmd/entire/cli/summarize/claude_test.go
+      - owns:
+          - tests for typed Claude error extraction
+          - tests for debug-log classifiers
+      - should not depend on Cobra command behavior
+  - cmd/entire/cli/explain.go
+      - owns:
+          - Generating checkpoint summary...
+          - delayed Still waiting for Claude summary response...
+          - mapping typed errors to final user-facing messages
+          - 30s hang-guard policy for explain --generate
+      - should not parse raw Claude stdout/stderr directly
+  - cmd/entire/cli/explain_test.go
+      - owns:
+          - tests for explain-specific messages
+          - tests for delayed waiting message
+          - tests for timeout fallback wording
+
+  Exact Helper Names
+
+  In cmd/entire/cli/summarize/claude.go:
+
+  - type ClaudeCLIEnvelope struct
+      - fields:
+          - Type string
+          - Subtype string
+          - IsError bool
+          - Result string
+  - type ClaudeSummaryErrorKind string
+      - values:
+          - ClaudeSummaryErrorAuth
+          - ClaudeSummaryErrorConfig
+          - ClaudeSummaryErrorRateLimit
+          - ClaudeSummaryErrorConnection
+          - ClaudeSummaryErrorCLIMissing
+          - ClaudeSummaryErrorTimeout
+          - ClaudeSummaryErrorUnknown
+  - type ClaudeSummaryError struct
+      - fields:
+          - Kind ClaudeSummaryErrorKind
+          - Message string
+          - ExitCode int
+          - Cause error
+      - methods:
+          - Error() string
+          - Unwrap() error
+  - type ClaudeDebugOptions struct
+      - fields:
+          - EnableAPIDebug bool
+          - DebugFile string
+  - func parseClaudeCLIEnvelope(stdout []byte) (*ClaudeCLIEnvelope, error)
+      - parse stdout JSON envelope regardless of exit status
+  - func classifyClaudeStructuredError(result string, exitCode int, cause
+    error) error
+      - convert structured Claude result text into ClaudeSummaryError
+  - func classifyClaudeExitFailure(stdout, stderr []byte, exitCode int,
+    cause error) error
+      - order:
+          - structured stdout
+          - stderr
+          - generic unknown
+  - func classifyClaudeTimeoutFromDebugLog(logContent string)
+    *ClaudeSummaryError
+      - only detect stable timeout patterns
+      - initial supported classification:
+          - repeated /v1/messages plus repeated Connection error or
+            ECONNREFUSED => Connection
+  - func buildClaudeCommand(ctx context.Context, runner
+    func(context.Context, string, ...string) *exec.Cmd, claudePath, model
+    string, debugOpts ClaudeDebugOptions) *exec.Cmd
+      - centralize subprocess flags
+      - append --debug api --debug-file <path> only when enabled
+  - func readClaudeDebugLog(path string) string
+      - best-effort read
+      - empty string on failure
+  - func removeClaudeDebugLog(path string)
+      - best-effort cleanup
+  - func newClaudeTempDebugFile() (string, error)
+      - create temp path for explain-time diagnostics
+
+  I would also change ClaudeGenerator slightly:
+
+  - add field:
+      - DebugOptions ClaudeDebugOptions
+
+  In cmd/entire/cli/explain.go:
+
+  - func generateCheckpointAISummary(ctx context.Context, scopedTranscript
+    []byte, filesTouched []string, agentType types.AgentType)
+    (*checkpoint.Summary, error)
+      - keep as the explain-only policy boundary
+      - inject debug options into the generator path
+      - keep the 30s context here
+  - func emitDelayedSummaryWaitMessage(ctx context.Context, errW
+    io.Writer, delay time.Duration) func()
+      - starts a goroutine/timer
+      - after delay, prints:
+          - Still waiting for Claude summary response...
+      - returns cancel function
+  - func formatCheckpointSummaryError(err error, timeoutDuration
+    time.Duration) error
+      - maps ClaudeSummaryError kinds to final user-facing command errors
+      - only this function should decide the exact CLI wording
+  - func explainSummaryTimeoutFallback(timeoutDuration time.Duration)
+    error
+      - generic no-diagnostics timeout fallback
+
+  Concrete Implementation Sequence
+
+  1. Add ClaudeCLIEnvelope, ClaudeSummaryErrorKind, ClaudeSummaryError.
+  2. Add parseClaudeCLIEnvelope.
+  3. Add classifyClaudeStructuredError and classifyClaudeExitFailure.
+  4. Refactor ClaudeGenerator.Generate to:
+      - build command through buildClaudeCommand
+        classifyClaudeTimeoutFromDebugLog
+  5. Add temp debug-file helpers and cleanup.
+  6. Add summarize tests for:
+      - structured login error on stdout
+      - stderr-only exit error
+      - timeout debug classification from sample log string
+  7. In explain.go, add emitDelayedSummaryWaitMessage.
+  8. In generateCheckpointAISummary, wire:
+      - 30s context
+      - delayed wait message
+      - Claude debug options
+  9. Add formatCheckpointSummaryError.
+  10. Add explain tests for:
+
+  - auth message
+  - timeout with connection-classified debug info
+  - generic timeout fallback
+  - delayed waiting message
+
+  Message Ownership
+
+  formatCheckpointSummaryError in explain.go should own the final strings:
+
+  - Claude is not logged in. Run claude login and retry.
+  - Claude configuration is invalid. Check your Claude CLI config and
+    selected model, then retry.
+  - Claude rejected the summary request due to rate limits or quota. Wait
+    and retry.
+  - Claude started the summary request but hit repeated connection errors
+    talking to Anthropic. Check network/VPN/firewall/API access and retry.
+  - Claude did not return a response for the summary request within 30s.
+    Check Claude login/config and network connection, then retry.
+
+---
+
+yes, agree on all your changes and yes, write proper deisgn, also firdt please clarify are these for 3. "  3. Typed error model with kinds (auth/config/rate_limit/connection/cli_missing/timeout/unknown)
+   — agree on the kinds. Define the type in agent/claudecode (or a small shared agentlerr package
+   if you don't want claude types leaking up). Have summarize/claude.go propagate it untouched
+  via %w so explain.go can errors.As it. Map is_error: true + api_error_status ranges
+  (401/403→auth, 429→rate_limit, 4xx→config, 5xx/network→connection) plus stderr substring
+  matches for a few well-known auth/login phrases." non exit 0 errors that happen before the tiemout?
+
+---
+
+can we detect on large trancstipts that would take longer? instead of having user manually edit settings? or then why don't we increase the time and logs that tell user what's going on, like if transcript is long, can we just let teh user know
+
+---
+
+or do we need the timeout at all and instead just let the user know what's hapepning because the main issue is the hanging with no warn, like we need to let hte user know summary has started generating if it did adn then the progress, etc.
+
+---
+
+yes
+
+---
+
+i reviwed the plan, so i like the start here, Pre-flight message with transcript size    Always    "Generating checkpoint summary… (transcript: 47KB)" — user knows it started and roughly what's involved
+Periodic progress ("…still working, 30s elapsed")    Always    Removes silent-wait uncertainty; later updates include "Press Ctrl+C to cancel" - in the periodic progress, we shouldn't prompt the user to cancel, it's kind of obvious they can do this, instead we need meaningul updates, like how the symmary is actually progressing, do we have/can we have visibility into that information instead?
+
+---
+
+1. yes, 2. that's fine, is there anything else like we use charmbracelet/huh, does that work here to style i guess
+
+---
+
+are we still adding the extra non exit 0 or, exit 0 additional errors too for potential failrue like we discussed?
+
+---
+
+yes okay good
