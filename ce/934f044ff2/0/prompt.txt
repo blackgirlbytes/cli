@@ -1,0 +1,90 @@
+Implement the following plan:
+
+# Plan: プロジェクトフックのバイナリ化による高速化
+
+## Context
+
+このプロジェクト（entire-cli）でClaude Codeが遅い原因は、`.claude/settings.json` のフックが全て `go run` を使っており、フック呼び出しのたびにGoのコンパイルが走ること。実測で **1回あたり約1秒** のオーバーヘッドがあり、ツールコールやターンの度に複数回発火するため体感が大幅に悪化している。
+
+## 変更内容
+
+### 1. `.claude/settings.json` のフックコマンドを変更
+
+**ファイル:** `.claude/settings.json`
+
+全7箇所の `go run ${CLAUDE_PROJECT_DIR}/cmd/entire/main.go` を `${CLAUDE_PROJECT_DIR}/entire` に変更:
+
+```diff
+- "command": "go run ${CLAUDE_PROJECT_DIR}/cmd/entire/main.go hooks claude-code session-start"
++ "command": "${CLAUDE_PROJECT_DIR}/entire hooks claude-code session-start"
+```
+
+対象:
+- SessionStart: `hooks claude-code session-start`
+- SessionEnd: `hooks claude-code session-end`
+- UserPromptSubmit: `hooks claude-code user-prompt-submit`
+- Stop: `hooks claude-code stop`
+- PreToolUse (Task): `hooks claude-code pre-task`
+- PostToolUse (Task): `hooks claude-code post-task`
+- PostToolUse (TodoWrite): `hooks claude-code post-todo`
+
+### 2. バイナリが存在しない場合のフォールバック
+
+バイナリが未ビルドの場合にわかりやすいエラーを出すため、フックコマンドを以下の形にする:
+
+```
+"command": "test -x ${CLAUDE_PROJECT_DIR}/entire && ${CLAUDE_PROJECT_DIR}/entire hooks claude-code stop || echo '[entire] Binary not found. Run: mise run build'"
+```
+
+これにより:
+- バイナリがあれば高速に実行
+- なければエラーメッセージで `mise run build` を案内
+
+## 検証
+
+1. `mise run build` でバイナリをビルド
+2. Claude Codeを再起動して体感速度を確認
+3. `time ./entire hooks claude-code stop` でバイナリ版の速度を測定（数十msになるはず）
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/sakamotoyasuaki/.REDACTED.jsonl
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+いいや普通にアプリ版はBuildされたものを使っていそう。それいがいの部分をあらって。てかなにしてるのこれ?
+
+---
+
+トランスクリプトと git commitはどうやって軽く出来る?
+
+---
+
+あとは時間がかかっても待機時間にならなければ嬉しい
+
+---
+
+はい、デモコレは機能する?バグや見落としはない?
+
+---
+
+非同期手前までやろうか
+
+---
+
+buildしたい
+
+---
+
+ビルド結果どこ?
+
+---
+
+テスト通して、ブランチ作ってPRしたい
+
+---
+
+settings.jsonの変更revertして、go runのままにしたい
