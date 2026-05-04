@@ -1,0 +1,50 @@
+can you do a review of the changes focusing on go best practices
+
+---
+
+on getAllChangedFilesBetweenTrees the signature of the method returns "string[]" but it now also returns err is that correct?
+
+---
+
+how much of that change would that be in calle code?
+
+---
+
+let's fix it then to return an err too
+
+---
+
+can we do   2. Double ctx.Err() call in ListAllTemporaryCheckpoints
+
+  temporary.go:539-543:
+
+  if branchErr != nil {
+      if ctx.Err() != nil {
+          return nil, ctx.Err()  // second call
+      }
+      continue
+  }
+
+  This is functionally correct (context errors are monotonic — once cancelled, they stay cancelled). But the double call is slightly unusual. A more idiomatic
+  pattern would be to just check the error from the sub-call directly:
+
+  if branchErr != nil {
+      if errors.Is(branchErr, context.Canceled) || errors.Is(branchErr, context.DeadlineExceeded) {
+          return nil, branchErr
+      }
+      continue
+  }
+
+  This avoids the second ctx.Err() call and returns the exact error that propagated up, which is slightly cleaner for debugging.
+
+---
+
+but is there a path where the branchErr wouldn't be `ctx.Err()` ?
+
+---
+
+ok, yeah and I mean the other way around, branchErr being nill but ctx.Err() not?
+
+---
+
+no, but branchErr being one error and `ctx.Err()` being a cancelled error?
