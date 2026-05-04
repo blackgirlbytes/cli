@@ -1,0 +1,71 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "c253a1c71ae2",
+  "session_id": "24965acf-0f7b-43bf-865e-b2ad1f67f30b",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T17:28:05.46347Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "dd00538a064b",
+  "token_usage": {
+    "input_tokens": 55,
+    "cache_creation_tokens": 65748,
+    "cache_read_tokens": 2396979,
+    "output_tokens": 12585,
+    "api_call_count": 43
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "summary": {
+    "intent": "Fix the memory loop TUI injection tab so it tests against all active memories and shows clear inject/skip status instead of raw scores. Then remove the skill, insights, improve, and permissions commands, keeping only summary and memory-loop.",
+    "outcome": "The injection tab was updated to use PreviewSelection() returning a full SelectionReport with INJECT/SKIP labels and skip reasons. Two new render tests were added and all 22 tests passed. The removal of the four commands was planned but not yet executed — the session ended at the planning stage.",
+    "learnings": {
+      "repo": [
+        "PreviewSelection() returns a SelectionReport with both Matches and Skipped fields; SelectRelevant() only returns matches — use PreviewSelection when you need the full picture",
+        "The memorylooptui package has a testPromptResultMsg type in messages.go that carries prompt test results between the root model and the injection tab",
+        "explanatory_insights.go is a hook handler, not a command — it should not be removed with the command cleanup",
+        "The skilldb, skilltui, permissions, and insights directories are candidates for removal when pruning to summary + memory-loop"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memorylooptui/messages.go",
+          "finding": "testPromptResultMsg was changed to carry a full SelectionReport instead of just a slice of matches"
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/root.go",
+          "finding": "Switched from SelectRelevant() to PreviewSelection() to get both matched and skipped memories"
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_injection.go",
+          "finding": "View now renders INJECT/SKIP labels with skip reasons (e.g. 'not active', 'scope mismatch', 'low strength') and a summary line instead of raw scores"
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/render_test.go",
+          "finding": "Tests set activeTab but call injectionTab.view() directly — unusedwrite lint fires if activeTab assignment is kept; removed those assignments to fix lint"
+        },
+        {
+          "path": "cmd/entire/cli/explanatory_insights.go",
+          "finding": "This file is a hook handler not a command; must be kept even when removing the insights command"
+        }
+      ],
+      "workflow": [
+        "Lint caught an unusedwrite warning on a struct field set in tests but never read — removing the assignment fixed it rather than suppressing",
+        "The 'RECENT INJECTIONS' section contained 'Injection Detail' which has 'INJECT' as a substring — caused a false positive in test assertions; needed more specific assertion strings",
+        "Command removal tasks require checking for shared helpers (refreshCacheIfStale, metadataToSessionRow, backfillSummaries, backfillFacets) before deleting files to avoid breaking retained code"
+      ]
+    },
+    "friction": [
+      "Plan mode was entered twice and interrupted by the user before implementation started, causing repeated plan writes",
+      "Test assertion for empty state falsely matched because 'INJECT' is a substring of 'RECENT INJECTIONS' in the view output",
+      "unusedwrite lint warning on activeTab field in tests required a second edit pass after initial test implementation"
+    ],
+    "open_items": [
+      "Removal of skill, insights, improve, and permissions commands and all related code is planned but not yet executed — session ended at the planning/discovery stage",
+      "Need to verify shared helpers (refreshCastIfStale etc.) are not used by summary or memory-loop before deleting insights/skill packages"
+    ]
+  }
+}
