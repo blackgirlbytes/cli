@@ -1,0 +1,55 @@
+anything else (e.g. UTC0, bogus names) falls through to UTC <- can you explain that more
+
+---
+
+If that is the intended product behavior, then the original review finding becomes much weaker.
+
+The real issue is not “you must parse every timezone properly.” It’s this:
+
+- The code and commit message currently claim “only IANA-valid names reach the API” and that POSIX-style values like `EST5EDT` fall through.
+- The implementation does not actually enforce that. It accepts anything Go can `LoadLocation`, which includes some non-IANA aliases.
+- If the backend simply falls back to `UTC` for anything it doesn’t recognize, that may be an acceptable shortcut.
+
+So I’d frame it this way:
+
+- If “best effort, else backend uses UTC” is the intended contract, I would not call this a bug.
+- I would call it a docs/tests mismatch. The comments are stricter than the behavior.
+- The only user-facing risk is mild mis-bucketing around day/hour boundaries when a non-IANA alias is accepted locally but not understood canonically by the API.
+
+Practical fix options:
+
+1. Keep the shortcut and update comments/tests to say “validated enough for Go; backend may fall back to UTC for unknown zones.”
+2. If you want stricter client behavior, reject anything that is not clearly an IANA name like `Area/Location` after stripping `:` and `.../zoneinfo/`.
+3. Push all normalization to the server and just send the raw candidate plus accept UTC fallback there.
+
+Given what you described, I’d recommend option 1 unless the time-bucket accuracy matters a lot.
+
+---
+
+ok, I'm confused now: 
+
+on entire.io: 
+
+- streak: 20 day, 18 current
+- 3rd box: continuity
+
+on entire activity: 
+
+- streak: 18 day, 18 current
+- 3rd box: orchestration
+
+
+also:
+
+REPOSITORIES
+entireio/cli        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 220
+entirehq/git-sync   ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░ 185
+entirehq/entire.io  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 111
+entirehq/go-git-api ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  55
+Soph/go-git-cli     ▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  19
+
+on entire.io cli has 161
+
+---
+
+can you look at ../entire.io I made two changes to the activity api, the long time streak should just work but the other fix means we get the same continuity data
