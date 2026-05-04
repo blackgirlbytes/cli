@@ -1,0 +1,193 @@
+I want to print into the agent as a warning with this content "Entire is enabled but not installed" only on sessions start events on every agent hook implementation. I want this to be the simplest implementation as posible, I love minimalism changes. Plan for it
+
+---
+
+Implement the plan.
+
+---
+
+here func WrapProductionSessionStartHookCommand(command string) string {
+	return fmt.Sprintf(
+		`sh -c 'if ! command -v entire >/dev/null 2>&1; then echo "%s" >&2; exit 0; fi; exec %s'`,
+		EntireNotInstalledWarning,
+		command,
+	)
+}
+do we need at the end exec %s ? can we just run %s ?
+
+---
+
+what do you mean by tighter version ?
+
+---
+
+great, now is time to think a proper message instead of "Entire is enabled but not installed" look for what we print on session start
+
+---
+
+I like the single line but I will also point at https://docs.entire.io/cli/installation#installation-methods to install it
+
+---
+
+y
+
+---
+
+that script does not work: 
+                                                                                                                                                                                                    
+⏺ Ran 1 stop hook (ctrl+o to expand)                                                                                                                                                                
+  ⎿  Stop hook error: Failed with non-blocking status code: /bin/sh: entire: command not found  
+
+what is the simplest way to do it, I want also to not scare consumers by watching that weird command
+
+---
+
+lets go with the inline solution, but the script was failing as I pasted the hook output
+
+---
+
+lets start with claude, it does not display the warning if entire is not there. are we sending back the expected warning format message?
+
+---
+
+do that
+
+---
+
+I'm getting this hook content on claude code:
+  {
+            "type": "command",
+            "command": "sh -c 'if ! command -v entire \u003e/dev/null 2\u003e\u00261; then printf \"%s\\n\" \"{\\\"systemMessage\\\":\\\"\\\\nPowered
+by Entire:\\\\n Tracking is enabled, but the Entire CLI is not installed or not on PATH.\\\\n Install it:
+https://docs.entire.io/cli/installation#installation-methods\\\"}\"; exit 0; fi; exec entire hooks claude-code session-start'"
+          }
+
+Can we make it cleaner for the user to understand what is going on there ?
+
+---
+
+I don't want to have another piece of script apart from the hook, I want the user to understand straightaway what is happening there as soon as they see the hook content.
+
+---
+
+and the content is:
+  {
+            "type": "command",
+            "command": "sh -c 'if ! command -v entire \u003e/dev/null 2\u003e\u00261; then printf \"%s\\n\" \"{\\\"systemMessage\\\":\\\"\\\\nPowered by Entire:\\\\n Tracking is enabled, but the Entire CLI is not installed or not on PATH.\\\\n Install it: https://docs.entire.io/cli/installation#installation-methods\\\"}\"; exit 0; fi; exec entire hooks claude-code session-start'"
+          }
+
+---
+
+I don't like those \u003e characters
+
+---
+
+what that method is also used? Do we have side effect bugs if we apply that change?
+
+---
+
+nah, let's be aggresive, that is why we have test.
+
+---
+
+it does works with claude, I did change it and added some new break lines to indent better the message. I know that won't work with for instance with codex, it has single line message warnings. How can we handle both cases?
+
+---
+
+can we have it, instead of agent aware, format aware? multi line or single line and then, every agent hook configuration use the correct one? Do not couple this with the agent logic
+
+---
+
+let's do that
+
+---
+
+please look into the code to all the agent implementations we have so we find out what are the system message formats for each agent. We have implemented the claude code specific. what other do we have to implement ?
+
+---
+
+Do that, so far, add those implementations inside hook_command file, later we decide where is the best place to locate that code.
+
+---
+
+mise lint fails
+
+---
+
+great, I'm testing it and what is happening is that othe hook calls throws errors like:
+UserPromptSubmit hook (failed)
+  error: hook exited with code 127
+that is codex. Let's make silent if entire is not found on all the other hook calls for all the implemented agents.
+
+---
+
+create a draft pr with all our progress so far
+
+---
+
+mention on the PR that this is fixing this issue: http://github.com/entireio/cli/issues/880 so when we merge the PR the issue is also closed
+
+---
+
+let's fix factory implementation. This is the way to print messages back on factory ia:
+https://docs.factory.ai/reference/hooks-reference#common-json-fields
+
+---
+
+revert it, it is not true
+
+---
+
+droid does not implement messages on sessionstart, it does on stop hook. Let's add the message on stop hook instead, just for droid implementation
+
+---
+
+ship it
+
+---
+
+cursor specific: https://cursor.com/docs/hooks#beforesubmitprompt
+
+We can return that message only on beforesubmitprompt. Do we have any hook implemented on that event ?
+
+---
+
+yes, do that.
+
+---
+
+cursor response is like this:
+{
+  "continue": true | false,
+  "user_message": "<message shown to user when blocked>"
+}
+
+change it
+
+---
+
+continue should be true
+
+---
+
+revert it, cursor does not implement system messages, do not add anything, just exit 0 on command calls
+
+---
+
+ship it
+
+---
+
+copilot does not prompt system messages on hook calls, at least if hook call is successfull, so, same as cursor, just exit 0, do not print anything
+
+---
+
+ship it!
+
+---
+
+opencode does not support system messages, lets do the same. exit 0 and silent
+
+---
+
+ship it
