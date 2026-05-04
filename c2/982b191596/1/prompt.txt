@@ -1,0 +1,171 @@
+Implement Task 2: Parse Blame Output Into Contiguous Blocks
+
+## Task Description
+
+**Files:**
+- Create: `cmd/entire/cli/why_blame.go`
+- Test: `cmd/entire/cli/why_blame_test.go`
+
+Requirements:
+1. Add a parser test with minimal blame porcelain input and assert contiguous lines with the same commit collapse into one block.
+2. Run `go test ./cmd/entire/cli -run TestParseWhyBlame_CollapsesContiguousBlocks` and verify it fails first.
+3. Implement the blame parser in `cmd/entire/cli/why_blame.go`.
+4. Parse the leading blame header to capture commit hash and final line number.
+5. Capture `author` and `summary` metadata when present.
+6. Capture the code line from the tab-prefixed content line.
+7. Collapse contiguous lines sharing the same commit hash into a single `whyBlock`.
+8. Populate `CodeLines` with the block’s source lines and `Commit.Subject` from `summary`.
+9. Add a second test asserting a wrapper can be stubbed.
+10. Add a `runGitBlamePorcelain` seam and `loadWhyBlocks(ctx, path)` wrapper.
+11. Run the targeted tests and ensure they pass.
+
+Planned test content:
+
+```go
+func TestParseWhyBlame_CollapsesContiguousBlocks(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		"b550507521111111111111111111111111111111 23 23 2",
+		"author Victor Gutierrez",
+		"summary Handle interrupt signals",
+		"\tif runtime.GOOS != \"windows\" {",
+		"b550507521111111111111111111111111111111 24 24",
+		"\t\tsignals = append(signals, syscall.SIGTERM)",
+		"7f93a963e3222222222222222222222222222222 38 38 1",
+		"author Stefan Haubold",
+		"summary Improve CLI error handling",
+		"\tvar silent *cli.SilentError",
+	}, "\n")
+
+	blocks, err := parseWhyBlamePorcelain(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("block count = %d, want 2", len(blocks))
+	}
+	if got, want := blocks[0].StartLine, 23; got != want {
+		t.Fatalf("first start line = %d, want %d", got, want)
+	}
+	if got, want := blocks[0].EndLine, 24; got != want {
+		t.Fatalf("first end line = %d, want %d", got, want)
+	}
+}
+```
+
+Wrapper seam test:
+
+```go
+func TestLoadWhyBlocks_UsesBlameRunner(t *testing.T) {
+	t.Parallel()
+
+	orig := runGitBlamePorcelain
+	t.Cleanup(func() { runGitBlamePorcelain = orig })
+
+	runGitBlamePorcelain = func(_ context.Context, _ string) (string, error) {
+		return "7f93a963e3222222222222222222222222222222 1 1 1\nauthor Stefan Haubold\nsummary boot\n\tpackage main\n", nil
+	}
+
+	blocks, err := loadWhyBlocks(context.Background(), "cmd/entire/main.go")
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("block count = %d, want 1", len(blocks))
+	}
+}
+```
+
+Implementation seam shape:
+
+```go
+var runGitBlamePorcelain = func(ctx context.Context, path string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "blame", "--line-porcelain", "--", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func loadWhyBlocks(ctx context.Context, path string) ([]whyBlock, error) {
+	out, err := runGitBlamePorcelain(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	return parseWhyBlamePorcelain(strings.NewReader(out))
+}
+```
+
+## Context
+
+This is Task 2 of the approved `entire why` prototype plan. Task 1 is already completed and committed. Task 2 should only add blame parsing and the command seam needed by later work. Do not implement enrichment, rendering, or command wiring.
+
+Work from: `/Users/pfleidi/entire/cli/.worktrees/feat/entire-why`
+
+## Important Constraints
+
+- You are not alone in the codebase. Do not revert edits you did not make.
+- Implement exactly Task 2 and nothing from later tasks.
+- Do not create any commits. The user wants review between steps.
+- Use `apply_patch` for edits.
+- Run only the targeted tests needed by Task 2.
+- Follow existing Go patterns in this repo.
+
+## Before You Begin
+
+If anything is unclear, ask now.
+
+## Report Format
+
+When done, report:
+- **Status:** DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
+- What you implemented
+- What you tested and test results
+- Files changed
+- Self-review findings
+- Any issues or concerns
+
+---
+
+Approved. Implement the full Task 2 scope exactly as described, including both tests, the failing-test check, the parser, and the `runGitBlamePorcelain` / `loadWhyBlocks` seam. Do not commit. Run the targeted tests, self-review, and report back with changed files and test results.
+
+---
+
+Code quality review found the following Task 2 issues to fix:
+
+Important:
+1. In `cmd/entire/cli/why_blame.go`, do not leave `bufio.Scanner` at the default 64 KiB token limit. Increase the scanner buffer so a long but valid blame line does not break parsing.
+2. In `runGitBlamePorcelain`, do not use `cmd.Output()` in a way that drops stderr. Capture stderr and wrap the error so later CLI failures include the git diagnostic.
+
+Minor but worth fixing now:
+3. Strengthen the seam test in `cmd/entire/cli/why_blame_test.go` so it verifies the stubbed output was actually parsed and that the `path` argument is passed through to the seam.
+
+Please fix only these Task 2 issues, rerun the targeted Task 2 tests plus any focused sanity check you need, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+Code quality review found the following remaining Task 2 issues to fix:
+
+Important:
+1. In `loadWhyBlocks`, wrap parse errors with the target file path so later callers get useful context.
+2. In the parser, do not let truncated/malformed blame input fall through as a bare `io.EOF`. Return a descriptive parse error for truncated records.
+3. In `cmd/entire/cli/why_blame_test.go`, do not mutate the package-global `runGitBlamePorcelain` seam inside a parallel test. Remove `t.Parallel()` from that seam test or otherwise make it non-parallel.
+
+Minor, but please fix now while staying in Task 2:
+4. Remove dead-weight error plumbing from any helper like `whyBlockFromHeader` if it cannot actually fail.
+5. Make the parser fixture more representative of real porcelain headers by using a fully formed second header too.
+
+Please fix only these Task 2 issues, rerun the targeted Task 2 tests plus any focused sanity check you need, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+One critical Task 2 bug remains to fix:
+
+- In `cmd/entire/cli/why_blame.go`, do not treat `LineText == ""` as evidence of a truncated record. A valid `git blame --line-porcelain` record can have a tab-only content line for a blank source line.
+- Track whether a content line was seen separately from the line text value itself.
+- Only report truncation when no content line was seen at all.
+- Add a regression test in `cmd/entire/cli/why_blame_test.go` covering a valid blank source line record.
+
+Please fix only this Task 2 issue, rerun the targeted Task 2 tests including the new blank-line case, self-review, and report back. Do not widen scope and do not commit.
