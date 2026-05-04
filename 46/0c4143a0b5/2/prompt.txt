@@ -1,0 +1,148 @@
+use playground to help me understand how entire checkpoints work
+
+---
+
+Tool loaded.
+
+---
+
+Base directory for this skill: /Users/alisha/.claude/plugins/cache/claude-plugins-official/playground/205b6e0b3036/skills/playground
+
+# Playground Builder
+
+A playground is a self-contained HTML file with interactive controls on one side, a live preview on the other, and a prompt output at the bottom with a copy button. The user adjusts controls, explores visually, then copies the generated prompt back into Claude.
+
+## When to use this skill
+
+When the user asks for an interactive playground, explorer, or visual tool for a topic — especially when the input space is large, visual, or structural and hard to express as plain text.
+
+## How to use this skill
+
+1. **Identify the playground type** from the user's request
+2. **Load the matching template** from `templates/`:
+   - `templates/design-playground.md` — Visual design decisions (components, layouts, spacing, color, typography)
+   - `templates/data-explorer.md` — Data and query building (SQL, APIs, pipelines, regex)
+   - `templates/concept-map.md` — Learning and exploration (concept maps, knowledge gaps, scope mapping)
+   - `templates/document-critique.md` — Document review (suggestions with approve/reject/comment workflow)
+   - `templates/diff-review.md` — Code review (git diffs, commits, PRs with line-by-line commenting)
+   - `templates/code-map.md` — Codebase architecture (component relationships, data flow, layer diagrams)
+3. **Follow the template** to build the playground. If the topic doesn't fit any template cleanly, use the one closest and adapt.
+4. **Open in browser.** After writing the HTML file, run `open <filename>.html` to launch it in the user's default browser.
+
+## Core requirements (every playground)
+
+- **Single HTML file.** Inline all CSS and JS. No external dependencies.
+- **Live preview.** Updates instantly on every control change. No "Apply" button.
+- **Prompt output.** Natural language, not a value dump. Only mentions non-default choices. Includes enough context to act on without seeing the playground. Updates live.
+- **Copy button.** Clipboard copy with brief "Copied!" feedback.
+- **Sensible defaults + presets.** Looks good on first load. Include 3-5 named presets that snap all controls to a cohesive combination.
+- **Dark theme.** System font for UI, monospace for code/values. Minimal chrome.
+
+## State management pattern
+
+Keep a single state object. Every control writes to it, every render reads from it.
+
+```javascript
+const state = { /* all configurable values */ };
+
+function updateAll() {
+  renderPreview(); // update the visual
+  updatePrompt();  // rebuild the prompt text
+}
+// Every control calls updateAll() on change
+```
+
+## Prompt output pattern
+
+```javascript
+function updatePrompt() {
+  const parts = [];
+
+  // Only mention non-default values
+  if (state.borderRadius !== DEFAULTS.borderRadius) {
+    parts.push(`border-radius of ${state.borderRadius}px`);
+  }
+
+  // Use qualitative language alongside numbers
+  if (state.shadowBlur > 16) parts.push('a pronounced shadow');
+  else if (state.shadowBlur > 0) parts.push('a subtle shadow');
+
+  prompt.textContent = `Update the card to use ${parts.join(', ')}.`;
+}
+```
+
+## Common mistakes to avoid
+
+- Prompt output is just a value dump → write it as a natural instruction
+- Too many controls at once → group by concern, hide advanced in a collapsible section
+- Preview doesn't update instantly → every control change must trigger immediate re-render
+- No defaults or presets → starts empty or broken on load
+- External dependencies → if CDN is down, playground is dead
+- Prompt lacks context → include enough that it's actionable without the playground
+
+
+ARGUMENTS: Create an interactive HTML playground that teaches how Entire CLI checkpoints work. The playground should visualize the full checkpoint lifecycle with these sections:
+
+## What to visualize
+
+### 1. Session Phase State Machine (Interactive)
+- Show three phases: IDLE, ACTIVE, ENDED as colored nodes
+- Show events as buttons: TurnStart, TurnEnd, GitCommit, SessionStart, SessionStop
+- When user clicks an event button, animate the transition between phases
+- Show the action emitted (e.g., ActionCondense, ActionUpdateLastInteraction)
+- Key transitions:
+  - IDLE + TurnStart → ACTIVE (ActionUpdateLastInteraction)
+  - ACTIVE + TurnEnd → IDLE
+  - ACTIVE + GitCommit → ACTIVE (ActionCondense)
+  - IDLE + GitCommit → IDLE (ActionCondense)
+  - ENDED + GitCommit → ENDED (ActionDiscardIfNoFiles)
+  - ENDED + TurnStart → ACTIVE (ActionClearEndedAt)
+
+### 2. Shadow Branch Visualization (Interactive Timeline)
+- Show a main branch with commits
+- Show a shadow branch named `entire/<commit-hash[:7]>-<worktreeHash[:6]>` forking off
+- User can click "Save Step" to add checkpoint commits to shadow branch
+- Each checkpoint commit shows: file state snapshot + metadata directory
+- Shadow branch metadata structure:
+  ```
+  .entire/metadata/<session-id>/
+  ├── full.jsonl
+  ├── prompt.txt
+  └── tasks/<tool-use-id>/
+  ```
+- Show deduplication: if tree matches previous, skip the write
+
+### 3. Condensation Flow (Animated)
+- User clicks "Git Commit" to trigger condensation
+- Animate: data flows from shadow branch → metadata branch (entire/checkpoints/v1)
+- Show the 12-hex-char checkpoint ID being generated
+- Show sharded directory structure: `<id[:2]>/<id[2:]>/`
+- Show metadata.json with session_ids, session_count
+- Show the Entire-Checkpoint trailer being added to user commit
+- Multi-session: show how a second session adds numbered subfolder
+
+### 4. Rewind Visualization
+- Show a list of rewind points from shadow branch
+- User clicks a rewind point
+- Animate: files restored from checkpoint tree (not git reset)
+- Show FilesToRestore, FilesToDelete, TrackedChanges preview
+
+### 5. Checkpoint ID Linking (Bidirectional)
+- Show user commit with Entire-Checkpoint trailer
+- Show metadata branch with sharded directory
+- Animate bidirectional lookup:
+  - User commit → extract trailer → find metadata
+  - Metadata → search commits → find user commit
+
+## Design
+- Dark theme, modern look
+- Use SVG or canvas for branch visualizations
+- Smooth animations for transitions
+- Step-by-step walkthrough mode with "Next" button
+- Each section should be independently explorable
+- Include brief explanatory text for each concept
+- Color coding: shadow branch (purple), metadata branch (green), main branch (blue)
+
+---
+
+Tool loaded.
