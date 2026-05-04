@@ -1,0 +1,120 @@
+can you take a look at this branch and also https://git-meta.com/
+
+I then want to come up with a better shape/architecture of the repo: Basically can we abstract what v1/v2 do in a clear boundary like "CheckpointBackend" which then could support the git-meta approach in the future (so bring back the work in this branch then, but not merge it as it is today)
+
+V1 would be removed, V2 would be the default, gmeta is an option and potentially we might have s3 or something in the future. 
+
+How should we structure this.
+
+And last but not least we got this architectural feedback on git as a whole:
+
+CLI
+1. The strategy package has no real seam — it's a single implementation pretending to be one
+2. Session state lives in three packages and you can't tell which to use
+3. ManualCommitStrategy is a 76-method procedure book, not a module
+4. The Agent interface is broad and shallow — the optional sub-interfaces leak duplication into every adapter
+5. Hook dispatch is a leaky seam: lifecycle events go through one path, PostTodo bypasses it
+
+---
+
+how hard would it to design it multiple backends could be enabled at the same time?
+
+---
+
+ok, can you give me a plan out of both?
+
+---
+
+can we remove the "v1 is removed" goal from this? is it important?
+
+---
+
+ok, can you give me the plan again?
+
+---
+
+This is a strong plan. The overall sequencing is right, especially the decision to stop after Phase 5 as the first meaningful landing point.
+
+The main thing I would change is the boundary in Phase 1: I would not put `PushRefs()` / `FetchRefs()` directly on `CheckpointBackend`. That mixes archive semantics with transport semantics too early, and it will get awkward fast for `gmeta` and especially `S3`. I would split it like this:
+
+- `CheckpointBackend`
+  - `WriteCommitted`
+  - `UpdateCommitted`
+  - `ReadCommitted`
+  - `ReadSessionContent` or `GetSessionLog`
+  - `ListCommitted`
+- optional `CheckpointSyncer`
+  - `Push`
+  - `Fetch`
+  - maybe backend-specific ref sync operations
+
+That keeps the core backend contract honest. `MultiBackend` can then fan out writes across mirrors without pretending every backend shares the same sync model.
+
+A few other comments:
+
+- Phase 1: good, but I would avoid “V1 and V2 implement via thin adapters” if that means wrapping concrete stores in extra boilerplate forever. If the adapter is just a temporary migration layer, fine. If not, you may be better off defining the interface around the methods they already naturally expose.
+- Phase 2: good. Keeping `migrate` backend-aware is the right call.
+- Phase 3: good and probably worth pulling slightly earlier if it reduces churn in Phase 2. The current session-state duplication is real technical drag.
+- Phase 4: good product direction. I would be explicit that “default backend for new repos” and “automatic read precedence” are separate decisions.
+- Phase 5: good, and I strongly agree with “mirrors don’t serve reads.” That keeps the model simple.
+- Phase 6: good, but I would not gate this on line counts like “400 lines.” The real test is whether each extracted type owns one slice of behavior and has a stable dependency set.
+- Phase 7: directionally good, but this is the riskiest and least urgent part, exactly as you called out.
+- Phase 8: good cleanup, but definitely last.
+
+Two things I’d add:
+
+- Add a config migration phase or subtask.
+Right now you move from:
+  - `checkpoints_version`
+  - `checkpoints_v2`
+  - `gmeta`
+to:
+  - `backend`
+  - `mirrors`
+You should decide early whether old keys are still read indefinitely, auto-migrated on write, or warned about.
+
+- Add a strict mirror policy.
+Document whether mirror failures:
+  - fail the whole operation
+  - warn and continue
+  - only fail in some commands
+For `gmeta`, I suspect you want “primary success wins, mirrors warn.”
+
+So my verdict is: good plan, with one substantial adjustment.
+
+The adjustment is:
+- make `CheckpointBackend` about permanent checkpoint storage
+- keep sync/push/fetch as a separate optional seam
+- then `MultiBackend` becomes much simpler and more durable
+
+If you want the shortest path to a first implementation, I’d start by rewriting just Phase 1 in that shape before touching code.
+
+---
+
+can you give me the full plan again?
+
+---
+
+- In Phase 1, decide whether ReadSessionContentByID is truly part of the backend contract or just a convenience helper.
+    If every real backend can support it naturally, keep it. If some backends only have index-addressed session layout, it may be better as shared helper logic
+    built on ReadCommitted + ReadSessionContent.
+  - In Phase 4, I would explicitly say old checkpoints_version handling too, not just checkpoints_v2 and gmeta.
+    That key is already part of current behavior and should be accounted for in the migration policy.
+
+Can you tell me your thoughts on this?
+
+---
+
+I feel we could now take a stab at change the settings.json before we start really rolling out v2.... Maybe directly have a better settings structure?
+
+---
+
+can you integrate this into the plan? full redesign
+
+---
+
+how encapsulated is the settings loading right now? could we parse the schema in a new object and make both work in parallel?
+
+---
+
+let's maybe just do the settings stuff now, I created a new branch, you can do meaningful commits
