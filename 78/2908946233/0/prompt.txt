@@ -1,0 +1,237 @@
+Implement the following plan:
+
+# Plan: Unify CalculateTokenUsage to accept `[]byte` instead of file paths
+
+## Context
+
+The goal is to move token calculation logic from the strategy package into each agent's implementation behind the `TokenCalculator` / `SubagentAwareExtractor` interfaces. The interfaces now expect `[]byte` (transcript data) instead of `string` (file paths), but Claude Code's implementations still work with file paths internally. OpenCode also has a broken helper deletion.
+
+The new unified entry point `agent.CalculateTokenUsage()` in `token_usage.go` dispatches to the right agent method, and the strategy code already calls it. The remaining work is making the agent implementations match the new signatures.
+
+## Changes
+
+### 1. Claude Code package-level functions (`claudecode/transcript.go`)
+
+Convert `CalculateTotalTokenUsage` and `ExtractAllModifiedFiles` from file-path to `[]byte` for the **main transcript**, while keeping file-based reads for **subagent transcripts** (which are separate files on disk).
+
+**`CalculateTotalTokenUsage`**: Change `transcriptPath string` to `transcriptData []byte`. Replace `transcript.ParseFromFileAtLine(transcriptPath, startLine)` with `transcript.SliceFromLine(transcriptData, startLine)` + `transcript.ParseFromBytes(sliced)`. Subagent reads via `CalculateTokenUsageFromFile` stay as-is.
+
+**`ExtractAllModifiedFiles`**: Same pattern - accept `[]byte`, parse with `SliceFromLine`+`ParseFromBytes`, keep subagent file reads.
+
+### 2. Claude Code delegate methods (`claudecode/claude.go` ~L376-387)
+
+Update method signatures from `sessionRef string` to `transcriptData []byte` to match interfaces:
+- `ExtractAllModifiedFiles(transcriptData []byte, fromOffset int, subagentsDir string)`
+- `CalculateTotalTokenUsage(transcriptData []byte, fromOffset int, subagentsDir string)`
+
+### 3. Claude Code `CalculateTokenUsage` method (`claudecode/lifecycle.go` L132-138)
+
+Fix broken body - replace `sessionRef` (undefined) with `transcriptData`:
+```go
+func (c *ClaudeCodeAgent) CalculateTokenUsage(transcriptData []byte, fromOffset int) (*agent.TokenUsage, error) {
+    return CalculateTotalTokenUsage(transcriptData, fromOffset, "")
+}
+```
+
+### 4. OpenCode: restore `parseExportSessionFromFile` (`opencode/transcript.go`)
+
+Re-add the removed private helper. It's still needed by `GetTranscriptPosition`, `ExtractModifiedFilesFromOffset`, `ExtractPrompts`, and `ExtractSummary` - these are hook-path methods that receive file paths, not bytes.
+
+### 5. Strategy tests (`manual_commit_condensation_test.go`)
+
+Update tests that called the deleted `calculateTokenUsage(agentType, data, offset)` to use the new `agent.CalculateTokenUsage(ag, data, offset, "")`. This requires getting an agent instance first via `agent.GetByAgentType()`.
+
+### 6. Claude Code transcript tests (`claudecode/transcript_test.go`)
+
+Update `TestCalculateTotalTokenUsage_PerCheckpoint` and `TestExtractAllModifiedFiles_IncludesSubagentFiles` to pass `[]byte` instead of file paths. Read the temp file into bytes, pass bytes to the function, keep subagentsDir as a path.
+
+## Key files to modify
+
+1. `cmd/entire/cli/agent/claudecode/transcript.go` - `CalculateTotalTokenUsage`, `ExtractAllModifiedFiles`
+2. `cmd/entire/cli/agent/claudecode/claude.go` - delegate methods (~L376-387)
+3. `cmd/entire/cli/agent/claudecode/lifecycle.go` - `CalculateTokenUsage` method (L132-138)
+4. `cmd/entire/cli/agent/opencode/transcript.go` - restore `parseExportSessionFromFile`
+5. `cmd/entire/cli/strategy/manual_commit_condensation_test.go` - update tests
+6. `cmd/entire/cli/agent/claudecode/transcript_test.go` - update tests
+
+## Reusable functions
+
+- `transcript.SliceFromLine(content []byte, startLine int) []byte` - already exists in `cmd/entire/cli/transcript/parse.go:114`
+- `transcript.ParseFromBytes(content []byte) ([]Line, error)` - already exists in `cmd/entire/cli/transcript/parse.go:17`
+- `CalculateTokenUsageFromFile(path, startLine)` - keep as-is for subagent file reads
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-remove-auto-commit/3275ac45-3f75-4ecd-bd84-a6f67850612d.jsonl
+
+---
+
+mise lint is broken
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user provided a detailed plan to "Unify CalculateTokenUsage to accept `[]byte` instead of file paths"
+2. I read all the key files to understand the current state
+3. I created 6 tasks to track the work
+4. I implemented changes to each file as specified in the plan
+5. Along the way, I discovered additional callers that needed updating (manual_commit_hooks.go)
+6. I also discovered pre-existing broken tests in parse_test.go, geminicli/transcript_test.go, and some strategy tests
+7. After all my changes, the user said "mise lint is broken"
+8. I ran lint and found the parse_test.go issue - tests expect 3 return values from ParseFromFileAtLine but it only returns 2
+9. I read the full parse_test.go file to understand all the places that need fixing
+10. I was about to fix parse_test.go when the summary was requested
+
+Let me capture all the technical details accurately.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked me to implement a plan to "Unify CalculateTokenUsage to accept `[]byte` instead of file paths". The plan involved converting Claude Code's `CalculateTotalTokenUsage` and `ExtractAllModifiedFiles` functions from accepting file paths (string) to accepting transcript data (`[]byte`) for the main transcript, while keeping file-based reads for subagent transcripts. The plan had 6 specific changes across multiple files. After implementation, the user reported "mise lint is broken" which I need to fix.
+
+2. Key Technical Concepts:
+   - Go interface compliance: `TokenCalculator` and `SubagentAwareExtractor` interfaces now expect `[]byte` parameters
+   - JSONL transcript parsing: Claude Code uses JSONL format, parsed via `transcript.SliceFromLine()` + `transcript.ParseFromBytes()`
+   - File-based vs bytes-based parsing: Main transcripts now passed as `[]byte`, subagent transcripts still read from disk via `CalculateTokenUsageFromFile`
+   - Agent registry pattern: `agent.GetByAgentType()` requires agents to be registered via `init()` functions
+   - `agent.CalculateTokenUsage()` dispatches to the right agent method based on interface implementation
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/agent/claudecode/transcript.go`** - Core file containing `CalculateTotalTokenUsage` and `ExtractAllModifiedFiles`. Changed both from `string` path to `[]byte` data parameter, using `transcript.SliceFromLine` + `transcript.ParseFromBytes` instead of `transcript.ParseFromFileAtLine`.
+     ```go
+     func CalculateTotalTokenUsage(transcriptData []byte, startLine int, subagentsDir string) (*agent.TokenUsage, error) {
+         if len(transcriptData) == 0 {
+             return &agent.TokenUsage{}, nil
+         }
+         sliced := transcript.SliceFromLine(transcriptData, startLine)
+         parsed, err := transcript.ParseFromBytes(sliced)
+         // ... rest unchanged
+     ```
+     ```go
+     func ExtractAllModifiedFiles(transcriptData []byte, startLine int, subagentsDir string) ([]string, error) {
+         if len(transcriptData) == 0 {
+             return nil, nil
+         }
+         sliced := transcript.SliceFromLine(transcriptData, startLine)
+         parsed, err := transcript.ParseFromBytes(sliced)
+         // ... rest unchanged
+     ```
+
+   - **`cmd/entire/cli/agent/claudecode/claude.go`** (~L376-387) - Delegate methods updated to match new signatures:
+     ```go
+     func (c *ClaudeCodeAgent) ExtractAllModifiedFiles(transcriptData []byte, fromOffset int, subagentsDir string) ([]string, error) {
+         return ExtractAllModifiedFiles(transcriptData, fromOffset, subagentsDir)
+     }
+     func (c *ClaudeCodeAgent) CalculateTotalTokenUsage(transcriptData []byte, fromOffset int, subagentsDir string) (*agent.TokenUsage, error) {
+         return CalculateTotalTokenUsage(transcriptData, fromOffset, subagentsDir)
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/claudecode/lifecycle.go`** (L132-138) - Fixed broken body replacing undefined `sessionRef` with `transcriptData`:
+     ```go
+     func (c *ClaudeCodeAgent) CalculateTokenUsage(transcriptData []byte, fromOffset int) (*agent.TokenUsage, error) {
+         return CalculateTotalTokenUsage(transcriptData, fromOffset, "")
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/opencode/transcript.go`** - Restored `parseExportSessionFromFile` private helper and removed stale `os.IsNotExist` check from `CalculateTokenUsage`:
+     ```go
+     func parseExportSessionFromFile(path string) (*ExportSession, error) {
+         data, err := os.ReadFile(path) //nolint:gosec // path from agent hook/session state
+         if err != nil {
+             return nil, err //nolint:wrapcheck // caller adds context or checks os.IsNotExist
+         }
+         return ParseExportSession(data)
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/opencode/transcript_test.go`** - Updated `TestCalculateTokenUsage*` tests to pass `[]byte` instead of file paths. Replaced `TestCalculateTokenUsage_NonexistentFile` with `TestCalculateTokenUsage_EmptyData`.
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation_test.go`** - Rewrote all `calculateTokenUsage(agentType, data, offset)` calls to use `agent.CalculateTokenUsage(ag, data, offset, "")`. Added imports for agent registration packages (`claudecode`, `cursor`).
+
+   - **`cmd/entire/cli/agent/claudecode/transcript_test.go`** - Updated `TestCalculateTotalTokenUsage_PerCheckpoint` to pass `[]byte` directly. Updated all `TestExtractAllModifiedFiles*` tests to use `buildJSONL` helper for main transcript bytes. Added `buildJSONL` test helper:
+     ```go
+     func buildJSONL(lines ...string) []byte {
+         var buf strings.Builder
+         for _, line := range lines {
+             buf.WriteString(line)
+             buf.WriteByte('\n')
+         }
+         return []byte(buf.String())
+     }
+     ```
+
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** (~L1312) - Updated `extractModifiedFilesFromLiveTranscript` to read the file first then pass bytes:
+     ```go
+     transcriptData, readErr := os.ReadFile(state.TranscriptPath)
+     if readErr != nil {
+         // log error
+     } else {
+         allFiles, extractErr := claudecode.ExtractAllModifiedFiles(transcriptData, offset, subagentsDir)
+         // ...
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/agent.go`** - Contains the interfaces (`TokenCalculator`, `SubagentAwareExtractor`) that now expect `[]byte` parameters. Already changed before my work.
+
+   - **`cmd/entire/cli/agent/token_usage.go`** - New file with `agent.CalculateTokenUsage()` dispatcher function. Already existed before my work.
+
+   - **`cmd/entire/cli/transcript/parse.go`** - Contains `ParseFromBytes`, `ParseFromFileAtLine`, and `SliceFromLine`. Not modified by me. `ParseFromFileAtLine` returns `([]Line, error)` (2 values).
+
+   - **`cmd/entire/cli/transcript/parse_test.go`** - NOT modified by me, but has pre-existing broken tests that expect `ParseFromFileAtLine` to return 3 values `(lines, totalLines, err)` when it only returns 2 `(lines, err)`. This is what's causing `mise lint` to fail. 10 occurrences at lines: 253, 287, 306, 325, 344, 366, 390, 420, 444, 524.
+
+4. Errors and fixes:
+   - **Build error: `undefined: sessionRef` in lifecycle.go**: The `CalculateTokenUsage` method body referenced `sessionRef` which didn't exist. Fixed by replacing with `transcriptData` (the actual parameter name).
+   - **Build error: `cannot use (*ClaudeCodeAgent)(nil) as agent.SubagentAwareExtractor`**: The delegate methods in claude.go still had `string` parameter types. Fixed by changing to `[]byte`.
+   - **Build error: `undefined: parseExportSessionFromFile` in opencode/transcript.go**: The private helper was deleted but still needed by 4 methods. Fixed by restoring it.
+   - **Build error in manual_commit_hooks.go**: Caller still passing `state.TranscriptPath` (string) to `ExtractAllModifiedFiles`. Fixed by reading file first with `os.ReadFile`.
+   - **Build error in opencode/transcript_test.go**: Tests passing string paths to `CalculateTokenUsage`. Fixed by passing `[]byte` directly.
+   - **Lint failure in parse_test.go**: Tests expect 3 return values from `ParseFromFileAtLine` but it returns 2. This is a pre-existing issue on the branch, NOT caused by my changes. **User explicitly said "mise lint is broken" asking me to fix this.**
+
+5. Problem Solving:
+   - Successfully converted Claude Code transcript functions from file-path to `[]byte` based
+   - Fixed all compile errors across the codebase
+   - Verified all directly-modified package tests pass
+   - Identified pre-existing broken tests in `parse_test.go` (lint failure), `geminicli/transcript_test.go` (undefined `CalculateTokenUsage`), and some strategy tests using unregistered "Agent" agent type
+   - The `parse_test.go` issue is actively blocking `mise lint` and needs to be fixed
+
+6. All user messages:
+   - First message: "Implement the following plan: [detailed plan for unifying CalculateTokenUsage to accept []byte]" with a link to a transcript file for reference
+   - Second message: "mise lint is broken"
+
+7. Pending Tasks:
+   - Fix `cmd/entire/cli/transcript/parse_test.go` - 10 call sites where tests assign 3 return values from `ParseFromFileAtLine` but the function only returns 2. Need to remove the `totalLines` variable and all assertions about `totalLines`.
+
+8. Current Work:
+   I had just read the entire `parse_test.go` file (570 lines) to understand all the locations that need fixing. The user said "mise lint is broken" and I confirmed the issue is in `parse_test.go` where 10 call sites use 3-variable assignment `lines, totalLines, err := ParseFromFileAtLine(...)` but the function signature is `func ParseFromFileAtLine(path string, startLine int) ([]Line, error)` (returns only 2 values). The affected lines are: 253, 287, 306, 325, 344, 366, 390, 420, 444, 524.
+
+9. Optional Next Step:
+   Fix `cmd/entire/cli/transcript/parse_test.go` by changing all 10 occurrences from 3-variable to 2-variable assignment patterns:
+   - `lines, totalLines, err :=` → `lines, err :=` (and remove `totalLines` assertions)
+   - `lines, _, err :=` → `lines, err :=`
+   
+   Then run `mise run lint` to verify the fix. The user's most recent message was: "mise lint is broken"
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-remove-auto-commit/0759affd-c396-458d-98ea-8ea96d13c7bb.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+create a pr, keep description breif, just what we have done.
+
+---
+
+ExtractAllModifiedFiles also reads subagent transcript files later using subagentsDir but doesn’t guard against subagentsDir being empty. If subagentsDir is "", joining paths will produce relative filenames (e.g., "agent-.jsonl"), potentially reading unintended files from the process working directory. Consider skipping subagent reads when subagentsDir is empty/invalid
+
+---
+
+commit it
