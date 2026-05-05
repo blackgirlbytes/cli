@@ -1,0 +1,35 @@
+Review the changes in https://github.com/entireio/cli/compare/more-migration-speedups?expand=1
+
+---
+
+# Review findings:
+
+## Finding 1 (cmd/entire/cli/migrate.go:323-339) [added]
+[P2] Existing v2 checkpoints can skip compact transcript backfill
+
+This path now treats an existing v2 checkpoint as fully migrated whenever all `/full/*` raw artifacts are present. It no longer checks `existing.Sessions[i].Transcript`, so older/partial v2 checkpoints that have raw `/full` data but no `/main/transcript.jsonl` are skipped forever unless the user reruns with `--force`. The removed `backfillCompactTranscripts` test covered this exact compatibility case.
+
+## Finding 2 (cmd/entire/cli/checkpoint/v2_read.go:220-226) [added]
+[P2] Metadata-only read bypasses blob fetch fallback
+
+`ReadSessionMetadata` reads `metadata.json` directly from the go-git tree. The v2 read paths normally use `wrapWithFetcher`, which also handles partial-clone/stale-packfile cases through `git cat-file` and the configured blob fetcher. Since migration reruns now call this helper in the partial-state hot path, repos where metadata blobs are fetchable but not visible to go-git can fail while the previous `ReadSessionMetadataAndPrompts` path would have recovered.
+
+## My request for Codex:
+Review the changes in https://github.com/entireio/cli/pull/1114
+
+---
+
+# Review findings:
+
+## Finding 1 (cmd/entire/cli/migrate.go:323-339) [added]
+[P2] Existing v2 checkpoints can skip compact transcript backfill
+
+This rerun path skips as soon as every session has `/full/*` raw artifacts, without checking whether `/main/transcript.jsonl` exists. Older partially migrated v2 checkpoints with raw full artifacts but no compact transcript will now be treated as complete forever unless users force a full remigration; the removed backfill test covered this compatibility case.
+
+## Finding 2 (cmd/entire/cli/checkpoint/v2_read.go:220-226) [added]
+[P2] Metadata-only read bypasses blob fetch fallback
+
+`ReadSessionMetadata` reads `metadata.json` directly through go-git. Other v2 read paths wrap the tree with `wrapWithFetcher`, which handles partial-clone or stale-packfile cases via `git cat-file` and the configured blob fetcher. Since migration reruns use this helper in the partial-state path, fetchable metadata blobs that are not visible to go-git can fail here where the previous read path would have recovered.
+
+## My request for Codex:
+Review the comments on https://github.com/entireio/cli/pull/1114 and address them
