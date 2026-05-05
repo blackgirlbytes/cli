@@ -1,0 +1,105 @@
+Implement the remaining Task 4 review fixes for `entire why`.
+
+## Scope
+
+Fix only these two issues:
+
+1. In `cmd/entire/cli/why.go`, do not route the static command path through pager-enabled output by default. Task 4 is the non-interactive/static renderer path, so the default command execution should write directly or otherwise ensure the static path does not invoke the pager automatically.
+
+2. In `cmd/entire/cli/why_test.go`, any test that mutates package-level function variables must not run with `t.Parallel()`. Remove `t.Parallel()` from those global-stubbing tests so they do not race.
+
+Do not widen scope. Do not add a golden test. Do not commit.
+
+## Context
+
+Task 4 already added:
+- `cmd/entire/cli/why_render.go`
+- static `newWhyCmd()` path in `cmd/entire/cli/why.go`
+- root registration in `cmd/entire/cli/root.go`
+- renderer test in `cmd/entire/cli/why_render_test.go`
+- command test in `cmd/entire/cli/why_test.go`
+
+The only work left is the two review fixes above.
+
+Work from: `/Users/pfleidi/entire/cli/.worktrees/feat/entire-why`
+
+## Verification
+
+After the fixes, rerun the targeted Task 4 tests and any focused tests affected by the `t.Parallel()` removals.
+
+Report back with:
+- Status
+- What you changed
+- What you tested and results
+- Files changed
+- Self-review findings
+
+---
+
+One Task 4 quality gap remains:
+
+- Strengthen the static command regression test so it actually protects the pager-path fix. Right now it only checks that output contains `package main`, which would still pass if `newWhyCmd()` were accidentally routed back through the pager/explain path.
+
+Use the smallest local change that makes this testable. If needed, introduce a narrow output seam in `why.go` for the static command path so the test can assert the direct-write path is used and the explain/pager path is not.
+
+Do not do the suggested file-structure refactor in this task.
+
+Please fix only this Task 4 testability gap, rerun the targeted Task 4 tests, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+One remaining Task 4 fix is required:
+
+1. In `cmd/entire/cli/why.go`, `writeWhyStaticOutput` must return a write error instead of dropping it. Propagate that error from `RunE` so a broken pipe or short write does not report success.
+
+Do NOT change `whyDetailKind` / `whyBlock.Detail` in this step. Those fields are part of the planned later detail/TUI work and are out of scope for this Task 4 fix.
+
+Please fix only the static-output error propagation issue, rerun the targeted Task 4 tests, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+One remaining Task 4 fix is required:
+
+1. Make the static `entire why` path repo-root-safe instead of cwd-dependent. Right now the raw user path flows straight to `git blame`, which will misbehave from nested subdirectories and can fail for repo-root-relative or absolute paths.
+
+Use the existing repo/worktree-root helpers to normalize the target path for blame. A good fix is:
+- resolve the repo root first
+- normalize the user-supplied path against that root
+- invoke `git blame` in a repo-root-safe way (`cmd.Dir = repoRoot` and/or pass a repo-root-relative path)
+
+Do not spend time on golden-test improvements in this task.
+
+Please fix only this Task 4 path-handling issue, rerun the targeted Task 4 tests and any focused sanity check you need, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+Two remaining Task 4 fixes are required:
+
+1. In `cmd/entire/cli/why_test.go`, remove `t.Parallel()` from any remaining tests that mutate package-level seams like `lookupWhyCommitInfo` / `lookupWhyCheckpointInfo`. These tests must not race.
+
+2. In `cmd/entire/cli/why.go`, make enrichment failure less brittle for the static command path. If optional checkpoint metadata cannot be loaded because the checkpoint is missing or unavailable, preserve commit-only blame output instead of failing the whole command. Only fail on the underlying git blame / commit lookup path.
+
+Keep this narrowly scoped to Task 4. Do not widen into fallback detail or TUI behavior.
+
+Please fix only these issues, rerun the targeted Task 4 tests plus any focused coverage you add for the degraded enrichment path, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+One final Task 4 fix is required:
+
+- Narrow the enrichment fallback in `cmd/entire/cli/why.go`. Right now the static path swallows every enrichment failure and returns raw blame blocks.
+- That is too broad. Preserve commit-only output only for optional checkpoint-metadata lookup failures such as missing/unavailable checkpoint metadata.
+- Do NOT swallow unrelated errors like context cancellation, repo-opening failures, commit lookup failures, or other unexpected errors.
+
+Please implement the smallest change that distinguishes optional checkpoint-enrichment failure from real command failure, add or adjust focused tests to prove the behavior, rerun the targeted Task 4 tests, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+One final Task 4 fix is required:
+
+- Make the optional checkpoint-enrichment fallback granular per commit/block, not all-or-nothing for the entire file.
+- Right now one missing checkpoint metadata record causes `loadWhyDisplayData` to throw away every successfully enriched block and return the original raw blame slice.
+- Preserve successful enrichments and only leave the specific failing commit/block in commit-only form when its checkpoint metadata is unavailable.
+- Continue to propagate non-optional errors.
+
+Please implement the smallest change that keeps successful enrichments while degrading only the affected commit/block, add or adjust focused tests to prove mixed-history behavior, rerun the targeted Task 4 tests, self-review, and report back. Do not widen scope and do not commit.

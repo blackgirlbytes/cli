@@ -1,0 +1,80 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "7c16b9136913",
+  "session_id": "e041aa5e-3e1b-4644-885c-2d1aede10d93",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-27T05:14:12.289306Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 9,
+  "files_touched": [
+    "cmd/entire/cli/lifecycle.go",
+    "cmd/entire/cli/memorylooptui/tab_history.go",
+    "cmd/entire/cli/memorylooptui/tab_injection.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "53030d334c50",
+  "checkpoint_transcript_start": 56,
+  "token_usage": {
+    "input_tokens": 57,
+    "cache_creation_tokens": 24115,
+    "cache_read_tokens": 3336209,
+    "output_tokens": 8381,
+    "api_call_count": 37
+  },
+  "session_metrics": {
+    "turn_count": 15
+  },
+  "summary": {
+    "intent": "Improve readability and clarity of the injection and history tabs in the memorylooptui TUI, and understand how the memory injection system works.",
+    "outcome": "Injection tab spacing was improved, prompt preview storage limit was increased from 120 to 500 chars, and the history tab gained a descriptive header and wider scope column. The user also gained clarity on how PromptPreview is display-only and doesn't affect injection matching.",
+    "learnings": {
+      "repo": [
+        "PromptPreview in injection logs is truncated at storage time in lifecycle.go and is purely for TUI display — the full prompt is always used for actual memory matching via SelectRelevant()",
+        "The History tab tracks runs of `entire memory-loop refresh`, which uses an LLM to generate/reconcile/prune memories from recent session transcripts",
+        "memory-loop.json stores all injection logs; storing full prompts risks significant file bloat since prompts can be multi-KB with file contents and context"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/lifecycle.go",
+          "line": 315,
+          "end_line": 315,
+          "finding": "truncatePromptPreview(event.Prompt, N) is called here at log-write time; limit was increased from 120 to 500 chars. Full prompt is used for matching before this truncation."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_injection.go",
+          "finding": "setSize caps table height at 10 and reserves 23 lines for other content; detail card gets the remainder. Prompt column truncation is set at 40 chars for table display."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_history.go",
+          "finding": "Scope column widened from 8 to 16, scope value truncation from 6 to 12. setSize must be adjusted when header lines are added to the tab."
+        }
+      ],
+      "workflow": [
+        "When a user complains about truncation in a detail view, check both the rendering layer and the data storage layer — truncation may happen at write time, not display time",
+        "Lipgloss handles word wrapping within card width automatically; explicit Width() on text elements is only needed for edge cases"
+      ]
+    },
+    "friction": [
+      "Misdiagnosis of where prompt truncation was happening — initially assumed it was a rendering/wrapping issue, required multiple grep passes to find the storage-time truncation in lifecycle.go",
+      "User had to clarify twice ('Im talking about prompt in injection detail card getting cut off') that they meant the detail card, not the table column",
+      "Widened prompt column to 70 then immediately reverted to 40 on user request — unnecessary churn"
+    ],
+    "open_items": [
+      "R key in the TUI is not yet wired up to trigger `entire memory-loop refresh` — noted as unimplemented during history tab explanation",
+      "No decision reached on whether 500 chars is the right long-term limit for PromptPreview storage, or if a higher limit (1000-2000) would be better",
+      "Full prompt storage was considered but deferred due to JSON bloat concerns — no alternative solution (e.g., separate prompt log file) was designed"
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-27T05:13:50.39944Z",
+    "agent_lines": 43,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 43,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

@@ -1,0 +1,195 @@
+Implement the following plan:
+
+# Plan: Add Context Plumbing Throughout the CLI
+
+## Context
+
+`main.go` creates a cancellable context (`context.WithCancel`) and passes it to Cobra via `rootCmd.ExecuteContext(ctx)`. However, no command retrieves it via `cmd.Context()`. Instead, ~120+ production code locations create `context.Background()`, losing cancellation support from SIGINT/SIGTERM and any parent context values.
+
+## Goal
+
+Thread the root context from `main.go` through the entire call chain, replacing `context.Background()` with the properly propagated context. This enables signal-based cancellation to propagate to git operations, checkpoint writes, and other long-running work.
+
+## Exceptions (keep `context.Background()`)
+
+- `main.go:18` — this IS the root context
+- `telemetry/detached_unix.go:23` — intentionally outlives parent process
+- `benchutil/benchutil.go` — benchmark utility, not part of CLI flow
+
+## Approach
+
+Work bottom-up through 5 layers. Each layer adds `context.Context` as a first parameter to functions, following Go convention.
+
+### Layer 1: Strategy Interface & Optional Interfaces
+
+**Files:** `strategy/strategy.go`
+
+Add `context.Context` as first parameter to all Strategy interface methods:
+
+```go
+// Before
+SaveStep(ctx StepContext) error
+SaveTaskStep(ctx TaskStepContext) error
+GetRewindPoints(limit int) ([]RewindPoint, error)
+Rewind(point RewindPoint) error
+CanRewind() (bool, string, error)
+PreviewRewind(point RewindPoint) (*RewindPreview, error)
+GetTaskCheckpoint(point RewindPoint) (*TaskCheckpoint, error)
+GetTaskCheckpointTranscript(point RewindPoint) ([]byte, error)
+GetSessionInfo() (*SessionInfo, error)
+GetSessionContext(sessionID string) string
+GetCheckpointLog(checkpoint Checkpoint) ([]byte, error)
+GetMetadataRef(checkpoint Checkpoint) string
+GetSessionMetadataRef(sessionID string) string
+
+// After
+SaveStep(ctx context.Context, step StepContext) error
+SaveTaskStep(ctx context.Context, step TaskStepContext) error
+GetRewindPoints(ctx context.Context, limit int) ([]RewindPoint, error)
+Rewind(ctx context.Context, point RewindPoint) error
+CanRewind(ctx context.Context) (bool, string, error)
+PreviewRewind(ctx context.Context, point RewindPoint) (*RewindPreview, error)
+GetTaskCheckpoint(ctx context.Context, point RewindPoint) (*TaskCheckpoint, error)
+GetTaskCheckpointTranscript(ctx context.Context, point RewindPoint) ([]byte, error)
+GetSessionInfo(ctx context.Context) (*SessionInfo, error)
+GetSessionContext(ctx context.Context, sessionID string) string
+GetCheckpointLog(ctx context.Context, checkpoint Checkpoint) ([]byte, error)
+GetMetadataRef(ctx context.Context, checkpoint Checkpoint) string
+GetSessionMetadataRef(ctx context.Context, sessionID string) string
+```
+
+Same for optional handler interfaces:
+- `SessionInitializer.InitializeSession(ctx, ...)`
+- `PrepareCommitMsgHandler.PrepareCommitMsg(ctx, ...)`
+- `PostCommitHandler.PostCommit(ctx)`
+- `CommitMsgHandler.CommitMsg(ctx, ...)`
+- `PrePushHandler.PrePush(ctx, ...)`
+- `TurnEndHandler.HandleTurnEnd(ctx, ...)`
+
+Note: `Name()`, `Description()`, `ValidateRepository()`, `EnsureSetup()` don't need context (pure getters / simple checks).
+
+### Layer 2: Strategy Implementations
+
+Update all implementations to accept and propagate context instead of creating `context.Background()`.
+
+**Files:**
+- `strategy/manual_commit_git.go` — `SaveStep`, `SaveTaskStep`, `AttemptAddAttribution` + internal helpers
+- `strategy/manual_commit_hooks.go` — `PrepareCommitMsg`, `PostCommit`, `InitializeSession`, `HandleTurnEnd` + helpers like `handleAmendCommitMsg`, `updateBaseCommitIfChanged`, `addTrailerForAgentCommit`
+- `strategy/manual_commit_condensation.go` — `CondenseSession`, `CondenseSessionByID`
+- `strategy/manual_commit_rewind.go` — `Rewind`, `GetRewindPoints`, rewind helpers
+- `strategy/manual_commit_logs.go` — `GetSessionInfo`, `GetSessionContext`, `GetCheckpointLog`, etc.
+- `strategy/manual_commit_session.go` — `loadSessionState`, `saveSessionState`, `clearSessionState`, `listAllSessionStates`
+- `strategy/manual_commit_push.go` — `PrePush`
+- `strategy/auto_commit.go` — all Strategy method implementations
+- `strategy/common.go` — shared helpers (`ListCheckpoints`, `getUntrackedFiles`, etc.)
+- `strategy/content_overlap.go` — content overlap detection functions
+- `strategy/cleanup.go` — cleanup functions
+- `strategy/push_common.go` — shared push logic
+- `strategy/hooks.go` — `getGitDirInPath`
+- `strategy/session_state.go` — package-level session state functions
+
+### Layer 3: Standalone Functions in session/checkpoint/paths
+
+**Files:**
+- `session/state.go` — `NormalizeAfterLoad`, `SaveStateFile` (use passed ctx instead of creating Background)
+- `session/phase.go` — `ApplyTransition` (add ctx parameter)
+- `checkpoint/temporary.go` — internal warn logging (use passed ctx)
+- `checkpoint/committed.go` — internal logging (use passed ctx)
+- `paths/paths.go` — `RepoRoot()` → `RepoRoot(ctx)` (propagate cancellation to git exec)
+
+### Layer 4: Lifecycle Dispatcher & Hook Registry
+
+**Files:**
+- `lifecycle.go` — `DispatchLifecycleEvent(ctx, ag, event)` + all `handleLifecycle*` handlers
+- `hook_registry.go` — `newAgentHookVerbCmdWithLogging`: use `cmd.Context()` as base, then layer logging attrs on top
+- `hooks_git_cmd.go` — `newGitHookContext(ctx)`: accept context instead of creating Background
+- `hooks_claudecode_posttodo.go` — use passed context
+
+### Layer 5: Command RunE Functions
+
+Each command's RunE grabs `cmd.Context()` and passes it through:
+
+**Files:**
+- `rewind.go` — `runRewindInteractive`, `displayCheckpointDetails`, `displaySessionLog`, `displayTaskCheckpointLog`, `formatTaskCheckpointInfo`, `displayCheckpointDiff`, `getCheckpointDetailsForDisplay`, `runRewindToWithOptions`
+- `resume.go` — `ResumeCheckpoint`
+- `explain.go` — all explain functions (13 occurrences)
+- `status.go` — `runStatus`
+- `setup.go` — `countSessionStates`, `countShadowBranches`
+- `config.go` — `GetStrategy` logging calls
+- `git_operations.go` — `getGitConfigValue`, `GetGitAuthor`, `IsOnDefaultBranch`, `HardResetWithProtection`, `CheckoutBranch`
+- `versioncheck/versioncheck.go` — `CheckAndNotify`, `fetchLatestVersion`
+- `agent/opencode/cli_commands.go` — opencode command functions
+- `agent/opencode/opencode.go` — session deletion logging
+- `agent/claudecode/lifecycle.go` — lifecycle handler
+- `agent/geminicli/gemini.go` — gemini agent functions
+
+### Layer 6: Free-standing functions called from commands
+
+**Files:**
+- `session.go` (standalone `ListSessions`, `GetSession`) — add ctx parameter
+- `cleanup.go` — add ctx parameter to cleanup functions
+- `content_overlap.go` — add ctx parameter
+
+## Implementation Order
+
+1. **Strategy interface + optional interfaces** (strategy.go) — define the new signatures
+2. **Strategy implementations** — update ManualCommitStrategy and AutoCommitStrategy to satisfy the interface (compiler will guide us)
+3. **Session/checkpoint/paths packages** — add ctx parameters where needed
+4. **Lifecycle + hooks** — thread context from cmd.Context()
+5. **Commands** — grab cmd.Context() and pass through
+6. **Run `mise run fmt && mise run lint && mise run test:ci`** to verify
+
+## Notes
+
+- For functions that add timeouts (e.g., `context.WithTimeout(context.Background(), 2*time.Minute)`), the pattern becomes `context.WithTimeout(ctx, 2*time.Minute)` — preserving the timeout but inheriting parent cancellation.
+- For logging context layering (e.g., `logging.WithComponent(context.Background(), "hooks")`), the pattern becomes `logging.WithComponent(ctx, "hooks")` — layering logging attrs on top of the inherited context.
+- Tests that call these functions directly will need `context.Background()` or `context.TODO()` passed — this is expected and correct for test code.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/pfleidi/.claude/projects/-Users-pfleidi-entire-cli/867c55cf-aa5f-4a59-b8d4-4b8da60ca753.jsonl
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+Continue from where you left off.
+
+---
+
+Please continue
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+What exactly are you doing here? You've been on this all day. Go is a compiled language with a type checker. Why are you using CLI tools for this?
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+Okay, go ahead.
+
+---
+
+Can you do me a favor and help me select appropriate changes to stage them so I can commit them in multiple commits. The goal is that each commit will continue to pass all tests and not produce any compile errors. Can you find changes that belong together, ensure that they still pass all checks and commit them together as a group?
+
+---
+
+[Request interrupted by user]
+
+---
+
+Given the complexity and interdepency of these changes, is it worth splitting them into different commits?

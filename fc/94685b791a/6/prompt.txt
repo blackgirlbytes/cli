@@ -1,0 +1,182 @@
+Implement the following plan:
+
+# Real-Time Turbopuffer Indexing via Cloudflare Queue
+
+## Context
+
+Checkpoints are indexed in Turbopuffer for search. Currently indexing only happens via the backfill script. When new checkpoints arrive via GitHub webhooks, they need to be indexed in Turbopuffer in real-time. The indexing must be async and non-blocking to the webhook processing pipeline, using Cloudflare Queues (already set up for other flows).
+
+## Approach
+
+Add a new `SEARCH_INDEX_QUEUE` Cloudflare Queue. After checkpoint data is upserted into PlanetScale (in both `processSessionsPushEvent` and `processCommitPushEvent`), send a lightweight message to the queue. A new queue consumer fetches checkpoint data from PlanetScale, embeds search text via OpenAI, and upserts vectors to Turbopuffer.
+
+## Files to Modify
+
+| File | Action | Description |
+|------|--------|-------------|
+| `api/src/lib/search-index-queue.ts` | **Create** | Message type, type guard, batch processor |
+| `api/src/lib/turbopuffer.ts` | **Modify** | Add `indexCheckpoints()` function (embed + upsert) |
+| `api/src/env.ts` | **Modify** | Add optional `SEARCH_INDEX_QUEUE?: Queue` |
+| `api/wrangler.jsonc` | **Modify** | Add queue producer + consumer (staging & production) |
+| `api/src/index.ts` | **Modify** | Add queue consumer branch for search index messages |
+| `api/src/lib/webhook/processing.ts` | **Modify** | Enqueue after upsert in both push event handlers |
+
+## Implementation Details
+
+### 1. Search Index Queue (`api/src/lib/search-index-queue.ts`)
+
+Follow existing `RepoSyncMessage` / `UserRepoSyncMessage` pattern from `repo-sync-queue.ts` and `user-repo-sync.ts`.
+
+```typescript
+export interface SearchIndexMessage {
+  repoId: string;
+  checkpointIds: string[];
+  queuedAt: string;
+}
+
+export function isSearchIndexMessage(msg: unknown): msg is SearchIndexMessage { ... }
+
+export async function processSearchIndexBatch(
+  batch: MessageBatch<SearchIndexMessage>,
+  env: Env,
+): Promise<void> { ... }
+```
+
+**Batch processor flow per message:**
+1. Early return if `TURBOPUFFER_API_KEY` or `OPENAI_API_KEY` missing — `msg.ack()` + warning log
+2. Fetch checkpoint + commit data from PlanetScale via `db.checkpoints.getByIds(repoId, checkpointIds)`
+3. Build search text per checkpoint (same format as `buildSearchText()` in backfill script)
+4. Call `indexCheckpoints()` from turbopuffer.ts
+5. Success → `msg.ack()`, transient failure → `msg.retry()`
+
+Logging follows `[search-index-queue]` prefix pattern, with batch metrics matching `repo-sync-queue.ts`.
+
+### 2. Turbopuffer Indexing Function (`api/src/lib/turbopuffer.ts`)
+
+Add `indexCheckpoints()` alongside existing `searchCheckpoints()`:
+
+```typescript
+export async function indexCheckpoints(
+  turbopufferApiKey: string,
+  openaiApiKey: string,
+  repoId: string,
+  checkpoints: Array<{
+    checkpoint_id: string;
+    branch: string | null;
+    agent: string | null;
+    commit_author_username: string | null;
+    created_at: string | null;
+    commit_sha: string | null;
+    commit_message: string | null;
+    prompt: string | null;
+    files_touched: string[] | null;
+  }>,
+): Promise<number>
+```
+
+- Build search text: `Prompt: ...\nCommit: ...\nFiles: ...` (same as backfill `buildSearchText()`)
+- Embed via OpenAI `text-embedding-3-small` (1536 dims) — batch all texts in one call
+- Upsert to Turbopuffer `POST /v1/vectors/checkpoints-{repoId}/upsert` with same attributes as backfill
+- Use deterministic numeric IDs from checkpoint_id hash (consistent with potential re-indexing)
+- Returns count of successfully indexed checkpoints
+
+### 3. Env Binding (`api/src/env.ts`)
+
+```typescript
+SEARCH_INDEX_QUEUE?: Queue;  // Optional — indexing skipped if not configured
+```
+
+Optional so existing environments without the queue continue working.
+
+### 4. Wrangler Config (`api/wrangler.jsonc`)
+
+**Staging (default):**
+```jsonc
+// In producers array:
+{ "binding": "SEARCH_INDEX_QUEUE", "queue": "partialto-api-search-index" }
+// In consumers array:
+{ "queue": "partialto-api-search-index", "max_retries": 3, "max_batch_size": 10, "max_batch_timeout": 5 }
+```
+
+**Production (`env.production`):**
+```jsonc
+// In producers array:
+{ "binding": "SEARCH_INDEX_QUEUE", "queue": "entireio-api-search-index" }
+// In consumers array:
+{ "queue": "entireio-api-search-index", "max_retries": 3, "max_batch_size": 10, "max_batch_timeout": 5 }
+```
+
+### 5. Queue Consumer Routing (`api/src/index.ts`)
+
+Add new branch in `queue()` handler at line ~193, before the unknown-message fallback:
+
+```typescript
+} else if (firstMessage && isSearchIndexMessage(firstMessage)) {
+  await processSearchIndexBatch(
+    batch as MessageBatch<SearchIndexMessage>,
+    env,
+  );
+}
+```
+
+Import `SearchIndexMessage`, `isSearchIndexMessage`, `processSearchIndexBatch` from `../lib/search-index-queue`.
+
+### 6. Enqueue in Webhook Processing (`api/src/lib/webhook/processing.ts`)
+
+**In `processSessionsPushEvent()`** — after line 965 (`db.checkpoints.upsertBatch` succeeds):
+```typescript
+if (env.SEARCH_INDEX_QUEUE) {
+  await env.SEARCH_INDEX_QUEUE.send({
+    repoId: repoRecord.id,
+    checkpointIds,
+    queuedAt: new Date().toISOString(),
+  } satisfies SearchIndexMessage);
+}
+```
+
+**In `processCommitPushEvent()`** — after line 1220 (`db.checkpoints.upsertCommitBatch` succeeds):
+```typescript
+if (env.SEARCH_INDEX_QUEUE) {
+  await env.SEARCH_INDEX_QUEUE.send({
+    repoId: repoRecord.id,
+    checkpointIds: checkpointCommits.map((c) => c.checkpointId),
+    queuedAt: new Date().toISOString(),
+  } satisfies SearchIndexMessage);
+}
+```
+
+Both are guarded by `env.SEARCH_INDEX_QUEUE` — if the binding isn't configured, webhook processing is unaffected. The `send()` call is fast (queue is local to the worker) and non-blocking to the webhook response.
+
+## Key Design Decisions
+
+- **Optional everything**: Queue binding, API keys — graceful degradation at every level
+- **Fetch from DB in consumer, not in message**: Keeps messages small, ensures latest data is indexed
+- **Same vector format as backfill**: Text construction and attributes match `backfill-search.ts` exactly
+- **`msg.ack()` on missing API keys**: Don't retry messages that can never succeed
+
+## Verification
+
+1. Create queue: `wrangler queues create partialto-api-search-index`
+2. Set secrets: `TURBOPUFFER_API_KEY` and `OPENAI_API_KEY` via `wrangler secret put`
+3. Deploy, then push a commit with an `Entire-Checkpoint` trailer
+4. Check worker logs for `[search-index-queue]` entries
+5. Search for the new checkpoint via the search endpoint to confirm it was indexed
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/b3a25300-460d-43d2-8f54-c13ecfe5387c.jsonl
+
+---
+
+can we locally test this follow with logging to see how it's working?
+
+---
+
+okay let's commit and push this
+
+---
+
+okay next let's enable the full text search as well that turbopuffer supports
+
+---
+
+[Request interrupted by user for tool use]

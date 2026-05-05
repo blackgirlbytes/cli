@@ -1,0 +1,131 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a33ff4893c32e8f10</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/c3eb3dfd-f856-4fb0-901f-7bae4034e1d7/tasks/a33ff4893c32e8f10.output</output-file>
+<status>completed</status>
+<summary>Agent "Review for code quality" completed</summary>
+<result>I have the full diff. Let me review it for code quality issues.
+
+## Findings
+
+**1. `cmd/entire/cli/lifecycle.go:22` — Dispatcher bypass predicate is stringly inline**
+The condition `event.Type != agent.SessionStart &amp;&amp; event.Type != agent.TurnStart &amp;&amp; event.SessionID != ""` plus the long comment block above it is an unnamed predicate. The two bypassed event types each need their own justification, but the code reads as a flat `&amp;&amp;` chain.
+Suggested fix: extract `eventBypassesAgentOwnershipCheck(event.Type) bool` (or `requiresOwnershipCheck`). Move the per-event-type rationale to doc comments on the helper. The dispatcher then reads `if event.SessionID != "" &amp;&amp; !eventBypassesAgentOwnershipCheck(event.Type) { ... }`.
+
+**2. `cmd/entire/cli/lifecycle.go:23` — `//nolint:errcheck` rationale is misleading**
+The comment says "load failures fall through to normal dispatch," but the code uses `if state, _ := ...; state != nil &amp;&amp; ...` — the error is discarded by `_`, not silenced via errcheck. The `//nolint:errcheck` directive is on the wrong construct (errcheck flags assignments to `_` only when configured to). More importantly: a load failure here silently lets the event through, which contradicts the comment if the intent was defensive. Either log the error at debug, or drop the nolint and rely on `_`.
+
+**3. `cmd/entire/cli/lifecycle.go:9-21` — Comment block narrates the change**
+The "Bypassed events:" enumeration is rationale that belongs near `eventBypassesAgentOwnershipCheck` (see #1). The lead-in paragraph is fine; the per-event subsections are noise once the predicate is named.
+
+**4. `cmd/entire/cli/lifecycle_test.go:175-180` — `_ = err` test is non-asserting**
+`REDACTED` confesses in its comment that "a real or non-nil error from downstream both prove the dispatcher dispatched" — meaning the test passes even if the dispatcher silently no-ops, as long as something runs. The assertion is effectively vacuous.
+Suggested fix: assert on observable side-effects of dispatch — e.g., that `LoadSessionState` after the call shows AgentType has been corrected to Cursor (via the transcript-path repair the comment describes), or use a mock agent that records whether `InitializeSession` was invoked. Drop `_ = err`.
+
+**5. `cmd/entire/cli/lifecycle_test.go:103-109, 144-150, 194-200, 221-227, 255-261` — Setup boilerplate duplicated 5x**
+The seven-line `tmpDir/InitRepo/WriteFile/GitAdd/GitCommit/Chdir/ClearWorktreeRootCache` block repeats verbatim across the new tests (and matches `TestHandleLifecycleSessionStart_EmptyRepoWarning` already in the file).
+Suggested fix: extract `setupLifecycleTestRepo(t *testing.T)` (or reuse `setupGitRepo` already used by `agent_resolution_test.go` if it lives in this package's test scope).
+
+**6. `cmd/entire/cli/strategy/agent_resolution_test.go:498-509` — Concurrent test has speculative `//nolint:errcheck` rationale**
+"errors are non-fatal — without serialization the goroutines may step on each other's writes" is correct, but the comment "see comment above" appears on both goroutines pointing at a comment that is not directly above either `_ = ...` line. Tighten to a single inline justification, or move the rationale to a const/helper.
+
+**7. `cmd/entire/cli/strategy/manual_commit_hooks.go:609-616` — Comment narrates rather than explains WHY**
+The "Concurrent InitializeSession calls..." block reads as design notes rather than function-local context. Half of it is restating callers (Cursor IDE forwarding); the function doesn't act on it.
+Suggested fix: keep the one-line "we do not serialize; convergence is via correctSessionAgentType" note, drop the rest (it duplicates the package-level explanation in CLAUDE.md and the doc comments on `resolveSessionAgentType`/`correctSessionAgentType`).
+
+**8. `cmd/entire/cli/lifecycle_test.go:117-118` — Stringly-typed agent identifier**
+`ag.agentType = "Gemini CLI"` uses a raw string while `testAgentClaude`/`testAgentCursor` constants are introduced for the same purpose two tests up. Add `testAgentGemini`.</result>
+<usage><total_tokens>49252</total_tokens><tool_uses>1</tool_uses><duration_ms>34507</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a9bdcfa216d573ca4</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/c3eb3dfd-f856-4fb0-901f-7bae4034e1d7/tasks/a9bdcfa216d573ca4.output</output-file>
+<status>completed</status>
+<summary>Agent "Review for efficiency" completed</summary>
+<result>Now I have everything I need. Let me also confirm how often handlers re-call LoadSessionState - I've seen multiple calls (e.g., `handleLifecycleTurnEnd` calls it at lines 486, 614, 870, 898; `handleLifecycleSessionEnd` calls via `markSessionEnded` and again via `CondenseAndMarkFullyCondensed`; `handleLifecycleCompaction` calls at line 645; `handleLifecycleModelUpdate` calls at line 219).
+
+Here are my findings.
+
+---
+
+**File: cmd/entire/cli/lifecycle.go:54-55**
+
+**Issue:** The dispatcher unconditionally calls `strategy.LoadSessionState` for every TurnEnd, Compaction, SessionEnd, SubagentStart, SubagentEnd, ModelUpdate event. `LoadSessionState` opens the git common dir (`getGitCommonDir` → invokes `git rev-parse --git-common-dir` or equivalent), opens an `os.Root`, reads + unmarshals JSON, and runs a stale-session check. On the hook hot path this adds one full state-file read + git-common-dir resolution per event in the *common* (owning-agent) case where the check returns early. The Cursor-forwarding case is the rare exception.
+
+**Suggested fix:** Resolve the state once per dispatch and thread it down. Either (a) attach the loaded `*SessionState` to `ctx` (e.g., `withLoadedSessionState`) so downstream `LoadSessionState` calls can hit a request-scoped cache, or (b) change the downstream handlers to accept `*SessionState` and skip the redundant load. `handleLifecycleTurnEnd` alone calls `LoadSessionState` 4 times (lines 486, 614, 870, 898) — a request-scoped cache eliminates all of those redundancies, not just the new one.
+
+---
+
+**File: cmd/entire/cli/lifecycle.go:54**
+
+**Issue:** Minor: condition order is fine — `event.Type` comparisons are cheap and short-circuit before the `event.SessionID != ""` string compare. Not a real concern.
+
+---
+
+**File: cmd/entire/cli/lifecycle.go:55**
+
+**Issue:** The error from `LoadSessionState` is swallowed via `_`. If the state file is briefly unreadable (concurrent rename from `SaveSessionState`'s tmp→final), the dispatcher falls through to normal dispatch — fine for correctness, but the silent error means observability is lost. The `nolint:errcheck` comment acknowledges this; fine as-is, but consider a debug-level log on non-`os.IsNotExist` errors so transient FS issues are diagnosable.
+
+---
+
+**File: cmd/entire/cli/strategy/manual_commit_hooks.go:617 (`InitializeSession`)**
+
+**Issue:** `InitializeSession` now calls `resolveSessionAgentType` (which calls `LoadAgentTypeHint` — a small disk read) and then immediately calls `s.loadSessionState`, then in the existing-session branch may call `correctSessionAgentType` (which calls `paths.WorktreeRoot` again — already resolved by `OpenRepository` above). Not a hot-path explosion, but `paths.WorktreeRoot` is called twice per TurnStart now. Caching the worktree root in the function (already cached globally per `paths.ClearWorktreeRootCache` in tests) likely makes this a non-issue in practice — confirm `WorktreeRoot` is memoized, otherwise pass the resolved root through.
+
+---
+
+**Concurrency/memory:** No leaked goroutines, no unbounded state, no missing cleanup introduced. The lock removal is clean — `InitializeSession`'s comment explicitly accepts the race and documents convergence via `correctSessionAgentType`.
+
+**Bottom line:** The dispatcher's new `LoadSessionState` call is the one real hot-path concern. Every lifecycle event now pays for one extra disk read + git-common-dir resolution, and downstream handlers immediately re-load the same file 1–4 more times. A request-scoped cache (context value) would eliminate both the new redundancy and several pre-existing ones.</result>
+<usage><total_tokens>72089</total_tokens><tool_uses>5</tool_uses><duration_ms>40880</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af9e18e8604e5e8cd</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/c3eb3dfd-f856-4fb0-901f-7bae4034e1d7/tasks/af9e18e8604e5e8cd.output</output-file>
+<status>completed</status>
+<summary>Agent "Review for code reuse" completed</summary>
+<result>Confirmed: this 6-line `t.TempDir() + InitRepo + WriteFile + GitAdd + GitCommit + t.Chdir + paths.ClearWorktreeRootCache()` block is duplicated 5 times across the new tests. The existing helper `setupStopTestRepo` in `sessions_test.go` (same package) does exactly this (the `session.ClearGitCommonDirCache()` call is a benign extra).
+
+Here are the findings.
+
+---
+
+## Findings
+
+### 1. `cmd/entire/cli/sessions_test.go:21` — `testAgentCursor` string constant duplicates an existing typed constant
+- **Existing utility:** `agent.AgentTypeCursor` (defined `cmd/entire/cli/agent/registry.go:171` as `types.AgentType = "Cursor"`). Same goes for `agent.AgentTypeClaudeCode` vs the existing `testAgentClaude`.
+- **Suggested change:** The new tests cast back: `types.AgentType(testAgentCursor)` (lifecycle_test.go:290, 325) — that cast disappears if the constant *is* the typed value. Drop `testAgentCursor` (and ideally the legacy `testAgentClaude`) and reference `agent.AgentTypeCursor` / `agent.AgentTypeClaudeCode` directly. The `cli` package already imports `agent`, and `lifecycle_test.go` already imports both `agent` and `types`.
+
+### 2. `cmd/entire/cli/lifecycle_test.go:127-131, 152-156, 272-278, 299-305, 333-339` — five copies of repo bootstrap
+- **Existing utility:** `setupStopTestRepo(t)` in `cmd/entire/cli/sessions_test.go:28` (same package). It already does `t.TempDir() + testutil.InitRepo + WriteFile + GitAdd + GitCommit + t.Chdir + ClearWorktreeRootCache + ClearGitCommonDirCache`.
+- **Suggested change:** Replace each 6-line block with `setupStopTestRepo(t)`. If the name reads oddly outside Stop tests, rename it to something like `setupRepoForCWDTest` and reuse (the helper itself is generic, only its name is stop-specific). The extra `session.ClearGitCommonDirCache()` is harmless and arguably wanted in lifecycle tests too.
+
+### 3. `cmd/entire/cli/lifecycle.go:55` — inline ownership check
+- **Existing utility:** None — there is no `IsOwning(state, agentType)` helper today. `strategy/common.go:378` has `resolveAgentType(ctxAgentType, state)` but it only picks a value, doesn't compare. The new `resolveSessionAgentType` / `correctSessionAgentType` in `manual_commit_hooks.go:2143-2189` are also pure-resolution, not ownership comparison.
+- **Suggested change:** Optional refactor: add a small `strategy.SessionOwnedByOtherAgent(ctx, sessionID, ag.Type()) (bool, types.AgentType)` helper in `strategy/session_state.go` (next to `LoadSessionState` / `LoadAgentTypeHint`) so the dispatcher's `LoadSessionState` + nil-check + empty-check + inequality check lives in one place. Today it's a one-off, but other lifecycle handlers in `lifecycle.go` already have eight `LoadSessionState` calls that may want similar guards.
+
+### 4. `correctSessionAgentType` / `resolveSessionAgentType` — overlap check
+- Compared against `agent.AgentForTranscriptPath` and `strategy.resolveAgentType` (`common.go:378`). They're complementary, not duplicates: `resolveAgentType` only consults `state`, the new functions consult transcript path + hint. No redundancy here.
+
+### 5. New test setup in `strategy/agent_resolution_test.go` — clean
+- Already reuses the package-local `setupGitRepo` (`strategy/phase_wiring_test.go:178`) and the typed `agent.AgentTypeCursor` / `agent.AgentTypeClaudeCode` constants. No issues.
+
+**Net:** the high-value fix is #1 (drop the duplicate string constants and use the typed `agent.AgentType*` values) and #2 (call `setupStopTestRepo` instead of hand-rolling repo setup five times). #3 is optional polish.</result>
+<usage><total_tokens>66826</total_tokens><tool_uses>24</tool_uses><duration_ms>90370</duration_ms></usage>
+</task-notification>
+
+---
+
+can you commit, and the please focus on test coverage / maybe integration tests on the fixes

@@ -1,0 +1,174 @@
+Implement the following plan:
+
+# Fix Droid CLI Args Passed as Prompt
+
+## Context
+
+Droid E2E tests intermittently time out because `StartSession` invokes droid with `exec`-only flags in interactive mode:
+
+```go
+// Current (broken) — e2e/agents/droid.go:190
+NewTmuxSession(name, dir, nil, "env", "ENTIRE_TEST_TTY=0", d.Binary(), "--model", defaultDroidModel, "--skip-permissions-unsafe")
+```
+
+From `droid --help`, interactive mode only accepts `-v`, `-r`, `-h`. Everything else becomes part of `[prompt...]`:
+```
+droid "review app.tsx"    ← initial prompt
+droid --model foo         ← "--model foo" is treated as an initial prompt, NOT a flag
+```
+
+Both `--model` and `--skip-permissions-unsafe` are `exec`-only flags (`droid exec --help`). In interactive mode, the string `--model custom:claude-haiku-4-5-20251001 --skip-permissions-unsafe` is sent to the agent as a user message — visible in every pane dump as `>  --model custom:...`. This wastes an agent turn on garbage input and can cause hangs when the agent gets confused.
+
+## Fix
+
+### File: `e2e/agents/droid.go`
+
+**Remove both flags from `StartSession`** (line 190). They're exec-only and become prompt text in interactive mode:
+
+```go
+// Before
+s, err = NewTmuxSession(name, dir, nil, "env", "ENTIRE_TEST_TTY=0", d.Binary(), "--model", defaultDroidModel, "--skip-permissions-unsafe")
+
+// After
+s, err = NewTmuxSession(name, dir, nil, "env", "ENTIRE_TEST_TTY=0", d.Binary())
+```
+
+**Model selection**: The `Bootstrap()` method already writes the BYOK custom model to `~/.factory/settings.json`. If droid doesn't auto-select it, we may need to add a `defaultModel` field to the settings JSON written by Bootstrap. Verify by running tests — if the TUI status bar still shows "Haiku 4.5", BYOK config handles it.
+
+**Permissions**: Interactive mode uses a built-in autonomy system ("Auto (Med)" visible in TUI). Medium autonomy allows file creation, git operations, and reversible commands — sufficient for E2E tests. No equivalent of `--skip-permissions-unsafe` is needed.
+
+### File: `e2e/agents/droid.go` — PromptPattern
+
+No change to `PromptPattern()`. The current `⛬|│ >` works correctly with WaitFor's `stableAtSend` mechanism. After removing the flags-as-prompt, there will be one fewer false `>` line in the pane, making startup detection more reliable.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint
+mise run test:e2e --agent factoryai-droid   # Run twice for flakiness
+```
+
+Check that:
+1. No `>  --model custom:...` line appears in pane content
+2. TUI status bar still shows correct model (Haiku 4.5)
+3. Agent can create files and commit without permission prompts
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/eefebb77-efd9-4b8c-ad28-823b0dbb8ee8.jsonl
+
+---
+
+does this handle setting the model to the custom one for the tmux mode?
+
+---
+
+still failing in ci [e2e/tests]········································✖✖··✖✖····················✖✖··✖✖✖✖
+=== Failed
+=== FAIL: e2e/tests TestInteractiveMultiStep/factoryai-droid (155.53s)
+    interactive_test.go:17: start session: droid failed to start after 3 attempts: timed out waiting for "⛬|│ >" after 30s
+        --- pane content ---
+        
+        
+                    █████████    █████████     ████████    ███   █████████
+                    ███    ███   ███    ███   ███    ███   ███   ███    ███
+                    ███    ███   ███    ███   ███    ███   ███   ███    ███
+                    ███    ███   █████████    ███    ███   ███   ███    ███
+                    ███    ███   ███    ███   ███    ███   ███   ███    ███
+                    ███    ███   ███    ███   ███    ███   ███   ███    ███
+                    █████████    ███    ███    ████████    ███   █████████
+        
+                                             v0.65.1
+        
+        
+                You are standing in an open terminal. An AI awaits your commands.
+        
+                  ENTER to send • \ + ENTER for a new line • @ to mention files
+        
+                             Current folder: /tmp/e2e-repo-1625394343
+        --- end pane content ---
+=== FAIL: e2e/tests TestInteractiveMultiStep (155.53s)
+=== FAIL: e2e/tests TestInteractiveContentOverlapRevertNewFile/factoryai-droid (211.30s)
+    existing_files_test.go:103: start session: droid failed to start after 3 attempts: timed out waiting for "⛬|│ >" after 30s
+        --- pane content ---
+        
+        
+                    █████████    █████████     ████████    ███   █████████
+                    ███    ███   ███    ███   ███    ███   ███   ███    ███
+                    ███    ███   ███    ███   ███    ███   ███   ███    ███
+✓ TestAttributionMixedHumanAndAgent (128.7s)
+  ✓ factoryai-droid      128.7s
+✗ TestAttributionMultiCommitSameSession (207.9s)
+  ✗ factoryai-droid      207.9s
+      attribution_test.go:84: start session: droid failed to start after 3 attempts: timed out waiting for "⛬|│ >" after 30s
+      --- pane content ---
+      █████████    █████████     ████████    ███   █████████
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   █████████    ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      █████████    ███    ███    ████████    ███   █████████
+      v0.65.1
+      You are standing in an open terminal. An AI awaits your commands.
+      ENTER to send • \ + ENTER for a new line • @ to mention files
+      Current folder: /tmp/e2e-repo-957252333
+✓ TestMultiSessionSequential (48.8s)
+  ✓ factoryai-droid      48.8s
+✓ TestPartialCommitStashNewPrompt (90.4s)
+  ✓ factoryai-droid      90.4s
+✓ TestPartialStaging (109.2s)
+  ✓ factoryai-droid      109.2s
+✓ TestRapidSequentialCommits (81.6s)
+  ✓ factoryai-droid      81.6s
+✓ TestRewindAfterCommit (41.7s)
+  ✓ factoryai-droid      41.7s
+✓ TestRewindMultipleFiles (65.0s)
+  ✓ factoryai-droid      65.0s
+✓ TestRewindPreCommit (56.3s)
+  ✓ factoryai-droid      56.3s
+✓ TestSessionDepletedManualEditNoCheckpoint (37.9s)
+  ✓ factoryai-droid      37.9s
+✗ TestShadowBranchCleanedAfterAgentCommit (125.4s)
+  ✗ factoryai-droid      125.4s
+      attribution_test.go:125: start session: droid failed to start after 3 attempts: timed out waiting for "⛬|│ >" after 30s
+      --- pane content ---
+      █████████    █████████     ████████    ███   █████████
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   █████████    ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      █████████    ███    ███    ████████    ███   █████████
+      v0.65.1
+      You are standing in an open terminal. An AI awaits your commands.
+      ENTER to send • \ + ENTER for a new line • @ to mention files
+      Current folder: /tmp/e2e-repo-655443176
+      --- end pane content ---
+✓ TestSingleSessionAgentCommitInTurn (96.1s)
+  ✓ factoryai-droid      96.1s
+✓ TestSingleSessionManualCommit (80.2s)
+  ✓ factoryai-droid      80.2s
+✓ TestSingleSessionSubagentCommitInTurn (103.8s)
+  ✓ factoryai-droid      103.8s
+✓ TestSplitModificationsToExistingFiles (99.8s)
+  ✓ factoryai-droid      99.8s
+✓ TestStashModificationsToTrackedFiles (83.0s)
+  ✓ factoryai-droid      83.0s
+✓ TestStashSecondPromptUnstashCommitAll (82.0s)
+  ✓ factoryai-droid      82.0s
+✓ TestSubagentCommitFlow (71.0s)
+  ✓ factoryai-droid      71.0s
+✓ TestTrailerRemovalSkipsCondensation (37.8s)
+  ✓ factoryai-droid      37.8s
+✓ TestUserSplitsAgentChanges (99.9s)
+  ✓ factoryai-droid      99.9s
+💥 FAILED (32/37 passed) 💥
+entire binary:  /home/runner/work/cli/cli/entire
+entire version: Entire CLI v0.0.0-dev-053f7c3 (053f7c3)
+Go version: go1.26.0
+OS/Arch: linux/amd64
+artifacts: /home/runner/work/cli/cli/e2e/artifacts/2026-03-02T22-48-30
+
+---
+
+[Request interrupted by user for tool use]

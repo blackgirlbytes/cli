@@ -1,0 +1,573 @@
+y
+
+---
+
+tell me how can i test it?
+
+---
+
+I am running:
+⏺ 1. Build fake-old binary:
+  go build -ldflags="-X github.com/entireio/cli/cmd/entire/cli/versioninfo.Version=v0.1.0" -o /tmp/entire ./cmd/entire
+
+  2. Clean HOME:
+  export H=$(mktemp -d)
+
+  3. Trigger prompt (real TTY + network):
+  HOME=$H /tmp/entire version
+
+And I'm not getting any update prompt
+
+---
+
+have you tested it?
+
+---
+
+ship it
+
+---
+
+why this PR contains changes on cmd/entire/cli/strategy/content_overlap.go files ?
+
+---
+
+2
+
+---
+
+delete them from this PR
+
+---
+
+yes force-push
+
+---
+
+create a new branch that starts from main, and cherry picks the ones we own
+
+---
+
+lets go thru the PR feedback!
+Let's start with:
+var confirmed bool initializes to false, and huh's .Value(&confirmed) uses the pointed-to value as the initial default selection. This makes "No" the pre-selected default. The architecture doc shows the prompt as (Y/n) — the capital-Y convention means "Yes" is the default — and the PR description says "Accepting runs whatever command…", implying accept is the expected default action. A user pressing Enter expecting to confirm the update will instead decline it.
+
+---
+
+quick remainder how to test it locally
+
+---
+
+Now, all the feedback is about the issue of the tty options. 
+1. MaybeAutoUpdate decides interactivity solely via stdoutIsTerminal() which checks os.Stdout, ignoring the passed w and also ignoring whether os.Stdin is a TTY. This can trigger an interactive huh prompt even when the caller has redirected output (e.g. Cobra cmd.SetOut(&bytes.Buffer) in versioncheck_test.go) or when stdin is piped, which can hang tests/local runs or consume piped input. Consider gating on the actual output writer when it’s an *os.File (and treating non-*os.File writers as non-interactive), and also requiring os.Stdin to be a terminal before running the confirm form.
+2. Adding MaybeAutoUpdate(ctx, w, currentVersion) to CheckAndNotify means the existing TestCheckAndNotify_PrintsNotificationWhenOutdated test now exercises the interactive auto-update prompt path. The setupCheckAndNotifyTest helper doesn't set ENTIRE_NO_AUTO_UPDATE, doesn't mock stdoutIsTerminal, and doesn't mock confirmUpdate. On a developer machine where CI is unset and stdout happens to be a real terminal (e.g. running the compiled test binary directly), realConfirmUpdate renders a huh interactive form and the test hangs waiting for input. This passes in CI (where CI=true) but can fail locally.
+
+3. defaultStdoutIsTerminal only checks term.IsTerminal on stdout, but the codebase's established hasTTY() function also guards against coding agent subprocesses (GEMINI_CLI, COPILOT_CLI, PI_CODING_AGENT, GIT_TERMINAL_PROMPT=0) that inherit the user's TTY yet cannot respond to interactive prompts. The new auto-update prompt can fire and block indefinitely in these agent environments since none of those env vars are checked and agents don't set CI.
+
+
+Please, tell me how are we right now detecting if we are on tty or not? By memory I recall these options:
+- normal user using a terminal -> it is interactive
+- run as a subprocess on testing -> it is not. It does not matter if we are running it on our terminal or on github actions or as a subprocess on an agent.
+
+
+Please, give me a proper solution agnostic if it is running on CI or adding flags or things like that. There should be a bulletproof check that tells us if huh is under interactive or not. I want the simplest solution but also the bulletproof, it does not matter what we have already implemented. What do you offer me ?
+
+---
+
+I do have another plan:
+Plan: Remove env-var TTY gating — pure /dev/tty detection for huh forms
+
+ Context
+
+ The Entire CLI uses charmbracelet/huh for interactive terminal forms across ~39 callsites. Currently, two env vars control TTY behavior:
+
+ - ENTIRE_TEST_TTY (100+ references): overrides /dev/tty detection in tests and e2e
+ - ACCESSIBLE (5 references): toggles huh's accessible (plain-text) mode
+
+ These proxy for one question: "is there a TTY?" The goal is to replace env-var gating with pure runtime TTY detection — no TTY means no form,
+ automatically. A Go function-variable test seam replaces the env vars for unit tests.
+
+ Additionally, strategy/manual_commit_hooks.go has a separate hasTTY() with agent-detection logic (GEMINI_CLI, COPILOT_CLI, PI_CODING_AGENT,
+ GIT_TERMINAL_PROMPT). This logic must be consolidated into the shared interactive package.
+
+ ---
+ Step 1: Rewrite interactive/interactive.go — single source of TTY truth
+
+ File: cmd/entire/cli/interactive/interactive.go
+
+ Replace the current implementation with:
+
+ package interactive
+
+ import "os"
+
+ // canPrompt is the TTY detection function. Swappable in tests via OverrideForTest.
+ var canPrompt = checkCanPrompt
+
+ // CanPromptInteractively reports whether interactive prompts can be shown.
+ // Returns false when there is no controlling terminal, or when running
+ // inside an AI agent subprocess that inherits the user's TTY but cannot
+ // respond to prompts.
+ func CanPromptInteractively() bool {
+        return canPrompt()
+ }
+
+ func checkCanPrompt() bool {
+        // Agent subprocesses may inherit the user's TTY but cannot respond
+        // to interactive prompts. Detect known agents and bail out.
+        if isAgentSubprocess() {
+                return false
+        }
+
+        tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+        if err != nil {
+                return false
+        }
+        _ = tty.Close()
+        return true
+ }
+
+ // isAgentSubprocess returns true when the process is a subprocess of a known
+ // AI coding agent. These agents may pass through the user's TTY but cannot
+ // respond to interactive prompts on the user's behalf.
+ func isAgentSubprocess() bool {
+        if os.Getenv("GEMINI_CLI") != "" {
+                return true
+        }
+        if os.Getenv("COPILOT_CLI") != "" {
+                return true
+        }
+        if os.Getenv("PI_CODING_AGENT") != "" {
+                return true
+        }
+        if os.Getenv("GIT_TERMINAL_PROMPT") == "0" {
+                return true
+        }
+        return false
+ }
+
+ // OverrideForTest replaces TTY detection for the duration of a test.
+ // Returns a restore function that must be deferred.
+ //
+ //     restore := interactive.OverrideForTest(func() bool { return false })
+ //     defer restore()
+ func OverrideForTest(fn func() bool) func() {
+        old := canPrompt
+        canPrompt = fn
+        return func() { canPrompt = old }
+ }
+
+ Key points:
+ - Agent-detection logic moves here FROM strategy/manual_commit_hooks.go:hasTTY()
+ - ENTIRE_TEST_TTY env var is gone — replaced by OverrideForTest()
+ - OverrideForTest is exported so all packages can use it
+
+ ---
+ Step 2: Rewrite interactive/interactive_test.go
+
+ File: cmd/entire/cli/interactive/interactive_test.go
+
+ Replace with tests that use the function seam:
+
+ package interactive
+
+ import "testing"
+
+ func TestCanPromptInteractively_ForcedOn(t *testing.T) {
+        restore := OverrideForTest(func() bool { return true })
+        defer restore()
+        if !CanPromptInteractively() {
+                t.Error("CanPromptInteractively() = false; want true")
+        }
+ }
+
+ func TestCanPromptInteractively_ForcedOff(t *testing.T) {
+        restore := OverrideForTest(func() bool { return false })
+        defer restore()
+        if CanPromptInteractively() {
+                t.Error("CanPromptInteractively() = true; want false")
+        }
+ }
+
+ ---
+ Step 3: Add Form wrapper type to utils.go
+
+ File: cmd/entire/cli/utils.go
+
+ Replace NewAccessibleForm and IsAccessibleMode with:
+
+ // Form wraps huh.Form with automatic TTY detection.
+ // When no controlling terminal is available, Run() returns nil
+ // and all field values remain at their defaults.
+ type Form struct {
+        inner *huh.Form
+ }
+
+ // NewForm creates a new Form with the Entire theme applied.
+ // The form will only run if a TTY is available.
+ func NewForm(groups ...*huh.Group) *Form {
+        return &Form{
+                inner: huh.NewForm(groups...).WithTheme(entireTheme()),
+        }
+ }
+
+ // Run executes the form if a TTY is available. Returns nil immediately
+ // when no terminal is present (CI, agent subprocesses, piped input).
+ func (f *Form) Run() error {
+        if !interactive.CanPromptInteractively() {
+                return nil
+        }
+        return f.inner.Run()
+ }
+
+ Delete:
+ - IsAccessibleMode() function
+ - NewAccessibleForm() function
+
+ Keep unchanged:
+ - entireTheme()
+ - handleFormCancellation()
+
+ ---
+ Step 4: Rename all NewAccessibleForm calls to NewForm
+
+ 39 callsites across these files. Mechanical find-replace — no logic changes:
+
+ ┌────────────────────────────────────────────┬────────────────┐
+ │                    File                    │ Callsite count │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/setup_github.go             │ 8              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/setup.go                    │ 6              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/rewind.go                   │ 5              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/sessions.go                 │ 4              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/trail_cmd.go                │ 4              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/clean.go                    │ 3              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/doctor.go                   │ 3              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/resume.go                   │ 2              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/attach.go                   │ 1              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/reset.go                    │ 1              │
+ ├────────────────────────────────────────────┼────────────────┤
+ │ cmd/entire/cli/explain_summary_provider.go │ 1              │
+ └────────────────────────────────────────────┴────────────────┘
+
+ Important: The return type changes from *huh.Form to *Form. Since no callsite chains huh methods after NewAccessibleForm() (verified — all just call
+ .Run()), this is safe.
+
+ ---
+ Step 5: Update search_cmd.go — replace IsAccessibleMode()
+
+ File: cmd/entire/cli/search_cmd.go (line 73)
+
+ // Before:
+ if query == "" && !hasFilters && (jsonOutput || !isTerminal || IsAccessibleMode()) {
+
+ // After:
+ if query == "" && !hasFilters && (jsonOutput || !isTerminal || !interactive.CanPromptInteractively()) {
+
+ Add interactive import if not already present.
+
+ Also check line 166 for another IsAccessibleMode() call and replace similarly.
+
+ ---
+ Step 6: Update versioncheck/autoupdate.go — remove ACCESSIBLE env var
+
+ File: cmd/entire/cli/versioncheck/autoupdate.go
+
+ The file already uses a function-variable seam (stdoutIsTerminal). Two changes:
+
+ 1. In realConfirmUpdate() (line 64-86): remove the ACCESSIBLE env var block and use interactive.CanPromptInteractively() as the guard instead of
+ relying on the caller's stdoutIsTerminal() check. Or simpler: just use NewForm from the cli package if possible. If import cycles prevent this, inline
+  the TTY check:
+
+ func realConfirmUpdate() (bool, error) {
+        confirmed := true
+        form := huh.NewForm(
+                huh.NewGroup(
+                        huh.NewConfirm().
+                                Title("Install the new version now?").
+                                Affirmative("Yes").
+                                Negative("No").
+                                Value(&confirmed),
+                ),
+        ).WithTheme(huh.ThemeDracula())
+
+        // No ACCESSIBLE env var check needed — the caller (MaybeAutoUpdate)
+        // already bails if !stdoutIsTerminal().
+        if err := form.Run(); err != nil {
+                if errors.Is(err, huh.ErrUserAborted) || errors.Is(err, huh.ErrTimeout) {
+                        return false, nil
+                }
+                return false, fmt.Errorf("confirm form: %w", err)
+        }
+        return confirmed, nil
+ }
+
+ Since MaybeAutoUpdate already checks stdoutIsTerminal() on line 42 before calling confirmUpdate(), the form will never run without a terminal. The
+ ACCESSIBLE block (lines 76-78) can be deleted.
+
+ ---
+ Step 7: Update strategy/manual_commit_hooks.go — delegate to interactive
+
+ File: cmd/entire/cli/strategy/manual_commit_hooks.go
+
+ 7a. Replace hasTTY() (lines 40-87)
+
+ Delete the local hasTTY() function entirely. Replace all calls with interactive.CanPromptInteractively(), which now contains the same agent-detection
+ logic (Step 1).
+
+ 7b. Replace askConfirmTTY() test seam (lines 110-115)
+
+ The current code:
+ if os.Getenv("ENTIRE_TEST_TTY") != "" {
+        return defaultResult
+ }
+
+ This exists because tests set ENTIRE_TEST_TTY=1 to make hasTTY() return true, but can't actually interact with /dev/tty. Since we're removing the env
+ var, we need a different seam.
+
+ Option: Make askConfirmTTY a package-level function variable (same pattern as versioncheck/autoupdate.go):
+
+ var askConfirm = realAskConfirmTTY
+
+ func realAskConfirmTTY(header string, details []string, prompt string, defaultYes bool) ttyResult {
+        // ... existing /dev/tty reading logic (lines 117+) ...
+ }
+
+ Tests that currently do t.Setenv("ENTIRE_TEST_TTY", "1") to exercise the "human at terminal" path can instead:
+ origAsk := askConfirm
+ askConfirm = func(...) ttyResult { return ttyResultLink }
+ defer func() { askConfirm = origAsk }()
+
+ Or expose a test helper similar to OverrideForTest.
+
+ ---
+ Step 8: Delete strategy/manual_commit_reset.go:isAccessibleMode()
+
+ File: cmd/entire/cli/strategy/manual_commit_reset.go (lines 14-18)
+
+ Delete the isAccessibleMode() function. If it's used within the strategy package, replace calls with !interactive.CanPromptInteractively().
+
+ ---
+ Step 9: Migrate unit tests — replace ENTIRE_TEST_TTY with OverrideForTest
+
+ ~56 occurrences of t.Setenv("ENTIRE_TEST_TTY", ...) across these test files:
+
+ ┌────────────────────────────────────────────────────────┬──────────────┐
+ │                          File                          │ Approx count │
+ ├────────────────────────────────────────────────────────┼──────────────┤
+ │ cmd/entire/cli/setup_test.go                           │ 28           │
+ ├────────────────────────────────────────────────────────┼──────────────┤
+ │ cmd/entire/cli/setup_github_test.go                    │ 16           │
+ ├────────────────────────────────────────────────────────┼──────────────┤
+ │ cmd/entire/cli/explain_test.go                         │ 3            │
+ ├────────────────────────────────────────────────────────┼──────────────┤
+ │ cmd/entire/cli/explain_summary_provider_test.go        │ 1            │
+ ├────────────────────────────────────────────────────────┼──────────────┤
+ │ cmd/entire/cli/strategy/condense_skip_test.go          │ 3            │
+ ├────────────────────────────────────────────────────────┼──────────────┤
+ │ cmd/entire/cli/strategy/manual_commit_test.go          │ 1            │
+ ├────────────────────────────────────────────────────────┼──────────────┤
+ │ cmd/entire/cli/strategy/commit_hook_perf_test.go       │ 1            │
+ ├────────────────────────────────────────────────────────┼──────────────┤
+ │ cmd/entire/cli/strategy/preparecommitmsg_bench_test.go │ 2            │
+ ├────────────────────────────────────────────────────────┼──────────────┤
+ │ cmd/entire/cli/strategy/rewind_test.go                 │ 1            │
+ └────────────────────────────────────────────────────────┴──────────────┘
+
+ Replacement pattern:
+
+ // Before:
+ t.Setenv("ENTIRE_TEST_TTY", "0")
+
+ // After:
+ restore := interactive.OverrideForTest(func() bool { return false })
+ defer restore()
+
+ // Before:
+ t.Setenv("ENTIRE_TEST_TTY", "1")
+
+ // After:
+ restore := interactive.OverrideForTest(func() bool { return true })
+ defer restore()
+
+ If multiple tests in the same file use the same override, consider a test helper:
+
+ func forceNonInteractive(t *testing.T) {
+        t.Helper()
+        restore := interactive.OverrideForTest(func() bool { return false })
+        t.Cleanup(restore)
+ }
+
+ ---
+ Step 10: Migrate integration tests
+
+ File: cmd/entire/cli/integration_test/testenv.go
+
+ 10a. cliEnv() (line 140)
+
+ Remove "ENTIRE_TEST_TTY=0" from the environment list. Without a PTY, the subprocess has no /dev/tty, so CanPromptInteractively() returns false
+ naturally.
+
+ 10b. gitCommitWithShadowHooks() (lines 1118-1126)
+
+ Currently toggles ENTIRE_TEST_TTY=1 vs ENTIRE_TEST_TTY=0 based on simulateTTY.
+
+ - When simulateTTY=true: the test should use pty.Start() to give the child a real TTY. If the test already uses PTY, just remove the env var — the
+ real TTY is enough.
+ - When simulateTTY=false: just remove the env var — no PTY means no /dev/tty.
+
+ If some tests set simulateTTY=true but DON'T use a PTY (relying solely on the env var to fake TTY presence), those tests need adjustment. They should
+ either:
+ - Actually use a PTY, or
+ - Accept that the non-interactive path runs and verify that behavior instead
+
+ 10c. RunCommandInteractive() in integration_test/interactive.go (line 29)
+
+ Remove "ACCESSIBLE=1" from the env. The test already uses pty.Start() which gives a real TTY. However, this means huh will render full TUI output
+ instead of plain text. Two options:
+ - Recommended: Keep "ACCESSIBLE=1" ONLY in this integration test helper. It's not gating TTY detection — it's controlling huh's output format so
+ WaitForPromptAndRespond can parse plain text. This is a legitimate use of the accessibility feature.
+ - Alternative: Rewrite WaitForPromptAndRespond to strip ANSI sequences. Higher effort, fragile.
+
+ ---
+ Step 11: Migrate e2e tests
+
+ ~20 references across e2e/ directory.
+
+ Pattern 1: "ENTIRE_TEST_TTY=0" in subprocess env
+
+ Files: e2e/entire/entire.go, e2e/testutil/repo.go, e2e/tests/resume_test.go, e2e/agents/copilot-cli.go
+
+ Remove these. Subprocesses without a PTY won't have /dev/tty, so detection works naturally.
+
+ Pattern 2: filterEnv(..., "ENTIRE_TEST_TTY") stripping the var
+
+ Files: e2e/agents/agent.go, e2e/agents/claude.go, e2e/agents/codex.go, e2e/agents/copilot-cli.go, e2e/agents/droid.go, e2e/agents/gemini.go,
+ e2e/agents/opencode.go, e2e/agents/roger_roger.go, e2e/agents/vogon.go
+
+ Remove the "ENTIRE_TEST_TTY" string from filter lists. If it's the only item being filtered, remove the filterEnv call. If other items are also
+ filtered, keep the call but remove the ENTIRE_TEST_TTY entry.
+
+ ---
+ Step 12: Update search_cmd_test.go
+
+ File: cmd/entire/cli/search_cmd_test.go (line 16)
+
+ // Before:
+ t.Setenv("ACCESSIBLE", "1")
+
+ // After:
+ restore := interactive.OverrideForTest(func() bool { return false })
+ defer restore()
+
+ The test (TestSearchCmd_AccessibleModeRequiresQuery) verifies that non-interactive mode requires a query. The override achieves the same thing.
+
+ ---
+ Step 13: Update autoupdate_test.go
+
+ File: cmd/entire/cli/versioncheck/autoupdate_test.go (line 25)
+
+ Remove t.Setenv("ACCESSIBLE", ""). The fixture already mocks stdoutIsTerminal and confirmUpdate via function variables — no env var cleanup needed.
+
+ ---
+ Verification
+
+ Compile check
+
+ cd /Users/gtrrz-victor/wks/cli/add-auto-aupdate
+ go build ./...
+
+ Unit tests
+
+ go test ./cmd/entire/cli/... -count=1 -short
+ go test ./cmd/entire/cli/interactive/... -count=1
+ go test ./cmd/entire/cli/strategy/... -count=1
+ go test ./cmd/entire/cli/versioncheck/... -count=1
+
+ Integration tests (if available locally)
+
+ go test ./cmd/entire/cli/integration_test/... -tags=integration -count=1
+
+ Grep for leftovers
+
+ # Should return zero results:
+ grep -r "ENTIRE_TEST_TTY" --include="*.go" .
+ grep -r "IsAccessibleMode" --include="*.go" .
+ grep -r "NewAccessibleForm" --include="*.go" .
+
+ # ACCESSIBLE should only appear in integration_test/interactive.go (for output formatting):
+ grep -r '"ACCESSIBLE"' --include="*.go" .
+
+ Manual smoke test
+
+ # From a terminal — should show interactive TUI:
+ entire doctor
+
+ # Piped — should skip forms, use defaults:
+ echo "" | entire doctor
+
+ ---
+ Summary of what's deleted
+
+ ┌───────────────────────────────────────┬─────────────────────────────────────────────────┬────────────────────────────────────────────────┐
+ │                 Item                  │                      Where                      │                  Replaced by                   │
+ ├───────────────────────────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ ENTIRE_TEST_TTY env var               │ everywhere                                      │ interactive.OverrideForTest()                  │
+ ├───────────────────────────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ ACCESSIBLE env var in production code │ utils.go, manual_commit_reset.go, autoupdate.go │ TTY detection in Form.Run()                    │
+ ├───────────────────────────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ IsAccessibleMode()                    │ utils.go                                        │ deleted (callers use CanPromptInteractively()) │
+ ├───────────────────────────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ NewAccessibleForm()                   │ utils.go                                        │ NewForm() returning *Form wrapper              │
+ ├───────────────────────────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ isAccessibleMode()                    │ strategy/manual_commit_reset.go                 │ deleted                                        │
+ ├───────────────────────────────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────────────┤
+ │ hasTTY()                              │ strategy/manual_commit_hooks.go                 │ interactive.CanPromptInteractively()           │
+ └───────────────────────────────────────┴─────────────────────────────────────────────────┴────────────────────────────────────────────────┘
+
+ What survives
+
+ ┌───────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │                     Item                      │                                               Why                                               │
+ ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ ACCESSIBLE=1 in                               │ Controls huh output format for test parsing — NOT TTY gating                                    │
+ │ integration_test/interactive.go               │                                                                                                 │
+ ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ CanPromptInteractively() guards before forms  │ Early bail-out with helpful messages (e.g., "Use: entire configure --agent")                    │
+ ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ handleFormCancellation()                      │ Still handles ErrUserAborted/ErrTimeout from forms that do run                                  │
+ ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ Agent-detection env vars (GEMINI_CLI, etc.)   │ Moves into interactive.isAgentSubprocess() — these detect real runtime conditions, not test     │
+ │                                               │ overrides                                                                                       │
+ ├───────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ stdoutIsTerminal in                           │ Already uses function-variable seam, not an env var                                             │
+ │ versioncheck/autoupdate.go                    │                                                                                                 │
+ └───────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+---
+
+ok
+
+---
+
+Missing CI environment variable guardrail check
+Medium Severity
+
+MaybeAutoUpdate and CanPromptInteractively never check the CI environment variable, despite both the PR description and the new auto-update.md documentation explicitly listing it as a guardrail. On CI runners that happen to have /dev/tty available (self-hosted runners, some Docker configs), the interactive huh prompt will fire and hang the pipeline waiting for input.
+
+---
+
+try again
+
+---
+
+delete from Pr auto-update.md

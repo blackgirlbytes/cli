@@ -1,0 +1,320 @@
+Implement the following plan:
+
+# Fix Droid E2E Startup Timeout
+
+## Context
+
+Droid E2E tests intermittently time out (8/37 failures) during `StartSession`. The pane content shows droid's splash screen but the prompt indicator (`>`) never appears:
+
+```
+--- pane content ---
+█████████    █████████     ████████    ███   █████████
+...
+v0.65.1
+You are standing in an open terminal. An AI awaits your commands.
+ENTER to send • \ + ENTER for a new line • @ to mention files
+Current folder: /tmp/e2e-repo-957252333
+--- end pane content ---
+```
+
+### Root cause: tmux pane too small
+
+Droid's full TUI layout (confirmed via screenshot) is ~30 lines tall:
+- ASCII "DROID" art: ~14 lines
+- Version + welcome text + instructions + current folder: ~8 lines
+- Autonomy bar ("Auto (Med) - allow reversible commands"): 2 lines
+- **Prompt line** (`> Try "Create a PR with these changes"`): 1 line
+- Help line ("? for help"): 1 line
+
+The CI tmux pane is **80x24** (default-size). The prompt `> ` renders below the visible area. `tmux capture-pane -p` only captures visible lines, so WaitFor never matches the prompt pattern.
+
+Intermittent because droid's TUI framework sometimes compresses the layout to fit (tests pass) and sometimes doesn't (tests fail).
+
+## Changes
+
+### File: `e2e/agents/droid.go` — `StartSession()`
+
+**1. Resize tmux window after creation** so droid's full-screen TUI fits:
+
+```go
+// After NewTmuxSession, before WaitFor:
+_ = exec.Command("tmux", "resize-window", "-t", name, "-x", "200", "-y", "50").Run()
+```
+
+This gives 50 vertical lines — enough for the splash + autonomy bar + prompt.
+
+**2. Increase prompt timeout from 30s to 60s** as a belt-and-suspenders measure for slow CI initialization.
+
+**3. Keep 2 retry attempts** (reduce from 3, since the root cause is now addressed and retries are a safety net).
+
+```go
+func (d *Droid) StartSession(ctx context.Context, dir string) (Session, error) {
+    const maxAttempts = 2
+
+    var s *TmuxSession
+    var lastErr error
+    for attempt := range maxAttempts {
+        name := fmt.Sprintf("droid-test-%d", time.Now().UnixNano())
+        var err error
+        s, err = NewTmuxSession(name, dir, nil, "env", "ENTIRE_TEST_TTY=0", d.Binary())
+        if err != nil {
+            return nil, err
+        }
+
+        // Resize so droid's full-screen TUI has room to render the prompt area.
+        // The default 80x24 pane is too small — droid's splash + prompt needs ~30 lines.
+        _ = exec.Command("tmux", "resize-window", "-t", name, "-x", "200", "-y", "50").Run()
+
+        // Wait for the interactive prompt indicator.
+        if _, err := s.WaitFor(d.PromptPattern(), 60*time.Second); err != nil {
+            _ = s.Close()
+            if attempt < maxAttempts-1 {
+                lastErr = err
+                fmt.Fprintf(os.Stderr, "droid startup attempt %d/%d failed: %s\n", attempt+1, maxAttempts, err)
+                continue
+            }
+            return nil, fmt.Errorf("droid failed to start after %d attempts: %w", maxAttempts, err)
+        }
+        s.stableAtSend = ""
+        return s, nil
+    }
+    return nil, fmt.Errorf("droid failed to start after %d attempts: %w", maxAttempts, lastErr)
+}
+```
+
+### Already applied (keep as-is)
+
+- **Removed exec-only flags** from `NewTmuxSession` call — `--model` and `--skip-permissions-unsafe` are `droid exec` flags that become prompt text in interactive mode
+- **Added `droidSessionDefaults`** struct — `Bootstrap()` now writes `sessionDefaultSettings.model` to `~/.factory/settings.json` so interactive mode uses the BYOK Haiku model
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Push and check CI:
+- All 37 droid E2E tests should pass
+- Failure pane dumps (if any) should now show the full TUI including the `> ` prompt line
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/228404dc-d548-4490-a92e-f892104f3aee.jsonl
+
+---
+
+/Projects/devenv/cli (alisha/droid-e2e-fix) $ mise run test:e2e --agent factoryai-droid
+[build] $ ~/Projects/devenv/cli/mise-tasks/build
+artifacts: /Users/alisha/Projects/devenv/cli/e2e/artifacts/2026-03-02T15-36-56
+[e2e/tests]··································································✖✖✖✖✖✖✖✖
+=== Failed
+=== FAIL: e2e/tests TestShadowBranchCleanedAfterAgentCommit/factoryai-droid (112.23s)
+    attribution_test.go:133: WaitFor("⛬|│ >"): timed out waiting for "⛬|│ >" after 1m30s
+        --- pane content ---
+
+
+                                                                                █████████    █████████     ████████    ███   █████████
+                                                                                ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                                                                ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                                                                ███    ███   █████████    ███    ███   ███   ███    ███
+                                                                                ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                                                                ███    ███   ███    ███   ███    ███   ███   ███    ███
+                                                                                █████████    ███    ███    ████████    ███   █████████
+
+                                                                                                         v0.65.1
+
+
+                                                                            You are standing in an open terminal. An AI awaits your commands.
+
+                                                                              ENTER to send • \ + ENTER for a new line • @ to mention files
+
+                                                              Current folder: /private/var/folders/5g/w6qvhr890pxfz9sg1l0d5c0r0000gn/T/e2e-repo-1980709840
+
+        >  Powered by Entire:
+             This conversation will be linked to your next commit.
+
+        >  create a file called hello.txt containing 'hello world', then commit it. Do not ask for confirmation.
+
+        ⠼ Thinking...  (Press ESC to stop)
+
+         Auto (Med) - allow reversible commands                                                                                                                                                       Haiku 4.5
+         shift+tab to cycle modes (auto/spec), ctrl+L for autonomy                                                                                                    ctrl+N to cycle models, tab for reasoning
+        ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+        │ >                                                                                                                                                                                                    │
+        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+         [⏱ 1m 29s]? for help                                                                                                                                                                             IDE ◌
+        --- end pane content ---
+
+=== FAIL: e2e/tests TestShadowBranchCleanedAfterAgentCommit (112.23s)
+
+=== FAIL: e2e/tests TestSingleSessionSubagentCommitInTurn/factoryai-droid (208.63s)
+    single_session_test.go:97: agent failed: signal: killed
+
+=== FAIL: e2e/tests TestSingleSessionSubagentCommitInTurn (208.63s)
+
+=== FAIL: e2e/tests TestMultiSessionSequential/factoryai-droid (298.60s)
+    multi_session_test.go:53: agent prompt 2 failed: signal: killed
+
+=== FAIL: e2e/tests TestMultiSessionSequential (298.61s)
+
+=== FAIL: e2e/tests TestAgentContinuesAfterCommit/factoryai-droid (289.33s)
+    edge_cases_test.go:37: agent prompt 2 failed: signal: killed
+
+=== FAIL: e2e/tests TestAgentContinuesAfterCommit (289.33s)
+
+DONE 74 tests, 8 failures in 361.818s
+E2E Test Report
+═══════════════
+
+Total: 37  Passed: 33  Failed: 4  Skipped: 0
+
+✓ TestAgentAmendsCommit (28.5s)
+  ✓ factoryai-droid      28.5s
+
+✓ TestAgentCommitsMidTurnUserCommitsRemainder (40.8s)
+  ✓ factoryai-droid      40.8s
+
+✗ TestAgentContinuesAfterCommit (289.3s)
+  ✗ factoryai-droid      289.3s
+      edge_cases_test.go:37: agent prompt 2 failed: signal: killed
+
+✓ TestAttributionMixedHumanAndAgent (24.8s)
+  ✓ factoryai-droid      24.8s
+
+✓ TestAttributionMultiCommitSameSession (44.0s)
+  ✓ factoryai-droid      44.0s
+
+✓ TestAttributionOnAgentCommit (55.9s)
+  ✓ factoryai-droid      55.9s
+
+✓ TestCheckpointMetadataDeepValidation (23.6s)
+  ✓ factoryai-droid      23.6s
+
+✓ TestDeletedFilesCommitDeletion (24.0s)
+  ✓ factoryai-droid      24.0s
+
+✓ TestDirtyWorkingTree (39.0s)
+  ✓ factoryai-droid      39.0s
+
+✓ TestEndedSessionUserCommitsAfterExit (5.6s)
+  ✓ factoryai-droid      5.6s
+
+✓ TestEntireDisable (23.3s)
+  ✓ factoryai-droid      23.3s
+
+✓ TestHumanOnlyChangesAndCommits (32.4s)
+  ✓ factoryai-droid      32.4s
+
+✓ TestInteractiveContentOverlapRevertNewFile (42.4s)
+  ✓ factoryai-droid      42.4s
+
+✓ TestInteractiveMultiStep (24.3s)
+  ✓ factoryai-droid      24.3s
+
+✓ TestLineAttributionReasonable (12.8s)
+  ✓ factoryai-droid      12.8s
+
+✓ TestMixedNewAndModifiedFiles (43.3s)
+  ✓ factoryai-droid      43.3s
+
+✓ TestModifiedFileAlwaysGetsCheckpoint (31.0s)
+  ✓ factoryai-droid      31.0s
+
+✓ TestModifyExistingTrackedFile (32.9s)
+  ✓ factoryai-droid      32.9s
+
+✓ TestMultiSessionManualCommit (41.1s)
+  ✓ factoryai-droid      41.1s
+
+✗ TestMultiSessionSequential (298.6s)
+  ✗ factoryai-droid      298.6s
+      multi_session_test.go:53: agent prompt 2 failed: signal: killed
+
+✓ TestPartialCommitStashNewPrompt (33.2s)
+  ✓ factoryai-droid      33.2s
+
+✓ TestPartialStaging (18.4s)
+  ✓ factoryai-droid      18.4s
+
+✓ TestRapidSequentialCommits (45.2s)
+  ✓ factoryai-droid      45.2s
+
+✓ TestRewindAfterCommit (31.6s)
+  ✓ factoryai-droid      31.6s
+
+✓ TestRewindMultipleFiles (41.1s)
+  ✓ factoryai-droid      41.1s
+
+✓ TestRewindPreCommit (43.3s)
+  ✓ factoryai-droid      43.3s
+
+✓ TestSessionDepletedManualEditNoCheckpoint (71.8s)
+  ✓ factoryai-droid      71.8s
+
+✗ TestShadowBranchCleanedAfterAgentCommit (112.2s)
+  ✗ factoryai-droid      112.2s
+      attribution_test.go:133: WaitFor("⛬|│ >"): timed out waiting for "⛬|│ >" after 1m30s
+      --- pane content ---
+      █████████    █████████     ████████    ███   █████████
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   █████████    ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      ███    ███   ███    ███   ███    ███   ███   ███    ███
+      █████████    ███    ███    ████████    ███   █████████
+      v0.65.1
+      You are standing in an open terminal. An AI awaits your commands.
+      ENTER to send • \ + ENTER for a new line • @ to mention files
+      Current folder: /private/var/folders/5g/w6qvhr890pxfz9sg1l0d5c0r0000gn/T/e2e-repo-1980709840
+      >  Powered by Entire:
+      This conversation will be linked to your next commit.
+      >  create a file called hello.txt containing 'hello world', then commit it. Do not ask for confirmation.
+      ⠼ Thinking...  (Press ESC to stop)
+      Auto (Med) - allow reversible commands                                                                                                                                                       Haiku 4.5
+      shift+tab to cycle modes (auto/spec), ctrl+L for autonomy                                                                                                    ctrl+N to cycle models, tab for reasoning
+      ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+      │ >                                                                                                                                                                                                    │
+      ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+      [⏱ 1m 29s]? for help                                                                                                                                                                             IDE ◌
+      --- end pane content ---
+
+✓ TestSingleSessionAgentCommitInTurn (39.2s)
+  ✓ factoryai-droid      39.2s
+
+✓ TestSingleSessionManualCommit (37.0s)
+  ✓ factoryai-droid      37.0s
+
+✗ TestSingleSessionSubagentCommitInTurn (208.6s)
+  ✗ factoryai-droid      208.6s
+      single_session_test.go:97: agent failed: signal: killed
+
+✓ TestSplitModificationsToExistingFiles (52.2s)
+  ✓ factoryai-droid      52.2s
+
+✓ TestStashModificationsToTrackedFiles (39.6s)
+  ✓ factoryai-droid      39.6s
+
+✓ TestStashSecondPromptUnstashCommitAll (26.0s)
+  ✓ factoryai-droid      26.0s
+
+✓ TestSubagentCommitFlow (44.3s)
+  ✓ factoryai-droid      44.3s
+
+✓ TestTrailerRemovalSkipsCondensation (62.7s)
+  ✓ factoryai-droid      62.7s
+
+✓ TestUserSplitsAgentChanges (39.8s)
+  ✓ factoryai-droid      39.8s
+
+💥 FAILED (33/37 passed) 💥
+
+
+entire binary:  /Users/alisha/Projects/devenv/cli/entire
+entire version: Entire CLI v0.4.9-dev-053f7c3a (053f7c3a)
+Go version: go1.26.0
+OS/Arch: darwin/arm64
+
+artifacts: /Users/alisha/Projects/devenv/cli/e2e/artifacts/2026-03-02T15-36-56
+
+---
+
+[Request interrupted by user for tool use]

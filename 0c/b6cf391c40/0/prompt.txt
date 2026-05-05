@@ -1,0 +1,88 @@
+Implement the following plan:
+
+# Plan: Update Droid E2E Tests to Use Anthropic API Key (BYOK)
+
+## Context
+
+Droid E2E tests currently require `FACTORY_API_KEY` for authentication. We're switching to use `ANTHROPIC_API_KEY` via Factory AI's [BYOK feature](https://docs.factory.ai/cli/byok/overview), which configures Droid to call the Anthropic API directly with a custom model entry in `.factory/settings.json`.
+
+## Changes
+
+### 1. `cmd/entire/cli/e2e_test/agent_runner.go`
+
+**Update `NewFactoryAIDroidRunner()`** — default model to haiku for cost efficiency:
+- If `E2E_DROID_MODEL` is set, use that
+- Otherwise default to `claude-haiku-4-5-20250929`
+
+**Update `IsAvailable()`** — check `ANTHROPIC_API_KEY` instead of `FACTORY_API_KEY`:
+```go
+if os.Getenv("ANTHROPIC_API_KEY") == "" {
+    return false, fmt.Errorf("ANTHROPIC_API_KEY environment variable not set")
+}
+```
+
+No changes to `runPromptWithExec()` — `os.Environ()` already passes `ANTHROPIC_API_KEY` through, and `-m` is already passed when `Model != ""`.
+
+### 2. `cmd/entire/cli/e2e_test/testenv.go`
+
+**Inject `customModels` into `.factory/settings.json`** in `NewFeatureBranchEnv()`, before `RunEntireEnable()` (which merges hooks while preserving unknown keys like `customModels`):
+
+```go
+if defaultAgent == AgentNameFactoryAIDroid {
+    if droidRunner, ok := env.Agent.(*FactoryAIDroidRunner); ok {
+        byokConfig := `{
+  "customModels": [
+    {
+      "model": "` + droidRunner.Model + `",
+      "displayName": "E2E BYOK Model",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "provider": "anthropic",
+      "maxOutputTokens": 16384
+    }
+  ]
+}`
+        env.WriteFile(".factory/settings.json", byokConfig)
+    }
+}
+```
+
+Uses `${ANTHROPIC_API_KEY}` (Droid env-var reference syntax) — the actual key never appears in the file or git.
+
+### 3. `scripts/manual-droid-e2e-tmux.sh` (line ~191)
+
+Replace `FACTORY_API_KEY` check with `ANTHROPIC_API_KEY`:
+```bash
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "Preflight: ANTHROPIC_API_KEY is not set" >&2
+    failures=$((failures + 1))
+fi
+```
+
+### 4. `cmd/entire/cli/manual-droid-e2e-testing.md` (line ~61-65)
+
+Update prerequisites:
+```
+2. **Factory AI Droid** installed with ANTHROPIC_API_KEY set:
+   ```bash
+   droid --version           # Verify installed
+   echo $ANTHROPIC_API_KEY   # Must be set
+   ```
+```
+
+## Files NOT Modified
+
+- `hooks.go` — Already preserves unknown JSON keys via `map[string]json.RawMessage`; no changes needed
+- `factoryaidroid.go` — Agent implementation is auth-agnostic; no changes needed
+- `runPromptWithExec()` — Already inherits env and passes `-m` flag; no changes needed
+
+## Verification
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+E2E_AGENT=factoryai-droid go test -tags=e2e -count=1 -timeout=30m -v \
+  -run TestE2E_BasicWorkflow ./cmd/entire/cli/e2e_test/...
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-factoryai-agent/a756b43f-a724-444d-9cb2-ea2cf92ec848.jsonl

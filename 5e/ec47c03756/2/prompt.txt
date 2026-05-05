@@ -1,0 +1,46 @@
+The on demand blob fetch for full.jsonl does not seem to be working when multiple sessions exist. And even when the file exists locally but not others, it still fails with Checkpoint 'cab75de47439' found in commit but session metadata not available.
+
+Fix the first problem and improve the error message for the latter.
+
+---
+
+The on demand blob fetch for full.jsonl does not seem to be working when multiple sessions exist. And even when the file exists locally but not others, it still fails with Checkpoint 'cab75de47439' found in commit but session metadata not available.
+
+Fix the first problem and improve the error message for the latter.
+
+---
+
+The same error is still happening. It looks to me that part of the metadata logic does a Tree.File() without first ensuring that the blob exists locally. Create a wrapper for the tree whereby it first checks if the blob exist, fetches it if it doesn't, and then returns the file if it does exist.
+
+---
+
+Make sure that all blobs within the checkpoint tree (and subtrees) are fetched.
+
+---
+
+The data is already available locally but resume still does not work. Debug the issue and improve logging so that it becomes easier to indentify what the problem is.
+
+---
+
+The error persists, however I'm sure that file exists - and is even available locally:
+
+DEBUG=true entire resume pjbgf/jsonl-data2
+2026/03/12 15:55:15 WARN ReadCheckpointMetadata failed, checking remote component=resume checkpoint_id=cab75de47439 checkpoint_path=ca/b75de47439 error="failed to find metadata at ca/b75de47439/metadata.json: file not found"
+Checkpoint 'cab75de47439' found in commit but its metadata could not be read from entire/checkpoints/v1.
+The metadata branch exists but checkpoint content may be missing or unreadable (e.g. after a partial fetch).
+
+Is the correct tree being passed? Add that information to the debug information
+
+---
+
+I think the problem is that the incorrect tree is being used. The shared path should be used to pick the checkpoint tree, and then use that going to start the fetching tree. At the moment the root tree is being used instead.
+
+---
+
+Now the subtree hash is not even being display, it still does not work. Improve debugging info so that it is easier to identify: the fetched blobs, errors fetching them, etc.
+
+2026/03/12 16:15:04 WARN ReadCheckpointMetadataFromSubtree failed, checking remote component=resume checkpoint_id=cab75de47439 error="failed to find metadata.json in checkpoint subtree: file not found"
+Checkpoint 'cab75de47439' found in commit but its metadata could not be read from entire/checkpoints/v1.
+The metadata branch exists but checkpoint content may be missing or unreadable (e.g. after a partial fetch).
+Try a full fetch:
+  git fetch origin entire/checkpoints/v1:entire/checkpoints/v1

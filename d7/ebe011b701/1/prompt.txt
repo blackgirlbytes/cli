@@ -1,0 +1,630 @@
+/pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>afdd043ea263b23c4</task-id>
+<tool-use-id>toolu_019NvQxL1p8rTB5LZ9pztzpu</tool-use-id>
+<status>completed</status>
+<summary>Agent "Code simplification review" completed</summary>
+<result>I now have a comprehensive picture. Let me compile my findings.
+
+---
+
+Here is my review of the `refactoring-transcript-reads` branch changes.
+
+## Review Findings
+
+### 1. Duplicated dedup+merge logic in `resolveFilesTouched`
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 1477-1492
+
+The dedup loop with the `seen` map iterates over two slices with identical logic:
+
+```go
+for _, f := range state.FilesTouched {
+    if _, ok := seen[f]; !ok {
+        seen[f] = struct{}{}
+        result = append(result, f)
+    }
+}
+for _, f := range tracked {
+    if _, ok := seen[f]; !ok {
+        seen[f] = struct{}{}
+        result = append(result, f)
+    }
+}
+```
+
+This is a textbook case for `slices.Concat` + a dedup helper, or at minimum collapsing the two loops into one by concatenating first: `for _, f := range append(state.FilesTouched, tracked...)`. The two identical 5-line blocks are a minor dupl risk. Not severe, but worth simplifying.
+
+### 2. `ReadFilesTouched` already deduplicates and sorts, making the merge in `resolveFilesTouched` partially redundant
+
+**Files:**
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go`, lines 446-483 (`ReadFilesTouched`)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 1470-1493 (`resolveFilesTouched`)
+
+`ReadFilesTouched` returns a deduplicated, sorted list. But `resolveFilesTouched` then re-deduplicates and re-sorts everything. The dedup in `ReadFilesTouched` is only useful for its own file (removing duplicate appends), while `resolveFilesTouched` needs dedup across both sources. This is fine functionally, but the doc comment on `ReadFilesTouched` (line 447) could note that callers merging with other sources will need their own dedup pass, so a reader does not wonder why the caller ignores the guarantee.
+
+### 3. Duplicated `ClearFilesTouched` call pattern in `manual_commit_hooks.go`
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 1034-1037 and 1130-1132
+
+The exact same 3-line pattern appears twice:
+
+```go
+if store, storeErr := s.getStateStore(ctx); storeErr == nil {
+    _ = store.ClearFilesTouched(ctx, state.SessionID)
+}
+```
+
+This is a "get store, clear tracking file, ignore errors" idiom that should be a small private helper method on `ManualCommitStrategy`, e.g. `clearFilesTracking(ctx, sessionID)`. It would reduce the nolint comment noise and make the intent clearer at both call sites.
+
+### 4. Redundant `nolint:errcheck` on `_ =` assignment
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 1036 and 1131
+
+Assigning to `_` already silences the errcheck linter. The `//nolint:errcheck` directive on `_ = store.ClearFilesTouched(...)` is redundant. The comment explaining *why* it is best-effort is good, but the nolint directive itself is unnecessary. This appears to be a pattern used elsewhere in the file (consistent), but it is still technically noise.
+
+### 5. Integration test re-implements `ReadFilesTouched` logic inline
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/file_tracking_test.go`, lines 54-65
+
+The test manually reads the `.files` file, deduplicates, and sorts -- which is exactly what `ReadFilesTouched` does. The test could instantiate a `StateStore` (using `NewStateStoreWithDir`) and call `ReadFilesTouched` instead. This would:
+- Reduce the 12 lines of dedup/sort logic to 1 call
+- Actually test `ReadFilesTouched` as part of the integration path
+- Avoid the subtle difference of using `map[string]bool` (test) vs `map[string]struct{}` (production code) for the seen set
+
+The unit tests in `state_test.go` already cover `ReadFilesTouched` in isolation, so the integration test re-implementing the same logic reads as duplication rather than deliberate verification of raw file contents.
+
+### 6. `handleLifecycleFileEdit` never returns a non-nil error
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, lines 178-209
+
+Every code path in this function returns `nil`, even on failure (the `AppendFileTouched` error is logged but swallowed). The function signature returns `error` to match the dispatcher interface, which is correct. However, the design choice of silently swallowing all errors deserves a brief doc note. Currently the comment says "intentionally lightweight" but does not say "never returns errors." A reader seeing the `error` return type would reasonably scan for error returns and find none, which is mildly confusing. A one-line addition like "Returns nil unconditionally; errors are logged but not propagated to avoid blocking the agent" would clarify intent.
+
+### 7. `postFileEditCmd` variable follows a pattern that is growing unwieldy
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/hooks.go`, lines 117-136
+
+The `var` declaration now lists 8 command string variables on one line, and the two `if localDev` / `else` blocks each have 8 nearly identical assignments that differ only in prefix. This predates this branch, but adding `postFileEditCmd` makes the pattern more noticeable. A refactor to a map or struct (e.g., `hookCommands := map[string]string`) would reduce the mechanical duplication. This is not a blocking concern for this branch, but worth noting as the pattern will break down further when the next hook type is added.
+
+### 8. `parseFileEdit` comment is slightly misleading
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle.go`, line 190
+
+The `fileEditToolInput` type comment says "extracts file_path from Write/Edit tool input" but the struct and the parsing function are generic -- they would work with any tool that has a `file_path` field. This is fine, just noting that the comment is narrower than the code. Minor.
+
+### 9. No validation that `event.FilePath` is an absolute path before calling `ToRelativePath`
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, line 189
+
+`paths.ToRelativePath` is called with `event.FilePath` which the doc on `Event.FilePath` (event.go:124) says "May be absolute." If the path is already relative, `ToRelativePath` will compute a relative path from `repoRoot` to a relative path, which may produce unexpected results (likely returning `""` and getting silently skipped). This is probably fine in practice since Claude Code's Write/Edit tools always emit absolute paths, but it is a latent assumption without a defensive check. A `filepath.IsAbs` guard or a comment noting the assumption would make it explicit.
+
+## Summary
+
+The overall design is sound -- the append-only `.files` tracking approach is a clean fit for the high-frequency FileEdit events, and the separation between real-time tracking (lifecycle handler) and authoritative resolution (strategy's `resolveFilesTouched`) is well-structured.
+
+The highest-value simplifications would be:
+1. **Extract the `clearFilesTracking` helper** (finding 3) -- eliminates the most visible duplication in production code
+2. **Use `ReadFilesTouched` in the integration test** (finding 5) -- reduces test code and improves coverage
+3. **Simplify the merge loop** (finding 1) -- a single loop over `append(state.FilesTouched, tracked...)` would cut the dedup logic in half</result>
+<usage><total_tokens>49009</total_tokens><tool_uses>28</tool_uses><duration_ms>130382</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-3/tasks/afdd043ea263b23c4.output
+
+---
+
+<task-notification>
+<task-id>a916e2f444b434ba0</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Test coverage analysis" completed</summary>
+<result>All tests pass. Now I have a thorough understanding of the changes and tests. Let me compile my analysis.
+
+---
+
+## Test Coverage Analysis: `refactoring-transcript-reads` Branch
+
+### 1. Summary
+
+The test coverage for this PR is **solid and well-structured**. The changes introduce real-time file tracking via `FileEdit` events across 6 production files and 6 test files. The core data layer (`session/state.go`) has excellent unit test coverage. The parsing layer (`claudecode/lifecycle.go`) has good happy-path and negative tests. The integration test verifies the end-to-end flow through the hook simulation framework. The strategy-level merge logic (`resolveFilesTouched`) has targeted tests for the two new code paths (tracking-file-only and merge-both-sources).
+
+The testing approach is pragmatic: it focuses on behavioral correctness at the appropriate abstraction levels and avoids over-mocking. The most important gaps are in the lifecycle dispatcher layer and one edge case in the parsing layer.
+
+---
+
+### 2. Critical Gaps
+
+None at the 9-10 level. This is fundamentally a best-effort tracking feature that falls back gracefully on errors, so no single missing test represents a data-loss or security risk.
+
+---
+
+### 3. Important Improvements
+
+**Gap 1: `parseFileEdit` with malformed/unparseable `tool_input` JSON** -- Criticality: 6/10
+
+The test `TestParseFileEdit_NoFilePath` covers the case where `file_path` is missing from `tool_input`, but there is no test for when `tool_input` itself is malformed JSON (e.g., `"tool_input": "not-an-object"` or `"tool_input": null`). The production code at `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle.go` lines 201-205 handles this by returning `(nil, nil)`, silently skipping. A test confirming this graceful degradation would prevent regressions where a future refactor might accidentally propagate the `json.Unmarshal` error instead of swallowing it.
+
+What it catches: A future change that accidentally returns an error for malformed `tool_input` would break the hook pipeline for any non-Write/Edit tool that happens to share the PostToolUse hook namespace.
+
+**Gap 2: `handleLifecycleFileEdit` has zero direct unit tests** -- Criticality: 7/10
+
+The function at `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go` lines 178-209 contains four distinct silent-return paths:
+- `event.SessionID == ""` or `event.FilePath == ""`
+- `paths.WorktreeRoot` fails (not in a git repo)
+- `paths.ToRelativePath` returns empty (path outside repo)
+- `session.NewStateStore` fails
+
+The integration test covers the happy path (absolute path normalized and written to tracking file), but none of the defensive early-return branches are tested. The most valuable test would be:
+1. A `FileEdit` event with an empty `FilePath` should be silently ignored (no error, no file written).
+2. A `FileEdit` event with a path outside the repo root should be silently ignored.
+
+These two cases are particularly important because they represent real scenarios: (a) a Write tool with an empty path from an agent bug, and (b) a Write to `/tmp/scratch.txt` that should not pollute the tracking file.
+
+The integration test framework already demonstrates how to simulate this. However, testing `handleLifecycleFileEdit` directly at the unit level is hard because it calls `paths.WorktreeRoot(ctx)` which requires CWD to be inside a git repo. The integration test covers the happy path well. The missing cases (empty FilePath, path outside repo) are low-risk silent returns, but a test would prevent a regression where someone removes a guard clause and starts tracking files outside the repo.
+
+**Gap 3: `resolveFilesTouched` transcript fallback behavior changed** -- Criticality: 5/10
+
+The existing test `TestResolveFilesTouched_PrefersStateFallsBackToTranscript` subtest "falls back to transcript when FilesTouched is empty" now also has the tracking file as an intermediary source. When `state.FilesTouched` is empty AND the tracking file has entries, the function will return the tracking file data instead of falling through to transcript extraction. The existing test passes because its `setupGitRepo` creates a fresh repo with no `.files` tracking file, so it correctly falls through. However, there is no test that explicitly verifies: **when `state.FilesTouched` is empty AND tracking file is empty (or missing), transcript extraction is still used as the final fallback**. The existing subtest does this implicitly but relies on the absence of a tracking file, which is fragile.
+
+**Gap 4: Cleanup in `postCommitProcessSession` and `condenseAndUpdateState`** -- Criticality: 5/10
+
+The two `ClearFilesTouched` calls added to `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go` (lines 1034-1037 in `postCommitProcessSession` and lines 1126-1129 in `condenseAndUpdateState`) are best-effort and ignore errors. There are no tests verifying that the tracking file is actually cleaned up after condensation or commit. The existing integration test only covers the write path, not the cleanup path. A test that simulates: write tracking data -> condense -> verify tracking file is removed would catch regressions where cleanup stops happening, which could cause stale files to accumulate and pollute future sessions.
+
+---
+
+### 4. Test Quality Issues
+
+**Issue 1: Integration test duplicates `ReadFilesTouched` logic** -- Minor
+
+The integration test at `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/file_tracking_test.go` lines 54-65 manually re-implements the deduplication and sorting logic of `ReadFilesTouched` instead of importing and calling the actual `ReadFilesTouched` function. If the deduplication logic in `ReadFilesTouched` changes (e.g., to case-insensitive dedup), the integration test would not catch the discrepancy. However, this is a reasonable tradeoff for integration tests that intentionally avoid importing internal packages, so this is a minor concern.
+
+**Issue 2: `TestResolveFilesTouched_MergesBothSources` lacks `t.Parallel()`** -- Minor
+
+The tests `TestResolveFilesTouched_FromTrackingFile` and `TestResolveFilesTouched_MergesBothSources` use `t.Chdir(dir)` which is incompatible with `t.Parallel()`. This is correctly handled (no `t.Parallel()` call). This is consistent with the project's CLAUDE.md guidance about CWD-modifying tests.
+
+---
+
+### 5. Positive Observations
+
+1. **Security-conscious testing**: `TestAppendFileTouched_InvalidSessionID` explicitly tests path traversal prevention (`../evil`), which is critical for a function that writes to the filesystem using a session ID as a filename component.
+
+2. **Newline injection prevention**: `TestAppendFileTouched_RejectsNewlines` tests both `\n` and `\r`, preventing a line-injection attack where a crafted file path could inject extra entries into the tracking file.
+
+3. **Idempotency testing**: `TestClearFilesTouched` verifies that clearing a non-existent file does not error, which is important for the best-effort cleanup pattern used throughout.
+
+4. **Cross-concern cleanup**: `TestClear_RemovesFilesTracking` verifies that the existing `Clear()` method (which uses glob `sessionID.*`) correctly removes the new `.files` extension. This is a well-targeted regression test -- if someone changed the glob pattern or the file extension, this test would catch it.
+
+5. **Behavioral testing**: The `TestResolveFilesTouched_MergesBothSources` test validates the merge semantics (dedup + sort across two sources) rather than testing implementation details. It would survive a refactor that changes the internal data structure.
+
+6. **Integration test design**: The integration test properly uses `SimulateUserPromptSubmit` before `SimulatePostFileEdit`, establishing that the session must be initialized before file tracking works. This tests the real lifecycle sequence.
+
+7. **Good test isolation**: All state tests use `NewStateStoreWithDir(t.TempDir())` with ephemeral directories, and strategy tests use `setupGitRepo(t)` + `t.Chdir(dir)` for proper git isolation.
+
+---
+
+### Relevant Files
+
+Production code:
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/event.go` -- New `FileEdit` event type
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle.go` -- `parseFileEdit()` implementation
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go` -- `handleLifecycleFileEdit()` dispatcher
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go` -- `AppendFileTouched`, `ReadFilesTouched`, `ClearFilesTouched`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go` -- `resolveFilesTouched` merge logic and cleanup calls
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/hook_registry.go` -- `getHookType` classification
+
+Test code:
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/file_tracking_test.go`</result>
+<usage><total_tokens>86524</total_tokens><tool_uses>32</tool_uses><duration_ms>148181</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-3/tasks/a916e2f444b434ba0.output
+
+---
+
+<task-notification>
+<task-id>a1a7697ccb6770f5c</task-id>
+<tool-use-id>toolu_01CuhvhW86HhaMFSJvmTrjSC</tool-use-id>
+<status>completed</status>
+<summary>Agent "Code review for guidelines" completed</summary>
+<result>Everything looks consistent. Let me now compile my full review.
+
+---
+
+## Code Review: `refactoring-transcript-reads` branch
+
+### Files Reviewed
+
+14 files, ~570 additions across:
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/event.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/hooks.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/hook_registry.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/agent_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/file_tracking_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/hooks.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_test.go`
+
+### Verification Results
+
+- **Linter**: 0 issues (`mise run lint`)
+- **Unit tests**: All pass (`mise run test`)
+- **Integration tests**: All pass (`mise run test:integration`)
+
+### Summary: No high-confidence issues found
+
+The code is well-implemented and adheres to project guidelines. Here is a detailed assessment of the areas I examined:
+
+**CLAUDE.md Compliance:**
+- Error handling follows project patterns correctly. `handleLifecycleFileEdit` uses `logging.Warn` for internal operational messages and returns `nil` on non-critical failures (consistent with `handleLifecycleModelUpdate`).
+- No `fmt.Print*` used for operational messages -- logging package is used appropriately.
+- No user content (file contents, prompts) is logged -- only operational metadata (session IDs, file paths, error messages).
+- `paths.WorktreeRoot` used correctly for git-relative path normalization (not `os.Getwd()`), consistent with the "Repo Root vs Current Working Directory" guideline.
+- Session ID validation via `validation.ValidateSessionID` happens inside `AppendFileTouched`/`ReadFilesTouched`/`ClearFilesTouched` (defense-in-depth).
+- Tests use `t.Parallel()` correctly where possible. The two new strategy tests (`TestResolveFilesTouched_FromTrackingFile`, `TestResolveFilesTouched_MergesBothSources`) use `t.Chdir()` which precludes `t.Parallel()` -- this is the documented exception in CLAUDE.md.
+- Tests use isolated temp repos via `setupGitRepo(t)` + `t.TempDir()` -- never the real repo CWD.
+- `NewStateStoreWithDir` used for test isolation instead of `NewStateStore`.
+
+**Security:**
+- Path traversal prevention: `ValidateSessionID` rejects `/` and `\` in session IDs, and `AppendFileTouched` validates before constructing file paths.
+- Newline injection: `AppendFileTouched` explicitly rejects `\n` and `\r` in file paths since the `.files` format is newline-delimited. Test coverage for this exists in `TestAppendFileTouched_RejectsNewlines`.
+- `ToRelativePath` rejects paths outside the repo (returns `""` for `..` prefix), and the lifecycle handler skips those silently.
+
+**Code Quality:**
+- The append-only `.files` design is a good choice for a high-frequency hook (Write/Edit fire per tool use) -- avoids JSON serialization/deserialization overhead.
+- `ReadFilesTouched` properly deduplicates (since the file is append-only and may have duplicates).
+- Existing `Clear` method uses `filepath.Glob(sessionID + ".*")` which automatically picks up `.files` alongside `.json` and `.model` -- no changes needed there, and `TestClear_RemovesFilesTracking` verifies this.
+- `resolveFilesTouched` correctly merges both sources (state + tracking file) with deduplication and sorting.
+- Cleanup happens in two correct places: `postCommitProcessSession` (carry-forward) and `condenseAndUpdateState` (full condensation).
+
+**Minor observations (below threshold, not issues):**
+- The `nolint:errcheck` comment on `ReadFilesTouched` at line 1473 of `manual_commit_hooks.go` is technically redundant since the error is already assigned to `_`, but this is a stylistic nit and consistent with other similar patterns in the file.
+- `handleLifecycleFileEdit` doesn't call `validation.ValidateSessionID` directly (unlike `handleLifecycleTurnStart` and `handleLifecycleSessionStart`), but this validation happens inside `AppendFileTouched`, so it's not a gap -- just a different layering choice appropriate for a lightweight handler.</result>
+<usage><total_tokens>78088</total_tokens><tool_uses>31</tool_uses><duration_ms>210264</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-3/tasks/a1a7697ccb6770f5c.output
+
+---
+
+<task-notification>
+<task-id>a56664a4936a21a92</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Silent failure analysis" completed</summary>
+<result>Good -- `Clear` uses `filepath.Glob(sessionID+".*")` which will match `.files` as well as `.json` and `.model`. This means the existing `Clear` method already handles `.files` cleanup implicitly. The test `TestClear_RemovesFilesTracking` covers this.
+
+Now I have everything I need to write a thorough audit report.
+
+---
+
+# Error Handling Audit: `refactoring-transcript-reads` Branch
+
+## Summary
+
+This branch adds real-time file tracking via `FileEdit` events (~570 additions across 14 files). The overall design is intentionally "lightweight and best-effort" for the hot-path `post-file-edit` hook, which runs on every Write/Edit tool invocation by the agent. The review below grades each error handling site, separating genuine issues from defensible design decisions.
+
+---
+
+## Issue 1: `parseFileEdit` returns `nil, nil` on unmarshal failure -- swallowing unexpected corruption
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle.go`, lines 202-204
+
+**Severity:** MEDIUM
+
+**Code:**
+```go
+if err := json.Unmarshal(raw.ToolInput, &toolInput); err != nil {
+    // tool_input doesn't match expected schema — skip silently
+    return nil, nil //nolint:nilnil,nilerr // not our tool format
+}
+```
+
+**Issue Description:** The comment says "not our tool format," implying this could fire for a tool whose `tool_input` lacks a `file_path` field. However, this hook is ONLY installed for `Write` and `Edit` matchers (see `hooks.go` lines 166-170). The only tools that trigger this code path ARE Write and Edit tools. If `json.Unmarshal` fails here, it means the input JSON is structurally malformed (not just missing a field) -- that is a real problem, not a schema mismatch.
+
+**Hidden Errors:** Corrupted JSON from the agent, encoding issues, truncated stdin piping, or a breaking change in Claude Code's hook payload format. All would be silently swallowed.
+
+**User Impact:** If Claude Code changes its payload format for Write/Edit hooks, file tracking silently stops working. No log entry, no error, no indication whatsoever. The user would only notice much later when their commit lacks file tracking data, and debugging would be extremely difficult because the entry point (the parser) leaves no trace.
+
+**Recommendation:** Since this hook is only installed for Write/Edit tools, an unmarshal failure is genuinely unexpected and should at minimum be logged at Debug level. The `nil, nil` return (skip the event) is still the right behavior -- you should not block the agent for a tracking failure. But the absence of any log makes this a debugging black hole.
+
+**Suggested fix:**
+```go
+if err := json.Unmarshal(raw.ToolInput, &toolInput); err != nil {
+    // Write/Edit tool_input should always have file_path — log unexpected format
+    // but don't block the agent hook.
+    logging.Debug(logging.WithComponent(ctx, "agent.claudecode"),
+        "parseFileEdit: unexpected tool_input format",
+        slog.String("error", err.Error()),
+    )
+    return nil, nil //nolint:nilnil,nilerr
+}
+```
+
+Note: This requires adding `ctx context.Context` as a parameter to `parseFileEdit` (or accepting the logging import). If that is too invasive for the signature, at minimum update the comment to acknowledge this is a real error path that happens only with malformed input, not a "wrong tool" scenario.
+
+---
+
+## Issue 2: `handleLifecycleFileEdit` silently returns `nil` on `WorktreeRoot` failure
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, lines 184-186
+
+**Severity:** MEDIUM
+
+**Code:**
+```go
+repoRoot, err := paths.WorktreeRoot(ctx)
+if err != nil {
+    return nil //nolint:nilerr // can't normalize path outside git repo, skip silently
+}
+```
+
+**Issue Description:** The comment says "outside git repo" but the calling chain already checks for git repo presence in `executeAgentHook` at line 98:
+```go
+if _, err := paths.WorktreeRoot(cmd.Context()); err != nil {
+    return nil
+}
+```
+
+So by the time `handleLifecycleFileEdit` runs, we are definitively inside a git repo. A `WorktreeRoot` failure here would indicate a transient filesystem error, permission problem, or corrupted git state -- not the benign "outside a repo" case the comment claims.
+
+**Hidden Errors:** Filesystem permission errors, corrupted `.git` directory, disk I/O errors. These would all be silently swallowed with zero logging.
+
+**User Impact:** Same as Issue 1 -- file tracking silently stops, user discovers much later.
+
+**Recommendation:** Since we already know we are in a git repo, this error is genuinely unexpected. Log it at Warn level and still return nil (do not block the agent).
+
+**Suggested fix:**
+```go
+repoRoot, err := paths.WorktreeRoot(ctx)
+if err != nil {
+    logCtx := logging.WithComponent(ctx, "lifecycle")
+    logging.Warn(logCtx, "failed to get worktree root for file edit tracking",
+        slog.String("session_id", event.SessionID),
+        slog.String("error", err.Error()),
+    )
+    return nil
+}
+```
+
+---
+
+## Issue 3: `handleLifecycleFileEdit` silently returns `nil` on `NewStateStore` failure
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, lines 194-196
+
+**Severity:** MEDIUM
+
+**Code:**
+```go
+store, err := session.NewStateStore(ctx)
+if err != nil {
+    return nil //nolint:nilerr // can't access state store, skip silently
+}
+```
+
+**Issue Description:** `NewStateStore` calls `getGitCommonDir` which runs `git rev-parse --git-common-dir`. As established above, we already confirmed we are in a git repo. A failure here means the git subprocess itself failed -- perhaps `git` is not in PATH (unlikely but possible in constrained environments), or the `.git` directory was corrupted between the earlier check and now.
+
+**Hidden Errors:** `git` binary not found, corrupted `.git` directory, permission errors, context cancellation.
+
+**User Impact:** File tracking silently stops. No indication in logs.
+
+**Recommendation:** Same pattern as Issue 2 -- log at Warn level, still return nil.
+
+---
+
+## Issue 4: `handleLifecycleFileEdit` returns `nil` on empty `SessionID` or `FilePath` without logging
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, lines 179-181
+
+**Severity:** LOW (but worth noting)
+
+**Code:**
+```go
+if event.SessionID == "" || event.FilePath == "" {
+    return nil
+}
+```
+
+**Issue Description:** This is a guard clause. A `FilePath == ""` would come from `parseFileEdit` returning an event with an empty `FilePath`, but `parseFileEdit` already checks `toolInput.FilePath == ""` and returns `nil, nil` in that case -- so the event would never reach this handler with an empty `FilePath`. The only way `SessionID == ""` would happen is if `postToolHookInputRaw` had an empty `session_id` field. This is a legitimate defensive check.
+
+**Assessment:** This is acceptable. The guard is redundant but harmless, and the conditions it guards against are filtered upstream. No change needed, but a Debug log would help in the rare case a different agent adapter routes through here.
+
+---
+
+## Issue 5: `resolveFilesTouched` silently discards `ReadFilesTouched` errors
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 1471-1473
+
+**Severity:** HIGH
+
+**Code:**
+```go
+var tracked []string
+if store, err := s.getStateStore(ctx); err == nil {
+    tracked, _ = store.ReadFilesTouched(ctx, state.SessionID) //nolint:errcheck // Best-effort read, falls back to transcript
+}
+```
+
+**Issue Description:** This is the most concerning error handling in the PR. `resolveFilesTouched` is called at a critical juncture -- during `postCommitProcessSession` (line 970) to determine what files the agent touched before condensation. If `ReadFilesTouched` fails (disk error, permission issue, corrupted file), the error is silently discarded and `tracked` remains nil. The function then falls through to `len(state.FilesTouched) > 0 || len(tracked) > 0` -- if `state.FilesTouched` is also empty (which it is for ACTIVE sessions where the tracking file IS the primary data source), it falls all the way through to transcript extraction.
+
+The "falls back to transcript" comment is technically true, but:
+
+1. **The fallback is non-obvious and undocumented at the call site.** The caller (`postCommitProcessSession` at line 970) calls `resolveFilesTouched` expecting "the file list for this session." It has no idea that a disk error might have silently degraded it to transcript-based extraction.
+
+2. **Transcript extraction is the old, slower path that this PR is specifically trying to replace.** Silently falling back to it defeats the purpose of the change.
+
+3. **Both `getStateStore` and `ReadFilesTouched` errors are swallowed without any logging.** If the tracking file is corrupted (e.g., partially written due to a crash), this would silently fall back without any indication, potentially losing files from the tracking.
+
+**Hidden Errors:** Permission errors on the `.files` tracking file, disk I/O errors, corrupted tracking file content, session ID validation failures (though unlikely since the same session ID was already used to load state).
+
+**User Impact:** If the tracking file has data but cannot be read, the system silently falls back to transcript parsing. The user sees correct behavior (transcript extraction still works) but the performance benefit of the tracking file is lost without any visibility. More importantly, if transcript extraction ALSO fails or returns incomplete data, files could be silently dropped from the checkpoint.
+
+**Recommendation:** Log at Debug level when falling back. The error should not block execution (the fallback is correct), but the fallback should be visible.
+
+**Suggested fix:**
+```go
+var tracked []string
+if store, err := s.getStateStore(ctx); err != nil {
+    logging.Debug(logging.WithComponent(ctx, "checkpoint"),
+        "resolveFilesTouched: could not get state store, falling back to transcript",
+        slog.String("session_id", state.SessionID),
+        slog.String("error", err.Error()),
+    )
+} else if files, readErr := store.ReadFilesTouched(ctx, state.SessionID); readErr != nil {
+    logging.Debug(logging.WithComponent(ctx, "checkpoint"),
+        "resolveFilesTouched: could not read tracking file, falling back to transcript",
+        slog.String("session_id", state.SessionID),
+        slog.String("error", readErr.Error()),
+    )
+} else {
+    tracked = files
+}
+```
+
+---
+
+## Issue 6: `_ = store.ClearFilesTouched(...)` -- best-effort cleanup without logging (two locations)
+
+**Location:**
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, line 1036
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, line 1131
+
+**Severity:** LOW
+
+**Code (both locations identical pattern):**
+```go
+if store, storeErr := s.getStateStore(ctx); storeErr == nil {
+    _ = store.ClearFilesTouched(ctx, state.SessionID) //nolint:errcheck // Best-effort cleanup, non-critical
+}
+```
+
+**Issue Description:** These are cleanup operations that run after the authoritative `state.FilesTouched` has already been set (line 1033: `state.FilesTouched = remainingFiles`, or line 1128: `state.FilesTouched = nil`). The session state JSON will be saved with the correct data regardless. The `.files` tracking file is just a hot-path optimization for the next cycle.
+
+**Assessment:** This is defensible. The tracking file is an acceleration structure -- the session state JSON is the authoritative source of truth after condensation. If cleanup fails:
+- The `.files` file contains stale data
+- On next read, `resolveFilesTouched` will merge it with `state.FilesTouched`, but deduplication handles the overlap
+- The file will be cleaned up on the next successful `ClearFilesTouched` or when `Clear()` runs (via `filepath.Glob(sessionID+".*")`)
+
+**However**, a persistent failure (e.g., permission error) would cause the tracking file to grow indefinitely with stale entries, and the merge in `resolveFilesTouched` would keep including old files. This is a slow data integrity degradation.
+
+**Recommendation:** Log at Debug level on failure. This is a minor improvement but prevents silent accumulation of stale data from going completely unnoticed.
+
+**Suggested fix:**
+```go
+if store, storeErr := s.getStateStore(ctx); storeErr == nil {
+    if clearErr := store.ClearFilesTouched(ctx, state.SessionID); clearErr != nil {
+        logging.Debug(logCtx, "failed to clear tracking file (non-critical)",
+            slog.String("session_id", state.SessionID),
+            slog.String("error", clearErr.Error()),
+        )
+    }
+}
+```
+
+---
+
+## Issue 7: `AppendFileTouched` deferred `f.Close()` error is not checked
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go`, line 438
+
+**Severity:** LOW
+
+**Code:**
+```go
+f, err := os.OpenFile(s.filesTouchedPath(sessionID), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+if err != nil {
+    return fmt.Errorf("failed to open files touched tracking file: %w", err)
+}
+defer f.Close()
+
+if _, err := fmt.Fprintln(f, filePath); err != nil {
+    return fmt.Errorf("failed to write to files touched tracking file: %w", err)
+}
+return nil
+```
+
+**Issue Description:** On certain filesystems (especially networked ones like NFS), `Close()` can return an error when buffered data fails to flush to disk. The `Fprintln` may succeed (writing to the OS buffer), but `Close()` could fail when actually persisting. The error from `defer f.Close()` is silently discarded.
+
+**Assessment:** This is a common Go pattern and the risk is very low for this use case (local `.git` directory, small writes). The existing codebase uses this same pattern extensively. This is a standard Go idiom, not a defect introduced by this PR.
+
+**Recommendation:** No change needed -- this is consistent with the rest of the codebase and the risk is negligible for local filesystem operations.
+
+---
+
+## Issue 8: Potential data inconsistency between tracking file and session state on crash
+
+**Location:** Multiple -- architectural concern across `handleLifecycleFileEdit`, `postCommitProcessSession`, and `condenseAndUpdateState`
+
+**Severity:** LOW (design consideration, not a bug)
+
+**Issue Description:** The tracking file (`.files`) and session state (`.json`) are not updated atomically. Consider this sequence:
+1. `handleLifecycleFileEdit` appends "foo.go" to the `.files` tracking file
+2. `postCommitProcessSession` reads both sources, condenses, and sets `state.FilesTouched = remainingFiles`
+3. `ClearFilesTouched` is called (line 1036) -- succeeds
+4. `SaveSessionState` (called later by the PostCommit handler) -- fails (e.g., disk full)
+
+Result: The `.files` tracking file is cleared but `state.FilesTouched` was never persisted. The files are lost from both sources.
+
+However, the reverse scenario is also possible: `SaveSessionState` succeeds but `ClearFilesTouched` fails -- in that case, the stale `.files` entries are harmless because they are deduplicated on merge and the next cleanup pass will clear them.
+
+**Assessment:** The "clear succeeded but state save failed" scenario is mitigated by the fact that `SaveSessionState` failures are already handled by existing code (the PostCommit handler logs and continues). The impacted data (carry-forward file list) would be reconstructed from the transcript on the next cycle via the fallback path. The architectural decision to keep the tracking file separate from the atomic JSON state is reasonable for the performance goals.
+
+**Recommendation:** Consider clearing the tracking file AFTER the session state save succeeds, not before. This would make the "save failed" scenario safer. However, this would require restructuring the caller, which may not be worth the churn.
+
+---
+
+## Positive Findings
+
+Several aspects of the error handling in this PR are done well:
+
+1. **Input validation in `AppendFileTouched`**: Session ID validation and newline rejection are thorough. The newline check prevents line-injection attacks that could corrupt the tracking file format. Tests cover both `\n` and `\r`.
+
+2. **Idempotent `ClearFilesTouched`**: Returns nil when the file does not exist. This is correct for a cleanup operation.
+
+3. **`ReadFilesTouched` deduplication**: The function handles duplicate entries from concurrent appends or repeated edits to the same file. This is a good defensive measure.
+
+4. **`Clear()` already handles `.files` via glob**: The existing `Clear()` method uses `filepath.Glob(sessionID+".*")` which naturally includes `.files`. The test `TestClear_RemovesFilesTracking` verifies this. No gap.
+
+5. **The `handleLifecycleFileEdit` properly logs `AppendFileTouched` failures** at Warn level (lines 200-205). This is the correct severity -- the append itself is the most important operation, and it IS logged when it fails.
+
+6. **`ReadAndParseHookInput` errors are properly propagated** from `parseFileEdit` line 198 (`return nil, err`). Malformed JSON at the top level IS treated as a real error. Only the inner `tool_input` unmarshal is swallowed (Issue 1).
+
+---
+
+## Summary Table
+
+| # | Location | Severity | Issue | Data Loss Risk |
+|---|----------|----------|-------|---------------|
+| 1 | `lifecycle.go:202` (claudecode) | MEDIUM | Unmarshal error swallowed without logging | None (event skipped) |
+| 2 | `lifecycle.go:185` (cli) | MEDIUM | WorktreeRoot error swallowed without logging | None (event skipped) |
+| 3 | `lifecycle.go:195` (cli) | MEDIUM | NewStateStore error swallowed without logging | None (event skipped) |
+| 4 | `lifecycle.go:179` (cli) | LOW | Empty field guard -- redundant but harmless | None |
+| 5 | `manual_commit_hooks.go:1473` | HIGH | ReadFilesTouched error silently discarded, fallback invisible | Potential (transcript extraction less reliable) |
+| 6 | `manual_commit_hooks.go:1036,1131` | LOW | ClearFilesTouched error discarded without logging | Stale data accumulation |
+| 7 | `state.go:438` | LOW | f.Close() error not checked | Negligible |
+| 8 | Architecture | LOW | Non-atomic tracking file + state update | Theoretical, mitigated by fallback |
+
+---
+
+## Overall Assessment
+
+The PR's error handling philosophy is "do not block the agent for tracking failures." This is the correct design for a hot-path hook that fires on every file edit. However, the current implementation swings too far toward silence. Issues 1, 2, 3, and 5 all suppress errors without any log output, creating debugging black holes.
+
+The fix for all of them is the same: add Debug or Warn level logging at the suppression points. None of these should change the return value (keep returning nil to avoid blocking the agent). The logging is purely for observability.
+
+Issue 5 is the most actionable because `resolveFilesTouched` is on the critical path for condensation correctness. A silent fallback from the tracking file to transcript extraction should at minimum leave a Debug breadcrumb.</result>
+<usage><total_tokens>77582</total_tokens><tool_uses>29</tool_uses><duration_ms>212122</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-3/tasks/a56664a4936a21a92.output
+
+---
+
+they all seem reasonable, let's do them all

@@ -1,0 +1,330 @@
+Is your todo list outdated again?
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a81c84f6576b1a36d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-entire-doctor/1685341a-8e9c-432d-8a93-a0e417db1e8f/tasks/a81c84f6576b1a36d.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>I have a thorough understanding of the code now. Here are my findings:
+
+---
+
+## Efficiency Review Findings
+
+### 1. Repeated `openRepository` calls in `runSessionsFix` (Redundant work)
+
+**File:** `cmd/entire/cli/doctor.go`, lines 101 and 147
+
+`openRepository(ctx)` is called up to 3 times in a single `runSessionsFix` invocation:
+- Once inside `checkDisconnectedV2Main` (line 418, called on line 93)
+- Once on line 101 for checks 3/4/5
+- Once on line 147 for the stuck-sessions section
+
+Each call goes through `strategy.OpenRepository(ctx)` which resolves the worktree root and opens the repo. The repo handle from line 101 could be reused for the stuck-sessions section, and the one created inside `checkDisconnectedV2Main` could be passed in instead of opened internally.
+
+### 2. Repeated `openRepository` inside `IsV2MainDisconnected` and `ReconcileDisconnectedV2Ref` (Redundant work)
+
+**File:** `cmd/entire/cli/strategy/metadata_reconcile.go`
+
+When `checkDisconnectedV2Main` detects a disconnection and the user confirms the fix, the code path is:
+1. `checkDisconnectedV2Main` calls `openRepository` (line 418)
+2. Passes `repo` to `IsV2MainDisconnected` which calls `getRepoPath(repo)`, `lsRemoteRef`, `fetchRefToTemp`
+3. Then passes `repo` to `ReconcileDisconnectedV2Ref` which re-reads `localRef`, re-calls `getRepoPath`, re-calls `lsRemoteRef`, re-calls `fetchRefToTemp`, and re-calls `isDisconnected`
+
+`ReconcileDisconnectedV2Ref` fully repeats the work already done by `IsV2MainDisconnected`: it re-resolves the local ref, re-runs `git ls-remote` (a network call), re-fetches the remote ref to a temp ref (another network call), and re-runs `git merge-base`. That is **3 redundant subprocess/network calls** for the reconciliation path.
+
+This is the most impactful finding. `lsRemoteRef` and `fetchRefToTemp` are network operations. The same pattern exists in the v1 code (`ReconcileDisconnectedMetadataBranch` also re-checks local/remote refs), but the v2 path is worse because it also re-runs `lsRemoteRef` and `fetchRefToTemp` which involve actual git network I/O rather than just reading local remote-tracking refs.
+
+### 3. Double ref resolution in `checkV2GenerationHealth` (Redundant computation)
+
+**File:** `cmd/entire/cli/doctor.go`, lines 496 and 502
+
+For each archived generation, both `GetRefState` and `ReadGenerationFromRef` are called. But `ReadGenerationFromRef` internally calls `GetRefState` again (see `v2_generation.go` line 79). So `GetRefState` is called twice per generation -- once to get `treeHash` for `CountCheckpointsInTree`, and once inside `ReadGenerationFromRef`.
+
+The fix would be to call `GetRefState` once and pass the `treeHash` to `readGeneration(treeHash)` directly (which is what `ReadGenerationFromRef` does internally).
+
+### 4. New `V2GitStore` allocated per check function (Minor waste)
+
+**Files:** `cmd/entire/cli/doctor.go`, lines 479 and 556
+
+`checkV2GenerationHealth` and `checkV2CheckpointCounts` each create their own `checkpoint.NewV2GitStore(repo, "origin")`. These are lightweight structs, so this is minor, but since both receive the same `repo` and run sequentially, a single store could be shared.
+
+### 5. `ReconcileDisconnectedV2Ref` fetches to temp ref but `IsV2MainDisconnected` already fetched it (Duplicate network I/O)
+
+**File:** `cmd/entire/cli/strategy/metadata_reconcile.go`
+
+`IsV2MainDisconnected` fetches the remote ref to `v2DoctorTmpRef` and then cleans it up via `defer cleanupTmpRef(repo)`. Then `ReconcileDisconnectedV2Ref` immediately fetches the same remote ref to the same `v2DoctorTmpRef` again. The temp ref is cleaned up prematurely because `IsV2MainDisconnected` returns before `ReconcileDisconnectedV2Ref` is called, triggering the deferred cleanup. This means the fetch happens twice -- once in the detection function and once in the reconciliation function.
+
+### 6. `checkV2RefExistence` re-resolves refs that `checkV2CheckpointCounts` resolves again (Minor redundancy)
+
+**File:** `cmd/entire/cli/doctor.go`
+
+`checkV2RefExistence` (check 3) resolves both `/main` and `/full/current` refs via `repo.Reference(...)`. Then `checkV2CheckpointCounts` (check 4) resolves the same two refs again via `v2Store.GetRefState(...)`, which calls `repo.Reference(...)` internally. The existence results from check 3 could be passed to check 4 to skip the re-resolution.
+
+### 7. No concurrency for independent v2 checks
+
+**File:** `cmd/entire/cli/doctor.go`, lines 102-124
+
+Checks 3 (ref existence), 4 (checkpoint counts), and 5 (generation health) are independent of each other and all operate on the same repo handle. They could run concurrently. However, this is a diagnostic command (not a hot path), so the impact is low.
+
+### 8. `ListSessionStates` called twice: once in `runSessionsFix`, once potentially in `canDeleteShadowBranch`
+
+**File:** `cmd/entire/cli/doctor.go`, lines 132 and 619
+
+`ListSessionStates` is called at line 132 to get all session states. Then for each discarded session, `canDeleteShadowBranch` (line 619) calls `ListSessionStates` again. This is an N+1 pattern -- if there are K sessions to discard, `ListSessionStates` is called K+1 times total. The states list from the first call could be passed to `canDeleteShadowBranch`. (Note: this is pre-existing, not introduced by this diff, but the diff adds new code paths that flow into the same discard logic.)
+
+### 9. Duplicate `createTestBlob` / `createBlob` helper functions in tests
+
+**Files:** `cmd/entire/cli/doctor_test.go` (function `createBlob`) and `cmd/entire/cli/strategy/metadata_reconcile_test.go` (function `createTestBlob`)
+
+These are identical functions in different test packages. Not a runtime efficiency issue, but worth noting as code duplication.
+
+---
+
+### Summary
+
+The most impactful finding is **#2/#5**: when a disconnection is detected and repaired, `ReconcileDisconnectedV2Ref` re-performs all the network operations (`git ls-remote`, `git fetch`) and local checks that `IsV2MainDisconnected` already did. This doubles the network round trips on the repair path. The second most notable finding is **#3**: double `GetRefState` per archived generation in the health check loop.</result>
+<usage><total_tokens>70146</total_tokens><tool_uses>14</tool_uses><duration_ms>90282</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa4c0c9598bcff3b2</task-id>
+<tool-use-id>toolu_01P8o644onPSQLeKfiuKkAk5</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-entire-doctor/1685341a-8e9c-432d-8a93-a0e417db1e8f/tasks/aa4c0c9598bcff3b2.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Now I have a complete picture. Here is the review.
+
+---
+
+## Code Quality Findings
+
+### 1. Copy-paste with slight variation: `ReconcileDisconnectedV2Ref` is a near-clone of `ReconcileDisconnectedMetadataBranch`
+
+**File:** `cmd/entire/cli/strategy/metadata_reconcile.go`
+
+`ReconcileDisconnectedV2Ref` (lines 250-337) follows the exact same structure as `ReconcileDisconnectedMetadataBranch` (lines 102-197): resolve local ref, resolve remote, check same-hash, check disconnected, collect commit chain, filter empty-tree commits, handle zero data commits, cherry-pick onto remote, update ref. The only differences are (a) how the remote hash is obtained (`lsRemoteRef` + `fetchRefToTemp` vs. local remote-tracking ref lookup) and (b) the ref name. The core reconciliation logic (lines ~296-336 vs ~154-196) is virtually identical and could be extracted into a shared helper parameterized by the ref resolution strategy.
+
+### 2. Copy-paste with slight variation: `IsV2MainDisconnected` duplicates the structure of `IsMetadataDisconnected`
+
+**File:** `cmd/entire/cli/strategy/metadata_reconcile.go`
+
+`IsV2MainDisconnected` (lines 208-243) mirrors `IsMetadataDisconnected` (lines 30-58). Both check local ref existence, resolve the remote counterpart, compare hashes, and call `isDisconnected`. They differ only in how they obtain the remote hash (go-git ref lookup vs. `lsRemoteRef` + `fetchRefToTemp`). A common pattern could be extracted where the "get remote hash" step is injected.
+
+### 3. Copy-paste with slight variation: `checkDisconnectedV2Main` is nearly identical to `checkDisconnectedMetadata`
+
+**File:** `cmd/entire/cli/doctor.go`
+
+`checkDisconnectedV2Main` (lines 416-471) follows the same pattern as `checkDisconnectedMetadata` (lines 360-412): open repo, check disconnected, print OK/DISCONNECTED, prompt if not forced, call reconcile, print fixed. The two functions share ~80% identical structure. The only differences are the detection/reconcile functions called and the user-facing strings. This could be a single function parameterized by a "check descriptor" (name, detect func, fix func, messages).
+
+### 4. Duplicate test helper: `createBlob` vs `createTestBlob`
+
+**Files:** `cmd/entire/cli/doctor_test.go:55` and `cmd/entire/cli/strategy/metadata_reconcile_test.go:825`
+
+These are byte-for-byte identical implementations in different packages. Both create a git blob from a string and return its hash. Since they are in different packages (`cli` vs `strategy`), direct sharing requires a `testutil` package, but the duplication should be acknowledged and ideally consolidated.
+
+### 5. Redundant `openRepository` calls
+
+**File:** `cmd/entire/cli/doctor.go`
+
+`openRepository(cmd.Context())` or `openRepository(ctx)` is called in three separate places during doctor execution:
+- Line 101: inside the v2 checks block in `runSessionsFix`
+- Line 146: for stuck session checking in `runSessionsFix`
+- Line 417: inside `checkDisconnectedV2Main`
+
+The call at line 417 is particularly wasteful because the repo was already opened at line 101 in the same code path. `checkDisconnectedV2Main` opens its own repo rather than accepting one as a parameter (unlike checks 3-5 which receive `repo *git.Repository`). This creates an inconsistency where check 2 opens its own repo while checks 3-5 share one.
+
+### 6. Inconsistent error accumulation pattern
+
+**File:** `cmd/entire/cli/doctor.go`, lines 86-127
+
+The `finalErr` accumulation uses a first-error-wins pattern (`if finalErr == nil { finalErr = ... }`), meaning only the first failing check's error is propagated. Later check errors are printed to stderr but lost from the return value. This means a caller inspecting the returned error gets incomplete information about which checks failed.
+
+### 7. Misleading "missing generation.json" detection logic
+
+**File:** `cmd/entire/cli/doctor.go`, lines 508-509
+
+The check `if gen.OldestCheckpointAt.IsZero() && gen.NewestCheckpointAt.IsZero()` is intended to detect missing `generation.json`, but `readGeneration` returns a zero-value `GenerationMetadata` (with zero timestamps) both when the file is missing AND when it can't be found in the tree. However, since `ReadGenerationFromRef` would have already returned an error if it couldn't read the ref at all, and `readGeneration` returns `GenerationMetadata{}` (no error) for a missing file, the zero-value check is actually detecting "file missing" correctly. The issue is that the warning message says "missing generation.json" but the code reached this point after `ReadGenerationFromRef` returned *no error*, which could be confusing to someone reading the code. The `genErr != nil` branch above already handles the true error case. The logic is correct but the reasoning chain is non-obvious and deserves a comment explaining WHY zero timestamps means missing.
+
+### 8. Unnecessary comment: "error return kept for consistency"
+
+**File:** `cmd/entire/cli/doctor.go`, line 590
+
+The `//nolint:unparam` comment on `checkV2RefExistence` says "error return kept for consistency with other check functions." This is a reasonable nolint justification, but the function currently always returns `nil`. If there's a design intent that this function should return errors for inconsistencies (not just print them), the inconsistency detection should actually surface as an error. Currently the function prints INCONSISTENT to stdout but returns nil, which means check 3 can never contribute to `finalErr` in the caller. This seems like a bug -- the other checks return errors for their failure modes, but this one silently succeeds even when it detects a problem.
+
+### 9. `initBareWithV2MainRef` duplicates `initBareWithMetadataBranch` boilerplate
+
+**File:** `cmd/entire/cli/strategy/metadata_reconcile_test.go:777` vs `cmd/entire/cli/strategy/common_test.go:1003`
+
+These two helpers share the same bare-repo + clone + config + push setup (~20 lines), diverging only in what ref they create afterward. A shared "init bare repo with main branch" helper could be extracted, with the ref-specific part parameterized.
+
+### 10. Test boilerplate: repeated `cobra.Command` + buffer setup
+
+**File:** `cmd/entire/cli/doctor_test.go`
+
+Every single test function (`TestCheckV2RefExistence_BothExist`, `_NeitherExist`, `_OnlyMainExists`, `_OnlyFullCurrentExists`, `TestCheckV2CheckpointCounts_Consistent`, etc.) repeats the exact same 6-line block:
+```go
+cmd := &cobra.Command{}
+cmd.SetContext(context.Background())
+var stdout, stderr bytes.Buffer
+cmd.SetOut(&stdout)
+cmd.SetErr(&stderr)
+```
+This appears 10+ times. A `newTestCmd(t)` helper returning `(cmd, stdout, stderr)` would eliminate this repetition.
+
+### 11. Stringly-typed status output
+
+**File:** `cmd/entire/cli/doctor.go`
+
+Health check results are communicated purely through formatted strings to stdout (e.g., `"✓ v2 refs: OK"`, `"INCONSISTENT"`, `"DISCONNECTED"`). There's no structured result type that captures what was checked, what the status is, and whether a fix was applied. This makes it harder to programmatically verify check outcomes (e.g., in tests, the assertions rely on `assert.Contains(t, stdout.String(), "OK")` substring matching). A `CheckResult` struct with status enum + message would make both the code and tests more robust.
+
+### 12. `checkV2GenerationHealth` mixes WARNING and INFO severity in the same `warnings` slice
+
+**File:** `cmd/entire/cli/doctor.go`, lines 491-535
+
+The `warnings` slice accumulates items labeled both "WARNING" and "INFO" (the generation sequence gap is INFO-level). These are then reported under a single count: `"%d issue(s) found"`. This conflates informational observations with actual problems, and the output count could be misleading (e.g., "2 issue(s) found" when one is just an INFO about a gap that may be intentional).</result>
+<usage><total_tokens>73618</total_tokens><tool_uses>20</tool_uses><duration_ms>117047</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a2be0fbcc515bce12</task-id>
+<tool-use-id>toolu_01Rtcokh4zmwphTYfgBXk2o6</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-entire-doctor/1685341a-8e9c-432d-8a93-a0e417db1e8f/tasks/a2be0fbcc515bce12.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>I have a thorough understanding of the changes now. Here are my findings:
+
+---
+
+## Code Reuse Findings
+
+### 1. Duplicate blob-creation test helpers (3 identical copies across 2 files)
+
+**`createBlob` in `doctor_test.go`** (line 55) and **`createTestBlob` in `metadata_reconcile_test.go`** (line 825) are functionally identical to **`storeBlob` in `checkpoint/parse_tree_test.go`** (line 15). All three store a string as a git blob and return its hash using the same `NewEncodedObject` / `SetType(BlobObject)` / `Writer()` / `SetEncodedObject` pattern. The only differences are naming and use of `require.NoError` vs `t.Fatalf`.
+
+Since they are in different packages (`cli`, `strategy`, `checkpoint`) they cannot directly share, but this is a candidate for extraction into the `testutil` package if there isn't a cross-package test helper for it already.
+
+**Files:**
+- `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/doctor_test.go` (line 55, `createBlob`)
+- `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/strategy/metadata_reconcile_test.go` (line 825, `createTestBlob`)
+- `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/checkpoint/parse_tree_test.go` (line 15, `storeBlob`)
+
+---
+
+### 2. `createV2Ref` and `createV2RefWithCheckpoints` could use `checkpoint.CreateCommit`
+
+Both `createV2Ref` (doctor_test.go:30) and `createV2RefWithCheckpoints` (doctor_test.go:69) manually encode a commit object (create `object.Commit`, call `Encode`, call `SetEncodedObject`). The existing `checkpoint.CreateCommit` utility does exactly this -- it takes a tree hash, parent hash, message, author name, and author email, and returns the commit hash. Using it would eliminate ~10 lines of boilerplate per helper.
+
+Similarly, `createArchivedGeneration` (doctor_test.go:~587) has the same manual commit-encoding pattern.
+
+**File:** `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/doctor_test.go`
+
+---
+
+### 3. `ReconcileDisconnectedV2Ref` largely duplicates `ReconcileDisconnectedMetadataBranch`
+
+The reconciliation logic (lines 250-337 of `metadata_reconcile.go`) follows the exact same structure as the v1 version (lines 102-197):
+
+1. Check local ref exists
+2. Check remote ref exists (different mechanism: ls-remote+fetch vs remote-tracking ref)
+3. Check if same hash
+4. Check if disconnected via `isDisconnected`
+5. Collect commit chain, filter empty-tree commits
+6. If no data commits, reset to remote
+7. Otherwise cherry-pick onto remote
+
+The core reconciliation logic (steps 4-7: ~40 lines starting from the `disconnected` check) is identical between v1 and v2 except for the ref name and log messages. This could be extracted into a shared helper like `reconcileDisconnectedRef(ctx, repo, refName, localHash, remoteHash, label, w)`.
+
+**File:** `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/strategy/metadata_reconcile.go`
+
+---
+
+### 4. `IsV2MainDisconnected` duplicates remote-lookup + fetch-to-temp + disconnection check with `ReconcileDisconnectedV2Ref`
+
+`IsV2MainDisconnected` (lines 208-243) and `ReconcileDisconnectedV2Ref` (lines 250-337) both perform the same sequence: resolve local ref, ls-remote for remote hash, early-return if missing/equal, fetch to temp ref, check `isDisconnected`. The reconcile function re-does all the checks that `IsV2MainDisconnected` already performed. In the doctor flow, `checkDisconnectedV2Main` calls `IsV2MainDisconnected` first and then `ReconcileDisconnectedV2Ref`, meaning the ls-remote + fetch + merge-base sequence runs twice.
+
+A possible improvement would be to have `ReconcileDisconnectedV2Ref` accept pre-computed state or combine detection and reconciliation.
+
+**File:** `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/strategy/metadata_reconcile.go`
+
+---
+
+### 5. `checkDisconnectedV2Main` structurally duplicates `checkDisconnectedMetadata` in doctor.go
+
+Both functions in `doctor.go` follow the same pattern:
+1. Open repository
+2. Check if disconnected
+3. Print OK or DISCONNECTED
+4. Show confirmation form (if not `--force`)
+5. Call reconcile
+6. Print success
+
+The only differences are: the function called for detection, the function called for reconciliation, and the display strings. This is a candidate for a generic `checkDisconnected(cmd, force, label, detectFn, reconcileFn)` helper.
+
+**File:** `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/doctor.go` (lines 360-471)
+
+---
+
+### 6. Repetitive error-handling pattern in `runSessionsFix`
+
+Lines 91-128 of `doctor.go` repeat the same pattern four times:
+```go
+if err := checkXxx(...); err != nil {
+    fmt.Fprintf(cmd.ErrOrStderr(), "Error: %s check failed: %v\n", label, err)
+    if finalErr == nil {
+        finalErr = NewSilentError(fmt.Errorf("%s check failed: %w", label, err))
+    }
+}
+```
+
+This could be extracted into a small helper like `recordCheckError(cmd, &finalErr, label, err)`.
+
+**File:** `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/doctor.go`
+
+---
+
+### 7. `TestIsV2MainDisconnected_NoRemoteRef` inlines bare+clone setup instead of using a helper
+
+Lines 855-874 of `metadata_reconcile_test.go` manually set up a bare repo, clone it, configure user info, write a README, and push -- the exact same sequence that `initBareWithV2MainRef` does (minus the v2 ref creation). The first half of `initBareWithV2MainRef` (lines 777-800) could be extracted into a reusable `initBareWithMainBranch` helper, which both `initBareWithV2MainRef` and `TestIsV2MainDisconnected_NoRemoteRef` could call. The existing `initBareWithMetadataBranch` in `common_test.go` also has the same bare+clone+push preamble.
+
+**File:** `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/strategy/metadata_reconcile_test.go`
+
+---
+
+### 8. Repetitive cobra command + buffer setup in doctor_test.go
+
+The pattern of creating `&cobra.Command{}`, setting context, creating `bytes.Buffer` for stdout/stderr, and calling `cmd.SetOut`/`cmd.SetErr` appears 17 times in `doctor_test.go`. A small helper like `newTestCmd(t) (*cobra.Command, *bytes.Buffer, *bytes.Buffer)` would reduce boilerplate.
+
+**File:** `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-entire-doctor/cmd/entire/cli/doctor_test.go`
+
+---
+
+### Summary
+
+| # | Finding | Severity | Location |
+|---|---------|----------|----------|
+| 1 | `createBlob` / `createTestBlob` / `storeBlob` -- 3 identical blob helpers across packages | Medium | doctor_test.go, metadata_reconcile_test.go, parse_tree_test.go |
+| 2 | Manual commit encoding instead of using `checkpoint.CreateCommit` | Low | doctor_test.go (3 helpers) |
+| 3 | `ReconcileDisconnectedV2Ref` duplicates core reconciliation logic from v1 | Medium | metadata_reconcile.go |
+| 4 | Double remote-lookup in detect + reconcile flow | Low | metadata_reconcile.go |
+| 5 | `checkDisconnectedV2Main` structurally duplicates `checkDisconnectedMetadata` | Medium | doctor.go |
+| 6 | Repetitive error-handling pattern in `runSessionsFix` | Low | doctor.go |
+| 7 | Bare+clone setup inlined instead of extracted into helper | Low | metadata_reconcile_test.go |
+| 8 | Repetitive cobra command + buffer setup in tests | Low | doctor_test.go |</result>
+<usage><total_tokens>64812</total_tokens><tool_uses>45</tool_uses><duration_ms>180903</duration_ms></usage>
+</task-notification>
+
+---
+
+Commit

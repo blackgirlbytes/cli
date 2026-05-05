@@ -1,0 +1,310 @@
+Implement the following plan:
+
+# Code Simplification: factoryaidroid Tests + lifecycle.go
+
+## Context
+
+The staged changes remove low-value tests and a misleading comment from the factoryaidroid agent package. This plan validates those removals and identifies one additional consolidation.
+
+## Staged Changes (Validated)
+
+All existing staged changes are correct simplifications:
+
+| File | Removal | Reason |
+|------|---------|--------|
+| `factoryaidroid_test.go` | `TestNewFactoryAIDroidAgent` | Constructor implicitly tested by every other test |
+| `lifecycle_test.go` | `TestGetHookNames` | All 9 hooks individually tested via `TestParseHookEvent_*` |
+| `transcript_test.go` | `TestExtractModifiedFiles_NotebookEdit` | Same code path as Write/Edit (single `slices.Contains` check) |
+| `transcript_test.go` | `TestExtractModifiedFiles_CreateAndMultiEdit` | Same reasoning |
+| `transcript_test.go` | `TestCalculateTokenUsage_EmptyTranscript` | Tests trivial Go nil-slice behavior |
+| `lifecycle.go` | Idempotency comment on `handleLifecycleSessionEnd` | Misleading — idempotency is a state machine property, not this function's |
+
+## Additional Change
+
+### Consolidate pass-through hook tests in `lifecycle_test.go`
+
+**File:** `cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go` (lines 162-186)
+
+Replace `TestParseHookEvent_SubagentStop_PassThrough` and `TestParseHookEvent_Notification_PassThrough` with a single table-driven `TestParseHookEvent_PassThroughHooks`. These two hooks share the same `case` clause at `lifecycle.go:45` and their tests are structurally identical (assert nil event, nil error).
+
+```go
+func TestParseHookEvent_PassThroughHooks(t *testing.T) {
+	t.Parallel()
+
+	passThroughHooks := []string{
+		HookNameSubagentStop,
+		HookNameNotification,
+	}
+
+	for _, hookName := range passThroughHooks {
+		t.Run(hookName, func(t *testing.T) {
+			t.Parallel()
+			ag := &FactoryAIDroidAgent{}
+			event, err := ag.ParseHookEvent(hookName, strings.NewReader(`{"session_id":"s"}`))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if event != nil {
+				t.Errorf("expected nil event for %s, got %+v", hookName, event)
+			}
+		})
+	}
+}
+```
+
+### Changes Considered but Rejected
+
+- **Combining EmptyInput + MalformedJSON error tests** — they test distinct error branches (empty-input guard vs JSON parse failure)
+- **Combining WriteSession error tests** — nil-session case needs different setup; table-driven would be longer
+- **Removing `TestExtractModifiedFiles_Empty`** — 7 lines, documents nil-return contract
+- **Removing `TestExtractSummary_EmptyTranscript`** — tests real edge case (empty transcript file)
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-factoryai-agent/99c02bff-621c-4ab0-9eea-f2bd9d4320f1.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/transcript_test.go
+	modified:   cmd/entire/cli/lifecycle.go
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+index 53de31a5..426facb1 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+@@ -10,17 +10,6 @@ import (
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
+ )
+ 
+-func TestNewFactoryAIDroidAgent(t *testing.T) {
+-	t.Parallel()
+-	ag := NewFactoryAIDroidAgent()
+-	if ag == nil {
+-		t.Fatal("NewFactoryAIDroidAgent() returned nil")
+-	}
+-	if _, ok := ag.(*FactoryAIDroidAgent); !ok {
+-		t.Fatal("NewFactoryAIDroidAgent() didn't return *FactoryAIDroidAgent")
+-	}
+-}
+-
+ // TestDetectPresence uses t.Chdir so it cannot be parallel.
+ func TestDetectPresence(t *testing.T) {
+ 	t.Run("factory directory exists", func(t *testing.T) {
+diff --git a/cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go b/cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go
+index 55337259..871f7c79 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go
+@@ -7,39 +7,6 @@ import (
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
+ )
+ 
+-func TestGetHookNames(t *testing.T) {
+-	t.Parallel()
+-
+-	ag := &FactoryAIDroidAgent{}
+-	names := ag.GetHookNames()
+-
+-	expected := []string{
+-		"session-start",
+-		"session-end",
+-		"stop",
+-		"user-prompt-submit",
+-		"pre-tool-use",
+-		"post-tool-use",
+-		"subagent-stop",
+-		"pre-compact",
+-		"notification",
+-	}
+-
+-	if len(names) != len(expected) {
+-		t.Fatalf("GetHookNames() returned %d hooks, want %d: got %v", len(names), len(expected), names)
+-	}
+-
+-	nameSet := make(map[string]bool, len(names))
+-	for _, n := range names {
+-		nameSet[n] = true
+-	}
+-	for _, want := range expected {
+-		if !nameSet[want] {
+-			t.Errorf("GetHookNames() missing expected hook %q", want)
+-		}
+-	}
+-}
+-
+ func TestParseHookEvent_SessionStart(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -192,29 +159,26 @@ func TestParseHookEvent_Compaction(t *testing.T) {
+ 	}
+ }
+ 
+-func TestParseHookEvent_SubagentStop_PassThrough(t *testing.T) {
++func TestParseHookEvent_PassThroughHooks(t *testing.T) {
+ 	t.Parallel()
+ 
+-	ag := &FactoryAIDroidAgent{}
+-	event, err := ag.ParseHookEvent(HookNameSubagentStop, strings.NewReader(`{"session_id":"s"}`))
+-	if err != nil {
+-		t.Fatalf("unexpected error: %v", err)
+-	}
+-	if event != nil {
+-		t.Errorf("expected nil event for SubagentStop, got %+v", event)
+-	}
+-}
+-
+-func TestParseHookEvent_Notification_PassThrough(t *testing.T) {
+-	t.Parallel()
+-
+-	ag := &FactoryAIDroidAgent{}
+-	event, err := ag.ParseHookEvent(HookNameNotification, strings.NewReader(`{"session_id":"s"}`))
+-	if err != nil {
+-		t.Fatalf("unexpected error: %v", err)
+-	}
+-	if event != nil {
+-		t.Errorf("expected nil event for Notification, got %+v", event)
++	passThroughHooks := []string{
++		HookNameSubagentStop,
++		HookNameNotification,
++	}
++
++	for _, hookName := range passThroughHooks {
++		t.Run(hookName, func(t *testing.T) {
++			t.Parallel()
++			ag := &FactoryAIDroidAgent{}
++			event, err := ag.ParseHookEvent(hookName, strings.NewReader(`{"session_id":"s"}`))
++			if err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if event != nil {
++				t.Errorf("expected nil event for %s, got %+v", hookName, event)
++			}
++		})
+ 	}
+ }
+ 
+diff --git a/cmd/entire/cli/agent/factoryaidroid/transcript_test.go b/cmd/entire/cli/agent/factoryaidroid/transcript_test.go
+index 8ce3abc3..177932ad 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/transcript_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/transcript_test.go
+@@ -214,60 +214,6 @@ func TestExtractModifiedFiles(t *testing.T) {
+ 	}
+ }
+ 
+-func TestExtractModifiedFiles_NotebookEdit(t *testing.T) {
+-	t.Parallel()
+-
+-	data := []byte(`{"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"tool_use","name":"NotebookEdit","input":{"notebook_path":"/repo/analysis.ipynb"}}]}}
+-`)
+-
+-	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+-	if err != nil {
+-		t.Fatalf("ParseDroidTranscriptFromBytes() error = %v", err)
+-	}
+-	files := ExtractModifiedFiles(lines)
+-
+-	if len(files) != 1 {
+-		t.Fatalf("ExtractModifiedFiles() got %d files, want 1", len(files))
+-	}
+-	if files[0] != "/repo/analysis.ipynb" {
+-		t.Errorf("ExtractModifiedFiles() got %q, want /repo/analysis.ipynb", files[0])
+-	}
+-}
+-
+-func TestExtractModifiedFiles_CreateAndMultiEdit(t *testing.T) {
+-	t.Parallel()
+-
+-	data := []byte(`{"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"tool_use","name":"Create","input":{"file_path":"new_file.go"}}]}}
+-{"type":"message","id":"a2","message":{"role":"assistant","content":[{"type":"tool_use","name":"MultiEdit","input":{"file_path":"existing_file.go"}}]}}
+-`)
+-
+-	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+-	if err != nil {
+-		t.Fatalf("ParseDroidTranscriptFromBytes() error = %v", err)
+-	}
+-	files := ExtractModifiedFiles(lines)
+-
+-	if len(files) != 2 {
+-		t.Fatalf("ExtractModifiedFiles() got %d files, want 2", len(files))
+-	}
+-
+-	hasFile := func(name string) bool {
+-		for _, f := range files {
+-			if f == name {
+-				return true
+-			}
+-		}
+-		return false
+-	}
+-
+-	if !hasFile("new_file.go") {
+-		t.Error("ExtractModifiedFiles() missing new_file.go")
+-	}
+-	if !hasFile("existing_file.go") {
+-		t.Error("ExtractModifiedFiles() missing existing_file.go")
+-	}
+-}
+-
+ func TestExtractModifiedFiles_Empty(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -420,19 +366,6 @@ func TestCalculateTokenUsage_IgnoresUserMessages(t *testing.T) {
+ 	}
+ }
+ 
+-func TestCalculateTokenUsage_EmptyTranscript(t *testing.T) {
+-	t.Parallel()
+-
+-	usage := CalculateTokenUsage(nil)
+-
+-	if usage.APICallCount != 0 {
+-		t.Errorf("APICallCount = %d, want 0", usage.APICallCount)
+-	}
+-	if usage.InputTokens != 0 {
+-		t.Errorf("InputTokens = %d, want 0", usage.InputTokens)
+-	}
+-}
+-
+ func TestExtractSpawnedAgentIDs_FromToolResult(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/cmd/entire/cli/lifecycle.go b/cmd/entire/cli/lifecycle.go
+index 7c29be98..b68ef9a3 100644
+--- a/cmd/entire/cli/lifecycle.go
++++ b/cmd/entire/cli/lifecycle.go
+@@ -446,8 +446,6 @@ func handleLifecycleCompaction(ag agent.Agent, event *agent.Event) error {
+ }
+ 
+ // handleLifecycleSessionEnd handles session end: marks the session as ended.
+-// Idempotent: if the session is already ended (e.g., some agents fire this hook
+-// twice), the second call is a no-op.
+ func handleLifecycleSessionEnd(ag agent.Agent, event *agent.Event) error {
+ 	logCtx := logging.WithAgent(logging.WithComponent(context.Background(), "lifecycle"), ag.Name())
+ 	logging.Info(logCtx, "session-end",
+- Current branch: alisha/factoryai-agent
+- Recent commits: c9f67b82 Fix Droid startOffset applied at raw JSONL level in token calculation
+ffb79f97 Add droid to condense session switch
+632f98d1 Merge branch 'main' into alisha/factoryai-agent
+8c608ebe Merge pull request #468 from entireio/dependabot/github_actions/goreleaser/goreleaser-action-7
+d16345d3 Merge pull request #410 from entireio/soph/agent-integration-instructions
+80695ef9 Merge pull request #484 from entireio/soph/changelog-0-4-7
+2e8f1300 Merge pull request #478 from entireio/docs/opencode-agent-documentation
+2dfbc359 ln -s CLAUDE.md AGENTS.md
+6538cf2d Merge pull request #481 from entireio/soph/opencode-acknowledgment
+9c6efe19 CHANGELOG.md for 0.4.7
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

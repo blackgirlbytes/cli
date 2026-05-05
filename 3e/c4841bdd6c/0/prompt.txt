@@ -1,0 +1,1571 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>aaf121782ec90f753</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/aaf121782ec90f753.output</output-file>
+<status>completed</status>
+<summary>Agent "Check reuse agent result" completed</summary>
+<result>This is understood. I'm ready to assist with code exploration and analysis tasks in this repository.
+
+The current working directory is `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-explain` on the `feat/checkpoints-v2-explain` branch.
+
+I'm in read-only mode and will use efficient search tools (Glob, Grep, Read, Bash for read-only operations) to explore the codebase. I will not create, modify, or delete any files.
+
+Ready when you are.</result>
+<usage><total_tokens>19500</total_tokens><tool_uses>0</tool_uses><duration_ms>2201</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/aaf121782ec90f753.output
+
+---
+
+<task-notification>
+<task-id>a04f1698c5e941990</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/a04f1698c5e941990.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Perfect. Now I have all the information I need to provide a thorough code review. Let me compile my findings:
+
+## Code Review: listCommittedForExplain and Related Changes
+
+### Issues Found:
+
+#### 1. **Variable Reuse Obscures Intent (Line 379 in explain.go)**
+```go
+v2Committed = append(v2Committed, c)  // Appending v1 entries to v2Committed
+```
+**Issue:** You're appending v1-only entries to the `v2Committed` slice, which is misleading. The variable name suggests it contains only v2 checkpoints, but after the merge loop, it contains a mix of both v1 and v2.
+
+**Recommendation:** Rename to `result` or `merged` to reflect the actual content after the merge:
+```go
+result := v2Committed
+// ... merge logic ...
+return result, nil
+```
+
+---
+
+#### 2. **Inconsistent Error Pattern in v2_read.go ListCommitted (Lines 99-103 vs 115)**
+```go
+// Line 99 - consistent error checking pattern
+if unmarshalErr := json.Unmarshal(...); unmarshalErr != nil {
+    logging.Debug(...)
+} else {
+    // extract data
+}
+
+// Line 115 - inconsistent pattern (different from line 99)
+if json.Unmarshal(...) == nil {  // ← Missing logged error handling
+    info.Agent = ...
+}
+```
+**Issue:** Line 115 silently ignores unmarshal errors without logging. This is inconsistent with your fix at line 99 and makes it harder to debug malformed session metadata.
+
+**Recommendation:** Apply the same pattern as line 99:
+```go
+var sessionMetadata CommittedMetadata
+if unmarshalErr := json.Unmarshal([]byte(sessionContent), &sessionMetadata); unmarshalErr != nil {
+    logging.Debug(ctx, "v2 ListCommitted: skipping malformed session metadata",
+        slog.String("checkpoint_id", checkpointID.String()),
+        slog.String("error", unmarshalErr.Error()))
+} else {
+    info.Agent = sessionMetadata.Agent
+    ...
+}
+```
+
+---
+
+#### 3. **Fragile Merging Logic (Lines 371-382 in explain.go)**
+```go
+// Merge: start with v2, add v1-only entries
+seen := make(map[id.CheckpointID]struct{}, len(v2Committed))
+for _, c := range v2Committed {
+    seen[c.CheckpointID] = struct{}{}
+}
+for _, c := range v1Committed {
+    if _, ok := seen[c.CheckpointID]; !ok {
+        v2Committed = append(v2Committed, c)
+    }
+}
+```
+**Issue:** While correct, this deduplication logic doesn't verify that the v2 version is "better" than v1. If v2's metadata is incomplete (missing SessionID, Agent, etc.), the merged result might be less informative than what v1 had. The function just assumes v2 is always superior.
+
+**Recommendation:** Add a comment explaining the assumption:
+```go
+// Merge: start with v2 (preferred when available), then backfill
+// any v1-only checkpoints. Note: we assume v2 entries are more complete
+// and never fall back to v1 for partially-loaded checkpoints.
+```
+
+Or consider a "best-of" merge if appropriate for your use case.
+
+---
+
+#### 4. **Test Copy-Paste Pattern (Lines 1064-1076 vs 1138-1150)**
+Both test functions duplicate identical repo setup code:
+```go
+tmpDir := t.TempDir()
+repo, err := git.PlainInit(tmpDir, false)
+require.NoError(t, err)
+
+wt, err := repo.Worktree()
+require.NoError(t, err)
+require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "f.txt"), []byte("x"), 0o644))
+_, err = wt.Add("f.txt")
+require.NoError(t, err)
+_, err = wt.Commit("init", &git.CommitOptions{
+    Author: &object.Signature{Name: "T", Email: "t@t.com", When: time.Now()},
+})
+require.NoError(t, err)
+```
+
+**Recommendation:** Extract to a helper:
+```go
+func setupGitRepoForTest(t *testing.T) (*git.Repository, string) {
+    t.Helper()
+    tmpDir := t.TempDir()
+    repo, err := git.PlainInit(tmpDir, false)
+    require.NoError(t, err)
+    
+    wt, err := repo.Worktree()
+    require.NoError(t, err)
+    require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "f.txt"), []byte("x"), 0o644))
+    _, err = wt.Add("f.txt")
+    require.NoError(t, err)
+    _, err = wt.Commit("init", &git.CommitOptions{
+        Author: &object.Signature{Name: "T", Email: "t@t.com", When: time.Now()},
+    })
+    require.NoError(t, err)
+    return repo, tmpDir
+}
+```
+
+---
+
+#### 5. **v1Err Handling in listCommittedForExplain (Line 368)**
+```go
+v1Committed, v1Err := v1Store.ListCommitted(ctx)
+
+if !preferCheckpointsV2 {
+    return v1Committed, v1Err  // ✓ Correctly propagated
+}
+
+// ... later ...
+return v1Committed, v1Err  // ✓ Also correct when v2 fails
+```
+✓ **No issue here** — v1Err is properly propagated in both fallback cases.
+
+---
+
+#### 6. **Unnecessary Comments**
+Comment at line 371-372:
+```go
+// Merge: start with v2, add v1-only entries so pre-v2 checkpoints
+// remain visible during the transition period.
+```
+This is good — it explains WHY. The comment correctly captures the transition logic.
+
+However, the inline comments in v2_read.go around error handling are mostly adequate:
+```go
+return []CommittedInfo{}, nil //nolint:nilerr // No /main ref means empty list
+```
+These are brief but justified since the nolint directives signal intentional behavior.
+
+---
+
+### Summary of Issues by Severity
+
+| Issue | Severity | File | Line(s) |
+|-------|----------|------|---------|
+| Variable name obscures intent (v2Committed used for merged result) | **Medium** | explain.go | 379, 382 |
+| Inconsistent error logging in nested unmarshal | **Medium** | v2_read.go | 115 |
+| Test code duplication | **Low** | explain_test.go | 1064-1076, 1138-1150 |
+| Missing explanatory comment on merge assumption | **Low** | explain.go | 371 |
+
+**The code is functionally correct but could be clearer.**</result>
+<usage><total_tokens>32526</total_tokens><tool_uses>8</tool_uses><duration_ms>23320</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/a04f1698c5e941990.output
+
+---
+
+<task-notification>
+<task-id>ad34604f988e57475</task-id>
+<tool-use-id>toolu_01KKHoE9QUVpfrjdjuBoE5cb</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/ad34604f988e57475.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Now let me compile my findings into a comprehensive analysis:
+
+## Efficiency Review Summary
+
+I've analyzed the three changes you mentioned. Here's what I found:
+
+### 1. **listCommittedForExplain Always Calls v1Store.ListCommitted() First**
+
+**Finding: This is inefficient but intentional.**
+
+The function always calls `v1Store.ListCommitted(ctx)` at line 357, even when `preferCheckpointsV2 = true`. Looking at the implementation:
+
+- **v1 ListCommitted** (committed.go:1003): Walks the v1 metadata branch tree, reads metadata.json files for each checkpoint, extracts session metadata. It's a **full tree traversal reading JSON** for every checkpoint.
+
+- **v2 ListCommitted** (v2_read.go:67): Walks the v2 /main ref tree, reads metadata.json files similarly.
+
+**The inefficiency:** When `preferCheckpointsV2 = true`, you're doing **both v1 and v2 walks** and paying the cost of:
+- Two separate tree walks of git objects
+- Reading and parsing metadata.json for every checkpoint in both branches
+- Only then deduping via the `seen` map
+
+**Why it exists:** Lines 371-381 show the intent — during v1→v2 migration, old checkpoints might only exist on v1, so the code fetches both and merges. This is a **migration/transition concern**, not a permanent strategy.
+
+**Verdict:** If `preferCheckpointsV2 = true`, callers expect v2 as the primary source. You could add a **conditional** to skip v1 entirely when v2 is preferred AND has checkpoints, only falling back if v2 is empty/fails. But the current approach is safe for transition.
+
+---
+
+### 2. **Debug Logging in ListCommitted Hot Callback**
+
+**Finding: This is very cheap when disabled.**
+
+Looking at logging.go:233-235:
+
+```go
+func Debug(ctx context.Context, msg string, attrs ...any) {
+	log(ctx, slog.LevelDebug, msg, attrs...)
+}
+
+func log(ctx context.Context, level slog.Level, msg string, attrs ...any) {
+	l := getLogger()
+	// ... builds allAttrs ...
+	l.Log(nil, level, msg, allAttrs...) // slog.Logger.Log checks level first
+}
+```
+
+**How slog handles level checking:**
+- `slog.Logger.Log()` (stdlib, line 299) checks the handler's level **before** processing any attributes
+- If the log level is below the handler's threshold (e.g., DEBUG when handler is set to INFO), **attributes are never evaluated**
+- The `slog.String()` calls (allocations) **happen before the level check** in your code, in the callback
+
+**The issue:** In v2_read.go lines 88-90 and 100-102, you're calling:
+
+```go
+slog.String("checkpoint_id", checkpointID.String()),
+slog.String("error", cpTreeErr.Error())
+```
+
+These allocate strings **unconditionally** in the argument list, even though slog will discard them if the level is filtered. The stdlib's `log/slog` package normally uses **lazy attribute evaluation** via functions to avoid this, but you're passing eager string allocations here.
+
+**However, this is a **hot callback inside tree walk** — every checkpoint pays this cost if called, even if logging is INFO or WARN.**
+
+**Verdict:** The attributes are created eagerly before slog sees them. For a hot path callback that fires once per checkpoint in ListCommitted:
+- If you have 100 checkpoints and debug is disabled (INFO level), you still allocate 100+ temporary strings
+- This is **not catastrophic** for `explain` (typically <100 checkpoints), but it's suboptimal
+- **Better pattern:** Use conditional logging: `if getLogger().Enabled(ctx, slog.LevelDebug) { logging.Debug(...) }` or refactor to avoid the hot path entirely
+
+---
+
+### 3. **Test Code Setup Duplication**
+
+**Finding: Not an efficiency concern for tests, but worth noting.**
+
+Two test functions with similar repo setup isn't a production performance issue. Integration tests use `testutil.InitRepo()` which is appropriate.
+
+---
+
+## Summary & Recommendations
+
+| Issue | Severity | Recommendation |
+|-------|----------|---|
+| v1+v2 dual ListCommitted calls when v2 preferred | **Low-Medium** | Conditional: skip v1 if v2 has results and preferV2=true. Safe to ship as-is during migration. |
+| Debug logging allocations in hot callback | **Low** | Refactor to conditional check before calling logging.Debug, OR move logging outside loop if possible. |
+| Test setup duplication | **None** | Not a concern for tests. |
+
+The most impactful optimization would be **skipping v1 entirely when v2 is preferred and non-empty**, since ListCommitted walks all checkpoints. The logging issue is minor for typical `explain` invocations (<100 checkpoints).</result>
+<usage><total_tokens>42194</total_tokens><tool_uses>16</tool_uses><duration_ms>32268</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/ad34604f988e57475.output
+
+---
+
+Don't extract the test helper since it makes reading the tests more difficult for not a lot of benefit.
+
+---
+
+commit and continue
+
+---
+
+/codex:adversarial-review
+
+---
+
+Continue
+
+---
+
+You forgot to add tests. You should never forget to add tests.
+
+---
+
+> always write through v1 store, which owns the summary field.
+
+This is wrong, though! We should write to both stores simulatinously when dual writes are enabled.
+
+---
+
+You didn't understand: summaries should be written to both stores. v2 doesn't write the summary, yet but it should. We should update that rather than update the comments.
+
+---
+
+Is this test name still accurate? TestRunExplainCheckpoint_V2PreferredGenerateUsesV1Store
+
+---
+
+Commit and continue
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>ade5397c024b69baf</task-id>
+<tool-use-id>toolu_01Y9gS2GAUYxZnG9YcazAUKP</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/ade5397c024b69baf.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>Perfect! Now I have enough information to provide a comprehensive review. Let me create the final report:
+
+## Code Reuse Opportunities Review
+
+I've completed a thorough analysis of the diff for code reuse opportunities. Here are my findings:
+
+### 1. **V2GitStore.UpdateSummary vs GitStore.UpdateSummary** — MODERATE DUPLICATION, LIMITED SHARING POTENTIAL
+
+**Location:** `v2_committed.go` (lines 581-648) vs `committed.go` (lines 1107-1197)
+
+**Core Logic Pattern:** Both implement identical business logic:
+- Get ref state (parent commit hash, root tree)
+- Flatten checkpoint entries
+- Read root CheckpointSummary
+- Find latest session index
+- Read session metadata
+- Update metadata summary field
+- Marshal updated metadata
+- Create blob, update entries
+- Splice subtree into root tree
+- Create commit and update ref
+
+**Why Sharing is Limited:**
+
+The implementations use **different ref management abstractions:**
+
+- **v1 (GitStore)**: `ensureSessionsBranch()` + `getSessionsBranchRef()` + `createCommit()` + `SetReference()` (lines 1115-1192)
+  - Hard-coded to `entire/checkpoints/v1` branch via `paths.MetadataBranchName`
+  - Uses `s.createCommit()` helper (GitStore method)
+  - Manual ref creation pattern
+
+- **v2 (V2GitStore)**: `GetRefState()` + `updateRef()` (lines 587, 647)
+  - Parameterized ref name (`paths.V2MainRefName`)
+  - Uses `s.updateRef()` helper (V2GitStore method)
+  - Already abstracted for reuse across multiple refs (/main, /full/current)
+
+**Why Extract Now is Risky:**
+
+Extracting a `updateSessionMetadataCore()` helper would need to:
+1. Abstract away ref initialization (`ensureSessionsBranch` vs implicit in `GetRefState`)
+2. Parameterize commit creation and ref updates (`s.createCommit()` + `SetReference()` vs `s.updateRef()`)
+3. Handle different error types (GitStore uses named errors implicitly, v2 uses explicit checks)
+
+The v1 and v2 implementations appear to be intentionally separate to maintain independence as you prepare for v1 removal. **Recommendation: Leave as-is** — the duplication is acceptable given the architectural goal of keeping v1 and v2 concerns isolated.
+
+---
+
+### 2. **marshalPromptAttributionsIncludingPending** — NO DUPLICATION
+
+**Location:** `manual_commit_condensation.go` (lines 313-330)
+
+**Status:** This is a **single, non-duplicated function** introduced in commit `a9f02fead` to replace the original `marshalPromptAttributions`. It appends `PendingPromptAttribution` to the prompt attributions slice before marshaling to JSON, ensuring persisted diagnostics match computed `InitialAttribution`.
+
+**Usage:** Only called once in `CondenseSession` (line 238).
+
+**No reuse opportunities** — this is a focused helper for a specific concern (mid-turn attribution persistence).
+
+---
+
+### 3. **generateCheckpointSummary** — APPROPRIATE DUAL-WRITE PATTERN
+
+**Location:** `explain.go` (lines 389-434)
+
+**Changes in diff:**
+```go
+// Lines 418-430: v1 persisted, v2 best-effort
+if err := v1Store.UpdateSummary(ctx, checkpointID, summary); err != nil {
+    return fmt.Errorf("failed to save summary: %w", err)
+}
+
+// Persist to v2 when available (best-effort — v1 is the primary)
+if v2Store != nil {
+    if v2Err := v2Store.UpdateSummary(ctx, checkpointID, summary); v2Err != nil {
+        logging.Debug(ctx, "v2 UpdateSummary failed (non-fatal)", ...)
+    }
+}
+```
+
+**Status:** This is **correct and intentional design**. The pattern:
+- **v1 primary** with error feedback
+- **v2 optional** with debug-level logging
+- Prevents `explain --generate` from rejecting v2-only checkpoints
+
+No refactoring needed — this is the appropriate dual-write entry point.
+
+---
+
+### 4. **Shared Helper Methods** — ALREADY FACTORED WELL
+
+**Lower-level shared utilities are already extracted:**
+- `readJSONFromBlob[T]` (used by both v1 and v2)
+- `flattenCheckpointEntries` (used by both via `s.gs.`)
+- `spliceCheckpointSubtree` (used by both via `s.gs.`)
+- `redactSummary()` (used by both)
+- `CreateBlobFromContent()` (used by both)
+
+These prevent re-implementing the same tree surgery and JSON marshaling logic. ✓
+
+---
+
+### Summary of Findings
+
+| Item | Duplication Level | Recommendation |
+|------|---|---|
+| `UpdateSummary` (v1 vs v2) | Moderate, 40+ lines | Leave as-is — v1/v2 isolation is intentional |
+| `marshalPromptAttributionsIncludingPending` | None — single function | ✓ No action |
+| `generateCheckpointSummary` | None — appropriate dual-write | ✓ No action |
+| Lower-level helpers | Already shared | ✓ Good factoring |
+
+**Overall Assessment:** The diff shows **good code discipline**. The v1/v2 duplication in `UpdateSummary` is a justified trade-off for keeping separate concerns isolated as you plan for v1 removal. The new v2 implementation follows the established v2 architecture (parameterized refs, `GetRefState`/`updateRef` pattern) consistently with other v2 methods.
+
+No refactoring is recommended at this time.</result>
+<usage><total_tokens>54655</total_tokens><tool_uses>30</tool_uses><duration_ms>59152</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/ade5397c024b69baf.output
+
+---
+
+<task-notification>
+<task-id>a543505e9f0fcdcdc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/a543505e9f0fcdcdc.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Excellent! Now I have all the information I need. Let me prepare a comprehensive code review report:
+
+## Code Quality Review
+
+Based on my analysis of the diff, here are the detailed findings on each issue:
+
+### 1. **V2GitStore.UpdateSummary — Parameter Sprawl vs v1**
+
+**Finding: Clean implementation, no unnecessary parameter sprawl.**
+
+Comparing v1 (`committed.go:1109`) with v2 (`v2_committed.go:581`):
+
+- **v1**: `func (s *GitStore) UpdateSummary(ctx context.Context, checkpointID id.CheckpointID, summary *Summary) error`
+- **v2**: `func (s *V2GitStore) UpdateSummary(ctx context.Context, checkpointID id.CheckpointID, summary *Summary) error`
+
+Both have identical signatures (3 parameters after receiver). The v2 version mirrors v1 exactly, which is the right design choice.
+
+**Error messages**: Both use consistent patterns:
+- v1 (line 1141): `fmt.Errorf("failed to read checkpoint summary: %w", err)`
+- v2 (line 607): `fmt.Errorf("failed to read checkpoint summary: %w", err)`
+
+Both use the same wrapped error format throughout.
+
+**readJSONFromBlob usage**: 
+- v1 uses `s.readSummaryFromBlob()` (line 1140), which wraps `readJSONFromBlob[CheckpointSummary]` for type safety
+- v2 uses `readJSONFromBlob[CheckpointSummary](s.repo, entry.Hash)` directly (line 605)
+
+This is **intentional and correct** — v2 doesn't have a `readSummaryFromBlob()` wrapper yet (likely by design for the new refactored structure). Both approaches work and maintain consistency with how their respective stores read metadata.
+
+**Status: ✓ PASS**
+
+---
+
+### 2. **generateCheckpointSummary — Parameter Sprawl (v1Store, v2Store)**
+
+**Finding: Parameter sprawl exists but is justified by design.**
+
+At `explain.go:392`:
+```go
+func generateCheckpointSummary(ctx context.Context, w, _ io.Writer, v1Store *checkpoint.GitStore, v2Store *checkpoint.V2GitStore, checkpointID id.CheckpointID, cpSummary *checkpoint.CheckpointSummary, content *checkpoint.SessionContent, force bool) error
+```
+
+**Analysis:**
+- The function takes both stores because it performs **dual writes**: v1 is primary (line 418), v2 is fallback (line 424)
+- This pattern is **not used elsewhere** in explain.go (verified by searching the file)
+- Looking at the call site (line 300):
+  ```go
+  if err := generateCheckpointSummary(ctx, w, errW, v1Store, v2Store, fullCheckpointID, summary, content, force); err != nil {
+  ```
+  Both stores are available at call site, so passing both is reasonable.
+
+**Could this be an interface?** Not ideal here because:
+- The two stores have different operations (v1 uses `createCommit()`, v2 uses `updateRef()`)
+- Only `UpdateSummary()` is shared, not enough for a cohesive interface
+- Dual-write pattern is intentional and temporary during v2 migration
+
+**Status: ⚠ ACCEPTABLE — Dual-write pattern is explicit and intentional, but consider documenting why both stores are needed if this becomes a pattern elsewhere**
+
+---
+
+### 3. **marshalPromptAttributionsIncludingPending — Slice Mutation**
+
+**CRITICAL FINDING: Potential slice aliasing bug.**
+
+At `manual_commit_condensation.go:317-330`:
+```go
+func marshalPromptAttributionsIncludingPending(state *SessionState) json.RawMessage {
+	pas := state.PromptAttributions
+	if state.PendingPromptAttribution != nil {
+		pas = append(pas, *state.PendingPromptAttribution)  // ← BUG
+	}
+	...
+}
+```
+
+**The Problem:**
+```go
+pas := state.PromptAttributions  // pas points to state's underlying array
+if state.PendingPromptAttribution != nil {
+    pas = append(pas, ...)  // If state.PromptAttributions has spare capacity,
+}                            // this mutates the original slice!
+```
+
+If `state.PromptAttributions` was allocated with spare capacity (e.g., `make([]T, len, cap)` with `cap > len`), the `append()` will write to that spare capacity and **mutate the original slice**.
+
+**Example of the bug:**
+```go
+original := make([]Attribution, 1, 3)  // len=1, cap=3
+original[0] = Attribution{...}
+
+state := &SessionState{
+    PromptAttributions: original,
+    PendingPromptAttribution: &Attribution{...},
+}
+
+// This mutates original!
+result := marshalPromptAttributionsIncludingPending(state)
+// original now has 2 elements instead of 1
+```
+
+**Status: ✗ FAIL — Actual bug that could cause state corruption**
+
+**Fix:** Make a copy:
+```go
+func marshalPromptAttributionsIncludingPending(state *SessionState) json.RawMessage {
+    pas := make([]Attribution, len(state.PromptAttributions), len(state.PromptAttributions)+1)
+    copy(pas, state.PromptAttributions)
+    if state.PendingPromptAttribution != nil {
+        pas = append(pas, *state.PendingPromptAttribution)
+    }
+    ...
+}
+```
+
+---
+
+### 4. **TestV2UpdateSummary_PersistsSummaryToLatestSession — Dead Code**
+
+**Finding: Line 314 is not dead code, it's legitimate test design.**
+
+At `v2_read_test.go:314`:
+```go
+_ = summary // used above
+```
+
+This is actually **good practice** — the line explicitly shows that `summary` (read at line 292) is being kept around even though it's not used after line 293. This prevents the compiler warning "unused variable" and documents the intent that the first read is a setup step for the later comparison (verifying the summary was initially nil).
+
+**Status: ✓ PASS — Legitimate use of blank assignment to suppress unused variable warning**
+
+---
+
+### 5. **TestRunExplainCheckpoint_V2PreferredGenerateWritesBothStores — Stale Comment**
+
+**Finding: Comment is now INACCURATE.**
+
+At `explain_test.go:1111-1112`:
+```go
+// generate=true, force=true — should succeed by writing through v1 store
+// even though the resolved reader is V2GitStore.
+```
+
+**The Problem:**
+After the dual-write change (commit `a9f02fead`), line 418-430 in explain.go shows:
+```go
+// Persist to v1
+if err := v1Store.UpdateSummary(ctx, checkpointID, summary); err != nil {
+    return fmt.Errorf("failed to save summary: %w", err)
+}
+
+// Persist to v2 when available (best-effort — v1 is the primary)
+if v2Store != nil {
+    if v2Err := v2Store.UpdateSummary(ctx, checkpointID, summary); v2Err != nil {
+        logging.Debug(...)
+    }
+}
+```
+
+The comment is **stale** — the function now writes to **both stores**, not just v1. The v2 write is intentional (dual-write pattern), not a fallback or exception.
+
+**Status: ✗ FAIL — Comment needs update to reflect dual-write behavior**
+
+**Fix:** Update to:
+```go
+// generate=true, force=true — should succeed by writing to both v1 and v2 stores.
+```
+
+---
+
+## Summary Table
+
+| Issue | Status | Severity |
+|-------|--------|----------|
+| 1. V2GitStore.UpdateSummary params | ✓ PASS | N/A |
+| 2. generateCheckpointSummary dual-store params | ⚠ ACCEPTABLE | Low |
+| 3. marshalPromptAttributionsIncludingPending slice mutation | ✗ FAIL | **High** |
+| 4. TestV2UpdateSummary dead code | ✓ PASS | N/A |
+| 5. Test comment about dual-write | ✗ FAIL | Medium |
+
+**Actions Required:**
+1. **Fix slice mutation bug** in `marshalPromptAttributionsIncludingPending` — this is a real correctness issue
+2. **Update test comment** at line 1111-1112 to reflect dual-write behavior</result>
+<usage><total_tokens>65082</total_tokens><tool_uses>28</tool_uses><duration_ms>58314</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/a543505e9f0fcdcdc.output
+
+---
+
+<task-notification>
+<task-id>aaee04c3acda3a476</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/aaee04c3acda3a476.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Perfect. Now I have all the context I need. Let me write the efficiency review:
+
+## Efficiency Review: Dual-Write Summary Generation
+
+Based on code analysis of the diff at commit `a9f02fead`, here are the findings:
+
+### 1. Sequential UpdateSummary Calls — Parallelization Feasibility
+
+**Current Implementation (explain.go:417-430):**
+```go
+// Persist to v1
+if err := v1Store.UpdateSummary(ctx, checkpointID, summary); err != nil {
+    return fmt.Errorf("failed to save summary: %w", err)
+}
+
+// Persist to v2 when available (best-effort — v1 is the primary)
+if v2Store != nil {
+    if v2Err := v2Store.UpdateSummary(ctx, checkpointID, summary); v2Err != nil {
+        logging.Debug(ctx, "v2 UpdateSummary failed (non-fatal)", ...)
+    }
+}
+```
+
+**Analysis:**
+
+Both `GitStore.UpdateSummary` (committed.go:1109) and `V2GitStore.UpdateSummary` (v2_committed.go:581) perform:
+- Full checkpoint subtree read via `flattenCheckpointEntries()` — tree walk + blob reads
+- Entry modifications (update session metadata blob)
+- Splice back into root tree via `spliceCheckpointSubtree()` — tree construction
+- Ref update (one git commit per operation)
+
+These operations **are independent** and could be parallelized since:
+- Each targets a different ref (`entire/checkpoints/v1` vs `refs/entire/main`)
+- No shared state modified between calls
+- No ordering dependency on v2's success for v1 results
+
+**Overhead Assessment:**
+- **Per-call cost:** ~2-3 git object reads (root tree, checkpoint subtree metadata, session metadata) + 2-3 blob writes (new metadata blob, new checkpoint tree, ref update)
+- **CLI context:** Called from `explain --generate`, a user-facing command where users may wait for completion
+- **Verdict:** Sequential overhead is **modest but noticeable** for large repos or slow disk. Parallelization would provide ~1.5-2x speedup with negligible complexity (one goroutine per store).
+
+**Recommendation:** Parallelization is reasonable for a CLI command (non-blocking), but not critical since:
+- Total time is dominated by LLM summary generation (100s+ ms), not persistence (10-50 ms per store)
+- The `--generate` flag is not a hot path (manual user command, not automatic)
+- Sequential error handling is cleaner (v1 failure blocks immediately rather than racing with v2)
+
+---
+
+### 2. Helper Reuse: flattenCheckpointEntries & spliceCheckpointSubtree
+
+**Discovery:**
+
+`V2GitStore` holds a composed `GitStore` field (`s.gs *GitStore` in v2_store.go:22) and **reuses** these exact helpers:
+
+```go
+// V2GitStore.UpdateSummary calls (v2_committed.go:594, 640):
+entries, err := s.gs.flattenCheckpointEntries(rootTreeHash, checkpointPath)
+newTreeHash, err := s.gs.spliceCheckpointSubtree(rootTreeHash, checkpointID, basePath, entries)
+```
+
+This is the **correct design** — no duplication.
+
+**Flatten Result Reuse:**
+
+Both `v1Store.UpdateSummary` and `v2Store.UpdateSummary` read the **same checkpoint path** and produce the same flattened entries. However, **reusing v1's flatten result for v2 is not feasible** because:
+
+1. **Different ref states:** v1 reads from `entire/checkpoints/v1` ref, v2 from `refs/entire/main` — different trees, different root hashes, different flatten results
+2. **Different checkpoint tree structures:** v1 stores raw transcripts + content hash; v2 stores only metadata on `/main` (raw transcripts go to `/full/current`), so entry sets differ
+3. **Serialization cost negligible:** `flattenCheckpointEntries()` does tree walks (cached by go-git), not expensive disk I/O — reuse savings would be minimal compared to parallelization gains
+
+**Verdict:** Current design with composed `GitStore` is optimal. No refactoring needed.
+
+---
+
+### 3. marshalPromptAttributionsIncludingPending Hot Path Analysis
+
+**Usage Location (manual_commit_condensation.go:238):**
+```go
+writeOpts := cpkg.WriteCommittedOptions{
+    ...
+    PromptAttributionsJSON:      marshalPromptAttributionsIncludingPending(state),
+    ...
+}
+// Then: store.WriteCommitted(ctx, writeOpts)
+```
+
+Called **once per session condense** in `CondenseSession()` (line 238), which is:
+- **Not a hot path:** Condensation happens once at session end (post-commit hook)
+- **Synchronous blocking operation:** User waits for checkpoint write to complete
+- **Called ~1-2 times per session max** (rarely more unless user does multiple commits)
+
+**Implementation (manual_commit_condensation.go:317-330):**
+```go
+func marshalPromptAttributionsIncludingPending(state *SessionState) json.RawMessage {
+    pas := state.PromptAttributions
+    if state.PendingPromptAttribution != nil {
+        pas = append(pas, *state.PendingPromptAttribution)  // ← slice append
+    }
+    if len(pas) == 0 {
+        return nil
+    }
+    data, err := json.Marshal(pas)
+    if err != nil {
+        return nil
+    }
+    return data
+}
+```
+
+**Analysis:**
+
+- **Slice allocation:** `append()` on `state.PromptAttributions` creates a new slice header (not a copy of underlying array if no PendingPromptAttribution)
+- **Cost:** O(1) for typical cases (1-5 PromptAttribution entries); allocation is on stack/small heap
+- **Frequency:** Called once per condense (not once per checkpoint or per file change)
+- **Verdict:** **Not a hot path.** The function is called at a natural serialization boundary with no performance sensitivity.
+
+Performance is acceptable because:
+1. PromptAttributions arrays are small (typically 1-10 entries)
+2. JSON marshaling dominates (much slower than slice operations)
+3. Execution is ordered between LLM generation and git operations (neither blocking nor in loops)
+
+**Recommendation:** No optimization needed. The implementation is clean and correct.
+
+---
+
+## Summary
+
+| Question | Finding | Action |
+|----------|---------|--------|
+| **1. Parallelization feasibility** | Yes, v1 and v2 UpdateSummary are independent operations; overhead is modest (2-5x10ms per call). Parallelization would give ~1.5-2x speedup. | **Optional nice-to-have:** Not critical since summary generation (100s+ ms) dominates. Sequential is simpler for error handling. |
+| **2. Helper reuse** | ✓ Correct: V2GitStore reuses GitStore's `flattenCheckpointEntries` and `spliceCheckpointSubtree` via composed field. Reusing flatten results across stores infeasible due to different refs. | **No change needed.** Design is optimal. |
+| **3. Hot path analysis** | Not a hot path: Called once per session end, small slices (1-5 entries), JSON marshaling dominates cost. | **No optimization needed.** Implementation is clean. |</result>
+<usage><total_tokens>50226</total_tokens><tool_uses>34</tool_uses><duration_ms>68820</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/aaee04c3acda3a476.output
+
+---
+
+commit and continue
+
+---
+
+/codex:adversarial-review
+
+---
+
+Continue
+
+---
+
+Yet again: If you change anything, ensure it's covered by tests!
+
+---
+
+> // Persist to both stores. Each is best-effort; at least one must succeed.
+
+I think at this point v2 is considered to be experimental and it can fail but the v1 write isn't optional and should always pass. Please update the AND the matching tests accordingly.
+
+---
+
+/codex:adversarial-review
+
+---
+
+For "explain --generate is still broken for checkpoints that exist only in v2": This is by design and won't be addressed at this point. There simply is no situation where a checkpoint only exists in v2 but not in v1 at this moment. At most we're dual writing and checkpoints will be in both places.
+
+> Commit-only sessions still produce combined attribution even though the new invariant says they must not
+
+As far as I can tell, this code wasn't updated in this branch and should therefore be out of scope for this review. Isn't it?
+
+---
+
+That's plain wrong! updateCombinedAttributionForCheckpoint was added to the `main` branch 17h ago and isn't part of the changes to this branch.
+
+---
+
+Commit and continue
+
+---
+
+When writing commits, ONLY describe the changes going into the commit. Don't describe the changes made based on input between commits.
+
+---
+
+Can you run all pre-push checks and ensure tests, linting, etc. still works?
+
+---
+
+Commit
+
+---
+
+Can you open a pull request now?
+
+---
+
+When creating the pull request description, also describe WHY a change was made, not just what changed. Try again.
+
+---
+
+Now the description is incorrect. The `explain` command wasn't updated because it broke when updating checkpoints v2 but simply because it wasn't implemented, yet.
+
+---
+
+The tests are failing in CI because `claude` isn't available. Can we somehow mock that interaction?
+
+?       github.com/entireio/cli/cmd/entire    [no test files]
+Error: not a git repository
+--- FAIL: REDACTED (0.05s)
+    explain_test.go:1167: 
+            Error Trace:    /home/runner/work/cli/cli/cmd/entire/cli/explain_test.go:1167
+            Error:          "failed to generate summary: failed to generate summary: claude CLI not found: exec: \"claude\": executable file not found in $PATH" does not contain "failed to save summary"
+            Test:           REDACTED
+            Messages:       v2-only checkpoint should fail --generate because v1 store is required
+
+---
+
+Commit and push
+
+---
+
+Yes
+
+---
+
+push it real good
+
+---
+
+Can you pull in `main` and address the merge conflicts?
+
+---
+
+/review
+
+---
+
+Yes
+
+---
+
+Yes, fix it
+
+---
+
+There's still `mise lint` failures. Can you fix them?
+
+---
+
+Nope, the linter still fails
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>afb2ea0d36fc0d2d9</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/afb2ea0d36fc0d2d9.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>I apologize, but I'm encountering permission issues accessing the files. The system has denied both Bash and Read access, likely due to the READ-ONLY context restrictions in place.
+
+To complete this code review, I need permission to:
+1. Read the three files you specified (`committed_reader_resolve.go`, `v2_read.go`, `explain.go`)
+2. Potentially read related test files to check for helper functions like `storeTree`
+
+Could you either:
+- Grant me read access to these files, or
+- Share the content of these files directly so I can analyze the code quality issues you've identified?
+
+Once I can access the code, I'll be able to provide a detailed review addressing all five items you listed.</result>
+<usage><total_tokens>21519</total_tokens><tool_uses>8</tool_uses><duration_ms>8685</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/afb2ea0d36fc0d2d9.output
+
+---
+
+<task-notification>
+<task-id>aee62afa03d707e00</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/aee62afa03d707e00.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Perfect! Now I have all the context I need. Let me create a comprehensive efficiency analysis document:
+
+## Efficiency Analysis: Checkpoints V2 Explain Implementation
+
+Based on my review of `v2_read.go` and `explain.go`, here are the three efficiency issues you identified:
+
+### 1. **Duplicate Tree Traversals (8 instead of 4 tree lookups)**
+
+**Issue:** When `readV2ContentFromMain` is called, it invokes:
+- `ReadSessionMetadataAndPrompts` (lines 414-417) - performs 4 tree lookups: root → checkpoint → session → files
+- `ReadSessionCompactTranscript` (lines 419) - performs the same 4 tree lookups again
+
+**Evidence:**
+- `ReadSessionMetadataAndPrompts` (lines 189-233): walks root (line 200) → cpTree (line 205) → sessionTree (line 211) → file reads
+- `ReadSessionCompactTranscript` (lines 141-182): identical sequence - root (line 152) → cpTree (line 157) → sessionTree (line 163) → file read
+
+**Call pattern** (lines 414-424 in explain.go):
+```go
+content, err := v2Reader.ReadSessionMetadataAndPrompts(ctx, checkpointID, latestIndex)  // Tree walk #1
+...
+compactTranscript, compactErr := v2Reader.ReadSessionCompactTranscript(ctx, checkpointID, latestIndex)  // Tree walk #2
+```
+
+**Impact:** High - each call re-traverses the same git tree structure separately.
+
+**Recommendation:** Consolidate into a single function that returns both in one tree traversal, or add a parameter-based variant that reads multiple files in one pass.
+
+---
+
+### 2. **Unconditional v1 ListCommitted call**
+
+**Issue:** In `listCommittedForExplain` (lines 347-388), line 348 always calls `v1Store.ListCommitted(ctx)` even when v2 is preferred and succeeds:
+
+```go
+v1Committed, v1Err := v1Store.ListCommitted(ctx)  // Line 348 - unconditional
+
+if !preferCheckpointsV2 {
+    if v1Err != nil {
+        return nil, fmt.Errorf("listing v1 checkpoints: %w", v1Err)
+    }
+    return v1Committed, nil
+}
+
+v2Committed, v2Err := v2Store.ListCommitted(ctx)  // Line 357 - only if v2 preferred
+```
+
+**Problem:** Even when `preferCheckpointsV2 = true` and v2 succeeds (line 357 succeeds), v1 is still called at line 348 for merge purposes (lines 375-386). However, this means v1 is ALWAYS called, even for v1-only mode where the extra work isn't needed.
+
+**Observation:** When `preferCheckpointsV2 = false`, line 348's result is returned directly (line 354) without ever touching v2. The v1 call is unavoidable in that case. But v1 is loaded regardless of preference.
+
+**Actual behavior:** 
+- When v2 is disabled: only v1 is used (line 348 + 354, v2 never called) ✓ efficient
+- When v2 is enabled: both are called (line 348 + 357), then merged (lines 375-386) ✓ necessary for migration
+- The issue is subtler: if v2 succeeds but v1 fails, you get v2 only (line 372) which is fine
+
+**Recommendation:** This is actually **not wasteful** during migration period (both should be loaded for merging). Consider only if you plan to drop v1 support entirely. For now, this is acceptable.
+
+---
+
+### 3. **Always Falls Back to v1 on Any v2 Error**
+
+**Issue:** `ResolveCommittedReaderForCheckpoint` (lines 27-67) at lines 46-51:
+
+```go
+if err != nil && !errors.Is(err, ErrCheckpointNotFound) && !errors.Is(err, ErrNoTranscript) {
+    logging.Debug(ctx, "v2 ReadCommitted failed, falling back to v1",
+        slog.String("checkpoint_id", checkpointID.String()),
+        slog.String("error", err.Error()),
+    )
+}
+// Falls through to v1 call at line 58
+```
+
+**Problem:** The condition allows **any error** (except the two explicitly-checked ones) to trigger fallback:
+- Transient network errors from git fetch operations
+- Malformed JSON parsing errors
+- Tree navigation errors
+- Any unknown error
+
+Then **unconditionally calls v1** (line 58) regardless of error type.
+
+**Acceptable design during migration**, but consider:
+- **Transient errors** (timeout, ECONNRESET) should probably be retried or surfaced, not silently swallowed
+- **Permanent errors** (ErrCheckpointNotFound, malformed data) should fail fast, not retry v1
+- Currently these are all conflated
+
+**Recommendation:** Distinguish error types:
+- For `ErrCheckpointNotFound` and `ErrNoTranscript`: skip fallback (v2 explicitly says "not there")
+- For transient errors: retry v2 before falling back
+- For permanent errors (malformed JSON): log and fail hard, don't try v1
+
+**Current behavior is defensible** for now (migration safety), but could cause confusion if v2 becomes primary.
+
+---
+
+### Summary
+
+| Issue | Severity | Current Impact | Recommendation |
+|-------|----------|-----------------|-----------------|
+| Duplicate tree walks | **High** | Calls git 8 times instead of 4 per checkpoint view | Consolidate `ReadSessionMetadataAndPrompts` + `ReadSessionCompactTranscript` into single function |
+| Unconditional v1 ListCommitted | **Low** | Necessary during v2 migration; only when listing all | Accept for now; revisit when v1 is deprecated |
+| Fallback on any error | **Medium** | Masks transient errors; fails silently in some cases | Consider error-type-specific fallback strategy |</result>
+<usage><total_tokens>39964</total_tokens><tool_uses>13</tool_uses><duration_ms>41492</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/aee62afa03d707e00.output
+
+---
+
+<task-notification>
+<task-id>a7fcf25b19214f778</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/a7fcf25b19214f778.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>Perfect! Now I have all the information I need. Let me compile the analysis:
+
+## Code Reuse Analysis: V2 Checkpoint Migration
+
+### Overview
+The diff introduces three key pieces for v2 checkpoint explain support. I've found **significant opportunities to reduce duplication** while maintaining the distinct responsibility boundaries.
+
+---
+
+## Finding 1: Tree Walking Logic Duplication
+
+### Issue: `readTranscriptFromTree` vs `readTranscriptFromObjectTree`
+
+**Location:** 
+- v1 (go-git FetchingTree wrapper): `committed.go:1638-1713`
+- v2 (raw object.Tree): `v2_read.go:429-489`
+
+**Duplication:**
+Both functions implement identical logic for:
+1. Scanning entries for chunk files
+2. Detecting base file presence  
+3. Sorting chunks by index
+4. Reassembling chunks via `agent.ReassembleTranscript`
+5. Falling back to non-chunked base file
+
+**Code Correspondence:**
+
+| Logic | v1 (FetchingTree) | v2 (object.Tree) |
+|-------|------|------|
+| Scan for base file | Lines 1643-1646 | Lines 436-439 |
+| Scan for chunks | Lines 1648-1652 | Lines 440-444 |
+| Chunk processing | Lines 1657-1695 | Lines 449-474 |
+| Fallback to base | Lines 1699-1712 | Lines 478-487 |
+
+**Key Differences:**
+- v1 uses `FetchingTree.RawEntries()` + logging warnings on chunk read failures (lines 1672-1676)
+- v2 silently skips unreadable chunks (lines 458-460)
+- v1 supports legacy filename fallback (line 1706-1710)
+- v2 does not check for legacy filename
+
+**Impact:**
+The **50-90 line duplication** exceeds the advisory threshold (50 tokens). Both implement the same algorithm independent of tree type.
+
+---
+
+## Finding 2: Metadata + Prompts Reading Pattern
+
+### Issue: `ReadSessionMetadataAndPrompts` vs `ReadSessionContent` Structure
+
+**Locations:**
+- v1 metadata-only: `committed.go:857-893` (`ReadSessionMetadata`)
+- v2 metadata+prompts: `v2_read.go:184-233` (`ReadSessionMetadataAndPrompts`)
+- v1 full content: `committed.go:895-952` (`ReadSessionContent`)
+- v2 full content: `v2_read.go:241-294` (`ReadSessionContent`)
+
+**Pattern:**
+
+The v2 implementation introduced a new method `ReadSessionMetadataAndPrompts` that is a **middle ground** between the two extremes:
+
+```go
+// v1 pattern: metadata only
+func ReadSessionMetadata(...) → *CommittedMetadata
+
+// v2 new pattern: metadata + prompts, no transcript
+func ReadSessionMetadataAndPrompts(...) → *SessionContent
+
+// Both: full content with transcript
+func ReadSessionContent(...) → *SessionContent
+```
+
+**Observation:**
+- v2 adds a new semantic level that v1 lacks
+- v1 has `ReadSessionMetadata` (just metadata)
+- v2 has `ReadSessionMetadataAndPrompts` (metadata + prompts, excluding transcript)
+- This is intentional for the "read /main only" optimization path
+
+**Duplication in tree-walking:**
+Both `ReadSessionMetadataAndPrompts` and `ReadSessionContent` in v2 (lines 189-233 and 241-294) share the same tree navigation pattern:
+```
+Get root tree → Tree(checkpointID.Path()) → Tree(sessionDir)
+Read metadata file → Read prompts file
+```
+
+Lines 194-214 and 246-266 are **nearly identical** (same pattern, both read checkpoint/session tree).
+
+---
+
+## Finding 3: Fallback Resolution Pattern
+
+### Issue: Inconsistent Fallback Semantics
+
+**Location:** `committed_reader_resolve.go:27-107`
+
+**The Change:**
+Both functions now fall back for **ALL non-sentinel v2 errors**:
+- Lines 46-50: Logs non-sentinel v2 errors before falling back
+- Line 94: Same pattern for `ResolveRawSessionLogForCheckpoint`
+
+**Previous vs Current:**
+The comments say "Fall back to v1 for any v2 failure except context cancellation" but the code checks:
+```go
+if err != nil && !errors.Is(err, ErrCheckpointNotFound) && !errors.Is(err, ErrNoTranscript) {
+    logging.Debug(...)  // Falls back but logs why
+}
+```
+
+**Good Design:**
+This is actually correct — it treats sentinel errors (not found, no transcript) as definitive "no checkpoint" signals, not failures. Only **unexpected errors** trigger fallback logging.
+
+**Concern:**
+The logging is debug-level. During migration, users might not see why v2 failed and v1 succeeded. Consider whether this needs to be more visible.
+
+---
+
+## Finding 4: The `/main`-Only Read Path in `explain.go`
+
+### Pattern: `readV2ContentFromMain` Helper
+
+**Location:** `explain.go:403-427`
+
+**Purpose:**
+Reads metadata + prompts + compact transcript from v2 `/main` ref only when:
+- NOT using `--full` (needs raw transcript for generation)
+- NOT using `--generate` (needs raw transcript for AI summary)
+- NOT using `--raw-transcript` (outputs raw log directly)
+
+**Flow:**
+```
+needsRawTranscript := full || generate || rawTranscript
+
+if isCheckpointsV2 && !needsRawTranscript:
+    readV2ContentFromMain()  // Faster: /main only
+else:
+    readLatestSessionContentForExplain()  // Full content (may fetch /full/*)
+```
+
+**Duplication with `readLatestSessionContentForExplain`:**
+```go
+// explain.go:390-401
+func readLatestSessionContentForExplain(...) {
+    latestIndex := len(summary.Sessions) - 1
+    return reader.ReadSessionContent(ctx, checkpointID, latestIndex)
+}
+
+// explain.go:407-427
+func readV2ContentFromMain(...) {
+    latestIndex := len(summary.Sessions) - 1
+    content, err := v2Reader.ReadSessionMetadataAndPrompts(...)
+    compactTranscript, compactErr := v2Reader.ReadSessionCompactTranscript(...)
+    content.Transcript = compactTranscript
+    return content, nil
+}
+```
+
+Both compute `latestIndex` the same way. `readV2ContentFromMain` could be a **parameter option** on a unified helper rather than a separate function.
+
+**Observation:**
+This is a reasonable separation given that it's explain.go-specific optimization, but the two functions are strategically related (both read latest session, different backends). Lines 300 and 302 show the same pattern being used twice in fallback handling.
+
+---
+
+## Summary of Findings
+
+| Issue | Type | Severity | Lines | Notes |
+|-------|------|----------|-------|-------|
+| `readTranscriptFromTree` duplication | Logic | **Medium** | 50-90 | Identical chunking/reassembly in v1 vs v2 |
+| Tree navigation boilerplate | Structure | Low | ~20 | Both v2 methods repeat checkpoint tree descent |
+| `/main`-only read helper | Pattern | Low | 24 | Intentional explain.go optimization, but related to generic pattern |
+| Fallback logging semantics | Clarity | Low | n/a | Debug logging during v2→v1 fallback may hide issues |
+
+---
+
+## Recommendations
+
+1. **High Priority (Transcript Reading):** Extract common transcript reading logic into a shared `readTranscriptChunks` helper that both `readTranscriptFromTree` and `readTranscriptFromObjectTree` can delegate to. Accept either tree type by using an interface for `File()` and `RawEntries()` operations.
+
+2. **Medium Priority (Tree Navigation):** Consider a helper `readSessionTreeForCheckpoint(tree, checkpoint, sessionIndex)` to reduce boilerplate in both `ReadSessionMetadataAndPrompts` and `ReadSessionContent` in v2_read.go. This is lower priority since the duplication is small (~20 lines) and both methods have distinct purposes.
+
+3. **Low Priority (Explain Helpers):** `readV2ContentFromMain` is appropriately scoped to explain.go. The duplication with `readLatestSessionContentForExplain` is acceptable for now given the strategic difference (v2 /main-only vs full read path). If both become widely used, unify them with a parameter.
+
+4. **Observation (Fallback Logging):** The debug logging in `committed_reader_resolve.go` is correct but consider whether migration-period visibility requires adjusting log levels or adding user-facing messages.
+
+---
+
+## Files Involved
+
+- `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-explain/cmd/entire/cli/checkpoint/v2_read.go` (new v2 read methods)
+- `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-explain/cmd/entire/cli/checkpoint/committed.go` (existing v1 patterns)
+- `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-explain/cmd/entire/cli/checkpoint/committed_reader_resolve.go` (fallback logic)
+- `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-explain/cmd/entire/cli/explain.go` (usage patterns)</result>
+<usage><total_tokens>57204</total_tokens><tool_uses>22</tool_uses><duration_ms>59742</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/a7fcf25b19214f778.output
+
+---
+
+<task-notification>
+<task-id>adafb19d8beb9866a</task-id>
+<tool-use-id>toolu_019cn6hCYibob9snf3PDNJ6g</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/adafb19d8beb9866a.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review retry" completed</summary>
+<result>Perfect! Now I have all the information I need. Let me compile my comprehensive code quality review.
+
+## Code Quality Review: `feat/checkpoints-v2-explain` (Commit fa1ae6d81)
+
+I've analyzed the uncommitted changes across the five files mentioned. Here are my findings:
+
+### 1. **Context Cancellation Check in `committed_reader_resolve.go` — CORRECT** ✓
+
+**Lines 34-35 and 43-44:** The logic is correct. The function checks `ctx.Err()` at entry to propagate immediate cancellations, then again after the v2 call to catch cancellations that occur during the v2 operation. This is the right pattern:
+
+```go
+if err != nil && ctx.Err() != nil {
+    return nil, nil, ctx.Err()  // Propagate context cancellation
+}
+```
+
+The check at line 46 (`!errors.Is(err, ErrCheckpointNotFound) && !errors.Is(err, ErrNoTranscript)`) correctly handles the remaining v2 errors—these fall through to fallback to v1. A v2 error cannot simultaneously be a context cancellation *and* a checkpoint error because `ctx.Err() != nil` is already checked at line 43. **No issue here.**
+
+---
+
+### 2. **Silent Empty Return in `ReadSessionMetadataAndPrompts` — ACCEPTABLE but SUBTLE** ⚠️
+
+**Lines 218-230:** The function silently returns empty metadata if `sessionTree.File(paths.MetadataFileName)` fails:
+
+```go
+result := &SessionContent{}  // Empty struct
+
+if metadataFile, fileErr := sessionTree.File(paths.MetadataFileName); fileErr == nil {
+    // ... parse metadata
+}
+// Falls through if fileErr != nil, leaving result.Metadata empty
+```
+
+**Assessment:** This is **intentional and acceptable** because:
+- The docstring says "Used by explain when the raw transcript is unavailable but compact transcript can substitute"
+- `explain.go` treats this as a success path (does not propagate errors)
+- An empty `SessionContent` with nil `Metadata` is still valid for display (prompts may be present)
+- Tests confirm this is expected (`TestV2ReadSessionMetadataAndPrompts_ReturnsWithoutTranscript` expects success with empty Transcript)
+
+**Minor caveat:** If `sessionTree.File()` at line 218 or 226 fails (tree corruption), the error is silently swallowed. This is acceptable for display-only reads, but consider adding a debug log if a metadata file *should* exist but is unreadable.
+
+---
+
+### 3. **No Logging When Compact Transcript Missing in `readV2ContentFromMain`** ⚠️
+
+**Lines 419-424 in explain.go:** The function silently handles missing compact transcript:
+
+```go
+compactTranscript, compactErr := v2Reader.ReadSessionCompactTranscript(ctx, checkpointID, latestIndex)
+if compactErr == nil && len(compactTranscript) > 0 {
+    content.Transcript = compactTranscript
+    // ...
+}
+// If compactErr != nil, no logging—silently skips
+```
+
+**Comparison to previous code:** The old version at lines 286-295 (in the diff) had explicit logging:
+
+```go
+if compactErr != nil && !errors.Is(compactErr, checkpoint.ErrNoTranscript) && !errors.Is(compactErr, checkpoint.ErrCheckpointNotFound) {
+    logging.Debug(ctx, "failed to read compact transcript, using raw transcript", ...)
+}
+```
+
+**Issue:** This logging was **removed in the refactor**. The function now fails silently if `compactErr` is non-nil (a parse error, tree corruption, etc.). For operational observability, consider adding debug logging when `compactErr != nil`:
+
+```go
+if compactErr != nil && !errors.Is(compactErr, checkpoint.ErrNoTranscript) && !errors.Is(compactErr, checkpoint.ErrCheckpointNotFound) {
+    logging.Debug(ctx, "compact transcript unavailable, content has no transcript",
+        slog.String("checkpoint_id", checkpointID.String()),
+        slog.String("error", compactErr.Error()))
+}
+```
+
+---
+
+### 4. **Reload Logic After `--generate` — CORRECT** ✓
+
+**Lines 299-303 in explain.go:** After summary generation, the reload is correct:
+
+```go
+if isCheckpointsV2 {
+    content, err = readV2ContentFromMain(ctx, v2Reader, fullCheckpointID, summary)
+} else {
+    content, err = readLatestSessionContentForExplain(ctx, resolvedReader, fullCheckpointID, summary)
+}
+```
+
+**Assessment:** This is correct because:
+- `--generate` triggers generation (lines 294-296) which updates metadata on the metadata branch
+- After generation, we only need metadata and prompts for display (no raw transcript needed)
+- `readV2ContentFromMain` reads from `/main` only (metadata + compact transcript) — appropriate post-generation
+- v1 uses `readLatestSessionContentForExplain` which reads the full session (correct for both pre- and post-generation)
+
+Both paths correctly target the storage location containing the updated summary. **No issue here.**
+
+---
+
+### 5. **Integration Test Tree Building — MISSING REFACTOR OPPORTUNITY** ⚠️
+
+**`corruptV2MainRef` function (lines 371-421):** The integration test manually builds git trees inline:
+
+```go
+cpTree := &object.Tree{Entries: []object.TreeEntry{...}}
+cpTreeObj := repo.Storer.NewEncodedObject()
+require.NoError(t, cpTree.Encode(cpTreeObj))
+cpTreeHash, err := repo.Storer.SetEncodedObject(cpTreeObj)
+require.NoError(t, err)
+// ... repeated for shardTree and rootTree
+```
+
+**Observation:** The `storeTree()` helper **already exists** in `parse_tree.go` (lines 180-192) and does exactly this:
+
+```go
+func storeTree(repo *git.Repository, entries []object.TreeEntry) (plumbing.Hash, error) {
+    tree := &object.Tree{Entries: entries}
+    obj := repo.Storer.NewEncodedObject()
+    if err := tree.Encode(obj); err != nil {
+        return plumbing.ZeroHash, fmt.Errorf("failed to encode tree: %w", err)
+    }
+    hash, err := repo.Storer.SetEncodedObject(obj)
+    // ...
+}
+```
+
+**Issue:** The test duplication can be reduced, but **not critical** because:
+- It's test code, and the duplication is minimal (5 lines per tree)
+- The test is in a different package (`integration_test` vs `checkpoint`)
+- `storeTree` is internal to `checkpoint` package
+
+**Recommendation:** If refactoring, consider exporting a test helper `CreateTreeFromEntries()` in the `checkpoint` package and using it here. Not urgent since this is a one-off test.
+
+---
+
+## Summary
+
+| Issue | Severity | Status |
+|-------|----------|--------|
+| Context cancellation check | Low | ✓ Correct |
+| Silent empty metadata return | Low | ⚠️ Acceptable but lacks logging on corruption |
+| Missing compact transcript logging | Medium | ⚠️ Observability gap—should log non-sentinel errors |
+| Reload logic after --generate | Low | ✓ Correct |
+| Integration test tree duplication | Low | ⚠️ Code reuse opportunity (not blocking) |
+
+**Actionable items:**
+1. **Optional:** Add debug logging in `readV2ContentFromMain` when compact transcript fails with non-sentinel errors
+2. **Optional:** Add logging in `ReadSessionMetadataAndPrompts` if metadata file exists but is unreadable
+3. **Nice-to-have:** Refactor integration test to use `storeTree()` or a shared helper to reduce duplication</result>
+<usage><total_tokens>53093</total_tokens><tool_uses>20</tool_uses><duration_ms>58109</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-explain/76a22c7e-19de-4161-86ec-e2249d072ec4/tasks/adafb19d8beb9866a.output
+
+---
+
+/review
+
+---
+
+Continue
+
+---
+
+Commit and push
+
+---
+
+Fix the remaining lint error, commit and push
+
+---
+
+/pr-feedback
+
+---
+
+Yes. How are you going to fix them?
+
+---
+
+1. I think we shouldn't copy the values but get rid of the alias since it's confusing that way. We might want to give it a generic name like `commmittedCheckpoints` or something like that.
+
+2. I would absolutely NOT skip it. I have run into hangups caused by gpg signing more than once and it was an oversight not to use the common helper in the first place.
+
+---
+
+Continue
+
+---
+
+Push it
+
+---
+
+When running `entire explain` in the current build of this project in my test repository located in `/Users/pfleidi/entire/pfleidi-test-repo`, it looks like it's only reading from the v1 storage: I have deleted the `entire/checkpoints/v1` branch and ran `entire explain` and I saw checkpoints that looked incomplete:
+
+❯ ~/go/bin/entire explain
+Branch: main
+Checkpoints: 4
+
+[ses_29b7a95f] [temporary] "Can you update all the git hooks to use the ~/go/bin/enti..."
+  04-06 13:56 (e31a7b3) Update all the git hooks to use the ~/go/bin/entire binary as well
+
+[ff48b0d5dae8] (no prompt)
+  04-06 13:51 (f95ba91) Add Test 2 line to 1.txt
+
+[04cc91b88ab5] (no prompt)
+  04-06 13:41 (d1bb65c) Use ~/go/bin/entire in agent hooks
+
+[8322117253a1] (no prompt)
+  04-06 13:24 (bb3a85b) Add 1.txt with Test 1 content
+
+---
+
+I don't think we should be showing "no prompt" here. Can you investigate?
+
+---
+
+Yes, implement a fix. We're not in pr review phase anymore but have identified a gap in our implementation here.
+
+---
+
+You should have implemented tests for this behavior to ensure we won't run into regressions.
+
+---
+
+Commit
+
+---
+
+Can you also add an integration test for this behavior to ensure `entire explain` works as expected when checkpoints v2 is enabled? Would it be possible to repurpose some of our v1 integration or e2e tests and run them with v2 enabled as well?
+
+---
+
+commit
+
+---
+
+When running `entire explain --checkpoint 8322117253a1 --generate` in my test repository, I get: `failed to save summary: checkpoint not found`. That's happening even though the `entire explain --checkpoint 8322117253a1` and `entire explain --checkpoint 8322117253a1 --full` succeed so the checkpoints seems to be there.
+
+---
+
+commit
+
+---
+
+I have added two new commits in my test repo which show up with a checkpoint trailer in the commit message:
+
+
+commit cb952592f89b8a1c92d576230d089e61b9042f88 (HEAD -> main)
+Author: Sven Pfleiderer <sven@entire.io>
+Date:   Thu Apr 9 14:43:05 2026 -0700
+
+    Add Test 3 line to 1.txt
+
+    Entire-Checkpoint: c44f756b9656
+
+commit f95ba915c272fbf32a630f2934d93370868a4026 (origin/main, origin/HEAD)
+Author: Sven Pfleiderer <sven@entire.io>
+Date:   Mon Apr 6 13:51:15 2026 -0700
+
+    Add Test 2 line to 1.txt
+
+    Entire-Checkpoint: ff48b0d5dae8
+
+When I run `entire explain` with the build from the current branch, it doesn't show these two checkpoints. What's going on there?
+
+---
+
+Yes, that was user error.
+
+---
+
+I found another small issue with the v2 code path: When `transcript.jsonl` doesn't exist in the `/main` ref, we are falling back to `prompt.txt` and not `/full/current` we should do the latter to display the most accurate data before falling back to `prompt.txt`.
+
+---
+
+commit
+
+---
+
+/review
+
+---
+
+Yes
+
+---
+
+/simplify
+
+---
+
+Something keeps removing `//nolint:ireturn` comments from this codebase and it's driving me nuts. How can I stop that?
+
+---
+
+Can you ensure that there's always an explanation? I'm pretty sure the code I saw being removed had an explantation.
+
+---
+
+I'm not interested in the simplest fix for this situation. I want to know exactly which formatter/linter is responsible and why!
+
+---
+
+Use option 2
+
+---
+
+That additional list seems excessive considering that we didn't have any issues with most of these packages. Can you try to stick to only the ones that kept getting touched automatically and ignore the rest?
+
+---
+
+Commit and push the changes

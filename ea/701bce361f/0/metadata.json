@@ -1,0 +1,104 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "ea701bce361f",
+  "session_id": "24965acf-0f7b-43bf-865e-b2ad1f67f30b",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T18:33:35.526419Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "cmd/entire/cli/agent/geminicli/lifecycle.go",
+    "cmd/entire/cli/improve/analyzer.go",
+    "cmd/entire/cli/memoryloop/memoryloop.go",
+    "cmd/entire/cli/memorylooptui/root.go",
+    "cmd/entire/cli/memorylooptui/tab_memories.go",
+    "cmd/entire/cli/summarytui/styles.go"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "c41947dc7184",
+  "token_usage": {
+    "input_tokens": 7636,
+    "cache_creation_tokens": 281719,
+    "cache_read_tokens": 14632661,
+    "output_tokens": 39203,
+    "api_call_count": 146
+  },
+  "session_metrics": {
+    "turn_count": 5
+  },
+  "summary": {
+    "intent": "Improve the memory-loop TUI injection tab to show all active memories with clear inject/skip status, then remove unused commands (skill, insights, improve, permissions) keeping only summary and memory-loop, then simplify/clean up the branch diff.",
+    "outcome": "All three goals achieved: injection tab now shows INJECT/SKIP labels with skip reasons via PreviewSelection; four commands and their package directories were deleted with shared helpers relocated to session_cache.go; simplification pass fixed truncate duplication, containsString, pushState copy-paste, unbounded History growth, and a Gemini pointer bug.",
+    "learnings": {
+      "repo": [
+        "PreviewSelection returns a SelectionReport with both Matches and Skipped (with reasons), while SelectRelevant only returns matches — use PreviewSelection when showing full injection status to users.",
+        "maxInjectionLogs = 50 cap already existed for injection logs; History on MemoryRecord had no equivalent cap and needed one (maxHistoryEvents = 100).",
+        "insights/, insightsdb/, improve/, and skillimprove/ are library packages still consumed by summary and memory-loop — they must not be deleted even when removing the CLI commands that expose them.",
+        "backfillSummaries and backfillFacets wrapper functions became dead code after commands were removed; only the ForRows variants were still called.",
+        "summarytui/root.go had nolint comments stripped by gofmt during mise run fmt — those changes should be reverted as unrelated before committing.",
+        "stringutil.TruncateRunes exists in the repo and is the correct UTF-8-safe truncation utility; the summarytui version was using a byte-unsafe hand-rolled version.",
+        "Gemini writeHookResponse used a value struct pattern while Claude Code and Codex used pointer pattern — mismatch caused spurious empty JSON fields in hook output.",
+        "pushState() method existed in memorylooptui/root.go but was not being called; three blocks copy-pasted its 4-line body instead."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_injection.go",
+          "finding": "Now uses SelectionReport from PreviewSelection to render INJECT/SKIP labels with skip reasons instead of raw score numbers."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/messages.go",
+          "finding": "testPromptResultMsg changed to carry a full SelectionReport instead of just a slice of matches."
+        },
+        {
+          "path": "cmd/entire/cli/session_cache.go",
+          "finding": "New file consolidating shared helpers: refreshCacheIfStale, metadataToSessionRow, extractToolCounts, backfillSummariesForRows, backfillFacetsForRows, sessionRowsToSummaries, renderUsageLine — relocated from deleted command files."
+        },
+        {
+          "path": "cmd/entire/cli/improve/analyzer.go",
+          "finding": "containsString hand-rolled helper replaced with slices.Contains from stdlib."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "finding": "Added maxHistoryEvents = 100 const and trimming logic to cap unbounded History growth on MemoryRecord."
+        },
+        {
+          "path": "cmd/entire/cli/agent/geminicli/lifecycle.go",
+          "finding": "writeHookResponse fixed to use pointer struct pattern matching Claude Code and Codex lifecycle implementations."
+        }
+      ],
+      "workflow": [
+        "When deleting CLI commands, verify which imported packages are libraries vs command-only before deleting — library packages used transitively must be kept.",
+        "mise run fmt can strip nolint comments from files not intended to be changed; always diff after fmt and revert unrelated file changes before committing.",
+        "Lint (unusedwrite) fires when test code sets struct fields that are never read — remove the assignments when calling methods directly on a sub-component.",
+        "Run git show HEAD:<path> to recover deleted file contents when grep finds nothing for a symbol in the working tree."
+      ]
+    },
+    "friction": [
+      "ExitPlanMode was called twice in a row after user interruptions, causing minor confusion in plan flow.",
+      "session_cache.go initially failed compilation because it imported the deleted insights package for scoring — had to restore insights/ as a library package.",
+      "Two functions (sessionRowsToSummaries, renderUsageLine) used by memory_loop_cmd.go were defined in improve_cmd.go (not insights_cmd.go) and only discovered at compile time after deletion.",
+      "The Edit tool's old_string uniqueness requirement caused multiple sequential edits to session_cache.go when appending functions, requiring a Bash fallback to append content.",
+      "lint flagged unusedwrite on activeTab assignments in new tests because tests called tab view methods directly rather than going through the root model."
+    ],
+    "open_items": [
+      "timeAgo duplication across packages — would require a new shared package, deferred as architectural change.",
+      "captureStdout test helper duplicated across 3 agent test packages — minor, test-only, not addressed.",
+      "writeHookResponse logic duplicated across 3 agent packages (geminicli, claudecode, codex) — needs agent refactor to unify.",
+      "Hot-path caching for maybeInjectMemoryLoop — performance optimization deferred.",
+      "N+1 patterns in refreshCacheIfStale — performance optimization deferred.",
+      "wrangler.search.jsonc (search worker) is NOT deployed by main CI and requires manual deploy — search routes 404 until manually deployed."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-03T18:32:50.091227Z",
+    "agent_lines": 22,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 22,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

@@ -1,0 +1,64 @@
+❯ entire resume soph/codex-agent-integration
+2026/03/27 16:58:43 WARN checkpoint subtree not found in metadata tree component=resume checkpoint_id=a7032dba76c5 checkpoint_path=a7/032dba76c5 tree_hash=46585ebe5f28f75283b8e5df5f69d28e7b3670d9 error="directory not found"
+Checkpoint 'a7032dba76c5' found in commit but its metadata could not be read from entire/checkpoints/v1.
+The metadata branch exists but checkpoint content may be missing or unreadable (e.g. after a partial fetch).
+Try a full fetch:
+  git fetch origin entire/checkpoints/v1:entire/checkpoints/v1
+
+The thing is: We are using checkpoint_remote so this error message is wrong, right?
+
+---
+
+yeah but another question: this checkpoint exists, I even developed on it on this mac, but maybe in a different worktree but I'm not understanding why it can't be found either?
+
+---
+
+yeah let's figure this out
+
+---
+
+sorry, continue
+
+---
+
+can you help me understand what you are doing right now?
+
+---
+
+ok, maybe the commit wasn't made on this machine, I might have remembered that wrong
+
+---
+
+yes
+
+---
+
+checkRemoteMetadata() — Rewritten to try origin first, then checkpoint_remote. Error messages now reflect whether a checkpoint_remote
+  is configured.
+
+why origin first?
+
+---
+
+/simplify
+
+---
+
+1. High: resume can no longer use checkpoint_remote from forked clones or any repo whose origin owner differs from the checkpoint repo owner. cmd/entire/cli/strategy/
+     checkpoint_remote.go:288 resolves the URL by calling resolvePushSettings(ctx, "origin"), and that path applies the push-only fork check in cmd/entire/cli/strategy/
+     checkpoint_remote.go:95. As a result, cmd/entire/cli/git_operations.go:460 and cmd/entire/cli/resume.go:626 will behave as if no checkpoint_remote is configured,
+     even though reading checkpoints from that repo is exactly what resume should do. This is a correctness regression for the fork workflow the feature is trying to
+     support.
+  2. Medium: ResolveCheckpointRemoteURL is no longer a pure “resolve” helper; it can perform a fetch and mutate local refs as a side effect. The call at cmd/entire/cli/
+     resume.go:626 is only checking whether a checkpoint remote exists, but under the hood cmd/entire/cli/strategy/checkpoint_remote.go:288 goes through
+     resolvePushSettings, which may call fetchMetadataBranchIfMissing at cmd/entire/cli/strategy/checkpoint_remote.go:116. Then the code immediately does the explicit
+     fetch again at cmd/entire/cli/resume.go:630. In the “branch missing locally” case this guarantees two network fetches, and the first one is hidden behind what looks
+     like a cheap config probe.
+
+---
+
+- I don’t see tests covering ResolveCheckpointRemoteURL or the new checkpoint-remote resume path, which is why the fork regression above slipped through.
+
+---
+
+/simplify

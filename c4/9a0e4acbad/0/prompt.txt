@@ -1,0 +1,113 @@
+Implement the following plan:
+
+# Benchmark: Session Start Hook Performance
+
+## Context
+
+A customer reports that the `entire hooks claude-code session-start` hook significantly slows down Claude Code startup. We need a benchmark that reproduces the customer-facing latency (full process spawn) to establish a baseline for optimization.
+
+## Approach
+
+### End-to-End Subprocess Benchmark
+
+**File:** `cmd/entire/cli/integration_test/hook_bench_test.go`
+**Build tag:** `//go:build integration`
+
+Uses the existing integration test infrastructure (`getTestBinary()`, `TestMain` binary build, `benchutil.NewBenchRepo`) to measure real-world latency of the session-start hook.
+
+**Scenarios:**
+- `SessionStart/NoSessions` — Clean repo, no prior sessions (best case)
+- `SessionStart/1Session` — 1 existing session state file
+- `SessionStart/5Sessions` — 5 session state files (typical user)
+- `SessionStart/20Sessions` — 20 session state files (heavy user, worst case)
+
+Each benchmark:
+1. Creates a `BenchRepo` via `benchutil.NewBenchRepo()`
+2. Creates N session state files via `benchutil.CreateSessionState()`
+3. Pipes `{"session_id":"bench-session","transcript_path":""}` to stdin
+4. Invokes `getTestBinary() hooks claude-code session-start` as a subprocess
+5. Measures wall-clock time (what the customer experiences)
+
+**Key patterns to reuse:**
+- `benchutil.NewBenchRepo()` from `cmd/entire/cli/benchutil/benchutil.go` — creates isolated repos
+- `benchutil.CreateSessionState()` — creates session state files
+- `getTestBinary()` from `cmd/entire/cli/integration_test/testenv.go` — shared pre-built binary
+- `HookRunner.runHookWithOutput()` pattern from `cmd/entire/cli/integration_test/hooks.go` — subprocess invocation with stdin
+
+### File to Create
+
+`cmd/entire/cli/integration_test/hook_bench_test.go`
+
+### How to Run
+
+```bash
+# End-to-end subprocess benchmarks (build binary + measure real latency)
+go test -tags=integration -bench=BenchmarkHookSessionStart -benchtime=10x -run='^$' -timeout=10m ./cmd/entire/cli/integration_test/...
+```
+
+### Verification
+
+1. `mise run fmt && mise run lint` — passes lint
+2. `mise run test:ci` — no regressions
+3. Run benchmarks and verify output shows timing data per scenario
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/884d9aba-796c-4049-90d0-7a969cda6bef.jsonl
+
+---
+
+how can i test this specifically?
+
+---
+
+im getting an error
+
+[2026-02-21 23:34] ~/code/entire/devenv/cli (optimize_claude_start)% go test -tags=integration -bench=BenchmarkHookSessionStart -benchtime=10x -run='^ -timeout=10m                       
+  ./integration_test/... 
+# .
+no Go files in /Users/evisdrenova/code/entire/devenv/cli
+FAIL    . [setup failed]
+zsh: no such file or directory: ./integration_test/...
+
+---
+
+still fails:
+
+[2026-02-21 23:34] ~/code/entire/devenv/cli (optimize_claude_start)%   go test -tags=integration -bench=BenchmarkHookSessionStart -benchtime=10x -run='^ -timeout=10m                       
+  ./cmd/entire/cli/integration_test/...
+# .
+no Go files in /Users/evisdrenova/code/entire/devenv/cli
+FAIL    . [setup failed]
+zsh: no such file or directory: ./cmd/entire/cli/integration_test/...
+
+---
+
+output in ms not ns
+
+---
+
+this is running pretty fast, how can it be that it took 10s in someones project?
+
+---
+
+yeah let's a large repo so we can see how this scales. start small and then along each dimension, scale it up
+
+---
+
+list the dimensions which could affect how fast claude code starts up given the entire hooks.
+
+---
+
+where is the entry point that claude code callls on the session-start hook? the function
+
+---
+
+let's jsut focus on the sessionstart hook for right now. come up with the dimensions that effect it's performance from most likely to least likely.
+
+---
+
+which dimensions should we add in our benchmarking to test against?
+
+---
+
+yes lets do it with increasing counts per dimension and then run it

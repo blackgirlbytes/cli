@@ -1,0 +1,1137 @@
+list all the env var we have to modify the tty, enable/disable/etc like GIT_TERMINAL or GEMINI_CLI etc
+
+---
+
+lets be focus only on those ones:
+
+---
+
+- ENTIRE_TEST_TTY — test override. =1 forces interactive ON, any other value forces OFF, unset = probe /dev/tty.
+  - GEMINI_CLI — non-empty → non-interactive (Gemini CLI shell tool).
+  - COPILOT_CLI — non-empty → non-interactive (Copilot CLI hook subprocess).
+  - PI_CODING_AGENT — non-empty → non-interactive (Pi Coding Agent shell tool).
+  - GIT_TERMINAL_PROMPT=0 → non-interactive (git's stop-prompting convention; CI, Factory AI Droid).
+  - CI — non-empty and not false → non-interactive (GH Actions, Circle, GitLab, Travis, Buildkite). CI=false = escape hatch.
+
+---
+
+Where is the complexity? Can we just know if there is tty or not by checking using cobra tty ?
+
+---
+
+check all our agents integrations, and check on internet if them all allow add env vars on their hooks. Claude code, allows you to set env var on session-start hook.
+
+---
+
+I want to avoid the issue of, running the test on agent works, because we disable tty but, running test on cli, does not work because they hang as we have to set manually the skip on each test. Any simpler solution?
+
+---
+
+uhm, the way to reduce complexity is by adding another check that does not delete any of other that are already in place ?
+
+---
+
+can we rename ENTIRE_TEST_TTY with something more clear, something like, fake tty is enabled, because it is what it is really doing
+
+---
+
+would be the CI check affected if now we check for testing.Testing() ?
+
+---
+
+but, what whould execute on CI that are not test?
+
+---
+
+but, won't the git hooks hang always ? for example post-commit?
+
+---
+
+let's go with the plan
+
+---
+
+lets rename it back to original ENTIRE_TEST_TTY
+
+---
+
+but, I'm getting confuse ENTIRE_TEST_TTY=0 means, disable tty?
+
+---
+
+But, if we are the ones executing the command? can we on purpose force no tty to that command? so we knot if /dev/tty is not set ?
+
+---
+
+can we make explicit run command as interactive enabled and non interactive enabled? So, no magic env vars around?
+
+---
+
+y
+
+---
+
+ship it
+
+---
+
+ship it as draft
+
+---
+
+/simplify
+
+---
+
+test are failing
+
+---
+
+Continue: check PR 1029 CI status with `gh pr checks 1029` and report whether test-core now passes.
+
+---
+
+go thru all the PR feedback comments. Ask if questions, fix what makes sense and mark as resolved as you go thru them all
+
+---
+
+let's check it all. Run the test here
+
+---
+
+why we are having those lines added and deleted all the time? //nolint:ireturn
+
+---
+
+I do get this error if running mise test on a terminal:
+gtrrz-victor@Victors-Laptop ~/w/c/add-auto-aupdate (reduce-tty-complexity)> mise run test                                      claude ● codex ● gemini ○ opencode ○
+[test] $ go test ./...
+?       github.com/entireio/cli/cmd/entire    [no test files]
+
+Error: not a git repository
+
+--- FAIL: TestRunDispatchWizard_ProceedsWhenCurrentBranchCannotBeResolved (594.39s)
+    dispatch_wizard_test.go:359: expected form execution error instead of eager branch failure, got resolve current branch for local dispatch: not on a branch (detached HEAD)
+panic: test timed out after 10m0s
+    running tests:
+        TestRunExplainAuto_CommitWithoutTrailer (0s)
+        TestRunExplainAuto_CommitWithoutTrailer/read-only_prints_friendly_message (0s)
+
+goroutine 652 [running]:
+testing.(*M).startAlarm.func1()
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2802 +0x2c4
+created by time.goFunc
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/time/sleep.go:215 +0x38
+
+goroutine 1 [chan receive]:
+testing.(*T).Run(0x5567d8506488, {0x1050395dc?, 0x5567d8b4fab8?}, 0x105f1ada0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2109 +0x3bc
+testing.runTests.func1(0x5567d8506488)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2585 +0x38
+testing.tRunner(0x5567d8506488, 0x5567d8b4fbe8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+testing.runTests({0x105002444, 0x17}, {0x105036631, 0x26}, 0x5567d8631080, {0x10616a6c0, 0x2db, 0x2db}, {0x108338108?, 0x7?, ...})
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2583 +0x3f0
+testing.(*M).Run(0x5567d8806e60)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2443 +0x578
+github.com/entireio/cli/cmd/entire/cli.TestMain(0x5567d8806e60)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/global_test.go:25 +0x48
+main.main()
+    _testmain.go:1514 +0x88
+
+goroutine 8 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d85066c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestNormalizeAgentString(0x5567d85066c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_cmd_test.go:11 +0x28
+testing.tRunner(0x5567d85066c8, 0x105f1aa50)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 9 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d8506908)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestGroupCommitsByDay_SortsNewestFirst(0x5567d8506908)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_cmd_test.go:48 +0x28
+testing.tRunner(0x5567d8506908, 0x105f1a6f0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 10 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d8506b48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestGroupCommitsByDay_UnknownDatesLast(0x5567d8506b48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_cmd_test.go:72 +0x28
+testing.tRunner(0x5567d8506b48, 0x105f1a6f8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 11 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d8506d88)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestGroupCommitsByDay_UnparseableDateGoesToUnknown(0x5567d8506d88)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_cmd_test.go:91 +0x24
+testing.tRunner(0x5567d8506d88, 0x105f1a700)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 12 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d8506fc8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestParseFlexibleTime(0x5567d8506fc8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_cmd_test.go:103 +0x24
+testing.tRunner(0x5567d8506fc8, 0x105f1aab0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 13 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d8507208)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCommitDate(0x5567d8507208)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_cmd_test.go:126 +0x28
+testing.tRunner(0x5567d8507208, 0x105f1a4e0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 51 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866e008)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestNormalizeTimezone(0x5567d866e008)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_cmd_test.go:190 +0x28
+testing.tRunner(0x5567d866e008, 0x105f1aa58)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 52 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866e248)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestUniqueCommitAgents_UsesAgentsSlice(0x5567d866e248)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:12 +0x28
+testing.tRunner(0x5567d866e248, 0x105f1b268)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 53 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866e488)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestUniqueCommitAgents_FallsBackToSingularAgent(0x5567d866e488)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:28 +0x28
+testing.tRunner(0x5567d866e488, 0x105f1b258)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 54 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866e6c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestUniqueCommitAgents_FallsBackToSingularAgentEmptySlice(0x5567d866e6c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:41 +0x28
+testing.tRunner(0x5567d866e6c8, 0x105f1b260)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 55 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866e908)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestUniqueCommitAgents_Dedupes(0x5567d866e908)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:54 +0x28
+testing.tRunner(0x5567d866e908, 0x105f1b248)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 56 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866eb48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestUniqueCommitAgents_Empty(0x5567d866eb48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:68 +0x28
+testing.tRunner(0x5567d866eb48, 0x105f1b250)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 57 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866ed88)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestRenderStatCards_ContainsAllLabels(0x5567d866ed88)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:77 +0x34
+testing.tRunner(0x5567d866ed88, 0x105f1abb0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 58 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866efc8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestRenderStatCards_IterationLabelSaysSession(0x5567d866efc8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:107 +0x34
+testing.tRunner(0x5567d866efc8, 0x105f1abb8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 59 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866f208)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestRenderCommitList_NilCommitMessage(0x5567d866f208)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:123 +0x34
+testing.tRunner(0x5567d866f208, 0x105f1ab60)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 60 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866f448)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestRenderCommitList_SingularPlural(0x5567d866f448)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:140 +0x20
+testing.tRunner(0x5567d866f448, 0x105f1ab68)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 61 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866f688)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestRenderContributionChart_Empty(0x5567d866f688)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:211 +0x34
+testing.tRunner(0x5567d866f688, 0x105f1ab78)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 62 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866f8c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestRenderContributionChart_MonthAxisWideWidth(0x5567d866f8c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:225 +0x34
+testing.tRunner(0x5567d866f8c8, 0x105f1ab80)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 63 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866fb08)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestRenderRepoChart_LimitsToFive(0x5567d866fb08)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:249 +0x34
+testing.tRunner(0x5567d866fb08, 0x105f1aba0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 64 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d866fd48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestPadOrTruncate(0x5567d866fd48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:278 +0x28
+testing.tRunner(0x5567d866fd48, 0x105f1aa70)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 65 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d86f0008)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestRenderCommitList_UnicodeMessageSafeTruncation(0x5567d86f0008)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:304 +0x34
+testing.tRunner(0x5567d86f0008, 0x105f1ab70)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 66 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d86f0248)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestNewStatsStylesWithWidth_RespectsColorFlag(0x5567d86f0248)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/activity_render_test.go:328 +0x34
+testing.tRunner(0x5567d86f0248, 0x105f1aa38)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 68 [chan receive, 10 minutes]:
+testing.(*T).Parallel(0x5567d86f06c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestAttach_MissingSessionID(0x5567d86f06c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/attach_test.go:34 +0x20
+testing.tRunner(0x5567d86f06c8, 0x105f19d18)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 133 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d86f0488)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCountUserTurns(0x5567d86f0488)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/attach_test.go:537 +0x28
+testing.tRunner(0x5567d86f0488, 0x105f1a0c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 476 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c02b48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestParseDispatchFlags_LocalRejectsRepos(0x5567d8c02b48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:69 +0x28
+testing.tRunner(0x5567d8c02b48, 0x105f1aa98)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 590 [chan receive]:
+testing.(*T).Parallel(0x5567d8e51b08)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2GenerationHealth_PartialTimestamp_MissingNewest(0x5567d8e51b08)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:609 +0x24
+testing.tRunner(0x5567d8e51b08, 0x105f19e70)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 643 [chan receive]:
+testing.(*T).Parallel(0x5567da11afc8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCheckpointSummaryError_TypedBranchesHandleEmptyMessage(0x5567da11afc8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:118 +0x20
+testing.tRunner(0x5567da11afc8, 0x105f1a4c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 512 [chan receive]:
+testing.(*T).Parallel(0x5567da11a908)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCheckpointSummaryError_RateLimit(0x5567da11a908)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:90 +0x20
+testing.tRunner(0x5567da11a908, 0x105f1a4c0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 475 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c02908)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestParseDispatchFlags_NormalizesRepoScopeValues(0x5567d8c02908)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:45 +0x28
+testing.tRunner(0x5567d8c02908, 0x105f1aaa0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 134 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d86f0908)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestExtractModelFromTranscript(0x5567d86f0908)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/attach_test.go:572 +0x28
+testing.tRunner(0x5567d86f0908, 0x105f1a368)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 135 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d86f0b48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestExtractFirstPromptFromTranscript_GeminiFormat(0x5567d86f0b48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/attach_test.go:612 +0x24
+testing.tRunner(0x5567d86f0b48, 0x105f1a350)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 136 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d86f0d88)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestExtractFirstPromptFromTranscript_JSONLFormat(0x5567d86f0d88)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/attach_test.go:622 +0x24
+testing.tRunner(0x5567d86f0d88, 0x105f1a358)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 515 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8d12488)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestGetStrategy_HasBlobFetcher(0x5567d8d12488?)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/config_test.go:297 +0x1c
+testing.tRunner(0x5567d8d12488, 0x105f1a678)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 582 [chan receive]:
+testing.(*T).Parallel(0x5567d86f1688)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2CheckpointCounts_Consistent(0x5567d86f1688)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:431 +0x20
+testing.tRunner(0x5567d86f1688, 0x105f19e28)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 583 [chan receive]:
+testing.(*T).Parallel(0x5567d86f18c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2CheckpointCounts_FullExceedsMain(0x5567d86f18c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:449 +0x20
+testing.tRunner(0x5567d86f18c8, 0x105f19e30)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 644 [chan receive]:
+testing.(*T).Parallel(0x5567da11b208)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCheckpointSummaryError_DeadlineExceeded(0x5567da11b208)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:141 +0x28
+testing.tRunner(0x5567da11b208, 0x105f1a4b0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 480 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c03448)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestParseDispatchFlags_InsecureHTTPAuthFlag(0x5567d8c03448)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:157 +0x28
+testing.tRunner(0x5567d8c03448, 0x105f1aa88)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 474 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c026c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestParseDispatchFlags_ServerReposAreAllowed(0x5567d8c026c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:15 +0x28
+testing.tRunner(0x5567d8c026c8, 0x105f1aaa8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 589 [chan receive]:
+testing.(*T).Parallel(0x5567d8e518c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2GenerationHealth_InvalidTimestamps(0x5567d8e518c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:588 +0x24
+testing.tRunner(0x5567d8e518c8, 0x105f19e58)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 615 [chan receive]:
+testing.(*T).Run(0x5567da4e0008, {0x1050273a4?, 0xcbc70413?}, 0x5567da200f50)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2109 +0x3bc
+github.com/entireio/cli/cmd/entire/cli.TestRunExplainAuto_CommitWithoutTrailer(0x5567da4e0008)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:331 +0x188
+testing.tRunner(0x5567da4e0008, 0x105f1ada0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 586 [chan receive]:
+testing.(*T).Parallel(0x5567d8e51208)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2GenerationHealth_NoArchives(0x5567d8e51208)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:539 +0x20
+testing.tRunner(0x5567d8e51208, 0x105f19e68)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 587 [chan receive]:
+testing.(*T).Parallel(0x5567d8e51448)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2GenerationHealth_HealthyGeneration(0x5567d8e51448)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:552 +0x24
+testing.tRunner(0x5567d8e51448, 0x105f19e50)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 530 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c038c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestNewDispatchCmd_LocalHelpText(0x5567d8c038c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:191 +0x20
+testing.tRunner(0x5567d8c038c8, 0x105f1aa10)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 646 [chan receive]:
+testing.(*T).Parallel(0x5567da11b688)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCheckpointSummaryError_Passthrough(0x5567da11b688)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:170 +0x20
+testing.tRunner(0x5567da11b688, 0x105f1a4b8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 529 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c03688)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestNewDispatchCmd_InsecureHTTPAuthFlagIsHidden(0x5567d8c03688)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:178 +0x20
+testing.tRunner(0x5567d8c03688, 0x105f1aa08)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 585 [chan receive]:
+testing.(*T).Parallel(0x5567d86f1d48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2CheckpointCounts_ReturnsErrorForCorruptRef(0x5567d86f1d48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:478 +0x24
+testing.tRunner(0x5567d86f1d48, 0x105f19e38)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 647 [chan receive]:
+testing.(*T).Parallel(0x5567da11b8c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCheckpointSummaryError_Unknown(0x5567da11b8c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:182 +0x28
+testing.tRunner(0x5567da11b8c8, 0x105f1a4d0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 519 [syscall, 9 minutes]:
+os/signal.signal_recv()
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/runtime/sigqueue.go:149 +0x108
+os/signal.loop()
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/signal/signal_unix.go:23 +0x1c
+created by os/signal.Notify.func1.1 in goroutine 557
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/signal/signal.go:152 +0x28
+
+goroutine 479 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c03208)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestParseDispatchFlags_LocalAllBranchesFlag(0x5567d8c03208)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:133 +0x28
+testing.tRunner(0x5567d8c03208, 0x105f1aa90)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 641 [chan receive]:
+testing.(*T).Parallel(0x5567da11ab48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCheckpointSummaryError_Config(0x5567da11ab48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:98 +0x20
+testing.tRunner(0x5567da11ab48, 0x105f1a4a8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 648 [chan receive]:
+testing.(*T).Parallel(0x5567da11bb08)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestExplainCmd_PositionalArgConflictsWithFlags(0x5567da11bb08)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:213 +0x28
+testing.tRunner(0x5567da11bb08, 0x105f1a318)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 588 [chan receive]:
+testing.(*T).Parallel(0x5567d8e51688)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2GenerationHealth_MissingGenerationJSON(0x5567d8e51688)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:572 +0x20
+testing.tRunner(0x5567d8e51688, 0x105f19e60)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 584 [chan receive]:
+testing.(*T).Parallel(0x5567d86f1b08)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2CheckpointCounts_SkipsWhenRefsMissing(0x5567d86f1b08)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:465 +0x20
+testing.tRunner(0x5567d86f1b08, 0x105f19e40)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 645 [chan receive]:
+testing.(*T).Parallel(0x5567da11b448)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCheckpointSummaryError_Canceled(0x5567da11b448)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:162 +0x20
+testing.tRunner(0x5567da11b448, 0x105f1a4a0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 478 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c02fc8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestParseDispatchFlags_CloudCapsReposAtFive(0x5567d8c02fc8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:111 +0x28
+testing.tRunner(0x5567d8c02fc8, 0x105f1aa78)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 477 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c02d88)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestParseDispatchFlags_CloudRejectsAllBranches(0x5567d8c02d88)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:90 +0x28
+testing.tRunner(0x5567d8c02d88, 0x105f1aa80)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 642 [chan receive]:
+testing.(*T).Parallel(0x5567da11ad88)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCheckpointSummaryError_CLIMissing(0x5567da11ad88)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:106 +0x20
+testing.tRunner(0x5567da11ad88, 0x105f1a498)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 531 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8c03b08)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestShouldRunDispatchWizard(0x5567d8c03b08?)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_test.go:205 +0x1c
+testing.tRunner(0x5567d8c03b08, 0x105f1b148)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 536 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e146c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDispatchStatusModel_ViewRendersInlineCard(0x5567d8e146c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_tui_test.go:53 +0x34
+testing.tRunner(0x5567d8e146c8, 0x105f1a1d0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 538 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e14b48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestNewDispatchWizardState_Defaults(0x5567d8e14b48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:21 +0x28
+testing.tRunner(0x5567d8e14b48, 0x105f1aa28)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 539 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e14d88)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDispatchWizardState_ResolveLocalAllBranches(0x5567d8e14d88)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:45 +0x28
+testing.tRunner(0x5567d8e14d88, 0x105f1a200)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 540 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e14fc8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDispatchWizardState_CloudIgnoresLocalBranchMode(0x5567d8e14fc8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:61 +0x28
+testing.tRunner(0x5567d8e14fc8, 0x105f1a1e0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 541 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e15208)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDispatchWizardState_LocalBranchModes(0x5567d8e15208)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:82 +0x28
+testing.tRunner(0x5567d8e15208, 0x105f1a1f0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 542 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e15448)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestBuildDispatchRepoOptions_UsesFullSlugLabels(0x5567d8e15448)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:91 +0x28
+testing.tRunner(0x5567d8e15448, 0x105f19db0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 543 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e15688)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDispatchWizardState_CloudResolvesSelectedRepos(0x5567d8e15688)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:100 +0x28
+testing.tRunner(0x5567d8e15688, 0x105f1a1e8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 544 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e158c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.REDACTED(0x5567d8e158c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:117 +0x28
+testing.tRunner(0x5567d8e158c8, 0x105f1a220)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 545 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e15b08)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDispatchWizardState_ShowsLocalBranchModeOnlyForLocal(0x5567d8e15b08)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:131 +0x28
+testing.tRunner(0x5567d8e15b08, 0x105f1a218)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 546 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e15d48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDispatchWizardState_ResolveVoiceInput(0x5567d8e15d48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:145 +0x28
+testing.tRunner(0x5567d8e15d48, 0x105f1a208)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 547 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e50008)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDispatchWizardState_ResolveEmptyVoiceDefaultsToNeutral(0x5567d8e50008)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:178 +0x28
+testing.tRunner(0x5567d8e50008, 0x105f1a1f8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 548 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e50248)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.REDACTED(0x5567d8e50248)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:195 +0x28
+testing.tRunner(0x5567d8e50248, 0x105f1a210)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 549 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e50488)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestBuildDispatchWizardSummary(0x5567d8e50488)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:209 +0x28
+testing.tRunner(0x5567d8e50488, 0x105f19db8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 550 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e506c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestBuildDispatchCommand(0x5567d8e506c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:241 +0x28
+testing.tRunner(0x5567d8e506c8, 0x105f19d98)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 551 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e50908)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestBuildDispatchCommand_AllBranches(0x5567d8e50908)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:272 +0x24
+testing.tRunner(0x5567d8e50908, 0x105f19da0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 552 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e50b48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestBuildDispatchRepoOptions_DedupesAndSorts(0x5567d8e50b48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:289 +0x28
+testing.tRunner(0x5567d8e50b48, 0x105f19da8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 553 [chan receive, 9 minutes]:
+testing.(*T).Parallel(0x5567d8e50d88)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDiscoverLocalRepoRoots_LimitsConcurrentResolution(0x5567d8e50d88)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:298 +0x28
+testing.tRunner(0x5567d8e50d88, 0x105f1a1a8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 454 [chan receive]:
+testing.(*T).Parallel(0x5567d8d12008)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestDispatchWizardState_CloudIgnoresCurrentBranchResolutionError(0x5567d8d12008)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/dispatch_wizard_test.go:364 +0x28
+testing.tRunner(0x5567d8d12008, 0x105f1a1d8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 581 [chan receive]:
+testing.(*T).Parallel(0x5567d86f1448)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2RefExistence_OnlyFullCurrentExists(0x5567d86f1448)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:415 +0x20
+testing.tRunner(0x5567d86f1448, 0x105f19ea0)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 578 [chan receive]:
+testing.(*T).Parallel(0x5567d8d13d48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2RefExistence_BothExist(0x5567d8d13d48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:369 +0x20
+testing.tRunner(0x5567d8d13d48, 0x105f19e90)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 616 [syscall]:
+syscall.syscalln(0x10414a620, {0x5567da101328, 0x6, 0x6})
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/runtime/sys_darwin.go:38 +0x20
+syscall.syscall6(0x1da3df740?, 0x12f277c68?, 0x10833ade0?, 0x90?, 0x10617c460?, 0x5567da456240?, 0x5567da1013c8?)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/syscall/syscall_darwin.go:388 +0x28
+syscall.wait4(0x5567da1013f8?, 0x10417303c?, 0x90?, 0x105ee57e0?)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/syscall/zsyscall_darwin_arm64.go:44 +0x4c
+syscall.Wait4(0x5567d905d650?, 0x5567da101434, 0x5567da3df740?, 0x5567d905d5e0?)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/syscall/syscall_bsd.go:144 +0x28
+os.(*Process).pidWait.func1(...)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec_unix.go:64
+os.ignoringEINTR2[...](...)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/file_posix.go:266
+os.(*Process).pidWait(0x5567da44c280)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec_unix.go:63 +0x9c
+os.(*Process).wait(0x10833ade0?)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec_unix.go:28 +0x24
+os.(*Process).Wait(...)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec.go:346
+os/exec.(*Cmd).Wait(0x5567da45ba00)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec/exec.go:930 +0x38
+os/exec.(*Cmd).Run(0x5567da45ba00)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec/exec.go:632 +0x38
+os/exec.(*Cmd).CombinedOutput(0x5567da45ba00)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec/exec.go:1047 +0x7c
+github.com/entireio/cli/cmd/entire/cli/checkpoint/remote.Fetch({0x105f358b8, 0x5567d905d260}, {{0x104f9e407, 0x6}, {0x5567d8aa0a90, 0x1, 0x1}, 0x1, 0x1, 0x0, ...})
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/checkpoint/remote/git.go:65 +0x424
+github.com/entireio/cli/cmd/entire/cli.fetchMetadataFromOrigin({0x105f35628?, 0x1061a8880?}, 0x1, 0x0)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/git_operations.go:433 +0x1f4
+github.com/entireio/cli/cmd/entire/cli.FetchMetadataTreeOnly(...)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/git_operations.go:412
+github.com/entireio/cli/cmd/entire/cli.runExplainCheckpointWithLookup({0x105f35628, 0x1061a8880}, {0x105f29580, 0x5567da541710}, {0x105f29580, 0x5567da541740}, {0x5567da4b1860, 0x28}, 0x1, 0x0, ...)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain.go:500 +0x2e0
+github.com/entireio/cli/cmd/entire/cli.runExplainAuto({0x105f35628, 0x1061a8880}, {0x105f29580, 0x5567da541710}, {0x105f29580, 0x5567da541740}, {0x5567da4b1860, 0x28}, 0x1, 0x0, ...)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain.go:368 +0xf4
+github.com/entireio/cli/cmd/entire/cli.TestRunExplainAuto_CommitWithoutTrailer.func1(0x5567da4e0248)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:333 +0xc0
+testing.tRunner(0x5567da4e0248, 0x5567da200f50)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 615
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 579 [chan receive]:
+testing.(*T).Parallel(0x5567d86f0fc8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2RefExistence_NeitherExist(0x5567d86f0fc8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:386 +0x20
+testing.tRunner(0x5567d86f0fc8, 0x105f19e98)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 580 [chan receive]:
+testing.(*T).Parallel(0x5567d86f1208)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2RefExistence_OnlyMainExists(0x5567d86f1208)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:399 +0x20
+testing.tRunner(0x5567d86f1208, 0x105f19ea8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 591 [chan receive]:
+testing.(*T).Parallel(0x5567d8e51d48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2GenerationHealth_PartialTimestamp_MissingOldest(0x5567d8e51d48)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:629 +0x24
+testing.tRunner(0x5567d8e51d48, 0x105f19e78)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 592 [chan receive]:
+testing.(*T).Parallel(0x5567d8d34008)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2GenerationHealth_EmptyGeneration(0x5567d8d34008)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:649 +0x24
+testing.tRunner(0x5567d8d34008, 0x105f19e48)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 593 [chan receive]:
+testing.(*T).Parallel(0x5567d8d34248)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2GenerationHealth_SequenceGap(0x5567d8d34248)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:670 +0x24
+testing.tRunner(0x5567d8d34248, 0x105f19e80)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 594 [chan receive]:
+testing.(*T).Parallel(0x5567d8d34488)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestCheckV2GenerationHealth_SequenceGapRange(0x5567d8d34488)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/doctor_test.go:697 +0x24
+testing.tRunner(0x5567d8d34488, 0x105f19e88)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 511 [chan receive]:
+testing.(*T).Parallel(0x5567da11a6c8)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:1803 +0x194
+github.com/entireio/cli/cmd/entire/cli.TestFormatCheckpointSummaryError_Auth(0x5567da11a6c8)
+    /Users/gtrrz-victor/wks/cli/add-auto-aupdate/cmd/entire/cli/explain_test.go:78 +0x20
+testing.tRunner(0x5567da11a6c8, 0x105f1a490)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2036 +0xc4
+created by testing.(*T).Run in goroutine 1
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/testing/testing.go:2101 +0x3a8
+
+goroutine 658 [IO wait]:
+internal/poll.runtime_pollWait(0x108449600, 0x72)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x5567da3f54a0?, 0x5567da586c00?, 0x1)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0x5567da3f54a0, {0x5567da586c00, 0x200, 0x200})
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/internal/poll/fd_unix.go:165 +0x234
+os.(*File).read(...)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/file_posix.go:29
+os.(*File).Read(0x5567d8a82eb0, {0x5567da586c00?, 0x10833ade0?, 0x0?})
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/file.go:144 +0x68
+bytes.(*Buffer).ReadFrom(0x5567da454390, {0x105f29398, 0x5567d8a82eb0})
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/bytes/buffer.go:229 +0x90
+io.copyBuffer({0x105f29580, 0x5567da454390}, {0x105f29398, 0x5567d8a82eb0}, {0x0, 0x0, 0x0})
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/io/io.go:415 +0x14c
+io.Copy(...)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/io/io.go:388
+os.genericWriteTo(0x5567d8563e01?, {0x105f29580?, 0x5567da454390?})
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/file.go:295 +0x44
+os.(*File).WriteTo(0x106138e00?, {0x105f29580?, 0x5567da454390?})
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/file.go:273 +0x5c
+io.copyBuffer({0x105f29580, 0x5567da454390}, {0x105f29480, 0x5567d8a82eb0}, {0x0, 0x0, 0x0})
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/io/io.go:411 +0x98
+io.Copy(...)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/io/io.go:388
+os/exec.(*Cmd).writerDescriptor.func1()
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec/exec.go:602 +0x40
+os/exec.(*Cmd).Start.func2(0x0?)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec/exec.go:757 +0x30
+created by os/exec.(*Cmd).Start in goroutine 616
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec/exec.go:756 +0x6c8
+
+goroutine 659 [select]:
+os/exec.(*Cmd).watchCtx(0x5567da45ba00, 0x5567da3bbd50)
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec/exec.go:797 +0x74
+created by os/exec.(*Cmd).Start in goroutine 616
+    /Users/gtrrz-victor/.local/share/mise/installs/go/1.26.2/src/os/exec/exec.go:783 +0x69c
+FAIL    github.com/entireio/cli/cmd/entire/cli    600.875s
+ok      github.com/entireio/cli/cmd/entire/cli/agent    2.272s
+ok      github.com/entireio/cli/cmd/entire/cli/agent/claudecode    5.645s
+ok      github.com/entireio/cli/cmd/entire/cli/agent/codex    1.780s
+ok      github.com/entireio/cli/cmd/entire/cli/agent/copilotcli    3.035s
+ok      github.com/entireio/cli/cmd/entire/cli/agent/cursor    1.559s
+ok      github.com/entireio/cli/cmd/entire/cli/agent/external    15.123s
+ok      github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid    2.028s
+ok      github.com/entireio/cli/cmd/entire/cli/agent/geminicli    1.912s
+ok      github.com/entireio/cli/cmd/entire/cli/agent/opencode    4.549s
+?       github.com/entireio/cli/cmd/entire/cli/agent/testutil    [no test files]
+?       github.com/entireio/cli/cmd/entire/cli/agent/types    [no test files]
+?       github.com/entireio/cli/cmd/entire/cli/agent/vogon    [no test files]
+ok      github.com/entireio/cli/cmd/entire/cli/api    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/auth    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/benchutil    (cached) [no tests to run]
+ok      github.com/entireio/cli/cmd/entire/cli/checkpoint    7.784s
+ok      github.com/entireio/cli/cmd/entire/cli/checkpoint/id    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/checkpoint/remote    5.031s
+ok      github.com/entireio/cli/cmd/entire/cli/dispatch    11.810s
+ok      github.com/entireio/cli/cmd/entire/cli/execx    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/gitops    0.762s
+ok      github.com/entireio/cli/cmd/entire/cli/gitremote    2.862s
+ok      github.com/entireio/cli/cmd/entire/cli/interactive    (cached)
+?       github.com/entireio/cli/cmd/entire/cli/jsonutil    [no test files]
+ok      github.com/entireio/cli/cmd/entire/cli/logging    4.453s
+ok      github.com/entireio/cli/cmd/entire/cli/osroot    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/paths    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/search    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/session    4.467s
+ok      github.com/entireio/cli/cmd/entire/cli/settings    4.629s
+ok      github.com/entireio/cli/cmd/entire/cli/strategy    30.271s
+ok      github.com/entireio/cli/cmd/entire/cli/stringutil    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/summarize    9.179s
+ok      github.com/entireio/cli/cmd/entire/cli/telemetry    3.502s
+?       github.com/entireio/cli/cmd/entire/cli/testutil    [no test files]
+ok      github.com/entireio/cli/cmd/entire/cli/textutil    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/trail    3.382s
+ok      github.com/entireio/cli/cmd/entire/cli/trailers    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/transcript    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/transcript/compact    (cached)
+ok      github.com/entireio/cli/cmd/entire/cli/validation    (cached)
+?       github.com/entireio/cli/cmd/entire/cli/vercelconfig    [no test files]
+ok      github.com/entireio/cli/cmd/entire/cli/versioncheck    (cached)
+?       github.com/entireio/cli/cmd/entire/cli/versioninfo    [no test files]
+ok      github.com/entireio/cli/e2e/agents    (cached)
+?       github.com/entireio/cli/e2e/bootstrap    [no test files]
+?       github.com/entireio/cli/e2e/cmd/testreport    [no test files]
+?       github.com/entireio/cli/e2e/entire    [no test files]
+?       github.com/entireio/cli/e2e/testutil    [no test files]
+?       github.com/entireio/cli/e2e/vogon    [no test files]
+ok      github.com/entireio/cli/perf    (cached)
+ok      github.com/entireio/cli/redact    (cached)
+FAIL
+[test] ERROR task failed
+
+---
+
+go test -run TestRunDispatchWizard_Proceeds... ./cmd/entire/cli/ hangs until i press enter..
+
+---
+
+ship it
+
+---
+
+double check docs about this refactor, docs like CLAUDE.md

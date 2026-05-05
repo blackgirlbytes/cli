@@ -1,0 +1,149 @@
+Implement the following plan:
+
+# Trail Store Refactoring Plan
+
+## Context
+
+The trail store (`trail/store.go`) uses O(n) full-flatten+rebuild for every write, while the checkpoint store evolved to O(depth) tree splicing via `UpdateSubtree`. This refactoring brings the trail store up to par across 5 improvements: performance, remote fallback consistency, code deduplication, input validation, and reduced round-trips.
+
+## Files to Modify
+
+- `cmd/entire/cli/checkpoint/committed.go` — export `CreateCommit` function
+- `cmd/entire/cli/checkpoint/temporary.go` — delegate `createCommit` method to exported `CreateCommit`
+- `cmd/entire/cli/trail/store.go` — main refactoring (Write, Delete, AddCheckpoint, validation, helpers)
+- `cmd/entire/cli/trail/store_test.go` — add validation + AddCheckpoint isolation tests
+
+## Key Functions to Reuse
+
+- `checkpoint.UpdateSubtree()` — O(depth) tree surgery (`checkpoint/parse_tree.go:51`)
+- `checkpoint.MergeKeepExisting`, `checkpoint.ReplaceAll` — merge modes
+- `checkpoint.UpdateSubtreeOptions{DeleteNames}` — for Delete
+- `checkpoint.CreateBlobFromContent()` — already used by trail store
+- `checkpoint.GetGitAuthorFromRepo()` — already used by trail store
+- `trail.ValidateID()` — exists in `trail/trail.go:37`, not yet called on input paths
+
+## Implementation Steps
+
+### Step 1: Export `CreateCommit` in checkpoint package
+
+**`checkpoint/committed.go`**: Add exported `CreateCommit(repo, treeHash, parentHash, message, authorName, authorEmail)` near `GetGitAuthorFromRepo` (~line 1497).
+
+**`checkpoint/temporary.go:766`**: Change `(s *GitStore) createCommit` to delegate to `CreateCommit(s.repo, ...)`.
+
+### Step 2: Add `getBranchRef` helper to trail store
+
+Replace `getBranchEntries` (flatten-based) with `getBranchRef()` that returns `(commitHash, rootTreeHash, error)` without flattening. Include remote fallback (matching `getBranchTree`'s behavior). Pattern follows checkpoint's `getSessionsBranchRef` (`checkpoint/parse_tree.go:294`).
+
+### Step 3: Refactor `Write` to use `UpdateSubtree`
+
+Replace the flatten+rebuild pattern. Create blob objects for the 3 files, then call:
+```
+UpdateSubtree(repo, rootTreeHash, ["<shard>", "<suffix>"], [3 file entries], {ReplaceAll})
+```
+`UpdateSubtree` with 2-level path preserves sibling trails in the same shard automatically. `ReplaceAll` at the leaf replaces the trail's directory contents completely.
+
+Extract `buildTrailEntries(metadata, discussion, checkpoints) ([]object.TreeEntry, error)` helper for blob creation.
+
+### Step 4: Refactor `Delete` to use `UpdateSubtree` with `DeleteNames`
+
+Call `EnsureBranch()` first (fixes remote-only fallback issue), then:
+```
+UpdateSubtree(repo, rootTreeHash, ["<shard>"], nil, {MergeKeepExisting, DeleteNames: ["<suffix>"]})
+```
+Add existence check by navigating tree at O(depth) before deleting.
+
+### Step 5: Add `ValidateID` to `Read`, `Delete`, `Update`, `AddCheckpoint`
+
+Add `ValidateID(string(trailID))` guard at the top of each method. Uses existing `ValidateID` from `trail/trail.go:37` which checks for exactly 12 lowercase hex characters.
+
+### Step 6: Optimize `AddCheckpoint` to read/write only checkpoints file
+
+Instead of Read(3 files) + Write(3 files), navigate to the trail subtree, read only `checkpoints.json`, prepend the new ref, create a new blob, then splice back with:
+```
+UpdateSubtree(repo, rootTreeHash, ["<shard>", "<suffix>"], [{checkpoints.json blob}], {MergeKeepExisting})
+```
+`MergeKeepExisting` at the leaf level preserves `metadata.json` and `discussion.json` untouched.
+
+### Step 7: Remove dead code
+
+Delete `getBranchEntries` method (no longer called). Remove unused imports if any.
+
+### Step 8: Update `trail/store.go` — delegate `createCommit` to shared function
+
+Replace the trail store's `createCommit` method body with `checkpoint.CreateCommit(s.repo, ...)`.
+
+### Step 9: Add tests
+
+In `store_test.go`:
+- `TestStore_ReadInvalidID` — invalid ID format returns error
+- `TestStore_DeleteInvalidID` — path traversal attempt returns error
+- `TestStore_AddCheckpointPreservesOtherFields` — verifies metadata/discussion unchanged after AddCheckpoint
+
+### Step 10: Run verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+## Complexity Summary
+
+| Method | Before | After |
+|--------|--------|-------|
+| Write | O(n) flatten + rebuild | O(depth) splice |
+| Delete | O(n) flatten + rebuild | O(depth) splice |
+| AddCheckpoint | O(n) flatten + rebuild (3 files) | O(depth) read 1 file + splice 1 file |
+| Update | 2x O(n) via Read+Write | O(depth) read + O(depth) splice |
+| Read | O(depth) unchanged | O(depth) unchanged |
+| List | O(n) unchanged (unavoidable) | O(n) unchanged |
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.claude/projects/-Users-soph-Work-entire-devenv-cli/81141d82-6026-4dc3-b295-3e4629e47d8a.jsonl
+
+---
+
+# Simplify: Code Review and Cleanup
+
+Review all changed files for reuse, quality, and efficiency. Fix any issues found.
+
+## Phase 1: Identify Changes
+
+Run `git diff` (or `git diff HEAD` if there are staged changes) to see what changed. If there are no git changes, review the most recently modified files that the user mentioned or that you edited earlier in this conversation.
+
+## Phase 2: Launch Three Review Agents in Parallel
+
+Use the Agent tool to launch all three agents concurrently in a single message. Pass each agent the full diff so it has the complete context.
+
+### Agent 1: Code Reuse Review
+
+For each change:
+
+1. **Search for existing utilities and helpers** that could replace newly written code. Use Grep to find similar patterns elsewhere in the codebase — common locations are utility directories, shared modules, and files adjacent to the changed ones.
+2. **Flag any new function that duplicates existing functionality.** Suggest the existing function to use instead.
+3. **Flag any inline logic that could use an existing utility** — hand-rolled string manipulation, manual path handling, custom environment checks, ad-hoc type guards, and similar patterns are common candidates.
+
+### Agent 2: Code Quality Review
+
+Review the same changes for hacky patterns:
+
+1. **Redundant state**: state that duplicates existing state, cached values that could be derived, observers/effects that could be direct calls
+2. **Parameter sprawl**: adding new parameters to a function instead of generalizing or restructuring existing ones
+3. **Copy-paste with slight variation**: near-duplicate code blocks that should be unified with a shared abstraction
+4. **Leaky abstractions**: exposing internal details that should be encapsulated, or breaking existing abstraction boundaries
+5. **Stringly-typed code**: using raw strings where constants, enums (string unions), or branded types already exist in the codebase
+
+### Agent 3: Efficiency Review
+
+Review the same changes for efficiency:
+
+1. **Unnecessary work**: redundant computations, repeated file reads, duplicate network/API calls, N+1 patterns
+2. **Missed concurrency**: independent operations run sequentially when they could run in parallel
+3. **Hot-path bloat**: new blocking work added to startup or per-request/per-render hot paths
+4. **Unnecessary existence checks**: pre-checking file/resource existence before operating (TOCTOU anti-pattern) — operate directly and handle the error
+5. **Memory**: unbounded data structures, missing cleanup, event listener leaks
+6. **Overly broad operations**: reading entire files when only a portion is needed, loading all items when filtering for one
+
+## Phase 3: Fix Issues
+
+Wait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it.
+
+When done, briefly summarize what was fixed (or confirm the code was already clean).

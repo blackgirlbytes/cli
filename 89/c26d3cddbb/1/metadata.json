@@ -1,0 +1,84 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "89c26d3cddbb",
+  "session_id": "ses_2b5c4f966ffeIY6gYo1V8UkxV2",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-02T00:47:16.387741Z",
+  "branch": "fix/opencode-export-transcript",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "OpenCode",
+  "model": "gpt-5.3-codex",
+  "turn_id": "0e9aa876a5cd",
+  "token_usage": {
+    "input_tokens": 741933,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 9768064,
+    "output_tokens": 37044,
+    "api_call_count": 120
+  },
+  "summary": {
+    "intent": "Identify and fix slow unit test bottlenecks in the CLI repo, addressing them one at a time with user review between each fix.",
+    "outcome": "Two test performance fixes landed on PR #830: isolated TestListSessionsFunctionsWithoutRepo in a temp non-repo dir (~4s → ~0.01s) and reduced external agent timeout test deadlines from 1s to 200ms with adjusted upper bounds (2s→4s after PR review feedback). P1 opencode tests were investigated but reverted due to approach disagreements.",
+    "learnings": {
+      "repo": [
+        "TestListSessionsFunctionsWithoutRepo in cmd/entire/cli/strategy/session_test.go was running from the real repo CWD, causing ~4s runtime by scanning the actual repo; a t.TempDir()+t.Chdir fix reduces it to ~0.01s",
+        "cmd/entire/cli/agent/opencode lifecycle tests (TestPrepareTranscript_*) invoke real opencode export path, making them ~1.1s each — but fixing this via injectable function fields on production structs or t.Setenv/t.Chdir are both unacceptable approaches",
+        "run() in external agent sets cmd.WaitDelay = 3*time.Second, so elapsed upper bounds in timeout tests must be at least timeout + WaitDelay (e.g. 200ms + 3s) to avoid CI flakes",
+        "ENTIRE_TEST_OPENCODE_MOCK_EXPORT=1 is a mock mode for opencode export but requires t.Setenv which conflicts with t.Parallel — not usable for parallel tests",
+        "The opencode export slow-path tests cannot be easily mocked without either modifying production structs (rejected as 'too much production change') or using t.Setenv (rejected as incompatible with t.Parallel)"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/strategy/session_test.go",
+          "line": 176,
+          "end_line": 176,
+          "finding": "TestListSessionsFunctionsWithoutRepo needed t.TempDir()+t.Chdir to avoid scanning real repo CWD"
+        },
+        {
+          "path": "cmd/entire/cli/agent/external/external_test.go",
+          "line": 167,
+          "end_line": 167,
+          "finding": "TestRun_AppliesTimeoutWhenNoDeadline defaultRunTimeout reduced from 1s to 200ms"
+        },
+        {
+          "path": "cmd/entire/cli/agent/external/external_test.go",
+          "line": 178,
+          "end_line": 178,
+          "finding": "Elapsed upper bound raised from 2s to 4s to accommodate WaitDelay=3s in production run()"
+        },
+        {
+          "path": "cmd/entire/cli/agent/external/external_test.go",
+          "line": 205,
+          "end_line": 205,
+          "finding": "TestRun_RespectsExistingDeadline context timeout reduced from 1s to 200ms"
+        },
+        {
+          "path": "cmd/entire/cli/agent/external/external_test.go",
+          "line": 215,
+          "end_line": 215,
+          "finding": "Elapsed upper bound raised from 2s to 4s to accommodate WaitDelay=3s in production run()"
+        }
+      ],
+      "workflow": [
+        "PR was initially created for only one commit on a new branch instead of the full feature branch — user corrected to use fix/optimize-tests branch containing all changes",
+        "The task/review tool reported nothing when working tree was clean; it requires uncommitted or branch-scoped changes to be useful",
+        "Cursor bot PR comments flagged the WaitDelay flake risk and the fix was valid — worth checking bot review comments before merging",
+        "Reverting via git checkout -- <file> was used to cleanly undo uncommitted test changes"
+      ]
+    },
+    "friction": [
+      "Two rounds of P1 (opencode PrepareTranscript) approach were rejected: first t.Setenv+t.Chdir removed t.Parallel (unacceptable), then injectable exportSession field on production struct deemed 'too much production code change' — no viable path found without touching production code",
+      "PR was created on wrong branch (pr/external-timeout-tests) with only one commit instead of the full fix/optimize-tests branch; had to close #829 and reopen #830",
+      "The task/review tool was invoked twice mid-session but returned no useful output both times because the working tree was clean",
+      "Agent tried to merge brainstorming P-label numbering between sessions (P1 summarize Claude test vs P1 opencode test) causing confusion when user questioned the plan"
+    ],
+    "open_items": [
+      "TestPrepareTranscript_AlwaysRefreshesTranscript and TestPrepareTranscript_ErrorOnBrokenSymlink in cmd/entire/cli/agent/opencode/lifecycle_test.go still take ~1.1s each — no acceptable test-only fix found without production changes",
+      "TestGenerateFromTranscript_NilGenerator in cmd/entire/cli/summarize/summarize_test.go (~4.6s) was deferred as it depends on real claude CLI — still slow",
+      "cmd/entire/cli/strategy git-heavy reconcile tests (metadata_reconcile_test.go) remain ~12s aggregate — deeper optimization deferred as medium-hard effort",
+      "cmd/entire/cli package-level slowness (~9s) not investigated — no obvious single bottleneck identified yet",
+      "TestWrap_HooksAndAnalyzer refactor (pure in-memory Agent construction) was considered but reverted to preserve incidental integration coverage — could revisit if integration coverage moves elsewhere"
+    ]
+  }
+}
