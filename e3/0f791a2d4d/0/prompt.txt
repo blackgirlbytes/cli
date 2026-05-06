@@ -1,0 +1,1102 @@
+I'd like you to go over the session logic especially the one that figures out if a session has ended and see if we can do improvements there. Basically we need a better / more reliable way a session ended. The main issue here is a user doing splitted commits after the session and the need to keep shadow branches around to continue to be able to do association. Maybe there is a better way
+
+---
+
+I'd like you to go over the session logic especially the one that figures out if a session has ended and see if we can do improvements there. Basically we need a better / more reliable way a session ended. The main issue here is a user doing splitted commits after the session and the need to keep shadow branches around to continue to be able to do association. Maybe there is a better way
+
+---
+
+for option b: but if a user splits into two commits, then the second commit should get a checkpoint with the same metadata/session logs as the first commit, can this work if the first commit removed the shadow branch?
+
+---
+
+the issue I'm seeing is a bit: the idea with the shadow branch was a bit that we have the full diff. Now with that we could also handle if I commit line 20-24 in one commit and line 100-120 in another commit of the same changed file. But we are not checking that at all yet right? Like in some way the shadow branch should have worked like staging / commiting until nothing is left
+
+---
+
+but stays the blob hash available once the shadow branch goes away?
+
+---
+
+and if we go back to the drawing board? could we abuse other refs instead of branches somehow to prevent gc issues? or have a completely different approach?
+
+---
+
+can you explain option 4 more?
+
+---
+
+the downside of using entire/checkpoints/v1 is that we would create commits there but also push this data out to a remote, which we don't need at all.
+
+---
+
+the shadow branch is based of the current commit, so the diff is based on that, but in the refs the file blobs is the whole file so wouldn't we loose the reference to what changed? or do I missunderstand the blobs?
+
+---
+
+but how is the filesOverlapWithContent then done? Like how can it differentiate with which lines were already there and which are actually changed?
+
+---
+
+I mean a shadow branch based on current head containing one commit, that has the diff implicitly right? It just doesn't work anymore with carry forward
+
+---
+
+I'd like to at least see if this is possible, so can you create a spec for diff/hunk level support and then we put one or more subagent on figuring out how this could be implemented
+
+---
+
+<task-notification>
+<task-id>a6033997951dd0fc7</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Research diff/hunk libraries in Go" completed</summary>
+<result>Perfect! Now I have enough information to provide comprehensive research findings. Let me create my summary:
+
+## Research Summary: Hunk-Level Diff Computation in Go
+
+Based on my thorough exploration of the codebase and available Go libraries, here are my findings:
+
+### 1. Go Libraries for Diff Computation
+
+#### **go-git v5** (`github.com/go-git/go-git/v5`)
+- **File-level diffs**: Available via `DiffTree()`, `DiffTreeContext()`, `DiffTreeWithOptions()`
+  - Location: `plumbing/object/difftree.go`
+  - Returns `Changes` type (slice of `*Change` objects)
+  - Each `Change` has `From` and `To` fields (type `ChangeEntry`)
+  - Supports rename detection via `DiffTreeOptions`
+
+- **Hunk-level diffs**: Supported via `Patch()` / `PatchContext()` methods
+  - Location: `plumbing/object/patch.go`
+  - `Change.Patch()` → `*Patch` with file patches
+  - `Changes.Patch()` → `*Patch` with all file patches
+  - Each `FilePatch` has `Chunks()` returning `[]fdiff.Chunk`
+  - Each `Chunk` has `Content()` and `Type()` (Operation: Equal/Add/Delete)
+
+- **Unified diff generation**: Built-in encoding
+  - Location: `plumbing/format/diff/unified_encoder.go`
+  - `UnifiedEncoder.Encode(patch Patch)` generates standard unified diff
+  - Includes `hunksGenerator` (internal struct) that computes hunk headers (`@@ -start,count +start,count @@`)
+  - Configurable context lines (default: 3)
+
+#### **sergi/go-diff** (`github.com/sergi/go-diff/diffmatchpatch`)
+- **Low-level line/char diffs**: 
+  - Location: `diffmatchpatch/diff.go`
+  - `DiffMain(text1, text2 string, checklines bool) []Diff`
+  - `DiffMainRunes()` for rune-level operations
+  - Returns `[]Diff` where each `Diff` has `Type` (DiffDelete/DiffInsert/DiffEqual) and `Text`
+  - Powers go-git's internal diff computation
+
+- **Patch object representation**:
+  - Location: `diffmatchpatch/patch.go`
+  - `Patch` struct with `Start1/Start2`, `Length1/Length2`, `diffs []Diff`
+  - `PatchMake()` converts diffs to patches
+  - `String()` emits GNU diff format (`@@ -start,length +start,length @@`)
+  - `PatchAddContext()` adds surrounding lines for context
+
+#### **gitleaks/go-gitdiff** (`github.com/gitleaks/go-gitdiff/gitdiff`)
+- **Git unified diff parsing** (does NOT compute diffs, only parses):
+  - Location: `gitdiff/gitdiff.go`
+  - `Parse(r io.Reader)` streams parsed file/fragment structure
+  - Excellent for consuming `git diff` output
+
+- **Text fragment representation** (hunks):
+  - Location: `gitdiff/text.go`
+  - `TextFragment` struct:
+    - `OldPosition/OldLines`, `NewPosition/NewLines` (hunk header ranges)
+    - `LinesAdded/LinesDeleted`, `LeadingContext/TrailingContext`
+    - `Lines []Line` - individual line ops (OpContext/OpAdd/OpDelete)
+  - `TextFragment.Header()` returns canonical `@@ -start,count +start,count @@` format
+  - `TextFragment.Validate()` checks consistency
+
+---
+
+### 2. Computing "Agent's Diff" (Base → Agent Version)
+
+**Recommended approach: Use go-git's tree diff API**
+
+```
+go-git.object.DiffTree(baseTree *Tree, agentTree *Tree) → Changes
+→ Changes.Patch() → Patch
+→ Patch.FilePatches() → []FilePatch
+→ FilePatch.Chunks() → []Chunk (already has operations and content)
+```
+
+**Implementation path:**
+1. Get base commit tree from repo
+2. Build agent's in-memory tree from workspace files (or shadow branch tree if building from metadata)
+3. Call `DiffTreeWithOptions(ctx, baseTree, agentTree, &DiffTreeOptions{DetectRenames: true})`
+4. Convert to hunks: iterate `Changes` → call `Patch()` on each → extract hunks from `hunksGenerator` (internal to unified_encoder)
+
+**Performance notes:**
+- File-level diffing is O(N*d) where N = min lines and d = diff size (Myers algorithm via sergi/go-diff)
+- Tree diffing is incremental - only processes changed files
+- For 10 files: typically milliseconds on modern hardware
+- Timeout available via `utils/diff.DoWithTimeout(src, dst, timeout)`
+
+**Key types:**
+- `github.com/go-git/go-git/v5/plumbing/object.Change` - single file change
+- `github.com/go-git/go-git/v5/plumbing/object.Changes` - collection of changes (sortable)
+- `github.com/go-git/go-git/v5/plumbing/object.Patch` - unified diff representation
+- `github.com/go-git/go-git/v5/plumbing/format/diff.FilePatch` - per-file patch
+- `github.com/go-git/go-git/v5/plumbing/format/diff.Chunk` - diff chunk (Equal/Add/Delete with content)
+
+---
+
+### 3. Detecting Hunk Consumption (Partial Commits)
+
+**Challenge**: Given diff A (base → agent) and diff B (parent → committed), determine which hunks from A are "covered" by B.
+
+**Current approach in codebase**: Content-aware overlap detection
+- Location: `cmd/entire/cli/strategy/content_overlap.go`
+- Uses blob hash comparison for file-level detection
+- `hasSignificantContentOverlap()` - line-based content matching (not hunk-aware)
+- Falls back to filename-only checks if metadata unavailable
+
+**For hunk-level detection, options:**
+
+**Option 1: Three-way merge approach** (NOT directly available in Go)
+- git internally uses `merge-base` + recursive 3-way merge
+- No standard Go library implements git's native 3-way merge
+- `go-git` has `merge_base.go` but only for finding common ancestors, not for merge computation
+
+**Option 2: Patch application / reversal** (PRACTICAL)
+- Use `git apply --reverse --check` to test if a hunk would apply cleanly
+- Or: convert hunk to unified diff, attempt dry-run application
+- `gitleaks/go-gitdiff` has `Apply()` function for this:
+  ```go
+  gitdiff.Apply(dst io.Writer, src io.ReaderAt, f *File) error
+  ```
+- Can use this to test if agent diff applies to committed state
+
+**Option 3: Line-by-line context matching** (RELIABLE, PERFORMANT)
+- Extract hunks from agent diff A
+- For each hunk: check if context lines exist in parent→committed diff B
+- If context lines are present in B, hunk was likely incorporated
+- Account for fuzz factor (git apply uses 1-line fuzz by default)
+- Build content overlap detection at hunk granularity (similar to current approach, but on hunks)
+
+**Option 4: Fuzzy matching** (RECOMMENDED FOR PARTIAL STAGING)
+- Given agent hunk H with content, search committed file for:
+  - Exact line match (strict)
+  - Subsequence match (5+ consecutive lines from H exist in B)
+  - Content distance (Levenshtein-style similarity threshold)
+- Current codebase already does this with `hasSignificantContentOverlap()` - could be adapted to hunks
+
+**Best approach for split commits scenario:**
+1. Compute agent diff A using go-git DiffTree + Patch
+2. Compute parent→committed diff B
+3. For each hunk in A:
+   - Extract hunk context lines (leading + trailing context from go-gitdiff parsing)
+   - Check if these lines appear in B's changed region
+   - If yes: hunk is "carried forward" to committed
+   - If no: hunk remains "uncommitted" (needs carry-forward)
+
+---
+
+### 4. Storing Diffs Efficiently
+
+**JSON-serializable hunk representation** (inspired by gitleaks/go-gitdiff):
+
+```json
+{
+  "file_path": "src/auth.go",
+  "old_range": {"start": 42, "count": 15},
+  "new_range": {"start": 42, "count": 18},
+  "old_end_context": "@@ function definition",
+  "leading_context_lines": 3,
+  "trailing_context_lines": 3,
+  "lines": [
+    {"op": "context", "content": "  existing code"},
+    {"op": "delete", "content": "  old_line"},
+    {"op": "add", "content": "  new_line"},
+    {"op": "context", "content": "  more existing code"}
+  ],
+  "stats": {"added": 2, "deleted": 1}
+}
+```
+
+**Size comparison:**
+- Unified diff (text): ~100-500 bytes per small hunk
+- Full blob storage: typically 1-10 KB per file
+- Hunk JSON: ~200-800 bytes per hunk (includes metadata)
+- **Recommendation**: Store unified diff text (most compact), parse on-demand using gitleaks/go-gitdiff
+
+**For session metadata**: Store hunk summary in JSONL format
+```jsonl
+{"type": "hunk_summary", "file": "auth.go", "hunks": 3, "added": 42, "deleted": 8, "status": "partial_staged"}
+```
+
+---
+
+### 5. Handling Line Number Drift After Partial Commits
+
+**The problem**: After `git add -p` (partial staging), remaining hunks have shifted line numbers because earlier hunks were applied.
+
+**Solutions:**
+
+**Option A: Fuzzy Context Matching** (SIMPLE, PRACTICAL)
+- Don't track absolute line numbers after first commit
+- Instead, track hunk by its "context signature": leading/trailing context lines + content hash
+- When re-mapping, search for this signature in the current file
+- If found within fuzzy distance (fuzz factor = 1-3 lines), apply hunk
+- This is how `git apply` handles rebased patches
+
+**Option B: Dynamic Recomputation** (MOST RELIABLE)
+- Don't try to re-map hunks after commits
+- Instead: after partial commit, recompute diffs between HEAD and current agent tree
+- Remaining uncommitted hunks naturally have correct line numbers
+- Store "checkpoint ID" + "agent tree hash", not individual hunks
+- Current codebase already does this via shadow branch storage
+
+**Option C: Blob-based Rewind** (CURRENT APPROACH)
+- Current `filesWithRemainingAgentChanges()` uses file-level comparison
+- Could be extended to hunk level:
+  1. Get agent version of file from shadow branch
+  2. Get committed version from HEAD
+  3. Get working tree version from disk
+  4. Recompute hunks: committed ← agent
+  5. For each hunk: check if it exists in working tree
+  6. If not in working tree: hunk was discarded (don't carry forward)
+  7. If in working tree but different lines: apply fuzzy matching
+
+**Recommended for this use case**: **Option B + Option C combined**
+- Use line-number-independent hunk identity (context signature)
+- When carrying forward after partial commit, recompute diffs on-demand
+- Don't cache absolute line numbers across commits
+- Location: Extend `filesWithRemainingAgentChanges()` to return hunks, not just files
+
+---
+
+### 6. Key Files & Types to Use
+
+**For hunk-level diff computation:**
+```
+github.com/go-git/go-git/v5/plumbing/object:
+  - DiffTree(a, b *Tree) → Changes
+  - Changes.Patch() → *Patch
+  - Patch.FilePatches() → []FilePatch
+  - FilePatch.Chunks() → []Chunk
+  - Operation (const: Equal=0, Add=1, Delete=2)
+
+github.com/go-git/go-git/v5/plumbing/format/diff:
+  - UnifiedEncoder (for emitting unified diff format)
+  - FilePatch, Chunk (interfaces)
+
+github.com/gitleaks/go-gitdiff/gitdiff:
+  - Parse(r io.Reader) → chan *File
+  - File struct (OldName, NewName, TextFragments)
+  - TextFragment (OldPosition, OldLines, NewPosition, NewLines, Lines)
+  - Line (Op: OpContext/OpAdd/OpDelete, Line: string)
+```
+
+**For existing project context:**
+- `cmd/entire/cli/strategy/content_overlap.go`: Content-aware overlap (file-level)
+- `cmd/entire/cli/gitops/diff.go`: Tree diffing via git CLI
+- `cmd/entire/cli/strategy/common.go`: `splitLines()` utility, tree building
+- `cmd/entire/cli/strategy/manual_commit_rewind.go`: Likely location for hunk-aware carry-forward logic
+
+---
+
+### 7. Performance Characteristics
+
+| Operation | Complexity | Time (10 files) | Notes |
+|-----------|-----------|-----------------|-------|
+| DiffTree (compute changes) | O(N*d) | 1-5ms | Myers algorithm, N=min lines, d=diff size |
+| Patch generation | O(M) | <1ms | M = number of chunks |
+| Hunk parsing (from diff output) | O(L) | 2-10ms | L = total diff lines |
+| Content overlap check | O(F*C) | 5-50ms | F=files, C=file comparisons |
+| Git CLI (git diff-tree) | O(N) | 5-50ms | Subprocess overhead ~10ms |
+
+**For hot path (hooks): Use go-git, avoid subprocess**
+
+---
+
+### Summary for Implementation
+
+To implement hunk-level split commit tracking:
+
+1. **Compute agent diff**: Use `go-git.DiffTree()` + `.Patch()`
+2. **Parse hunks**: Either extract from go-git's `Chunks` or use `gitleaks/go-gitdiff.Parse()` on unified diff output
+3. **Store hunk metadata**: JSON with file, ranges, context signature, added/deleted counts
+4. **Track consumption**: Use context lines + fuzzy matching or recompute diffs on-demand
+5. **Handle carry-forward**: Extend `filesWithRemainingAgentChanges()` to be hunk-aware
+6. **Avoid line drift**: Use content-based signatures, not absolute line numbers
+
+The current project architecture (shadow branches + metadata blobs) already supports this - hunks can be stored alongside session transcripts with checkpoint IDs.</result>
+<usage><total_tokens>63191</total_tokens><tool_uses>44</tool_uses><duration_ms>96639</duration_ms></usage>
+</task-notification>
+Full transcript available at: /tmp/claude-1000/-Users-soph-Work-entire-devenv-cli/tasks/a6033997951dd0fc7.output
+
+---
+
+<task-notification>
+<task-id>ab8e9a8f723c4cc43</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Research refs/entire/ and integration" completed</summary>
+<result>Perfect. Now I have enough information to provide a comprehensive analysis. Let me compile the research findings:
+
+## Comprehensive Integration Analysis: Hunk-Level Carry-Forward with Entire CLI
+
+Based on research and codebase analysis, here's a detailed integration plan for hunk-level carry-forward in the Entire CLI.
+
+---
+
+## PART 1: Custom Git Refs Research Findings
+
+### 1. Go-git Support for Custom Refs
+
+**Yes, go-git supports custom refs under arbitrary namespaces:**
+- `Storer.SetReference()` (plumbing API) accepts any ref name via `plumbing.NewHashReference(refName, hash)`
+- Reference names can be arbitrary paths like `refs/entire/carry_forward/<session-id>`
+- Example from `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/strategy/clean_test.go:414-417`:
+  ```go
+  shadowRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName(shadowBranchName), commitHash)
+  if err := repo.Storer.SetReference(shadowRef); err != nil { ... }
+  ```
+- The codebase already uses this pattern for shadow branches (`refs/heads/entire/<hash>-<worktreeHash>`)
+
+### 2. Push Behavior for Custom Refs
+
+**Custom refs under `refs/entire/` are NOT pushed by default with `git push`:**
+- Standard `git push` only pushes `refs/heads/*` and `refs/tags/*`
+- Custom refs in `refs/entire/` remain local-only
+- **To push custom carry-forward refs**, you would need:
+  - Explicit refspec: `git push origin refs/entire/carry_forward/*:refs/entire/carry_forward/*`
+  - Or `git push --mirror` (mirrors all refs, but has other implications)
+  - Or configure: `[remote "origin"] push = +refs/entire/carry_forward/*:refs/entire/carry_forward/*`
+
+**Current strategy**: The codebase already keeps carry-forward data local-only via shadow branches on `refs/heads/entire/`, which is the right approach.
+
+### 3. Garbage Collection Safety
+
+**Custom refs keep objects reachable, same as regular branches:**
+- Git gc respects all refs (branches, tags, custom refs) as reachability roots
+- Objects referenced by `refs/entire/carry_forward` are NOT garbage-collected
+- Custom refs can have gc policies via config: `[gc "refs/entire/*"] reflogExpire = never`
+- **Recommendation**: Add gc config to preserve carry-forward refs indefinitely
+
+### 4. Clone Behavior
+
+**Custom refs are NOT fetched by default by `git clone`:**
+- Only `refs/heads/*` and `refs/tags/*` are fetched by default
+- Custom refs remain on the origin remote
+- **For Entire CLI**: This is fine—carry-forward refs are development-time artifacts that don't need to sync across clones
+
+### 5. Excluding Refs from Push/Fetch
+
+**Negative refspecs with `^` prefix exclude refs:**
+```bash
+# Exclude refs/entire/ from push
+git push origin refs/heads/*:refs/heads/* ^refs/entire/*:refs/entire/*
+
+# Exclude from fetch
+git fetch origin refs/heads/*:refs/heads/* ^refs/entire/carry_forward/*
+```
+
+**For Entire CLI**: The CLI should explicitly exclude `refs/entire/` from push operations or require explicit opt-in to push them.
+
+### 6. go-git References Iteration
+
+**go-git's `repo.References()` can filter by prefix:**
+```go
+iter, err := repo.References()  // Returns all refs
+iter.ForEach(func(ref *plumbing.Reference) error {
+  if strings.HasPrefix(ref.Name().String(), "refs/entire/carry_forward/") {
+    // Process carry-forward refs
+  }
+  return nil
+})
+```
+
+The codebase already uses this pattern in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/checkpoint/temporary.go:184-196` to list shadow branches.
+
+---
+
+## PART 2: Integration Analysis with Existing Codebase
+
+### Architecture Overview
+
+The hunk-level carry-forward would use:
+- **Storage**: `refs/entire/carry_forward/<session-id>/<commit-hash>` (local-only ref)
+- **Metadata**: Stored in shadow branch metadata directory or as ref-scoped JSON
+- **Computation**: Done at checkpoint condensation time (first-commit)
+- **Application**: At PrepareCommitMsg time (next commit)
+
+---
+
+### 1. **content_overlap.go** — File-Level to Hunk-Level Migration
+
+**Current State (lines 356-506)**: `filesWithRemainingAgentChanges()` works at file level using blob hash comparison.
+
+**Changes Needed**:
+
+A. Add hunk-level data structure to `content_overlap.go`:
+```go
+// HunkState represents the content state of hunks in a file
+type HunkState struct {
+  FilePath    string
+  Hunks       []HunkInfo     // Hunks from agent diff (carry-forward candidates)
+  CommittedAt *CommitHunkMap // Hunks consumed in this commit (or nil)
+}
+
+type HunkInfo struct {
+  StartLine   int
+  EndLine     int
+  Content     string
+  ContentHash plumbing.Hash
+}
+
+type CommitHunkMap struct {
+  ConsumedHunks map[int]struct{} // Hunk indices that were part of the commit
+  ModifiedAt    time.Time
+}
+```
+
+B. Modify `filesWithRemainingAgentChanges()` signature:
+```go
+func filesWithRemainingAgentChanges(
+  ctx context.Context,
+  repo *git.Repository,
+  shadowBranchName string,
+  headCommit *object.Commit,
+  filesTouched []string,
+  committedFiles map[string]struct{},
+  opts ...overlapOpts,
+) ([]string, map[string]*HunkState) {  // NEW: Also return hunk data
+```
+
+C. Change blob-hash comparison (line 472) to hunk-level logic:
+- Instead of `if commitFile.Hash == shadowFile.Hash`, parse both as diffs
+- For each hunk in shadow file, check if it appears in committed file
+- Track which hunks were consumed vs. remain uncommitted
+
+D. Modify `stagedFilesOverlapWithContent()` (lines 177-338):
+- Add hunk parsing alongside current line-overlap check (lines 318-330)
+- Return `(bool, *HunkState)` instead of just `bool`
+- Use hunk presence to determine partial staging vs. full staging
+
+E. Update helper: `hasSignificantContentOverlap()` (lines 552-586)
+- Current approach counts lines; add hunk-aware variant
+- A hunk "survives" staging if ≥80% of its lines remain in the staged content
+- Return hunk indices that partially match
+
+**Lines affected**: 356, 369-377 (signature), 436-506 (logic), 278-330 (helpers)
+
+---
+
+### 2. **manual_commit_hooks.go** — Hook Integration Points
+
+**Current State**: Three hooks interact with carry-forward:
+- `PrepareCommitMsg()` (lines 301-478) — adds checkpoint trailer before commit
+- `PostCommit()` (lines 727-1100+) — detects what was committed
+- `postCommitProcessSession()` (lines 843-1011) — orchestrates carry-forward
+
+**Changes Needed**:
+
+#### A. In `PrepareCommitMsg()` (lines 301-478):
+
+Add hunk-level carry-forward detection after line 367 (`filterSessionsWithNewContent`):
+
+```go
+// Line ~370, add new check for hunk-level content
+if len(sessionsWithContent) > 0 {
+  // NEW: Load hunk state from refs/entire/carry_forward/<session-id>
+  hunkState, hunkErr := s.loadCarryForwardHunks(ctx, sessionsWithContent[0].SessionID)
+  if hunkErr == nil && hunkState != nil {
+    // Hunk-level carry-forward exists from previous partial commit
+    // Log for visibility: "Previous commit consumed X of Y hunks"
+    logging.Debug(logCtx, "prepare-commit-msg: hunk-level carry-forward detected",
+      slog.String("session_id", sessionsWithContent[0].SessionID),
+      slog.Int("remaining_hunks", len(hunkState.RemainingHunks)),
+    )
+    // Trailer is still added—hunk state guides what to condense in PostCommit
+  }
+}
+```
+
+#### B. In `postCommitProcessSession()` (lines 843-1011):
+
+**Line ~910-916 (filesTouchedBefore capture)**:
+Add hunk state capture alongside file list:
+```go
+var filesTouchedBefore []string
+var fileHunkStateBefore map[string]*HunkState  // NEW
+if state.Phase.IsActive() {
+  filesTouchedBefore = s.resolveFilesTouched(ctx, state)
+  // NEW: Load hunk-level carry-forward from last checkpoint
+  fileHunkStateBefore, _ = s.loadCarryForwardHunks(ctx, state.SessionID)
+}
+```
+
+**Line ~967-970 (filesWithRemainingAgentChanges call)**:
+Update call to accept and return hunk data:
+```go
+remainingFiles, remainingHunks := filesWithRemainingAgentChanges(ctx, repo, shadowBranchName, 
+  commit, filesTouchedBefore, committedFileSet, overlapOpts{
+    headTree:   headTree,
+    shadowTree: shadowTree,
+    hunkState:  fileHunkStateBefore,  // NEW
+  })
+```
+
+**Line ~980-982 (carryForwardToNewShadowBranch call)**:
+Pass hunk data:
+```go
+if len(remainingFiles) > 0 {
+  s.carryForwardToNewShadowBranch(ctx, repo, state, remainingFiles, remainingHunks)  // NEW param
+}
+```
+
+#### C. New method: `loadCarryForwardHunks()`:
+
+Add after line 2289 (after `carryForwardToNewShadowBranch`):
+```go
+func (s *ManualCommitStrategy) loadCarryForwardHunks(ctx context.Context, sessionID string) (map[string]*HunkState, error) {
+  repo, err := OpenRepository(ctx)
+  if err != nil {
+    return nil, err
+  }
+  
+  // Read refs/entire/carry_forward/<session-id>
+  refName := plumbing.ReferenceName(fmt.Sprintf("refs/entire/carry_forward/%s", sessionID))
+  ref, err := repo.Reference(refName, true)
+  if err != nil {
+    return nil, nil // Not found is normal (first commit in session)
+  }
+  
+  commit, err := repo.CommitObject(ref.Hash())
+  if err != nil {
+    return nil, err
+  }
+  
+  // Read metadata from commit message or tree
+  // Format: Store hunk state as JSON in tree at .entire/hunk_state.json
+  // ...extraction logic...
+  return hunkState, nil
+}
+```
+
+**Performance notes**:
+- Current hook time budget: <100ms (measured in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/strategy/postcommit_bench_test.go`)
+- Hunk parsing adds ~20-50ms for typical files (needs benchmarking)
+- Mitigate by: caching parsed hunks, lazy-loading only for sessionsWithContent
+
+---
+
+### 3. **checkpoint/temporary.go** — Shadow Branch Storage
+
+**Current State (lines 52-142)**: `WriteTemporary()` stores files and metadata on shadow branch.
+
+**Changes Needed**:
+
+#### A. Extend `WriteTemporaryOptions` struct (line ~57, in checkpoint/types.go):
+```go
+type WriteTemporaryOptions struct {
+  // ... existing fields ...
+  
+  // NEW: Hunk-level carry-forward data
+  AgentDiffPerFile map[string]string  // filename -> unified diff
+  HunkStatePath    string             // Path to .entire/hunk_state.json
+}
+```
+
+#### B. Modify `WriteTemporary()` signature and logic:
+
+**Line ~100-142**: After building tree with changes, also compute agent diff:
+```go
+// NEW: If first checkpoint, compute and store agent diff
+if opts.IsFirstCheckpoint && len(opts.AgentDiffPerFile) == 0 {
+  diffs, err := s.computeAgentDiffs(ctx, baseTreeHash, allFiles, opts.AuthorName)
+  if err == nil {
+    opts.AgentDiffPerFile = diffs
+  }
+}
+
+// NEW: Build hunk state from diffs
+hunkState := s.buildHunkState(ctx, opts.AgentDiffPerFile)
+
+// NEW: Add hunk_state.json to tree at opts.HunkStatePath
+newTreeHash, err := s.addHunkStateToTree(ctx, treeHash, hunkState, opts.HunkStatePath)
+if err != nil {
+  // Non-fatal: continue without hunk metadata
+  logging.Warn(...)
+}
+
+// Existing commit creation (now uses updated treeHash with hunk state)
+commitHash, err := s.createCommit(newTreeHash, parentHash, commitMsg, ...)
+```
+
+#### C. New methods in GitStore (in temporary.go):
+
+```go
+func (s *GitStore) computeAgentDiffs(ctx context.Context, baseTree plumbing.Hash, files []string, authorName string) (map[string]string, error) {
+  // For each file in baseTree, compute diff vs. working tree
+  // Return: filename -> unified diff string
+  // Uses go-git tree walking + diff library or git CLI
+}
+
+func (s *GitStore) buildHunkState(ctx context.Context, diffs map[string]string) map[string]*HunkState {
+  // Parse unified diffs into HunkState structures
+  // Return: filename -> HunkState with StartLine, EndLine, Content, etc.
+}
+
+func (s *GitStore) addHunkStateToTree(ctx context.Context, treeHash plumbing.Hash, 
+  hunkState map[string]*HunkState, hunkStatePath string) (plumbing.Hash, error) {
+  // Serialize hunkState to JSON
+  // Add to tree at hunkStatePath using ApplyTreeChanges
+  // Return new tree hash
+}
+```
+
+#### D. Storage format for hunk metadata:
+
+Store in shadow branch tree at `.entire/hunk_state.json`:
+```json
+{
+  "file.go": {
+    "hunks": [
+      {
+        "start_line": 10,
+        "end_line": 25,
+        "content": "func foo() { ... }",
+        "content_hash": "abc123"
+      }
+    ]
+  }
+}
+```
+
+**Lines affected**: WriteTemporaryOptions struct definition, lines 85-142 in WriteTemporary()
+
+---
+
+### 4. **session/state.go** — Session State Extensions
+
+**Current State (lines 32-158)**: Session state tracks files, transcripts, and checkpoint IDs.
+
+**Changes Needed**:
+
+#### A. Add fields to `State` struct (after line 158):
+
+```go
+type State struct {
+  // ... existing fields ...
+  
+  // NEW: Hunk-level carry-forward tracking (minimal to keep state file small)
+  CarryForwardRefHash string `json:"carry_forward_ref_hash,omitempty"`
+  // Only stores the ref hash, not full hunk data
+  // Full hunk state lives in refs/entire/carry_forward/<session-id>
+  
+  // NEW: Track which hunks were partially consumed in last commit
+  LastPartialCommitHunks map[string][]int `json:"last_partial_commit_hunks,omitempty"`
+  // filename -> list of hunk indices that were consumed
+}
+```
+
+#### B. Add helper methods to `State`:
+
+```go
+// LoadCarryForwardHunks fetches full hunk state from git ref
+func (s *State) LoadCarryForwardHunks(ctx context.Context, repo *git.Repository) (map[string]*HunkState, error) {
+  if s.CarryForwardRefHash == "" {
+    return nil, nil
+  }
+  
+  hash := plumbing.NewHash(s.CarryForwardRefHash)
+  commit, err := repo.CommitObject(hash)
+  if err != nil {
+    return nil, fmt.Errorf("carry-forward ref not found: %w", err)
+  }
+  
+  // Parse hunk_state.json from tree
+  // ...
+}
+
+// UpdateCarryForwardRef updates the ref hash after WriteTemporary
+func (s *State) UpdateCarryForwardRef(refHash plumbing.Hash) {
+  s.CarryForwardRefHash = refHash.String()
+}
+```
+
+**Design rationale**:
+- Keep `.json` files small by storing only the ref hash, not full hunk data
+- Full hunk state lives in git objects (more robust and version-controlled)
+- This avoids duplicating diff data in both state files and git refs
+
+**Lines affected**: Lines 32-158 (State struct definition), new helper methods at end of file
+
+---
+
+### 5. **manual_commit_condensation.go** — Agent Diff Computation
+
+**Current State (lines 96-266)**: `CondenseSession()` condenses shadow branch metadata to permanent storage.
+
+**Changes Needed**:
+
+#### A. Add method to compute agent diff at first-commit time:
+
+New method after line 266 (after CondenseSession):
+```go
+// computeAgentDiffForCondensation calculates the agent's diff from base to shadow branch.
+// This enables hunk-level carry-forward detection: which hunks were consumed vs. remain.
+func (s *ManualCommitStrategy) computeAgentDiffForCondensation(ctx context.Context, 
+  repo *git.Repository, 
+  baseCommit *object.Commit, 
+  shadowCommit *object.Commit,
+  filesTouched []string,
+) (map[string]string, error) {
+  logCtx := logging.WithComponent(ctx, "attribution")
+  
+  baseTree, err := baseCommit.Tree()
+  if err != nil {
+    logging.Debug(logCtx, "computeAgentDiffForCondensation: failed to get base tree", slog.String("error", err.Error()))
+    return nil, err
+  }
+  
+  shadowTree, err := shadowCommit.Tree()
+  if err != nil {
+    logging.Debug(logCtx, "computeAgentDiffForCondensation: failed to get shadow tree", slog.String("error", err.Error()))
+    return nil, err
+  }
+  
+  diffs := make(map[string]string)
+  for _, filePath := range filesTouched {
+    baseFile, baseErr := baseTree.File(filePath)
+    shadowFile, shadowErr := shadowTree.File(filePath)
+    
+    // Compute unified diff between base and shadow
+    // Use go-git's diff utilities or git CLI
+    // Store in diffs[filePath]
+  }
+  
+  return diffs, nil
+}
+```
+
+#### B. Modify `CondenseSession()` to store agent diffs:
+
+**Line ~126-129** (after extracting session data):
+```go
+// NEW: For first checkpoint, compute and store agent diff for carry-forward
+var agentDiffs map[string]string
+if sessionData.CheckpointNumber == 1 {  // Or check if no previous shadow branch exists
+  agentDiffs, _ = s.computeAgentDiffForCondensation(ctx, repo, baseCommit, shadowCommit, sessionData.FilesTouched)
+}
+```
+
+**Line ~233-253** (WriteCommitted call):
+```go
+// NEW: Pass agent diffs to WriteCommitted
+if err := store.WriteCommitted(ctx, cpkg.WriteCommittedOptions{
+  // ... existing fields ...
+  AgentDiffPerFile: agentDiffs,  // NEW
+}); err != nil {
+  return nil, fmt.Errorf("failed to write checkpoint metadata: %w", err)
+}
+```
+
+**Lines affected**: Lines 96-266, new method ~270-310
+
+---
+
+## Integration Summary: Key Touch Points
+
+| File | Function | Lines | Change Type | Purpose |
+|------|----------|-------|-------------|---------|
+| `content_overlap.go` | `filesWithRemainingAgentChanges()` | 356-506 | Logic update | Return hunk data alongside file list |
+| `content_overlap.go` | `hasSignificantContentOverlap()` | 552-586 | Add variant | Hunk-aware overlap check |
+| `manual_commit_hooks.go` | `PrepareCommitMsg()` | 367-370 | Add check | Load carry-forward hunk state |
+| `manual_commit_hooks.go` | `postCommitProcessSession()` | 910-916, 967-982 | Pass data | Thread hunk state through handlers |
+| `manual_commit_hooks.go` | `carryForwardToNewShadowBranch()` | 2232-2289 | Update signature | Accept hunk data parameter |
+| `manual_commit_hooks.go` | NEW: `loadCarryForwardHunks()` | ~2295-2320 | New method | Fetch hunk state from refs |
+| `checkpoint/temporary.go` | `WriteTemporary()` | 85-142 | Add hunk logic | Compute and store agent diffs |
+| `checkpoint/temporary.go` | NEW: `computeAgentDiffs()` | ~145-170 | New method | Parse diffs into hunks |
+| `checkpoint/temporary.go` | NEW: `buildHunkState()` | ~172-190 | New method | Convert diffs to HunkState |
+| `session/state.go` | `State` struct | 32-158 | Add fields | CarryForwardRefHash, LastPartialCommitHunks |
+| `manual_commit_condensation.go` | `CondenseSession()` | 126-129, 233-253 | Update | Compute and store agent diffs |
+| `manual_commit_condensation.go` | NEW: `computeAgentDiffForCondensation()` | ~270-310 | New method | Agent diff computation |
+
+---
+
+## Custom Ref Namespace Design
+
+**Location**: `refs/entire/carry_forward/<session-id>/<base-commit-hash[:7]>`
+
+**Contents** (git commit object):
+```
+Tree:
+  .entire/
+    hunk_state.json       # { filename -> [hunks] }
+  <actual files>          # User files matching filesTouched
+    
+Commit message:
+  Carry-forward: <session-id>
+  
+  Entire-Session: <session-id>
+  Entire-Strategy: manual-commit
+  Entire-Hunk-Metadata: .entire/hunk_state.json
+```
+
+**Push behavior**: Explicit opt-in only via config or CLI flag (not pushed by default)
+
+**GC behavior**: Add config to preserve:
+```
+[gc "refs/entire/*"]
+  reflogExpire = never
+```
+
+**Lifecycle**:
+1. Created after first commit in session (by `carryForwardToNewShadowBranch`)
+2. Updated with each partial commit
+3. Deleted when session ends and all files are committed
+4. Cleaned up by `gc` after 30+ days if session orphaned
+
+---
+
+## Performance Considerations
+
+- **Hunk parsing overhead**: ~30-50ms per session (profile before optimizing)
+- **Cache parsed hunks** in session state for re-use across multiple commits
+- **Lazy-load** hunk data only when `filesWithRemainingAgentChanges()` needed
+- **Benchmark** with `mise run postcommit_bench_test.go` after implementation
+- **Target**: Keep PostCommit hook <200ms (currently <100ms with file-level)
+
+Sources:
+- [go-git plumbing reference API](https://github.com/go-git/go-git/blob/main/plumbing/reference.go)
+- [Git refspec documentation](https://git-scm.com/book/en/v2/Git-Internals-The-Refspec)
+- [Git push documentation](https://git-scm.com/docs/git-push)
+- [Git garbage collection](https://git-scm.com/docs/git-gc)
+- [Git clone documentation](https://git-scm.com/docs/git-clone)</result>
+<usage><total_tokens>67963</total_tokens><tool_uses>34</tool_uses><duration_ms>79369</duration_ms></usage>
+</task-notification>
+Full transcript available at: /tmp/claude-1000/-Users-soph-Work-entire-devenv-cli/tasks/ab8e9a8f723c4cc43.output
+
+---
+
+<task-notification>
+<task-id>a3a852a2c8fa36ec5</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Research git-absorb and hunk tracking" completed</summary>
+<result>Now I have comprehensive research across all the areas. Let me compile the findings.
+
+---
+
+## Research Summary: Hunk Tracking/Matching Algorithms in the Git Ecosystem
+
+### 1. git-absorb
+
+**How it works:** git-absorb uses **patch commutation** (ported from Facebook's `hg absorb`) to determine which commit a staged hunk belongs to. It walks backward through a range of commits (default: last 10, configurable via `--base`), testing whether each staged hunk "commutes" with each commit.
+
+**Commutation algorithm (from `src/commute.rs`):**
+
+Two hunks commute (can be reordered without changing the result) if:
+1. **Non-overlapping:** The first hunk's lower bound is at or before the second hunk's upper bound. In this case, the "below" hunk's start positions are adjusted by `(added_count - removed_count)` of the "above" hunk.
+2. **Overlapping but uniform:** Both hunks are exclusively adding (or exclusively removing) the same repeated line. These can be reordered regardless of position.
+3. **Otherwise:** They do NOT commute, meaning the hunk "belongs to" that commit.
+
+When a hunk fails to commute with a commit, that commit is identified as the correct target for a fixup. If it commutes with all commits in the range, it remains staged with a warning.
+
+**Go port:** No Go port exists. The algorithm is straightforward enough to reimplement. The key data structures are `Hunk` (with `added` and `removed` blocks, each having `start` position and `lines`) and the `commute()` function itself.
+
+**Alternative approach -- git-autofixup:** Uses `git blame` instead of commutation. It blames each context line surrounding a hunk and assigns the hunk to a commit if all context lines blame the same topic-branch commit. Has strictness levels (0-2) for increasingly conservative matching.
+
+**Relevance to your problem:** The commutation concept is directly applicable. If you have the agent's hunks and want to know if they were "consumed" by a commit, you can test whether each agent hunk commutes with the commit's diff. Non-commuting means the commit touched the same region.
+
+**Source:** [tummychow/git-absorb](https://github.com/tummychow/git-absorb), specifically `src/commute.rs`
+
+---
+
+### 2. git range-diff
+
+**How it works:** git range-diff matches corresponding commits between two versions of a patch series using a **bipartite graph assignment** algorithm.
+
+**Matching algorithm:**
+1. Compute the diff (patch) for each commit in both ranges
+2. For every pair of commits (one from each range), compute a "diff of diffs" -- the textual diff between the two patches
+3. Use the size of each diff-of-diffs as the cost in a cost matrix
+4. Add dummy nodes for wholly new/removed commits with a fudge-factor cost
+5. Solve the **minimum-cost assignment** using the **Jonker-Volgenant algorithm** (cubic runtime)
+
+**Key insight:** It operates at commit granularity, not hunk granularity. It measures similarity between entire patches, not individual hunks.
+
+**Relevance to your problem:** The approach of "diff two diffs and measure similarity" is conceptually useful but heavyweight for your use case. The Jonker-Volgenant assignment is overkill when you have just two diffs to compare (agent diff vs commit diff) rather than two series of commits.
+
+**Source:** [git range-diff documentation](https://git-scm.com/docs/git-range-diff), [range-diff.c in git source](https://github.com/git/git/blob/master/range-diff.c)
+
+---
+
+### 3. Three-Way Merge / diff3
+
+**How diff3 works:**
+1. Compute `diff(O, A)` and `diff(O, B)` where O is the common ancestor
+2. Align matching regions across all three texts
+3. Classify each chunk:
+   - **Both unchanged:** Output the original
+   - **Only A changed:** Output A's version (A's change)
+   - **Only B changed:** Output B's version (B's change)
+   - **Both changed differently:** Conflict
+
+**Change attribution:** diff3 inherently tells you which side a change came from. This is exactly the property you need: given base (pre-agent state), A (agent's version), and B (committed version), diff3 classification tells you which agent changes are present in B.
+
+**Go implementations:**
+- [epiclabs-io/diff3](https://github.com/epiclabs-io/diff3) -- Go port of a JS implementation based on Synchrotron. Provides `Merge(a, o, b, detailed, labelA, labelB)` returning a `MergeResult`.
+- [charlesvdv/go-three-way-merge](https://github.com/charlesvdv/go-three-way-merge) -- Another Go library for three-way merge.
+- [golang/go#68765](https://github.com/golang/go/issues/68765) -- Ongoing discussion about adding diff3 to Go's standard tools.
+
+**Academic reference:** ["A Formal Investigation of Diff3"](https://www.cis.upenn.edu/~bcpierce/papers/diff3-short.pdf) by Khanna, Kuber, and Pierce (FSTTCS 2007) -- formal analysis of diff3 properties and guarantees about non-conflicting edits to well-separated regions.
+
+**Relevance to your problem:** This is highly applicable. With three versions (base, agent-version, committed-version), diff3 can classify every chunk as "agent-only change," "commit-only change," "both changed identically" (consumed), or "conflict" (modified differently). This directly answers "which agent hunks were included in the commit."
+
+---
+
+### 4. Patch Algebra / Hunk Intersection
+
+**Darcs patch commutation:**
+Two hunk patches on the same file commute if their line ranges do not overlap. When they do commute, you adjust line offsets. When they overlap, you have a conflict (cannot commute). The formal rule from Darcs (Haskell):
+- If `p1` occurs in an earlier part of the file than `p2`, they commute by adjusting line offsets
+- If they overlap in line ranges, they do NOT commute -- this signals a dependency/conflict
+
+**Pijul's category-theoretic approach:**
+Merge is defined as a **pushout** in a category where files are objects and patches are arrows. The key paper is ["A Categorical Theory of Patches"](https://arxiv.org/abs/1311.3903) by Mimram and Di Giusto. The core insight: the "free completion under finite colimits" of the file category gives you a system where every pair of patches has a well-defined merge (pushout), with conflicts represented as objects labeled by lines with ordering relations.
+
+**Homotopical Patch Theory** (Angiuli, Morehouse, Licata, Harper -- [CMU paper](https://www.cs.cmu.edu/~rwh/papers/htpt/jfp.pdf)): Models patch theory using higher inductive types in homotopy type theory, separating the formal theory from the repository interpretation.
+
+**Relevance to your problem:** Patch commutation from Darcs is the most directly applicable concept. The question "did this commit consume this agent hunk?" is equivalent to "does this agent hunk commute with the commit's inverse?" If not, the regions overlap and the hunk was (at least partially) consumed. The category-theoretic approaches are elegant but impractical to implement for your use case.
+
+---
+
+### 5. Code Review Tools
+
+**Gerrit -- `GitPositionTransformer` and `CommentPorter`:**
+
+Gerrit's ported-comments feature (introduced in 3.4) maps comment positions across patchsets using a two-phase algorithm:
+
+1. **File path resolution:** Handle renamed/deleted/copied files
+2. **Line range shifting:** Process range mappings sequentially top-to-bottom, tracking cumulative line shifts. If a comment's position falls within a changed range, it uses a conflict strategy (either omit the position or degrade to file-level).
+
+Key classes: `GitPositionTransformer` (handles the position mapping), `CommentPorter` (orchestrates porting of unresolved comments across patchsets). The algorithm is essentially: walk through the diff hunks, maintaining a running offset, and adjust comment line numbers accordingly. Comments on changed lines get marked as conflicting/outdated.
+
+**GitHub:**
+GitHub tracks which lines were modified between force-pushes. Comments on lines that changed in a subsequent push are marked "outdated." The algorithm is simpler than Gerrit's -- if the line a comment was on is part of a changed hunk in the new push, it's outdated.
+
+**Gitea:**
+Uses `git blame` to track whether commented lines changed, automatically marking outdated comments. Has known issues with incorrect line number tracking after insertions.
+
+**Relevance to your problem:** Gerrit's `GitPositionTransformer` pattern (sequential range-mapping with cumulative offset tracking) is a practical, proven approach for mapping line positions across diffs. This is useful if you need to track "where did this agent hunk end up after the commit."
+
+**Source:** [Gerrit source at googlesource.com](https://gerrit.googlesource.com/gerrit/)
+
+---
+
+### 6. Practical Approaches
+
+Given the agent's diff (`base -> agent_version`) and a commit's diff (`parent -> commit`), here are the approaches ranked by simplicity and reliability:
+
+**Approach A: Three-way diff (RECOMMENDED)**
+
+This is the simplest reliable algorithm:
+
+1. You have three versions of each file: `base` (before agent), `agent_version` (agent's changes), `committed_version` (what was actually committed)
+2. Run diff3 with `base` as the ancestor, `agent_version` as side A, `committed_version` as side B
+3. Classification:
+   - Chunks where A changed but B matches base = **agent changes NOT committed** (remaining)
+   - Chunks where B changed but A matches base = **user's own changes** (not from agent)
+   - Chunks where both A and B changed identically = **agent changes COMMITTED** (consumed)
+   - Chunks where both changed differently = **agent changes MODIFIED** by user (partially consumed)
+
+This leverages diff3's inherent change-attribution. Go libraries: [epiclabs-io/diff3](https://github.com/epiclabs-io/diff3) or [charlesvdv/go-three-way-merge](https://github.com/charlesvdv/go-three-way-merge).
+
+**Approach B: Residual diff**
+
+1. Compute `diff(agent_version, committed_version)` -- this is the "residual"
+2. If the residual is empty for a file, all agent changes were committed verbatim
+3. If the residual contains hunks, analyze them against the original agent diff to determine which hunks remain
+4. Limitation: Cannot distinguish "user removed an agent change" from "user added their own change" without the base version
+
+**Approach C: Reverse-apply check**
+
+1. For each hunk in the agent's diff, try `git apply --reverse --check` against the committed version
+2. If reverse-apply succeeds for a hunk, that hunk was consumed (its changes are present)
+3. If it fails, the hunk was not consumed or was modified
+4. Limitation: Context-sensitive -- may fail due to surrounding changes even when the core change is present. Also requires shelling out to git per hunk, which is expensive.
+
+**Approach D: Hunk-level line-range overlap (simplest approximation)**
+
+1. Parse both diffs into hunks per file using [sourcegraph/go-diff](https://github.com/sourcegraph/go-diff) or [bluekeyes/go-gitdiff](https://github.com/bluekeyes/go-gitdiff)
+2. For each agent hunk, check if the commit's diff has a hunk touching the same line range in the same file
+3. If the commit hunk's added lines contain the agent hunk's added lines (substring/subsequence match), the agent hunk was consumed
+4. Limitation: Fragile with split/reorganized hunks and line-offset shifts
+
+**Approach E: Commutation test (git-absorb style)**
+
+1. Parse the agent's diff and the commit's diff into hunks
+2. For each agent hunk, test if it commutes with each commit hunk (using the algorithm from git-absorb's `commute.rs`)
+3. Non-commuting means the commit touched the same region -- the agent hunk was likely consumed
+4. To confirm consumption vs. conflict, compare the actual line content
+5. Advantage: Well-founded in patch theory. Disadvantage: Requires implementing the commutation logic.
+
+**Recommendation:** Approach A (three-way diff) is the most reliable and semantically clean. You already have all three versions available (the checkpoint stores the base state, the agent produced its version, and the commit is the committed version). The diff3 algorithm gives you exactly the classification you need, with proven Go libraries available. It handles edge cases like line reordering and partial hunk inclusion naturally.
+
+For a quick-and-dirty first pass, Approach D (hunk overlap) combined with content matching gives a good approximation and is easy to implement with existing Go diff libraries.
+
+---
+
+### Key Go Libraries for Implementation
+
+| Library | Purpose | Link |
+|---------|---------|------|
+| `sourcegraph/go-diff` | Unified diff parsing, `FileDiff`/`Hunk` structs | [pkg.go.dev](https://pkg.go.dev/sourcegraph.com/sourcegraph/go-diff/diff) |
+| `bluekeyes/go-gitdiff` | Git diff parsing + patch application | [github.com](https://github.com/bluekeyes/go-gitdiff) |
+| `epiclabs-io/diff3` | Three-way merge with conflict detection | [github.com](https://github.com/epiclabs-io/diff3) |
+| `charlesvdv/go-three-way-merge` | Three-way merge on text | [github.com](https://github.com/charlesvdv/go-three-way-merge) |
+| `go-git/go-git` | Git operations (already in your codebase) | [github.com](https://github.com/go-git/go-git) |
+
+### Key Academic Papers
+
+| Paper | Authors | Relevance |
+|-------|---------|-----------|
+| [A Formal Investigation of Diff3](https://www.cis.upenn.edu/~bcpierce/papers/diff3-short.pdf) | Khanna, Kuber, Pierce (2007) | Formal properties of diff3, guarantees about well-separated edits |
+| [A Categorical Theory of Patches](https://arxiv.org/abs/1311.3903) | Mimram, Di Giusto (2013) | Merge as pushout, theoretical foundation for patch intersection |
+| [Homotopical Patch Theory](https://www.cs.cmu.edu/~rwh/papers/htpt/jfp.pdf) | Angiuli, Morehouse, Licata, Harper (2014/2016) | Patch theory via higher inductive types |
+| [Darcs Patch Theory](https://www.cs.tufts.edu/~nr/cs257/archive/david-roundy/Theory%20of%20patches.html) | Roundy | Original theory of patch commutation |
+| [Ganesh Patch Algebra](https://darcs.net/Theory/GaneshPatchAlgebra) | Sittampalam et al. | Formal properties of patch commutation |
+
+Sources:
+- [tummychow/git-absorb](https://github.com/tummychow/git-absorb)
+- [Super-charging git rebase with git absorb](https://andrewlock.net/super-charging-git-rebase-with-git-absorb/)
+- [torbiak/git-autofixup](https://github.com/torbiak/git-autofixup)
+- [Absorb changes across a topic branch](https://torbiak.com/post/autofixup/)
+- [git range-diff documentation](https://git-scm.com/docs/git-range-diff)
+- [git/range-diff.c source](https://github.com/git/git/blob/master/range-diff.c)
+- [diff3 Wikipedia](https://en.wikipedia.org/wiki/Diff3)
+- [Merging with diff3 - The If Works](https://blog.jcoglan.com/2017/05/08/merging-with-diff3/)
+- [epiclabs-io/diff3 (Go)](https://github.com/epiclabs-io/diff3)
+- [charlesvdv/go-three-way-merge (Go)](https://github.com/charlesvdv/go-three-way-merge)
+- [golang/go#68765 - three-way merge](https://github.com/golang/go/issues/68765)
+- [Understanding Darcs/Patch theory](https://en.wikibooks.org/wiki/Understanding_Darcs/Patch_theory)
+- [Darcs Patch Algebra](https://darcs.net/Theory/GaneshPatchAlgebra)
+- [Pijul Model](https://pijul.org/model/)
+- [Part 1: Merging and patches](https://jneem.github.io/merging/)
+- [Gerrit 3.4.x release notes](https://www.gerritcodereview.com/3.4.html)
+- [Gerrit Review UI](https://gerrit-review.googlesource.com/Documentation/user-review-ui.html)
+- [GitHub PR commenting docs](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/reviewing-changes-in-pull-requests/commenting-on-a-pull-request)
+- [sourcegraph/go-diff](https://github.com/sourcegraph/go-diff)
+- [bluekeyes/go-gitdiff](https://github.com/bluekeyes/go-gitdiff)
+- [git-apply documentation](https://git-scm.com/docs/git-apply)
+- [A Formal Investigation of Diff3](https://www.cis.upenn.edu/~bcpierce/papers/diff3-short.pdf)
+- [A Categorical Theory of Patches](https://arxiv.org/abs/1311.3903)
+- [Homotopical Patch Theory](https://www.cs.cmu.edu/~rwh/papers/htpt/jfp.pdf)</result>
+<usage><total_tokens>49177</total_tokens><tool_uses>49</tool_uses><duration_ms>336310</duration_ms></usage>
+</task-notification>
+Full transcript available at: /tmp/claude-1000/-Users-soph-Work-entire-devenv-cli/tasks/a3a852a2c8fa36ec5.output
+
+---
+
+as a alternative / less complext option can we also investigate: If we do the carry forward only as long as no new session is doing any file changes, wouldn't it then work properly? Like I have changes in line 20-50 and 100-120 now I commit 20-50, we update the shadow branch so it only contains 100-120 still, now if I don't commit the rest but instead a new session produces changes, we reset the shadow branch and start fresh with those changes. Carry forward if two sessions work is not possible. Would that work? would it simplify things? also it means we can completely end the session from before. Basically: keep parts / chunks as long as no new session generates new changes, as soon as it does, we wipe the old shadow branch and put all local changes in to a new shadow branch, in the example that would mean 100-120 might be associated to the new session but so be it
+
+---
+
+where it is not great is the line attribution to the coding session... But there is no right option here, we could say we don't attribute 100-120 to this session stats but what are they then when they get commited. So if they get commited they are attributed, if they aren't commited in this session then all statst are right, ok - yes add this as option B

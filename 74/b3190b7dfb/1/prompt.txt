@@ -1,0 +1,100 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>acd8ddbbb8a69796d</task-id>
+<tool-use-id>toolu_015L1RwwMrrVbNFLDom4Zbx9</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/068a5de0-262f-45ec-925b-1f12a57286b8/tasks/acd8ddbbb8a69796d.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>**Findings:**
+
+1. **`fetchV1MetadataWithFallback` / `fetchV2MetadataWithFallback` duplicate `getMetadataTree` / `getV2MetadataTree`** (resume.go:383, 506). These already exist as same-package helpers, are already used by attach.go (lines 321, 324), and crucially return a *fresh repo handle* — solving the stale-storer issue documented in the diff. The new fallback helpers throw the fresh repo away. Replace lines 510–512 in explain.go with `tree, freshRepo, err := getMetadataTree(ctx)` and use `freshRepo` to rebuild the lookup. Same pattern for v2.
+
+2. **`loadV1MetadataRootTree` duplicates `strategy.GetMetadataBranchTree`** (strategy/common.go:686). The body is identical except for an origin remote-tracking fallback — which is `strategy.GetRemoteMetadataBranchTree` (strategy/common.go:916). Replace `loadV1MetadataRootTree` with: `tree, err := strategy.GetMetadataBranchTree(repo); if err != nil { tree, err = strategy.GetRemoteMetadataBranchTree(repo) }`. Or, since `getMetadataTree` already returns a tree, drop `loadV1MetadataRootTree` entirely and have `prefetchCheckpointBlobs` accept the tree from `getMetadataTree`.
+
+3. **No general "navigate to tree path" helper exists** — `cpSubtree, _ := rootTree.Tree(cpID.Path())` is the idiomatic go-git pattern; resume.go:344 does the same thing. Keep as-is.
+
+4. **The exact fetch chain `FetchMetadataFromCheckpointRemote → FetchMetadataTreeOnly → FetchMetadataBranch` is implemented as `getMetadataTree` (item 1).** The new helpers reimplement only the fetching half and lose the freshness guarantee.
+
+**Net suggestion:** delete `fetchV1MetadataWithFallback`, `fetchV2MetadataWithFallback`, and `loadV1MetadataRootTree`. Call `getMetadataTree`/`getV2MetadataTree` instead — fewer ~40 lines, plus the diff's documented stale-storer concern gets handled correctly. User-visible: identical fallback order, but the post-fetch lookup actually sees the new packfiles.</result>
+<usage><total_tokens>380207</total_tokens><tool_uses>7</tool_uses><duration_ms>45675</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a6e5574c38ce44767</task-id>
+<tool-use-id>toolu_012oCAtUJyfmPsJL7jJsZSrs</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/068a5de0-262f-45ec-925b-1f12a57286b8/tasks/a6e5574c38ce44767.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Restating: efficiency review of commit f26c0a047 in `cli_experiments` repo, five concerns.
+
+**1. `blobOnDisk` per-blob subprocess in `collectMissingBlobs`**: confirmed N subprocesses for N missing-from-storer blobs (line 156). For typical checkpoint subtree (~5 blobs, 1 deep), trivial. For a tree with hundreds, real overhead. Minimal fix: batch with `git cat-file --batch-check=%(objectname) %(objecttype)` over a single stdin pipe:
+```go
+cmd := exec.CommandContext(t.ctx, "git", "cat-file", "--batch-check=%(objectname)")
+stdin, _ := cmd.StdinPipe()
+go func() { for _,h := range candidates { fmt.Fprintln(stdin, h) }; stdin.Close() }()
+out, _ := cmd.Output()
+// Parse: lines like "&lt;sha&gt;" for found, "&lt;sha&gt; missing" for absent.
+```
+Speedup: one process spawn + parse vs N. Worth it if you ever scan large trees.
+
+**2. Fast-path overhead in `File()`**: confirmed clean (lines 67–71). go-git hit returns immediately; no extra work. ✓
+
+**3. `prefetchCheckpointBlobs` always runs**: walks the cp subtree (fast, in-memory tree object) → collectMissingBlobs which now spawns ~5 `cat-file -e` subprocesses on a fully-cached repo. ~5–25ms/run wasted. Fix via #1's batch approach makes this a single subprocess (~2–5ms). Or short-circuit: skip prefetch when `t.storer.HasEncodedObject` returns nil for the cp metadata.json (storer-truthful case).
+
+**4. Three sequential fetches per fallback fn**: each is a separate `git fetch` to potentially different remotes (checkpoint_remote URL → origin → origin), so SSH multiplexing won't naturally help. They're correctly short-circuited: first success returns. ✓ Not parallelizable—order matters (cheapest first).
+
+**5. v2 chain gating** (explain.go ~line 504): `if lookup.preferCheckpointsV2 { ... }` correctly gates the entire v2 fetch chain. With the user's `prefer_v2: false`, v2 chain is skipped. ✓
+
+Net: only #1+#3 are real; bundle them as the batch-check optimization.</result>
+<usage><total_tokens>379863</total_tokens><tool_uses>2</tool_uses><duration_ms>30794</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3dfc4b2e83b26337</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/068a5de0-262f-45ec-925b-1f12a57286b8/tasks/a3dfc4b2e83b26337.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>**Reviewing commit f26c0a047 — code-quality findings:**
+
+**1. Copy-paste in `fetchV1/V2MetadataWithFallback`** ✓ real issue. ~30 lines each, identical structure, only fetcher fns + log strings differ. Minimal fix:
+
+```go
+func fetchWithFallback(ctx context.Context, label string, fetchers []func(context.Context) error) bool {
+    names := []string{"checkpoint_remote", "treeless origin", "full origin"}
+    for i, f := range fetchers {
+        if err := f(ctx); err == nil {
+            logging.Debug(ctx, "explain "+label+" fetch: "+names[i]+" succeeded")
+            return true
+        } else {
+            logging.Debug(ctx, "explain "+label+" fetch: "+names[i]+" failed", slog.String("error", err.Error()))
+        }
+    }
+    return false
+}
+// callers:
+fetchWithFallback(ctx, "v1", []func(context.Context)error{FetchMetadataFromCheckpointRemote, FetchMetadataTreeOnly, FetchMetadataBranch})
+fetchWithFallback(ctx, "v2", []func(context.Context)error{FetchV2MetadataFromCheckpointRemote, FetchV2MainTreeOnly, FetchV2MainRef})
+```
+
+**2. WHAT-comments to delete:**
+- `FetchingTree.File`: `// 1. Fast path: blob available in go-git's storer.` / `// We need the entry to get the blob hash for the cat-file / fetch paths.` / `// 3. Blob isn't on disk at all — fetch from the remote.` — the docstring already lists these steps; the inline numbering just narrates.
+- `prefetchCheckpointBlobs` body has no narrating comments — clean.
+- `loadV1MetadataRootTree` body has no comments — clean.
+- Inline `// Batch-prefetch all blobs in the checkpoint's subtree...` above the call — function name says it; only the "Best-effort: …" half is non-obvious. Keep one line: `// Best-effort: per-File fetcher recovers if this fails.`
+- Inline above `SetBlobFetcher` is good (explains rationale, non-obvious).
+
+**3. `fetchV2MetadataWithFallback(ctx) || anyFetched`** — semantic change is correct &amp; intentional: v2 always runs (operand is LHS), result OR'd with v1's bool. v1 and v2 are independent stores, so always trying both is right. Confirmed.
+
+**4. `prefetchCheckpointBlobs` cost when warm** — PreFetch's `collectMissingBlobs` now spawns `git cat-file -e` per blob (your change at line 156). For warm checkpoint with ~5 blobs that's 5 subprocess fork/execs (~25ms). Real cost. Cheap mitigation: skip prefetch if `lookup.committed` entry has `len(FilesTouched) &gt; 0` (signals cp metadata.json already read successfully during ListCommitted, blobs likely local). Or just accept it — the warm overhead is small relative to binary startup.
+
+**5. `loadV1MetadataRootTree`** ✓ leaky/duplicate. Identical logic exists at `strategy.GetMetadataBranchTree` (common.go:686) minus the remote-tracking fallback, which exists privately at `checkpoint.GitStore.getSessionsBranchTree`. Three copies of the same walk. Minimal fix: export the checkpoint version (`(s *GitStore) ResolveSessionsBranchTree() (*object.Tree, error)`) and call from explain via `lookup.v1Store.ResolveSessionsBranchTree()`. Removes the new function entirely.</result>
+<usage><total_tokens>384653</total_tokens><tool_uses>5</tool_uses><duration_ms>71379</duration_ms></usage>
+</task-notification>

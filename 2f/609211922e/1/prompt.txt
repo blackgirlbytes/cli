@@ -1,0 +1,100 @@
+Implement the following plan:
+
+# Plan: Update e2e-test-prompt.md for Consolidated E2E Infrastructure
+
+## Context
+
+Commit `83edba93` ("Consolidate E2E test suite into cli repo") moved the entire E2E test infrastructure from `cmd/entire/cli/e2e_test/` into a new top-level `e2e/` directory with a completely restructured architecture. The skill file at `.claude/skills/agent-integration/e2e-test-prompt.md` still references the old paths, types, patterns, and commands. It needs a full rewrite to match the new infrastructure.
+
+## Key Changes to Reflect
+
+| Aspect | Old | New |
+|--------|-----|-----|
+| Test location | `cmd/entire/cli/e2e_test/` | `e2e/` (multiple packages) |
+| Agent abstraction | `AgentRunner` interface in `agent_runner.go` | `Agent` interface in `e2e/agents/agent.go` |
+| Setup | `setup_test.go` (`TestMain`) | `e2e/tests/main_test.go` |
+| Repo helpers | `testenv.go` (`TestEnv`, `NewFeatureBranchEnv`) | `e2e/testutil/repo.go` (`RepoState`, `SetupRepo`, `ForEachAgent`) |
+| Assertions | `assertions.go` | `e2e/testutil/assertions.go` (much richer) |
+| Prompts file | `prompts.go` (`PromptTemplate`) | Removed — prompts are inline in tests |
+| Entire CLI wrapper | N/A | `e2e/entire/entire.go` |
+| Metadata types | N/A | `e2e/testutil/metadata.go` |
+| Artifacts | Manual | `e2e/testutil/artifacts.go` (automatic via t.Cleanup) |
+| Interactive sessions | N/A | `e2e/agents/tmux.go` (tmux PTY) |
+| Package names | `package e2e` (single) | `agents`, `testutil`, `tests`, `entire` |
+| Build command | `go test -c -tags=e2e ./cmd/entire/cli/e2e_test` | `go test -c -tags=e2e ./e2e/tests` |
+| Run commands | `E2E_AGENT=$SLUG go test -tags=e2e ...` | `mise run test:e2e:$SLUG TestFoo` |
+| Agent runner pattern | `AgentRunner` struct + `NewAgentRunner` factory | `Agent` interface + `Register()` in `init()` |
+| Concurrency | Manual | `RegisterGate()` + `ForEachAgent` auto-gating |
+| Timeout | Hardcoded | `TimeoutMultiplier()` per agent |
+| Transient errors | Manual | `IsTransientError()` + auto-retry |
+
+## File to Modify
+
+- `.claude/skills/agent-integration/e2e-test-prompt.md`
+
+## Files to Reference (read-only)
+
+- `e2e/agents/agent.go` — `Agent` interface, `Register()`, `RegisterGate()`
+- `e2e/agents/claude.go`, `gemini.go`, `opencode.go` — existing implementations
+- `e2e/agents/tmux.go` — `TmuxSession` for interactive tests
+- `e2e/tests/main_test.go` — `TestMain` setup
+- `e2e/testutil/repo.go` — `RepoState`, `SetupRepo`, `ForEachAgent`
+- `e2e/testutil/assertions.go` — assertion helpers
+- `e2e/testutil/metadata.go` — `CheckpointMetadata`, `SessionMetadata`
+- `e2e/testutil/artifacts.go` — artifact capture
+- `e2e/entire/entire.go` — CLI wrapper (`Enable`, `RewindList`, etc.)
+- `e2e/README.md` — full docs for the new structure
+
+## Implementation
+
+Rewrite the skill file to:
+
+1. **Update Step 1** — Replace old file references with new package structure:
+   - `e2e/tests/main_test.go` (TestMain, preflight, bootstrap)
+   - `e2e/testutil/repo.go` (RepoState, SetupRepo, ForEachAgent)
+   - `e2e/agents/agent.go` (Agent interface, Register, RegisterGate)
+   - `e2e/agents/tmux.go` (TmuxSession for interactive tests)
+   - `e2e/testutil/assertions.go` (checkpoint, file, session assertions)
+   - `e2e/testutil/metadata.go` (CheckpointMetadata, SessionMetadata types)
+   - `e2e/entire/entire.go` (CLI wrapper for entire commands)
+   - `e2e/testutil/artifacts.go` (automatic artifact capture)
+
+2. **Update Step 2** — Change glob to `e2e/tests/*_test.go`; remove mention of `PromptTemplate` (prompts are inline now)
+
+3. **Keep Step 3** — `docs/architecture/checkpoint-scenarios.md` still exists
+
+4. **Rewrite Step 4 (Create Agent)** — Replace `AgentRunner` pattern with new `Agent` interface:
+   - New file: `e2e/agents/${agent_slug}.go`
+   - Implement `Agent` interface methods: `Name()`, `Binary()`, `EntireAgent()`, `PromptPattern()`, `TimeoutMultiplier()`, `RunPrompt()`, `StartSession()`, `Bootstrap()`, `IsTransientError()`
+   - Call `Register()` in `init()`
+   - Optionally call `RegisterGate()` for rate-limited agents
+   - Show updated code pattern
+
+5. **Rewrite Step 5 (Update TestEnv)** — Replace with "Update SetupRepo (if needed)": check if `testutil.SetupRepo` needs agent-specific config (like OpenCode's `opencode.json`)
+
+6. **Rewrite Step 6 (Write Tests)** — Update to reflect `ForEachAgent` pattern, inline prompts, new assertion helpers; mention `e2e/README.md` as canonical reference
+
+7. **Rewrite Step 7 (Verify)** — Update compile command to `go test -c -tags=e2e ./e2e/tests` and run commands to `mise run test:e2e:$SLUG`
+
+8. **Update Key Conventions** — New package names, `ForEachAgent` instead of `NewFeatureBranchEnv`, remove `PromptTemplate` reference, add `e2e/README.md` reference, update run commands
+
+## Verification
+
+- Read the updated skill file to confirm all old paths/types are gone
+- Grep for any remaining references to old paths (`e2e_test`, `AgentRunner`, `NewFeatureBranchEnv`, `PromptTemplate`, `setup_test.go`, `testenv.go`)
+- Verify the new Agent interface pattern matches what's actually in `e2e/agents/agent.go`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/34854f42-f71b-43f2-8dbf-f1a9f1970dae.jsonl
+
+---
+
+I don't like the names of the md files in the agent-integration skill
+
+---
+
+prob is really an agent / entire evaluator. e2e test is a test writer and implement-prompt is really an agent implementer. need better names
+
+---
+
+[Request interrupted by user for tool use]

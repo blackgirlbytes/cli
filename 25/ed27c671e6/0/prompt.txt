@@ -1,0 +1,343 @@
+Implement the following plan:
+
+# Fix: ACTIVE mid-turn agent commits skip condensation due to overlap check
+
+## Context
+
+When an agent modifies files in Turn 1 (e.g., `.gitstats_cache.sqlite3` as a side-effect), then in Turn 2 modifies *different* files and commits them (`README.md`, `org_commit_activity.py`), the post-commit hook's `shouldCondenseWithOverlapCheck` incorrectly skips condensation. This is because it checks if Turn 1's tracked files overlap with the committed files — they don't, so condensation is skipped. The `Entire-Checkpoint` trailer is added to the commit (by `PrepareCommitMsg`), but no corresponding data appears on `entire/checkpoints/v1`.
+
+This bug is agent-agnostic — it's in the strategy layer, not tied to any specific agent.
+
+## The Fix
+
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks.go` (~line 663)
+
+In `shouldCondenseWithOverlapCheck`, add an early return for ACTIVE sessions:
+
+```go
+func (h *postCommitActionHandler) shouldCondenseWithOverlapCheck(isActive bool) bool {
+    if !h.hasNew {
+        return false
+    }
+    // ACTIVE sessions: always condense when hasNew is true.
+    // PrepareCommitMsg already validated this commit is session-related
+    // (added trailer). The overlap check is only meaningful for IDLE/ENDED
+    // sessions where we need to determine if an unrelated commit happened.
+    if isActive {
+        return true
+    }
+    if len(h.filesTouchedBefore) == 0 {
+        return false // IDLE/ENDED: no files tracked = no overlap evidence
+    }
+    // ... rest of overlap check for IDLE/ENDED sessions unchanged
+}
+```
+
+**Rationale:** For ACTIVE sessions, a commit happening mid-turn is definitionally session-related — the agent is running. The overlap check only makes sense for IDLE/ENDED sessions where we need heuristic evidence that a commit was related to the session.
+
+## Implementation Order (TDD)
+
+### Step 1: Unit test (expect failure)
+
+**File:** `cmd/entire/cli/strategy/phase_postcommit_test.go`
+
+Add `TestPostCommit_ActiveSession_DifferentFilesThanCommit_ShouldCondense`:
+- Session phase: ACTIVE, with checkpoints (`hasNew = true`)
+- `filesTouchedBefore`: `[".gitstats_cache.sqlite3"]` (from Turn 1)
+- Committed files: `["README.md", "org_commit_activity.py"]` (from Turn 2, no overlap)
+- **Expected**: Condensation happens (currently fails — returns false)
+
+Also update existing test `TestPostCommit_StaleActiveSession_NotCondensed`:
+- This test has an ACTIVE session with stale `LastInteraction` and no overlap
+- With the fix, ACTIVE sessions always condense, so this test's expectation needs updating
+- The "stale active" scenario is actually fine to condense — if the session is ACTIVE, it's still running
+
+### Step 2: Integration test (expect failure)
+
+**File:** `cmd/entire/cli/integration_test/mid_session_commit_test.go` (new)
+
+Test scenario:
+1. Create repo with initial commit
+2. Start session (simulate `UserPromptSubmit` → ACTIVE)
+3. Save checkpoint touching file A (e.g., `cache.db`)
+4. Simulate agent committing different files (B, C) mid-turn:
+   - Run `PrepareCommitMsg` hook → adds trailer
+   - Run `git commit`
+   - Run `PostCommit` hook → should condense
+5. Assert: `entire/checkpoints/v1` branch exists with checkpoint data
+
+Use existing `TestEnv` patterns from `cmd/entire/cli/integration_test/`:
+- `NewFeatureBranchEnv(t)` for repo setup
+- `SimulateSessionStart()` / hook helpers for session lifecycle
+- `AssertCheckpointBranchExists()` type assertions
+
+### Step 3: E2E test (optional, user requested)
+
+**File:** `e2e/tests/mid_turn_commit_test.go` (new)
+
+Test with real agent:
+1. Agent Turn 1: create a file (tracked as touched)
+2. Agent Turn 2: modify a different file and commit it
+3. Verify `entire/checkpoints/v1` has the checkpoint
+
+Note: E2E tests cost real API tokens. Will add the test file but it should only be run when explicitly requested.
+
+### Step 4: Apply the fix
+
+Modify `shouldCondenseWithOverlapCheck` as described above.
+
+### Step 5: Verify all tests pass
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+## Key Files
+
+- `cmd/entire/cli/strategy/manual_commit_hooks.go:663` — Bug location (`shouldCondenseWithOverlapCheck`)
+- `cmd/entire/cli/strategy/phase_postcommit_test.go` — Existing post-commit unit tests
+- `cmd/entire/cli/integration_test/` — Integration test directory
+- `cmd/entire/cli/integration_test/helpers_test.go` — TestEnv and helper functions
+- `e2e/tests/` — E2E test directory
+- `cmd/entire/cli/session/phase.go` — Phase state machine (ACTIVE/IDLE/ENDED transitions)
+
+## Verification
+
+1. Run unit test alone first to confirm it fails before fix: `go test ./cmd/entire/cli/strategy/ -run TestPostCommit_ActiveSession_DifferentFiles -v`
+2. Run integration test to confirm it fails: `mise run test:integration`
+3. Apply fix
+4. Run full suite: `mise run fmt && mise run lint && mise run test:ci`
+5. Optionally run E2E: `mise run test:e2e` (only if user requests)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.claude/projects/-Users-soph-Work-entire-devenv-cli/4e0ecf4a-16bf-4eeb-b8b8-aa44b7b5a6ed.jsonl
+
+---
+
+│ Also update existing test TestPostCommit_StaleActiveSession_NotCondensed:                                                                                                      │
+│ - This test has an ACTIVE session with stale LastInteraction and no overlap                                                                                                    │
+│ - With the fix, ACTIVE sessions always condense, so this test's expectation needs updating                                                                                     │
+│ - The "stale active" scenario is actually fine to condense — if the session is ACTIVE, it's still running
+
+I'm struggling with this now, can you expand a bit the reasoning?
+
+---
+
+> The 1-hour threshold is deliberately generous — long agent turns (complex refactoring) can take many minutes,
+
+But in this happy path scenario, we would also get a new hook with the tool call when the "git commit" is called, right? Or no, right now we wouldn't since we only look for task tools (at least with claude, but not sure with OpenCode?)
+
+---
+
+I wonder if we could introduce a generic "alive" hook, that we configure in more places where hooks are called and by that get a better signaling if a session is still alive.
+
+---
+
+but we couldn't do it for the other agents, so there we would need to keep the 24h treshold, right?
+
+---
+
+yes, use 24h for now
+
+---
+
+clarification question: how could hasNew be true if the session is in IDLE/ENDED?
+
+---
+
+the change in manual_commit_hooks.go:683:686 isn't that the same as the old `return isActive` ?
+
+---
+
+but we did not add an e2e test, you think it's not necessary?
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Initial Request**: User provided a detailed plan to fix a bug where ACTIVE mid-turn agent commits skip condensation due to overlap check in `shouldCondenseWithOverlapCheck`. The plan included TDD steps: write failing tests first, then apply fix, then verify.
+
+2. **My Initial Implementation**: I read the key files, understood the codebase, created tasks, and implemented:
+   - Unit test `TestPostCommit_ActiveSession_DifferentFilesThanCommit_ShouldCondense`
+   - Updated `TestPostCommit_StaleActiveSession_NotCondensed` → renamed to `TestPostCommit_StaleActiveSession_AlsoCondensed` (expecting stale sessions to also be condensed)
+   - Integration test `TestShadowStrategy_MidTurnCommit_DifferentFilesThanCheckpoint`
+   - Fix: added `if isActive { return true }` early return in `shouldCondenseWithOverlapCheck`
+   - All tests passed
+
+3. **User's First Feedback**: User questioned the stale session test change, asking for expanded reasoning. I traced through the code and realized the "zombie session" problem - a stale ACTIVE session would be condensed into every commit forever because:
+   - After condensation, carry-forward recreates shadow branch
+   - `hasNew = true` unconditionally for ACTIVE
+   - No guard against repeated condensation
+
+4. **Revised Approach**: I changed the fix to use `LastInteractionTime` as a discriminator:
+   - `isActive && isRecentInteraction(lastInteraction)` → skip overlap check
+   - Stale sessions (old LastInteractionTime) → fall through to overlap check
+   - Added `isRecentInteraction` helper with 1-hour threshold
+   - Reverted stale session test back to original expectations (NOT condensed)
+   - Updated function signature to pass `lastInteraction *time.Time`
+
+5. **User's Second Feedback**: User pointed out that `LastInteractionTime` only updates on agent lifecycle hooks (TurnStart, TurnEnd), NOT on individual tool calls or git hooks. A long refactoring turn could exceed 1 hour. The git commit action doesn't fire an agent hook that updates LastInteractionTime.
+
+6. **Threshold Update**: I changed from 1 hour to 24 hours, with updated comments explaining the rationale. No single agent turn lasts a full day.
+
+7. **User's Third Feedback (Alive Hook Discussion)**: User suggested introducing a generic "alive" hook configured in more places. I researched the hook architecture across all agents and presented options. We discussed that:
+   - Gemini already has per-tool hooks (`after-tool *`)
+   - Claude Code only hooks Task and TodoWrite
+   - OpenCode/Cursor have no per-tool hooks
+   - Adding an Alive hook would still need the 24h fallback for agents without per-tool support
+   - User agreed to keep 24h threshold for now
+
+8. **User's Fourth Feedback**: User pointed out that lines 683-686 (`if isActive { return true }` inside the `filesTouchedBefore == 0` check) was the same as the old `return isActive` behavior, defeating the staleness guard for stale sessions with no files tracked. I simplified it to just `return false` for all phases when no files tracked.
+
+9. **User's Fifth Feedback**: User asked about E2E tests, noting we hadn't added one. I started looking at the E2E test structure.
+
+10. **Summary Request**: User asked for a summary before I finished writing the E2E test.
+
+Key files modified:
+- `cmd/entire/cli/strategy/manual_commit_hooks.go` - The fix
+- `cmd/entire/cli/strategy/phase_postcommit_test.go` - Unit tests
+- `cmd/entire/cli/integration_test/mid_session_commit_test.go` - Integration test
+
+Key errors:
+- StepCount assertion wrong (expected 0, got 1) because carry-forward increments it
+- Stale session test initially changed to "also condensed" but had to be reverted
+- `filesTouchedBefore == 0 && isActive` was same as old behavior
+
+Current state: All tests pass (fmt, lint, test:ci). E2E test was about to be written.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to implement a plan fixing a bug where ACTIVE mid-turn agent commits skip condensation due to the overlap check in `shouldCondenseWithOverlapCheck`. The scenario: Turn 1 touches file A (e.g., `.gitstats_cache.sqlite3`), Turn 2 commits different files B and C (`README.md`, `org_commit_activity.py`). The overlap check incorrectly skips condensation because `filesTouchedBefore` (from Turn 1) doesn't overlap with committed files (from Turn 2). The `Entire-Checkpoint` trailer is added but no data appears on `entire/checkpoints/v1`. The user requested TDD approach: write failing tests, then fix, then verify.
+
+   Through iterative feedback, the user refined the approach:
+   - Challenged blind `isActive` skip of overlap check due to zombie session concerns
+   - Pointed out `LastInteractionTime` only updates on lifecycle hooks, not tool calls
+   - Suggested an "alive" hook concept (deferred to future work)
+   - Caught a code path that replicated the old buggy behavior
+   - Asked about E2E test coverage
+
+2. Key Technical Concepts:
+   - **Session Phase State Machine**: ACTIVE/IDLE/ENDED phases with event-driven transitions
+   - **Shadow branches**: `entire/<commit-hash[:7]>-<worktreeHash[:6]>` for temporary checkpoint storage
+   - **Condensation**: Moving session data from shadow branches to `entire/checkpoints/v1` permanent branch
+   - **Carry-forward**: After condensation, uncommitted agent files are preserved on a new shadow branch with `StepCount = 1`
+   - **`shouldCondenseWithOverlapCheck`**: Guard that prevents sessions from being condensed into unrelated commits
+   - **`hasNew`**: For ACTIVE sessions, unconditionally `true` (line 915-916). For IDLE/ENDED, determined by `sessionHasNewContent()`
+   - **`LastInteractionTime`**: Updated only on agent lifecycle events (TurnStart, TurnEnd, SessionStop, Compaction), NOT on individual tool calls or git hooks
+   - **Zombie/stale session**: ACTIVE session where agent was killed without Stop hook firing - stuck in ACTIVE forever
+   - **`activeSessionInteractionThreshold`**: 24 hours - generous because LastInteractionTime reflects TurnStart, not last tool call
+   - **Hook architecture**: Claude Code hooks Task+TodoWrite only; Gemini has per-tool wildcard hooks; OpenCode/Cursor have no per-tool hooks
+
+3. Files and Code Sections:
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** - Contains the bug and fix
+     - Added `"time"` import
+     - Modified `shouldCondenseWithOverlapCheck` signature and logic (the core fix)
+     - Added `activeSessionInteractionThreshold` constant and `isRecentInteraction` helper
+     - Updated both callers (`HandleCondense`, `HandleCondenseIfFilesTouched`) to pass `state.LastInteractionTime`
+     - Current state of the fix:
+     ```go
+     const activeSessionInteractionThreshold = 24 * time.Hour
+
+     func isRecentInteraction(lastInteraction *time.Time) bool {
+         return lastInteraction != nil && time.Since(*lastInteraction) < activeSessionInteractionThreshold
+     }
+
+     func (h *postCommitActionHandler) shouldCondenseWithOverlapCheck(isActive bool, lastInteraction *time.Time) bool {
+         if !h.hasNew {
+             return false
+         }
+         if isActive && isRecentInteraction(lastInteraction) {
+             return true
+         }
+         if len(h.filesTouchedBefore) == 0 {
+             return false // No files tracked = no overlap evidence
+         }
+         // ... rest of overlap check for IDLE/ENDED/stale-ACTIVE unchanged
+     }
+     ```
+     - Callers updated:
+     ```go
+     // HandleCondense (line 601)
+     shouldCondense := h.shouldCondenseWithOverlapCheck(state.Phase.IsActive(), state.LastInteractionTime)
+     // HandleCondenseIfFilesTouched (line 624)
+     shouldCondense := len(state.FilesTouched) > 0 && h.shouldCondenseWithOverlapCheck(state.Phase.IsActive(), state.LastInteractionTime)
+     ```
+
+   - **`cmd/entire/cli/strategy/phase_postcommit_test.go`** - Unit tests
+     - Added `TestPostCommit_ActiveSession_DifferentFilesThanCommit_ShouldCondense`: ACTIVE session with recent `LastInteractionTime`, `filesTouchedBefore=[".gitstats_cache.sqlite3"]`, committed files=`["README.md", "org_commit_activity.py"]`. Expects condensation + carry-forward (`StepCount=1`).
+     - Updated `TestPostCommit_StaleActiveSession_NotCondensed`: Set `LastInteractionTime` to 48 hours ago, kept original expectations that stale session is NOT condensed. Added recent `LastInteractionTime` to the new ACTIVE session so it IS condensed.
+
+   - **`cmd/entire/cli/integration_test/mid_session_commit_test.go`** - Integration test
+     - Added `TestShadowStrategy_MidTurnCommit_DifferentFilesThanCheckpoint`: Full flow - start session → stop (saves `cache.db` checkpoint) → reactivate → agent commits different files (`README.md`, `main.py`) mid-turn → verify `entire/checkpoints/v1` exists with checkpoint data.
+
+   - **`cmd/entire/cli/session/phase.go`** - Read for understanding state machine transitions
+     - ACTIVE + GitCommit → ACTIVE + ActionCondense (line 209-212)
+     - ActionCondense calls HandleCondense which calls shouldCondenseWithOverlapCheck
+
+   - **`cmd/entire/cli/session/state.go`** - Read for understanding staleness
+     - `LastInteractionTime` field (line 90)
+     - `IsStale()` method uses 7-day `StaleSessionThreshold`
+     - `LastInteractionTime` updated on TurnStart, TurnEnd, SessionStop, NOT on GitCommit
+
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go:872-927`** - PostCommit session processing
+     - `hasNew = true` unconditionally for ACTIVE sessions (line 915-916)
+     - `sessionHasNewContent()` for IDLE/ENDED sessions
+     - Carry-forward logic at lines 950-967 with `carryForwardToNewShadowBranch`
+     - `carryForwardToNewShadowBranch` sets `StepCount = 1` (line 2216)
+
+   - **E2E test files read** for pattern reference:
+     - `e2e/tests/single_session_test.go` - `ForEachAgent`, `RunPrompt`, `WaitForCheckpoint`, `AssertCheckpointAdvanced` patterns
+     - `e2e/tests/split_commits_test.go` - Multi-commit checkpoint flow
+     - `e2e/tests/subagent_commit_flow_test.go` - Agent commit mid-turn pattern
+
+4. Errors and fixes:
+   - **StepCount assertion (expected 0, got 1)**: The new unit test initially asserted `StepCount == 0` after condensation, but carry-forward for uncommitted files (`.gitstats_cache.sqlite3`) sets `StepCount = 1`. Fixed by changing assertion to expect 1 with explanation.
+   - **Stale session test expectations**: Initially renamed test to `AlsoCondensed` expecting stale sessions to be condensed. User challenged this reasoning, pointing out the zombie session problem (infinite condensation cycle). Reverted test back to `NotCondensed` and added `LastInteractionTime`-based guard.
+   - **1-hour threshold too short**: User pointed out `LastInteractionTime` only updates at TurnStart, not on tool calls. A 90-minute turn would exceed 1 hour. Changed to 24 hours with detailed comment explaining why.
+   - **`filesTouchedBefore == 0 && isActive` same as old behavior**: User caught that lines 683-686 (`if isActive { return true }`) inside the empty-files check was identical to the old `return isActive` behavior, letting stale ACTIVE sessions with no tracked files bypass the guard. Simplified to `return false` for all phases when no files tracked.
+
+5. Problem Solving:
+   - Core bug: ACTIVE sessions with different files across turns skipping condensation → fixed by checking `LastInteractionTime` to skip overlap check for genuinely-active sessions
+   - Zombie session prevention: Stale ACTIVE sessions must still go through overlap check → solved by `isRecentInteraction` guard with 24h threshold
+   - Alive hook concept: Discussed adding per-tool hooks to get fresher `LastInteractionTime` signals → deferred to future work since it wouldn't help all agents (OpenCode/Cursor lack per-tool hooks)
+
+6. All user messages:
+   - "Implement the following plan: [detailed plan for fixing ACTIVE mid-turn agent commits skip condensation]"
+   - "I'm struggling with this now, can you expand a bit the reasoning?" (about updating the stale active session test)
+   - "But in this happy path scenario, we would also get a new hook with the tool call when the 'git commit' is called, right? Or no, right now we wouldn't since we only look for task tools (at least with claude, but not sure with OpenCode?)"
+   - "I wonder if we could introduce a generic 'alive' hook, that we configure in more places where hooks are called and by that get a better signaling if a session is still alive."
+   - "but we couldn't do it for the other agents, so there we would need to keep the 24h treshold, right?"
+   - "yes, use 24h for now"
+   - "the change in manual_commit_hooks.go:683:686 isn't that the same as the old `return isActive` ?"
+   - "but we did not add an e2e test, you think it's not necessary?"
+
+7. Pending Tasks:
+   - Write E2E test for mid-turn commit with different files (user just asked about this)
+   - The E2E test should go in `e2e/tests/` following existing patterns with `ForEachAgent`, `RunPrompt`, etc.
+
+8. Current Work:
+   All code changes are complete and passing (fmt, lint, test:ci). I was about to write an E2E test when the user asked "but we did not add an e2e test, you think it's not necessary?" I had just read the E2E test patterns from `single_session_test.go`, `split_commits_test.go`, and `subagent_commit_flow_test.go` to understand the structure. The test needs to:
+   1. Agent Turn 1: create a file (tracked as touched)
+   2. Agent Turn 2: modify a different file and commit it
+   3. Verify `entire/checkpoints/v1` has the checkpoint
+
+9. Optional Next Step:
+   Write the E2E test file at `e2e/tests/mid_turn_commit_test.go`. The user's most recent message was: "but we did not add an e2e test, you think it's not necessary?" — I responded that an E2E test would be valuable and started reading the test patterns. The test should follow the `ForEachAgent` pattern seen in existing E2E tests, with two prompts (Turn 1 creates file A, Turn 2 creates+commits different files B,C) and verification that `entire/checkpoints/v1` has the checkpoint data.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.claude/projects/-Users-soph-Work-entire-devenv-cli/f766655b-80c9-49b8-8734-8bf7b86bdd8d.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+Unknown skill: simplify
+
+---
+
+can you run simplifier
+
+---
+
+The E2E test makes sense because it will run against any new agent. Maybe we could flag this on the E2E test and maybe we separate the tests in the future into "should always run" and "only run on new agents"

@@ -1,0 +1,20 @@
+Refactor CheckpointGitCommand, let's add that to checkpoint/remote. Ideally at a higher abstraction level (e.g. Fetch, Push and LsRemote). Are there any additional use cases?
+
+---
+
+Show commit message and ask confirmation before committing changes
+
+---
+
+Create an additional E2E test that ensures that an `entire resume` does a full fetch (no filters) for a given branch, regardless of whether or not the repository is configured with partial clone.
+
+---
+
+1) FetchBlobsByHash now uses remote.Fetch, which adds --filter=blob:none when the setting is enabled. The old code intentionally did not call AppendFetchFilterArgs here. This is semantically contradictory — the function's purpose is to download specific blob objects by hash, but the filter tells git to exclude blobs from the packfile. This can cause the fetch to fail unnecessarily, triggering an expensive full-metadata-branch fallback. Additionally, resolveCheckpointFetchTarget can return "origin" (a remote name), which combined with --filter also persists promisor settings.
+
+For this, lets create a new FetchBlobs in the remote package. This should be its own execution path.
+
+
+2) FetchAndCheckoutRemoteBranch passes "origin" (a remote name) to remote.Fetch, which now unconditionally adds --filter=blob:none when the filtered-fetches setting is enabled. The old code used strategy.CheckpointGitCommand directly and never called AppendFetchFilterArgs, so no filter was added. This regression combines --filter=blob:none with the remote name "origin", which causes git to persist remote.origin.promisor=true and remote.origin.partialclonefilter=blob:none into .git/config, polluting all future fetches. The fix is to either call remote.ResolveFetchTarget first (like other callers do) or skip the filter for this call site.
+
+Is this still the case? What options do we have here?

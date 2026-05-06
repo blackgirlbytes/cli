@@ -1,0 +1,110 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "0a6755b0f24f",
+  "session_id": "6408b42b-dd62-42c9-91f4-aee6ccf53330",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-29T07:02:05.625117Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 17,
+  "files_touched": [
+    "cmd/entire/cli/facets/facets.go",
+    "cmd/entire/cli/facets/facets_test.go",
+    "cmd/entire/cli/insightsdb/queries.go",
+    "cmd/entire/cli/skilldb/cache.go",
+    "cmd/entire/cli/skilldb/cache_test.go",
+    "cmd/entire/cli/skilldb/discovery.go",
+    "cmd/entire/cli/skilldb/queries.go",
+    "cmd/entire/cli/skilltui/keys.go",
+    "cmd/entire/cli/skilltui/picker.go",
+    "cmd/entire/cli/skilltui/render.go",
+    "cmd/entire/cli/skilltui/root.go",
+    "cmd/entire/cli/skilltui/styles.go",
+    "cmd/entire/cli/skilltui/tab_improve.go",
+    "cmd/entire/cli/skilltui/tab_stats.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "4515102b02b1",
+  "token_usage": {
+    "input_tokens": 806,
+    "cache_creation_tokens": 766721,
+    "cache_read_tokens": 32477349,
+    "output_tokens": 81252,
+    "api_call_count": 203
+  },
+  "session_metrics": {
+    "turn_count": 19
+  },
+  "summary": {
+    "intent": "Debug and fix the skill analytics TUI showing empty skill data, then iteratively improve the UI with filtering, deduplication, and visual fixes.",
+    "outcome": "Fixed the root cause (skill name mismatch between insights.db signals and discovered skills), resolved multiple UI bugs (panic, tab misalignment, duplicate rows, stale suggestions), and added repo/personal scope filtering. All changes committed.",
+    "learnings": {
+      "repo": [
+        "skill_signals in insights.db uses LLM-extracted names (e.g. 'e2e:triage', 'cli-e2e-failure-fix') while skilldb discovery uses filesystem-derived names (e.g. 'e2e') — exact match was the cause of 0/5 signals matching",
+        "insights.db has 2,084 sessions and 7 skill_signals; skill-analytics.db had 0 skill_sessions before the fix",
+        "owner_name and owner_email columns exist in the sessions schema but are empty for all 2,084 sessions — per-user filtering is not yet viable",
+        "The installed binary at /opt/homebrew/bin/entire is separate from the worktree build; testing fixes requires building /tmp/entire-dev manually",
+        "skill-analytics.db cache invalidation uses a tip key; adding a 'v2:' version prefix forces repopulation without manual cache clearing",
+        "Skill discovery only scanned .claude/skills/, .claude/commands/, .gemini/ inside repo root — missed ~/.claude/ personal skills and plugin/superpowers skills",
+        "Skills are discovered for both claude-code and gemini-cli source agents, creating duplicate names in the picker before deduplication was added"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/skilldb/cache.go",
+          "line": 52,
+          "end_line": 52,
+          "finding": "PopulateFromInsightsDB used exact string match skillMap[sig.SkillName] — any name mismatch silently skips the signal"
+        },
+        {
+          "path": "cmd/entire/cli/skilltui/tab_stats.go",
+          "line": 111,
+          "end_line": 111,
+          "finding": "renderSuccessRate panic: TotalFriction counts individual items (not sessions), so it can exceed TotalSessions, making barWidth - frictionFill negative in strings.Repeat"
+        },
+        {
+          "path": "cmd/entire/cli/skilltui/render.go",
+          "finding": "Tab underline misalignment: activeStart was calculated with len() (byte count) instead of lipgloss.Width() — '‹' and '›' are 3 bytes each but 1 display column"
+        },
+        {
+          "path": "cmd/entire/cli/skilltui/tab_improve.go",
+          "finding": "suggestions field on improveModel was never cleared in setData — caused stale suggestions from one skill to display on all other skills"
+        },
+        {
+          "path": "cmd/entire/cli/skilldb/queries.go",
+          "finding": "ListSkills reads from DB which does not store the Scope field — scope must be carried in-memory from DiscoverSkills, not persisted to DB"
+        }
+      ],
+      "workflow": [
+        "When a local binary fix isn't reflected in the running app, the installed system binary may be shadowing it — always verify which binary is executing",
+        "go fmt can automatically replace fmt.Sprintf(\"%d\", n) with strconv.Itoa(n), which then breaks compilation if strconv import is missing",
+        "Cache versioning (prefixing tip keys) is a clean way to force repopulation after schema/logic changes without requiring manual DB operations",
+        "For TUI column alignment with ANSI codes, lipgloss.Width() must be used instead of len() for any string that may contain color codes or multi-byte Unicode"
+      ]
+    },
+    "friction": [
+      "Multiple read retries on the same tool-results file for the PR diff — file wasn't being found or content was paginated",
+      "Binary not being rebuilt between test runs caused confusion about whether fixes were working ('all data is still empty')",
+      "go fmt silently changed strconv import requirement, causing a build failure after formatting",
+      "The f-key filter appeared to not work because the visual difference between active/inactive chips was too subtle — needed bracket markers to confirm toggle was functioning",
+      "Scope field lost in transit: set on DiscoveredSkill, never written to DB, then ListSkills returns rows without it — required reworking data flow to skip DB roundtrip for scope"
+    ],
+    "open_items": [
+      "owner_name and owner_email columns exist but are unpopulated — per-user 'My Usage' filter exists in UI but shows same data as 'All Users' until population pipeline is fixed",
+      "simplify and superpowers:writing-plans signals (2 of 5) still don't match any discovered skill — superpowers/plugin skills are intentionally excluded from discovery scope but represent real usage",
+      "The facet extraction prompt improvement (BuildPromptWithSkills) was added but the insights engine doesn't yet pass discovered skill names when calling Extract() — canonical name extraction is not yet active",
+      "Cross-repo memory loop enhancement (--scope=org flag using search API checkpoint domain) was identified as high-value but not implemented",
+      "QuerySkillSignalsForSkills now fetches ALL signals then filters in Go — could be inefficient at scale if skill_signals table grows large"
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-29T07:01:17.987997Z",
+    "agent_lines": 547,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 547,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

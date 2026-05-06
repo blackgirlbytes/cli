@@ -1,0 +1,123 @@
+Review the following feedback for this branch and apply changes as necessary. If the changes require large sweeping changes, avoid them for now - we can do it as a followup (assuming it's not a bug)
+
+  1. Redundant timestamp-fallback chain in repairOneV2GenerationMetadata
+
+  generation_repair.go:91:
+
+  gen, found, timestampErr := store.ComputeGenerationTimestampsFromTrees(treeHash, nil)
+  ...
+  if !found {
+      gen, found, timestampErr = store.ComputeGenerationCheckpointTimestamps(treeHash)
+      ...
+      if !found {
+          return false, nil
+      }
+  }
+
+  But ComputeGenerationCheckpointTimestamps is now defined in v2_generation.go:158 as:
+
+  func (s *V2GitStore) ComputeGenerationCheckpointTimestamps(rootTreeHash plumbing.Hash) (..., error) {
+      mainTree, _ := s.v2MainTree()
+      return s.ComputeGenerationTimestampsFromTrees(rootTreeHash, mainTree)
+  }
+
+  Internally it tries /main metadata first, then falls back to raw transcripts. So the first call (with mainTree=nil) only
+  attempts raw transcripts; the second call walks the same checkpoints again, attempting raw transcripts a second time. The
+  first call is dead weight unless you specifically want to skip /main — which the function is in the wrong position to decide.
+  Just call ComputeGenerationCheckpointTimestamps once.
+
+  2. Silent failure when no timestamps can be computed
+
+  Same block: when neither path finds timestamps, repairOneV2GenerationMetadata returns (false, nil) → counted as "Skipped" → no
+   warning printed. A generation whose timestamps can't be repaired looks identical to a generation whose generation.json was
+  already correct. That's exactly the kind of silent failure that makes "did the repair fix everything?" unanswerable.
+
+  Either return an error so it lands in Failed with a warning, or push a Warnings entry from repairV2GenerationMetadata for "no
+  timestamps available". Don't conflate "already correct" with "couldn't determine".
+
+  3. Triple-fallback in writeMigratedFullGeneration should invert
+
+  migrate.go:404:
+
+  gen, found, err := v2Store.ComputeGenerationTimestampsFromTrees(treeHash, nil)  // raw transcripts
+  if !found { gen, found, err = v2Store.ComputeGenerationCheckpointTimestamps(treeHash) }  // /main + raw
+  if !found { gen, found = generationMetadataFromMigratedSessions(checkpoints) }  // in-memory
+
+  We just wrote this tree from checkpoints two lines earlier — the in-memory Metadata.CreatedAt is the authoritative source. The
+   two tree walks are doing IO to rederive what we already have in memory. Invert: use in-memory first, tree-walk only as a
+  defensive check (or drop it). This also eliminates the third-fallback errors.New("no timestamps found") path that's
+  effectively unreachable when sessions have valid CreatedAt.
+
+  4. Package-global mutable batch size
+
+  migrate.go:159:
+
+  var migrateMaxCheckpointsPerGeneration = checkpoint.DefaultMaxCheckpointsPerGeneration
+
+  This exists so tests can shrink the batch. Combined with the project's t.Parallel() mandate (CLAUDE.md "Test Parallelization")
+   and the fact that migration tests touch global state, this is a race waiting to happen. Pass batch size into
+  newGenerationPacker as a parameter, default it from the constant in the production caller, override it via constructor in
+  tests.
+
+  5. Duplicate author identity across packages
+
+  migrate.go:165 and generation_repair.go:15:
+
+  const (
+      migrateAuthorName  = "Entire Migration"
+      migrateAuthorEmail = "migration@entire.dev"
+  )
+  // ...and separately...
+  const (
+      repairAuthorName  = "Entire Migration"
+      repairAuthorEmail = "migration@entire.dev"
+  )
+
+  Identical values, two definitions, two packages. Move to a single exported pair in checkpoint (alongside CreateCommit) and
+  have both call sites use it. The two-package split is what made this duplicate happen in the first place; without
+  consolidation it'll drift.
+
+  6. writeMigratedFullGeneration re-creates V2GitStore
+
+  migrate.go:409: v2Store := checkpoint.NewV2GitStore(repo, migrateRemoteName) — but generationPacker already holds one
+  (p.v2Store). writeMigratedFullGeneration is called from flush with the packer in scope. Make it a method on *generationPacker
+  (or pass the store), and stop instantiating a second one.
+
+  ---
+  Smaller things I noticed but wouldn't gate on: generationMetadataEqual only compares the two timestamp fields by name (silent
+  rot if GenerationMetadata grows fields — a method on the type would be more robust); pushWithLease's errCtx parameter is
+  awkwardly named for "operation description"; printV2GenerationRepairResult prints the summary line only when Repaired or
+  Failed is non-zero, which is fine but means a pure-warnings outcome silently has no summary line.
+
+✻ Baked for 2m 24s
+
+※ recap: Reviewing PR #1091 (v2 checkpoint migration repair) for idiomatic Go and maintainability. I delivered six pressing
+  issues, top among them a redundant timestamp-fallback chain and a silent-failure path in repairOneV2GenerationMetadata. Next:
+  await your direction on which to address. (disable recaps in /config)
+
+---
+
+are you still working
+
+---
+
+> and treats missing timestamps as a failed repair with a warning.
+
+if timestamps are missing for downstream consumers (like for `clean` for example), will that cause issues?
+
+---
+
+does it change the behavior of what was on the pr? if the pr failed for no timestamp, don't change that now
+
+---
+
+```
+-	assert.True(t, gen.OldestCheckpointAt.Equal(rawOldest))
+-	assert.True(t, gen.NewestCheckpointAt.Equal(rawNewest))
+-	assert.False(t, gen.OldestCheckpointAt.Equal(createdAt), "raw transcript timestamps should take precedence over checkpoint metadata")
++	assert.True(t, gen.OldestCheckpointAt.Equal(createdAt))
++	assert.True(t, gen.NewestCheckpointAt.Equal(createdAt))
++	assert.False(t, gen.OldestCheckpointAt.Equal(rawOldest), "migrated CreatedAt metadata should take precedence over raw transcript event timestamps")
+```
+
+this behavior shouldn't have changed I don't think

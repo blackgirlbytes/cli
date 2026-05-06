@@ -1,0 +1,55 @@
+Implement the following plan:
+
+# Droid E2E: Retry prompt on WaitFor timeout
+
+## Context
+
+Droid E2E tests sometimes time out waiting for the prompt pattern `⛬|│ >` after 60s. Instead of failing the test, we want to re-send the last prompt and wait again (one retry).
+
+## Approach
+
+Single-file change in `e2e/testutil/repo.go`. No interface changes, no new files.
+
+## Changes to `e2e/testutil/repo.go`
+
+### 1. Add `lastSentInput` field to `RepoState` (line 22)
+
+```go
+type RepoState struct {
+    // ...existing fields...
+    lastSentInput string // tracks last input for retry-on-timeout
+}
+```
+
+### 2. Record input in `Send` (line 378)
+
+Add `s.lastSentInput = input` after the successful send.
+
+### 3. Add retry logic to `WaitFor` (line 366)
+
+On timeout, if all three conditions are met:
+- Agent is Droid (`s.Agent.Name() == "factoryai-droid"`)
+- Pattern is the prompt pattern (`pattern == s.Agent.PromptPattern()`)
+- A prompt was previously sent (`s.lastSentInput != ""`)
+
+Then: log a warning, re-send `s.lastSentInput`, wait again with the same timeout. Clear `lastSentInput` after retry to prevent infinite loops.
+
+### 4. Add `shouldRetryPromptTimeout` helper
+
+Small private method encapsulating the three conditions above.
+
+## Key behaviors
+
+- **Single retry only** — `lastSentInput` cleared after retry attempt
+- **Droid-only** — name check restricts to `"factoryai-droid"`
+- **Prompt pattern only** — won't retry for arbitrary WaitFor patterns
+- **Initial WaitFor unaffected** — `lastSentInput` is empty before first Send
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-droid-e2e-fix/796c23c2-6a33-4ce1-89e4-12a422e413b8.jsonl

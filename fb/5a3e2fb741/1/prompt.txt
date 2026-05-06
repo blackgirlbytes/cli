@@ -1,0 +1,118 @@
+Implement the following plan:
+
+# Fix: Deferred condensation when live transcript is empty at commit time
+
+## Context
+
+CI run [22840528443](https://github.com/entireio/cli/actions/runs/22840528443) shows 42/43 cursor-cli E2E tests passing after our config isolation fix. The single failure is `TestMultiSessionSequential` — a **real-bug** in the CLI where condensation fails silently and is never retried.
+
+**Root cause:** When Cursor commits mid-turn, the post-commit hook tries to condense session data to `entire/checkpoints/v1`. For the second session, the live transcript file hasn't been flushed yet by Cursor, so `extractSessionDataFromLiveTranscript` returns `"live transcript is empty"`. The checkpoint ID (`1f78a5eea34d`) was already written to the commit trailer by `prepare-commit-msg`, but:
+1. `condenseAndUpdateState` returns `false` → `handler.condensed = false`
+2. Line 1017: `if handler.condensed && state.Phase.IsActive()` → FALSE → checkpoint ID NOT recorded in `TurnCheckpointIDs`
+3. At stop time, `finalizeAllTurnCheckpoints` finds `TurnCheckpointIDs` empty → no-op
+4. Result: commit trailer points to nonexistent checkpoint metadata
+
+## Triage Classification
+
+| Test | Agent | Classification | Evidence |
+|------|-------|----------------|----------|
+| TestMultiSessionSequential | cursor-cli | **real-bug** | `entire.log` WARN: "condensation failed: live transcript is empty"; checkpoint `1f78a5eea34d` missing from `entire/checkpoints/v1` tree |
+
+## Fix: Record checkpoint IDs on attempt + deferred CondenseSession at stop time
+
+### File: `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+#### Change 1: Add `condenseAttempted` flag to `postCommitActionHandler` (line 611)
+
+Add a new field alongside `condensed`:
+```go
+type postCommitActionHandler struct {
+    // ... existing fields ...
+    condensed          bool // true if condensation succeeded
+    condenseAttempted  bool // true if condensation was attempted (even if it failed)
+}
+```
+
+#### Change 2: Set `condenseAttempted` in handler methods (lines 650, 676)
+
+In both `HandleCondense` and `HandleCondenseIfFilesTouched`, set `h.condenseAttempted = true` when `shouldCondense` is true (before calling `condenseAndUpdateState`):
+
+```go
+if shouldCondense {
+    h.condenseAttempted = true
+    h.condensed = h.s.condenseAndUpdateState(...)
+}
+```
+
+#### Change 3: Record checkpoint ID on attempt, not just success (line 1017)
+
+Change the guard from requiring success to requiring attempt:
+```go
+// Before:
+if handler.condensed && state.Phase.IsActive() {
+    state.TurnCheckpointIDs = append(...)
+}
+
+// After:
+if handler.condenseAttempted && state.Phase.IsActive() {
+    state.TurnCheckpointIDs = append(...)
+}
+```
+
+This ensures the checkpoint ID is recorded even when condensation failed due to an empty transcript. The existing carry-forward logic (line 1027) still gates on `handler.condensed`, so carry-forward and shadow branch cleanup remain correct.
+
+#### Change 4: Handle `ErrCheckpointNotFound` in `finalizeAllTurnCheckpoints` (~line 2232)
+
+When `UpdateCommitted` returns `ErrCheckpointNotFound`, fall back to `CondenseSession`:
+
+```go
+updateErr := store.UpdateCommitted(ctx, checkpoint.UpdateCommittedOptions{...})
+if updateErr != nil {
+    if errors.Is(updateErr, checkpoint.ErrCheckpointNotFound) {
+        // Checkpoint wasn't created at post-commit time (e.g., transcript was empty).
+        // Now that the full transcript is available, create it via CondenseSession.
+        _, condenseErr := s.CondenseSession(ctx, repo, cpID, state, nil)
+        if condenseErr != nil {
+            logging.Warn(logCtx, "finalize: deferred condensation failed", ...)
+            errCount++
+        } else {
+            logging.Info(logCtx, "finalize: deferred checkpoint created", ...)
+        }
+        continue
+    }
+    // Original error path for other failures
+    ...
+}
+```
+
+`CondenseSession` with `nil` committedFiles skips file filtering (line 158) and uses files from session data as-is — acceptable since files ARE agent-touched, just not filtered to a specific commit.
+
+### File: `cmd/entire/cli/strategy/phase_postcommit_test.go`
+
+Add unit tests:
+
+1. **`TestPostCommit_ActiveSession_RecordsTurnCheckpointIDs_OnCondensationFailure`** — ACTIVE session with empty transcript → condensation fails → verify `TurnCheckpointIDs` still contains the checkpoint ID
+2. **`TestFinalizeAllTurnCheckpoints_DeferredCondensation`** — `TurnCheckpointIDs` contains ID with no checkpoint on metadata branch + non-empty transcript on disk → verify checkpoint created via `CondenseSession`
+3. **`TestFinalizeAllTurnCheckpoints_DeferredCondensation_TranscriptStillEmpty`** — Same setup but transcript still empty → verify graceful failure (error logged, no panic)
+
+## Why This Is Safe
+
+- **No behavior change for working agents:** Claude Code, Gemini, etc. flush transcripts before committing. For them, `condenseAttempted = true` AND `condensed = true`, so `TurnCheckpointIDs` is recorded as before. `UpdateCommitted` succeeds at stop time — the `ErrCheckpointNotFound` fallback is never hit.
+- **Carry-forward unaffected:** The carry-forward logic (line 1027) still gates on `handler.condensed`, not `handler.condenseAttempted`. Shadow branch preservation (line 1072) also gates on `condensed`. Both remain correct.
+- **State remains consistent:** When condensation fails, `state.BaseCommit` stays at the old commit and the shadow branch is preserved — exactly what `CondenseSession` needs at stop time to find the shadow data.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint           # Static checks
+mise run test                           # Unit tests (includes new tests)
+mise run test:e2e:canary                # Canary (Vogon) — no API cost
+mise run test:e2e --agent cursor-cli    # Full cursor-cli suite — verify fix
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/061fd814-f357-4c55-a9c5-5b97c5911bf5.jsonl
+
+---
+
+commit and push

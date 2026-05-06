@@ -1,0 +1,54 @@
+❯ In a given environment (Copilot Agent) the push (with tokens) is showing the progress below. There is a new checkpoint trailer on the commit. But
+  the push never made it to the server. What would be the problem? Is there a firewall that blocks internet/push o
+
+  Pushing to https://github.com/pjbgf/test
+  [entire] Pushing entire/checkpoints/v1 to checkpoint remote... already up-to-date
+
+---
+
+❯ In a given environment (Copilot Agent) the push (with tokens) is showing the progress below. There is a new checkpoint trailer on the commit. But
+  the push never made it to the server. What would be the problem? Is there a firewall that blocks internet/push or is this a problem in the cli/entire?
+
+  Pushing to https://github.com/pjbgf/test
+  [entire] Pushing entire/checkpoints/v1 to checkpoint remote... already up-to-date
+
+---
+
+Additionally, check the configured hooks: ~/git/pjbgf/test/.github/hooks/entire.json. Does that align with the current theory or could it be something else?
+
+---
+
+Fix the hooks then so that I can retest it
+
+---
+
+What's the best way to confirm the PostCommit condensation? Note that the commits are getting the trailer, but running git show entire/checkpoint/v1 shows no new commits (after the change commit but before push)
+
+---
+
+Note that in this specific scenario the Agent (Copilot Cloud Agent) is enabling entire, committing and pushing the changes, it is not an user. How does that impact the post trailer actions?
+
+---
+
+{"time":"2026-04-21T22:28:30.655351022Z","level":"INFO","msg":"session-start","component":"lifecycle","agent":"copilot-cli","event":"SessionStart","session_id":"3a6b818a-b016-4aaa-83d8-a3e13a429b5a","session_ref":"","model":""}
+{"time":"2026-04-21T22:28:30.66877701Z","level":"INFO","msg":"turn-start","component":"lifecycle","agent":"copilot-cli","event":"TurnStart","session_id":"3a6b818a-b016-4aaa-83d8-a3e13a429b5a","session_ref":"/home/runner/.copilot/session-state/3a6b818a-b016-4aaa-83d8-a3e13a429b5a/events.jsonl","model":""}
+{"time":"2026-04-21T22:28:30.676639611Z","level":"INFO","msg":"phase transition","component":"session","agent":"copilot-cli","session_id":"3a6b818a-b016-4aaa-83d8-a3e13a429b5a","event":"TurnStart","from":"","to":"active"}
+{"time":"2026-04-21T22:28:30.678074052Z","level":"INFO","msg":"initialized shadow session","component":"hooks","agent":"copilot-cli","session_id":"3a6b818a-b016-4aaa-83d8-a3e13a429b5a"}
+{"time":"2026-04-21T22:29:01.401016092Z","level":"INFO","msg":"prepare-commit-msg: agent commit trailer added","session_id":"3a6b818a-b016-4aaa-83d8-a3e13a429b5a","component":"checkpoint","strategy":"manual-commit","source":"message","checkpoint_id":"a7e892c7f7d9","session_id":"3a6b818a-b016-4aaa-83d8-a3e13a429b5a"}
+{"time":"2026-04-21T22:29:01.751445175Z","level":"WARN","msg":"condensation failed","session_id":"3a6b818a-b016-4aaa-83d8-a3e13a429b5a","component":"checkpoint","session_id":"3a6b818a-b016-4aaa-83d8-a3e13a429b5a","error":"failed to extract session data from live transcript: transcript not found at /home/runner/.copilot/session-state/3a6b818a-b016-4aaa-83d8-a3e13a429b5a/events.jsonl (also tried /home/runner/.copilot/session-state/3a6b818a-b016-4aaa-83d8-a3e13a429b5a/events/events.jsonl): file does not exist"}
+
+---
+
+The most likely issue is that the automation is assuming Copilot CLI local session storage exists inside the GitHub Copilot cloud agent runner, but those are not the same thing.
+
+GitHub’s docs say ~/.copilot/session-state/ is where Copilot CLI persists session files locally on your machine for resume/history features. That is documented as local CLI storage, not as a guaranteed artifact path for cloud-agent jobs.
+
+By contrast, for Copilot cloud agent, GitHub documents tracking via the session logs in GitHub, the agents tab, VS Code, Raycast, or gh agent-task view --log; the docs do not describe /home/runner/.copilot/session-state/.../events.jsonl as a supported cloud-agent log location.
+
+---
+
+Right.. I tried the same with a subagent claude, and the logs are per below:
+
+---
+
+{"time":"2026-04-21T22:57:25.603116182Z","level":"INFO","msg":"session-start","component":"lifecycle","agent":"copilot-cli","event":"SessionStart","session_id":"374576a4-14ed-4d49-8c69-b2403193cd81","session_ref":"","model":""} {"time":"2026-04-21T22:57:25.642701548Z","level":"INFO","msg":"turn-start","component":"lifecycle","agent":"copilot-cli","event":"TurnStart","session_id":"374576a4-14ed-4d49-8c69-b2403193cd81","session_ref":"/home/runner/.copilot/session-state/374576a4-14ed-4d49-8c69-b2403193cd81/events.jsonl","model":""} {"time":"2026-04-21T22:57:25.658429878Z","level":"INFO","msg":"phase transition","component":"session","agent":"copilot-cli","session_id":"374576a4-14ed-4d49-8c69-b2403193cd81","event":"TurnStart","from":"","to":"active"} {"time":"2026-04-21T22:57:25.661017085Z","level":"INFO","msg":"initialized shadow session","component":"hooks","agent":"copilot-cli","session_id":"374576a4-14ed-4d49-8c69-b2403193cd81"} {"time":"2026-04-21T22:57:27.986334392Z","level":"INFO","msg":"session-start","session_id":"374576a4-14ed-4d49-8c69-b2403193cd81","component":"lifecycle","agent":"claude-code","event":"SessionStart","session_id":"033221eb-65a9-47cb-b87e-fbf7572ab916","session_ref":"/home/runner/.claude/projects/-home-runner-work-test-test/033221eb-65a9-47cb-b87e-fbf7572ab916.jsonl","model":""} {"time":"2026-04-21T22:57:28.021606317Z","level":"INFO","msg":"turn-start","session_id":"374576a4-14ed-4d49-8c69-b2403193cd81","component":"lifecycle","agent":"claude-code","event":"TurnStart","session_id":"033221eb-65a9-47cb-b87e-fbf7572ab916","session_ref":"/home/runner/.claude/projects/-home-runner-work-test-test/033221eb-65a9-47cb-b87e-fbf7572ab916.jsonl","model":""} {"time":"2026-04-21T22:57:28.029529632Z","level":"INFO","msg":"phase transition","session_id":"374576a4-14ed-4d49-8c69-b2403193cd81","component":"session","agent":"claude-code","session_id":"033221eb-65a9-47cb-b87e-fbf7572ab916","event":"TurnStart","from":"","to":"active"} {"time":"2026-04-21T22:57:28.033300588Z","level":"INFO","msg":"initialized shadow session","session_id":"374576a4-14ed-4d49-8c69-b2403193cd81","component":"hooks","agent":"claude-code","session_id":"033221eb-65a9-47cb-b87e-fbf7572ab916"}

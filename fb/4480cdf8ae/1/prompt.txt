@@ -1,0 +1,110 @@
+Implement Task 1 from the implementation plan: make `reviewScope` carry a resolvable base ref. You are not alone in the codebase: do not revert edits made by others, and adjust your implementation to fit the current files. Do not commit changes.
+
+Ownership:
+- Modify only `cmd/entire/cli/review.go` and `cmd/entire/cli/review_test.go`.
+
+Current preamble already passed in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/entire-review`:
+- `git rev-parse --abbrev-ref HEAD` => `feat/entire-review`
+- Expected symbols exist in `cmd/entire/cli/review.go`
+- `go test ./cmd/entire/cli -run 'Test(ComposeReviewPrompt|DetectReviewScope|DetectBaseBranch|FormatReviewScope)' -count=1` passed.
+
+Follow TDD exactly for this task:
+1. Add failing tests first.
+2. Run the focused tests and confirm they fail for the expected reason.
+3. Implement the minimal code.
+4. Run the focused tests and confirm they pass.
+
+Task 1 details:
+
+Goal: `detectReviewScope` should retain both the user-facing base display name and the exact git ref to use in git range commands. This fixes cases where `detectBaseBranch` displays `main` while only `origin/main` exists locally.
+
+Test changes in `cmd/entire/cli/review_test.go`:
+- Extend `TestDetectReviewScope_FeatureBranchAheadOfMain` to assert:
+```go
+if got.BaseRef != testMainBranch {
+    t.Errorf("BaseRef = %q, want %s", got.BaseRef, testMainBranch)
+}
+```
+- Add a new non-parallel test because it uses `t.Chdir()`:
+```go
+func TestDetectReviewScope_UsesOriginMainBaseRefWhenNoLocalMain(t *testing.T) {
+    tmp := t.TempDir()
+    testutil.InitRepo(t, tmp)
+    testutil.WriteFile(t, tmp, "a.txt", "hello")
+    testutil.GitAdd(t, tmp, "a.txt")
+    testutil.GitCommit(t, tmp, "init")
+
+    headSHA := testutil.GetHeadHash(t, tmp)
+    runGit(t, tmp, "update-ref", "refs/remotes/origin/main", headSHA)
+    testutil.GitCheckoutNewBranch(t, tmp, "feat/x")
+    runGit(t, tmp, "branch", "-D", "master")
+    testutil.WriteFile(t, tmp, "b.txt", "new")
+    testutil.GitAdd(t, tmp, "b.txt")
+    testutil.GitCommit(t, tmp, "add b")
+    t.Chdir(tmp)
+
+    got, err := detectReviewScope(context.Background())
+    if err != nil {
+        t.Fatalf("detectReviewScope: %v", err)
+    }
+    if got.Base != testMainBranch {
+        t.Errorf("Base = %q, want %s", got.Base, testMainBranch)
+    }
+    if got.BaseRef != "origin/main" {
+        t.Errorf("BaseRef = %q, want origin/main", got.BaseRef)
+    }
+    if got.AheadCommits != 1 {
+        t.Errorf("AheadCommits = %d, want 1", got.AheadCommits)
+    }
+}
+```
+
+Implementation changes in `cmd/entire/cli/review.go`:
+- Add:
+```go
+type baseBranchRef struct {
+    display string
+    ref     string
+}
+```
+- Preserve public/local helper shape for existing callers:
+```go
+func detectBaseBranch(ctx context.Context, repoRoot string) string {
+    return detectBaseBranchRef(ctx, repoRoot).display
+}
+```
+- Add `detectBaseBranchRef(ctx, repoRoot) baseBranchRef` with this behavior:
+  1. `refs/remotes/origin/HEAD` via `git symbolic-ref --short`; return display without `origin/`, ref as returned (e.g. `origin/main`).
+  2. Try remote-tracking branches `origin/main`, then `origin/master`; return display as `main`/`master`, ref as `origin/main`/`origin/master`.
+  3. Try local branches `main`, then `master`; return both display and ref as the branch name.
+  4. Return zero value when none match.
+- Add `BaseRef string` to `reviewScope` comments.
+- Update `detectReviewScope` to call `detectBaseBranchRef`, set `s.Base` and `s.BaseRef`, and use `s.BaseRef` in `rev-list --count` and `diff --name-only` range commands.
+
+Required verification:
+- First run after adding tests should fail because `reviewScope` has no `BaseRef` or implementation is missing.
+- Final run: `go test ./cmd/entire/cli -run 'Test(DetectReviewScope|DetectBaseBranch|FormatReviewScope)' -count=1`
+
+Final response format:
+- Status: DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED
+- Files changed
+- Tests run, with pass/fail
+- Short notes on any deviations from the task.
+
+---
+
+Code quality review found two issues that need fixing before Task 1 can close. Please edit only `cmd/entire/cli/review.go` and `cmd/entire/cli/review_test.go`; do not commit.
+
+1. Medium correctness issue: `detectBaseBranchRef` currently returns the `origin/HEAD` target without verifying it resolves. A stale `refs/remotes/origin/HEAD -> origin/main` can exist while `origin/main` is missing, which would set a non-resolvable `BaseRef` and prevent fallback to `origin/master`, local `main`, or local `master`.
+   - Add/adjust a test proving stale `origin/HEAD` falls back to the next available resolvable candidate.
+   - Update implementation so the `origin/HEAD` target is used only if the returned target resolves with `git rev-parse --verify --quiet` (or equivalent existing helper). If not resolvable, continue to the remote/local candidate loops.
+
+2. Low test coverage issue: `TestDetectReviewScope_UsesOriginMainBaseRefWhenNoLocalMain` asserts `AheadCommits` but not `FilesChanged`; add `FilesChanged == 1` so both range commands are covered.
+
+Follow TDD for the stale-origin/HEAD case: add failing test, run focused tests to see the expected failure, implement minimal fix, rerun focused tests.
+
+Final response format:
+- Status: DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED
+- Files changed
+- Tests run, with pass/fail
+- Notes on the review fixes.

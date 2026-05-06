@@ -1,0 +1,702 @@
+Base directory for this skill: /Users/alex/workspace/cli/.claude/skills/debug-e2e
+
+# Debug Entire CLI via E2E Artifacts
+
+Diagnose Entire CLI bugs using captured artifacts from the E2E test suite. Artifacts are written to `e2e/artifacts/` locally or downloaded from CI via GitHub Actions.
+
+## Inputs
+
+The user provides either:
+- **A test run directory:** `e2e/artifacts/{timestamp}/` — triage all failures
+- **A specific test directory:** `e2e/artifacts/{timestamp}/{TestName}-{agent}/` — debug one test
+
+## Artifact Layout
+
+```
+e2e/artifacts/{timestamp}/
+├── report.nocolor.txt          # Pass/fail/skip summary with error lines
+├── test-events.json            # Raw Go test events (NDJSON)
+├── entire-version.txt          # CLI version under test
+└── {TestName}-{agent}/
+    ├── PASS or FAIL            # Status marker
+    ├── console.log             # Full operation transcript
+    ├── git-log.txt             # git log --decorate --graph --all
+    ├── git-tree.txt            # ls-tree HEAD + checkpoint branch
+    ├── entire-logs/entire.log  # CLI structured JSON logs
+    ├── checkpoint-metadata/    # Checkpoint + session metadata
+    └── repo -> /tmp/...        # Symlink to preserved repo (E2E_KEEP_REPOS=1 only)
+```
+
+## Preserved Repo
+
+When the test run was executed with `E2E_KEEP_REPOS=1`, each test's artifact directory contains a `repo` symlink pointing to the preserved temporary git repository. This is the actual repo the test operated on — you can inspect it directly.
+
+**Navigate via the symlink** (e.g., `{artifact-dir}/repo/`) rather than resolving the `/tmp/...` path. The symlink lives inside the artifact directory so permissions and paths stay consistent.
+
+The preserved repo contains:
+- Full git history with all branches (main, `entire/checkpoints/v1`)
+- The `.entire/` directory with CLI state, config, and raw logs
+- The `.claude/` directory (if Claude Code was the agent)
+- All files the agent created or modified, in their final state
+
+This is the most powerful debugging tool — you can run `git log`, `git diff`, `git show`, inspect `.entire/` internals, and see exactly what the CLI left behind.
+
+## Debugging Workflow
+
+### 1. Triage (if given a run directory)
+
+Read `report.nocolor.txt` to identify failures and their error messages. Each entry shows the test name, agent, duration, and failure output with file:line references.
+
+### 2. Read console.log (most important)
+
+Full transcript of every operation:
+- `> claude -p "..." ...` — agent prompts with stdout/stderr
+- `> git add/commit/...` — git commands
+- `> send: ...` — interactive session inputs
+
+This tells you what happened chronologically.
+
+### 3. Read test source code
+
+Use the file:line from the report to find the test in `e2e/tests/`. Understand what the test expected to happen vs what console.log shows actually happened.
+
+### 4. Diagnose the CLI behavior
+
+Cross-reference console.log (what happened) with the test (what should have happened). Focus on CLI-level issues:
+
+| Symptom | CLI Investigation |
+|---------|-------------------|
+| Checkpoint not created / timeout | Check `entire-logs/entire.log` for hook invocations, phase transitions, errors |
+| Wrong checkpoint content | Check `git-tree.txt` for checkpoint branch files, `checkpoint-metadata/` for session info |
+| Hooks didn't fire | Check `entire.log` for missing hook entries (session-start, user-prompt-submit, stop, post-commit) |
+| Stash/unstash problems | Check `entire.log` for stash-related log lines, `git-log.txt` for commit ordering |
+| Attribution issues | Check `checkpoint-metadata/` for `files_touched`, session metadata for attribution data |
+| Strategy mismatch | Check `entire.log` for `strategy` field, verify auto-commit vs manual-commit behavior |
+
+### 5. Deep dive files
+
+- **entire-logs/entire.log**: Structured JSON logs — hook lifecycle, session phases (`active` → `idle` → `ended`), warnings, errors. Key fields: `component`, `hook`, `strategy`, `session_id`.
+- **git-log.txt**: Commit graph showing main branch, `entire/checkpoints/v1`, checkpoint initialization.
+- **git-tree.txt**: Files at HEAD vs checkpoint branch (separated by `--- entire/checkpoints/v1 ---`).
+- **checkpoint-metadata/**: `metadata.json` has `checkpoint_id`, `strategy`, `files_touched`, `token_usage`, and `sessions` array. Session subdirs have per-session details.
+
+### 6. Report findings
+
+Identify whether the issue is in:
+- **CLI hooks** (prepare-commit-msg, commit-msg, post-commit)
+- **Session management** (phase transitions, session tracking)
+- **Checkpoint creation** (branch management, metadata writing)
+- **Attribution** (file tracking, prompt correlation)
+- **Strategy logic** (auto-commit vs manual-commit behavior)
+
+
+ARGUMENTS: /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T11-45-27 - this had failures (main branch)
+
+and it seems like subsquent runs are fine /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T12-02-11
+
+non-deterministic agent behaviour? or something else?
+
+---
+
+is the claude invocation in the e2e's picking up user settings? we shouldn't be, right?
+
+---
+
+could we enable sandboxing? https://code.claude.com/docs/en/settings#sandbox-settings
+
+---
+
+the 'auth' fixes we did yesterday to use keychain based auth - do we even need the claude dir to copy anything?
+
+---
+
+let's try it
+
+---
+
+Base directory for this skill: /Users/alex/.claude/skills/tdd-dev
+
+# TDD Developer
+
+Implement features using Test-Driven Development and Clean Code principles.
+
+## TDD Cycle
+
+1. **Red** - Write failing test first
+2. **Green** - Minimal code to pass
+3. **Refactor** - Clean up, tests stay green
+
+## Clean Code Standards
+
+- **Names reveal intent** - Variables, functions, classes
+- **Small functions** - One responsibility each
+- **DRY** - Extract duplication
+- **SOLID** - Single responsibility, Open/closed, Liskov, Interface segregation, Dependency inversion
+- **Self-documenting** - Comments explain "why", not "what"
+
+Always consider: edge cases, input validation, security, performance, concurrency.
+
+## Development Workflow
+
+### 1. Understand Requirements
+
+Read `docs/requirements/[feature]/README.md` for specifications.
+
+### 2. Check for Review Feedback
+
+Look for `review-NN.md` files in the requirements folder:
+
+```markdown
+# In review-NN.md, update status line:
+> Status: pending    → when review is new
+> Status: in-progress → when addressing
+> Status: addressed   → when complete
+```
+
+Address each issue before proceeding.
+
+### 3. Plan Tasks
+
+Break work into testable increments. Create task files in `docs/requirements/[feature]/`:
+
+```markdown
+# Task NN: [Short Description]
+
+> Status: todo
+
+## Goal
+What this accomplishes.
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Notes
+Implementation notes, decisions, blockers.
+```
+
+Update status: `todo` → `in-progress` → `done`
+
+### 4. Implement (TDD)
+
+For each task:
+
+1. Write failing test
+2. Run test (confirm red)
+3. Write minimal implementation
+4. Run test (confirm green)
+5. Refactor if needed
+6. Run full validation
+
+### 5. Validate After Each Step
+
+Run after every change:
+
+```bash
+# Linting/formatting (adjust to project)
+mise run list
+
+# Tests
+mise run test
+```
+
+Fix failures immediately before proceeding.
+
+## Final Report
+
+When complete, summarize:
+
+- What was implemented
+- Tests added
+- Design decisions and trade-offs
+- Issues encountered
+- Suggested next steps
+
+
+ARGUMENTS: Fix E2E test isolation: Claude Code invocations in E2E tests are picking up user settings (~/.claude/CLAUDE.md, projects/, plugins/, etc.) when running locally. The fix: always set CLAUDE_CONFIG_DIR to an empty temp dir (both locally and on CI), and on CI only symlink .claude.json into it for API key auth. Delete the broad isolatedConfigDir() function. File to modify: e2e/agents/claude.go
+
+---
+
+but keep the comment for DISABLE_NONESSENTIAL
+
+---
+
+commit this, then let's have a look at the latest test failures /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T12-25-30
+
+---
+
+yes, look into the WaitFor race condition
+
+---
+
+and we're sure it won't impact the other things?
+
+---
+
+ok, next problem:
+
+E2E_ENTIRE_BIN
+
+this sets the `entire` we are calling _from_ the test harness...but it doesn't change any of the hooks getting called by the agents / git I think - can we confirm?
+
+---
+
+can we alter the $PATH that goes into the test contexts?
+
+---
+
+this is scoped just to this process, yes? (as in it won't pollute the user's PATH ongoing?)
+
+---
+
+is there any way to show this information at the start of the test run?
+
+---
+
+the gotestsum is swallowing it though 😭
+
+---
+
+and let's print the version information at the end after the report (also show the artifacts directory again)
+
+---
+
+let's create a PR
+
+---
+
+entire binary: and entire(PATH) are the same in version.txt?
+
+we're also printing the artifacts dir twice at the end
+
+entire binary:  /var/folders/wl/8b8rnjvn6_jfl4wz9fw883qh0000gn/T/entire-e2e-2287416292/entire
+entire (PATH):  /var/folders/wl/8b8rnjvn6_jfl4wz9fw883qh0000gn/T/entire-e2e-2287416292/entire
+entire version: Entire CLI dev (unknown)
+Go version: go1.26.0
+OS/Arch: darwin/arm64
+
+artifact dir:   /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T13-12-28
+artifacts: /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T13-12-28
+
+---
+
+what is the E2E_PARALLEL setting?
+
+---
+
+don't we already have the internal gate?
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. User invoked `/debug-e2e` with two artifact paths - a failing run and a passing run, asking about non-deterministic behavior.
+
+2. I read the reports: first run had 5 failures, second had 0. Two failure patterns:
+   - 3 tests: "expected at least 1 new commit(s), got 0 after 10s" (interactive session timeouts)
+   - 2 tests: "shadow branches should be cleaned up after commit" (carry-forward)
+
+3. Deep dive into console.log and entire.log files for all 5 failures.
+
+4. For shadow branch failures: The agent (Haiku) was creating extra test files via TDD patterns, which weren't committed by the tests. The carry-forward logic correctly created new shadow branches for uncommitted files.
+
+5. For interactive failures: WaitFor("❯") was matching the ❯ character in echoed input before the agent processed anything.
+
+6. User asked to verify E2E binary build - confirmed both runs used `Entire CLI dev (unknown)` built from source.
+
+7. User asked about Claude invocations picking up user settings. Investigation revealed `isolatedConfigDir()` only excluded CLAUDE.md and skills/ but symlinked everything else (projects/, plugins/, etc.). The CI guard on `CLAUDE_CONFIG_DIR` meant local runs got NO isolation.
+
+8. User asked about sandboxing via Claude Code docs - I fetched the docs and explained sandboxing only restricts tool execution, not the context load chain.
+
+9. User confirmed sandboxing won't help with context loading. We agreed the fix is `CLAUDE_CONFIG_DIR` isolation.
+
+10. User asked if we even need to copy anything from ~/.claude/ - since Keychain auth works without files, the answer was no (locally). On CI, only `.claude.json` is needed.
+
+11. User said "let's try it" - I invoked tdd-dev skill, then implemented the fix.
+
+12. User rejected writing tests for test harness code - "we don't need to test our test harness code directly..."
+
+13. I made the changes directly:
+    - Replaced `isolatedConfigDir()` with `cleanConfigDir()` 
+    - Always set `CLAUDE_CONFIG_DIR`
+    - On CI: symlink only `.claude.json`
+    - Locally: empty dir
+    - Fixed `nilerr` lint issue by nesting the error check
+    - Fixed `err :=` redeclaration issue with `err =`
+
+14. User asked to commit, then look at another artifact. Committed and examined `/Users/alex/workspace/cli/e2e/artifacts/2026-02-26T12-25-30`.
+
+15. New artifact showed ALL 5 failures had Claude Code onboarding flow (theme picker, login). Empty config dir meant no `hasCompletedOnboarding: true`.
+
+16. Fixed by writing minimal `.claude.json` with `hasCompletedOnboarding` locally. On CI, the symlinked `.claude.json` from Bootstrap already has it.
+
+17. User asked about WaitFor race condition. I investigated tmux.go and found the race: Send() snapshots pre-echo state, WaitFor matches ❯ in echoed input, contentChanged fires because echo IS in stable content, settles for 2s while agent hasn't started.
+
+18. User asked if the fix would impact other agents. I traced through Claude (affected), Gemini (not affected - pattern disappears), OpenCode (not affected). Fix is safe.
+
+19. User confirmed, I implemented post-echo snapshot in Send().
+
+20. User asked about E2E_ENTIRE_BIN - does it affect hooks? Investigation confirmed hooks call bare `entire` from PATH, not the test binary.
+
+21. User suggested altering PATH. I added PATH prepend in TestMain. User confirmed it's process-scoped only.
+
+22. User asked to show preflight info. I added binary path, PATH resolution, version to entire-version.txt and stderr.
+
+23. User noted gotestsum swallows stderr. I moved info to artifact file and added cat after test report.
+
+24. User asked to print version info at end after report and show artifacts dir again.
+
+25. User asked to refactor mise.toml duplication. I extracted `mise-tasks/test-e2e` script with E2E_PARALLEL support. Fixed shellcheck issue with quoting.
+
+26. User pointed out `entire binary:` and `entire (PATH):` are the same (redundant after PATH fix), and artifacts dir printed twice. I removed the redundant PATH line and artifact dir from preflight.
+
+27. User asked about E2E_PARALLEL - I explained it parameterized Gemini's `-parallel 1`. User corrected me about TimeoutMultiplier (just for slowness) vs RegisterGate (actual queueing). User wants gate size configurable from outside for CI with higher rate limits.
+
+28. I proposed per-agent env vars. User said "just use E2E_CONCURRENT_TEST_LIMIT global".
+
+29. I implemented, user also wanted Gemini default changed from 3 to 2. Dropped E2E_PARALLEL entirely.
+
+Current state: 7 commits on `alex/more-e2e-fixes`, PR #508 open.
+
+Branch commits:
+1. d3409a7c2 - Isolate E2E from user settings
+2. 2db3e1736 - hasCompletedOnboarding 
+3. 6ddd69c8b - Post-echo snapshot WaitFor fix
+4. 77af66f51 - PATH prepend for hooks
+5. 5e77aee07 - Preflight info + mise refactor
+6. dae0aca25 - Remove redundant PATH line and artifact dir
+7. cf6a6ede0 - E2E_CONCURRENT_TEST_LIMIT gate override
+
+Summary:
+1. Primary Request and Intent:
+   The user invoked `/debug-e2e` to diagnose E2E test failures across two test runs. The initial failing run (`2026-02-26T11-45-27`) had 5 failures while a subsequent run (`2026-02-26T12-02-11`) passed all 37 tests. The user wanted to understand whether failures were from non-deterministic agent behavior or something else. This evolved into a comprehensive E2E infrastructure hardening effort addressing: user settings isolation, onboarding flow bypass, WaitFor race conditions, binary PATH resolution for hooks, preflight diagnostics, mise task deduplication, and configurable concurrency gates. A PR was created (#508) on branch `alex/more-e2e-fixes`.
+
+2. Key Technical Concepts:
+   - E2E test isolation via `CLAUDE_CONFIG_DIR` environment variable
+   - Claude Code onboarding flow (`hasCompletedOnboarding` in `.claude.json`)
+   - tmux-based interactive agent sessions with `Send()`/`WaitFor()` pattern matching
+   - Post-echo terminal snapshot to prevent false pattern matches
+   - Git hook invocation PATH resolution (hooks call bare `entire`, not full path)
+   - `RegisterGate` concurrency semaphore for per-agent test parallelism
+   - `E2E_CONCURRENT_TEST_LIMIT` env var to override gate size in CI
+   - mise task file-based scripts (`mise-tasks/test-e2e`) vs TOML inline tasks
+   - `stableContent()` strips last 3 terminal lines to ignore TUI status bar
+   - `settleTime` (2s) and `pollInterval` (500ms) constants for WaitFor
+
+3. Files and Code Sections:
+
+   - **`e2e/agents/claude.go`** — Core fix for user settings isolation
+     - Replaced `isolatedConfigDir()` (symlinked everything from `~/.claude/` except CLAUDE.md and skills/) with `cleanConfigDir()` (empty temp dir)
+     - Always sets `CLAUDE_CONFIG_DIR` (removed `CI` guard)
+     - On CI: symlinks only `.claude.json` for API key auth
+     - Locally: writes `{"hasCompletedOnboarding":true}` to skip onboarding
+     - `RunPrompt` and `StartSession` both use `cleanConfigDir()`
+     ```go
+     func cleanConfigDir() (string, error) {
+         dst, err := os.MkdirTemp("", "claude-config-*")
+         if err != nil {
+             return "", err
+         }
+         if os.Getenv("CI") != "" {
+             if home, err := os.UserHomeDir(); err == nil {
+                 src := filepath.Join(home, ".claude", ".claude.json")
+                 if _, err := os.Stat(src); err == nil {
+                     _ = os.Symlink(src, filepath.Join(dst, ".claude.json"))
+                 }
+             }
+         } else {
+             _ = os.WriteFile(filepath.Join(dst, ".claude.json"),
+                 []byte(`{"hasCompletedOnboarding":true}`), 0o644)
+         }
+         return dst, nil
+     }
+     ```
+
+   - **`e2e/agents/tmux.go`** — WaitFor race condition fix
+     - `Send()` now waits for terminal echo to render before snapshotting `stableAtSend`
+     - Polls up to 5s for content to change from pre-send state, then captures post-echo snapshot
+     - This prevents `WaitFor("❯")` from matching the `❯` in echoed user input
+     ```go
+     func (s *TmuxSession) Send(input string) error {
+         preSend := stableContent(s.Capture())
+         if err := s.SendKeys(input); err != nil {
+             return err
+         }
+         time.Sleep(200 * time.Millisecond)
+         if err := s.SendKeys("Enter"); err != nil {
+             return err
+         }
+         deadline := time.Now().Add(5 * time.Second)
+         for time.Now().Before(deadline) {
+             time.Sleep(200 * time.Millisecond)
+             current := stableContent(s.Capture())
+             if current != preSend {
+                 s.stableAtSend = current
+                 return nil
+             }
+         }
+         s.stableAtSend = stableContent(s.Capture())
+         return nil
+     }
+     ```
+
+   - **`e2e/tests/main_test.go`** — PATH prepend and preflight info
+     - Prepends test binary directory to PATH so hooks resolve correctly
+     - Writes preflight info (binary path, version) to `entire-version.txt`
+     ```go
+     entireBin := entire.BinPath()
+     os.Setenv("PATH", filepath.Dir(entireBin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+     // ...
+     preflight := fmt.Sprintf("entire binary:  %s\nentire version: %s\n",
+         entireBin, version)
+     fmt.Fprint(os.Stderr, preflight)
+     _ = os.WriteFile(filepath.Join(runDir, "entire-version.txt"), []byte(preflight), 0o644)
+     ```
+
+   - **`e2e/agents/agent.go`** — Configurable concurrency gate
+     - `RegisterGate` now checks `E2E_CONCURRENT_TEST_LIMIT` env var
+     ```go
+     func RegisterGate(name string, defaultMax int) {
+         max := defaultMax
+         if v, err := strconv.Atoi(os.Getenv("E2E_CONCURRENT_TEST_LIMIT")); err == nil && v > 0 {
+             max = v
+         }
+         gates[name] = make(chan struct{}, max)
+     }
+     ```
+
+   - **`e2e/agents/gemini.go`** — Gate default changed from 3 to 2
+     ```go
+     RegisterGate("gemini-cli", 2)
+     ```
+
+   - **`mise-tasks/test-e2e`** — Extracted shared E2E runner script
+     - Hidden internal task (`#MISE hide=true`)
+     - Handles artifact dir setup, gotestsum invocation, report generation, preflight output
+     - Documents `E2E_AGENT` and `E2E_CONCURRENT_TEST_LIMIT` env vars
+
+   - **`mise.toml`** — Simplified E2E tasks to thin wrappers
+     ```toml
+     [tasks."test:e2e"]
+     run = "mise run test-e2e ${usage_filter:+\"$usage_filter\"}"
+     
+     [tasks."test:e2e:claude"]
+     run = "E2E_AGENT=claude-code mise run test-e2e ${usage_filter:+\"$usage_filter\"}"
+     
+     [tasks."test:e2e:gemini"]
+     run = "E2E_AGENT=gemini-cli mise run test-e2e ${usage_filter:+\"$usage_filter\"}"
+     
+     [tasks."test:e2e:opencode"]
+     run = "E2E_AGENT=opencode mise run test-e2e ${usage_filter:+\"$usage_filter\"}"
+     ```
+
+4. Errors and fixes:
+   - **`nilerr` lint error**: `cleanConfigDir()` returned `(dst, nil)` when `os.UserHomeDir()` errored. Fixed by nesting the home dir check: `if home, err := os.UserHomeDir(); err == nil {`.
+   - **`no new variables on left side of :=`**: `err` from `cleanConfigDir()` in `RunPrompt` conflicted with later `err := cmd.Run()`. Fixed by changing to `err = cmd.Run()`.
+   - **User rejected writing tests for test harness**: "we don't need to test our test harness code directly..." — I dropped the test file and made changes directly.
+   - **`unknown field(s) ["usage"]` in mise task file header**: `#MISE usage=` is not valid for file-based tasks. Fixed by removing it and using `usage_filter` env var passed from TOML wrappers.
+   - **shellcheck SC2086**: `exit ${rc:-0}` needs quoting. Fixed to `exit "${rc:-0}"`.
+   - **Redundant output**: User pointed out `entire binary:` and `entire (PATH):` were identical after PATH fix, and artifacts dir printed twice. Removed the PATH line and artifact dir from preflight output.
+   - **E2E_PARALLEL was unnecessary**: User corrected that `RegisterGate` already handles concurrency, not `-parallel 1`. `TimeoutMultiplier` is for slowness, not rate limiting. Dropped `E2E_PARALLEL` entirely.
+   - **Per-agent env var rejected**: I proposed `E2E_GATE_<AGENT>` per-agent overrides. User said "just use E2E_CONCURRENT_TEST_LIMIT global".
+
+5. Problem Solving:
+   - **Root cause of shadow branch failures**: User's personal `~/.claude/CLAUDE.md` had TDD instructions that leaked into E2E tests, causing Haiku to create extra test files. The carry-forward mechanism correctly tracked these uncommitted files, but tests asserted no shadow branches should exist.
+   - **Root cause of interactive session timeouts**: `WaitFor("❯")` matched the `❯` in echoed user input before the agent started processing. `Send()` was snapshotting pre-echo terminal state, so `contentChanged` fired on the echo itself.
+   - **Root cause of onboarding failures (12:25 run)**: Empty `CLAUDE_CONFIG_DIR` meant no `hasCompletedOnboarding`, triggering first-run onboarding that the test harness couldn't navigate.
+   - **Hook binary mismatch**: `E2E_ENTIRE_BIN` only affected direct test harness calls. Git hooks and agent hooks called bare `entire` from PATH. Fixed by prepending test binary dir to PATH in TestMain.
+
+6. All user messages:
+   - `/debug-e2e` with two artifact paths, asking about non-deterministic behavior vs something else
+   - "(also double check we are using the built binary each time from the current branch)"
+   - "is the claude invocation in the e2e's picking up user settings? we shouldn't be, right?"
+   - "could we enable sandboxing? https://code.claude.com/docs/en/settings#sandbox-settings"
+   - "but I guess that doesn't stop the context load chain"
+   - "the 'auth' fixes we did yesterday to use keychain based auth - do we even need the claude dir to copy anything?"
+   - "let's try it"
+   - "we don't need to test our test harness code directly..."
+   - "but keep the comment for DISABLE_NONESSENTIAL"
+   - "commit this, then let's have a look at the latest test failures /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T12-25-30"
+   - "yes, look into the WaitFor race condition"
+   - "and we're sure it won't impact the other things?"
+   - "is there any way to show this information at the start of the test run?"
+   - "the gotestsum is swallowing it though 😭"
+   - "and let's print the version information at the end after the report (also show the artifacts directory again)"
+   - "last but not least: can we refactor the duplication in mise.toml? as we add more agents this will become more unwieldy"
+   - "is this pattern true of all the agents?" (re: WaitFor race)
+   - "ok, next problem: E2E_ENTIRE_BIN - this sets the `entire` we are calling _from_ the test harness...but it doesn't change any of the hooks getting called by the agents / git I think - can we confirm?"
+   - "can we alter the $PATH that goes into the test contexts?"
+   - "this is scoped just to this process, yes? (as in it won't pollute the user's PATH ongoing?)"
+   - "entire binary: and entire(PATH) are the same in version.txt? we're also printing the artifacts dir twice at the end"
+   - "what is the E2E_PARALLEL setting?"
+   - "don't we already have the internal gate?"
+   - "let's have a think about this. you're also not quite right about the multiplier, that's just for dealing with gemini slowness. the RegisterGate functionality is what does queueing per-agent. I would like to have the ability to choose the gate size from the outside though - we've recently gotten api keys which have higher rate limits and I want to use that in CI"
+   - "RegisterGate only gets called by Gemini at the moment; I think we can make it across the board, with 'unlimited' by default for all other agents and an override for gemini in code (2). and in CI we can push that number up for gemini"
+   - "just use E2E_CONCURRENT_TEST_LIMIT global"
+   - "let's create a PR"
+   - "Your task is to create a detailed summary..." (this message)
+
+7. Pending Tasks:
+   - PR #508 is open and needs review/merge. The PR description may need updating to reflect the additional commits (gate override, preflight cleanup).
+
+8. Current Work:
+   The most recent work was implementing `E2E_CONCURRENT_TEST_LIMIT` env var support in `RegisterGate`, changing Gemini's default gate from 3 to 2, removing the `E2E_PARALLEL` mechanism, and pushing all changes. The PR was already created at https://github.com/entireio/cli/pull/508 with 7 commits on branch `alex/more-e2e-fixes`. The user then requested this summary.
+
+9. Optional Next Step:
+   The PR description at #508 was created before commits 6 and 7 (redundant output cleanup and E2E_CONCURRENT_TEST_LIMIT). It may need updating to reflect these additions. However, the user has not explicitly requested this — they asked for a summary, which suggests a natural pause point.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli/d9f0a13a-2256-4ef2-a6ed-7fe605e55655.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+can we update the CI gemini call to up the concurrency limit? let's say to 6?
+
+---
+
+just for gemini?
+
+---
+
+and let's fire off the e2e workflow
+
+---
+
+Base directory for this skill: /Users/alex/workspace/cli/.claude/skills/debug-e2e
+
+# Debug Entire CLI via E2E Artifacts
+
+Diagnose Entire CLI bugs using captured artifacts from the E2E test suite. Artifacts are written to `e2e/artifacts/` locally or downloaded from CI via GitHub Actions.
+
+## Inputs
+
+The user provides either:
+- **A test run directory:** `e2e/artifacts/{timestamp}/` — triage all failures
+- **A specific test directory:** `e2e/artifacts/{timestamp}/{TestName}-{agent}/` — debug one test
+
+## Artifact Layout
+
+```
+e2e/artifacts/{timestamp}/
+├── report.nocolor.txt          # Pass/fail/skip summary with error lines
+├── test-events.json            # Raw Go test events (NDJSON)
+├── entire-version.txt          # CLI version under test
+└── {TestName}-{agent}/
+    ├── PASS or FAIL            # Status marker
+    ├── console.log             # Full operation transcript
+    ├── git-log.txt             # git log --decorate --graph --all
+    ├── git-tree.txt            # ls-tree HEAD + checkpoint branch
+    ├── entire-logs/entire.log  # CLI structured JSON logs
+    ├── checkpoint-metadata/    # Checkpoint + session metadata
+    └── repo -> /tmp/...        # Symlink to preserved repo (E2E_KEEP_REPOS=1 only)
+```
+
+## Preserved Repo
+
+When the test run was executed with `E2E_KEEP_REPOS=1`, each test's artifact directory contains a `repo` symlink pointing to the preserved temporary git repository. This is the actual repo the test operated on — you can inspect it directly.
+
+**Navigate via the symlink** (e.g., `{artifact-dir}/repo/`) rather than resolving the `/tmp/...` path. The symlink lives inside the artifact directory so permissions and paths stay consistent.
+
+The preserved repo contains:
+- Full git history with all branches (main, `entire/checkpoints/v1`)
+- The `.entire/` directory with CLI state, config, and raw logs
+- The `.claude/` directory (if Claude Code was the agent)
+- All files the agent created or modified, in their final state
+
+This is the most powerful debugging tool — you can run `git log`, `git diff`, `git show`, inspect `.entire/` internals, and see exactly what the CLI left behind.
+
+## Debugging Workflow
+
+### 1. Triage (if given a run directory)
+
+Read `report.nocolor.txt` to identify failures and their error messages. Each entry shows the test name, agent, duration, and failure output with file:line references.
+
+### 2. Read console.log (most important)
+
+Full transcript of every operation:
+- `> claude -p "..." ...` — agent prompts with stdout/stderr
+- `> git add/commit/...` — git commands
+- `> send: ...` — interactive session inputs
+
+This tells you what happened chronologically.
+
+### 3. Read test source code
+
+Use the file:line from the report to find the test in `e2e/tests/`. Understand what the test expected to happen vs what console.log shows actually happened.
+
+### 4. Diagnose the CLI behavior
+
+Cross-reference console.log (what happened) with the test (what should have happened). Focus on CLI-level issues:
+
+| Symptom | CLI Investigation |
+|---------|-------------------|
+| Checkpoint not created / timeout | Check `entire-logs/entire.log` for hook invocations, phase transitions, errors |
+| Wrong checkpoint content | Check `git-tree.txt` for checkpoint branch files, `checkpoint-metadata/` for session info |
+| Hooks didn't fire | Check `entire.log` for missing hook entries (session-start, user-prompt-submit, stop, post-commit) |
+| Stash/unstash problems | Check `entire.log` for stash-related log lines, `git-log.txt` for commit ordering |
+| Attribution issues | Check `checkpoint-metadata/` for `files_touched`, session metadata for attribution data |
+| Strategy mismatch | Check `entire.log` for `strategy` field, verify auto-commit vs manual-commit behavior |
+
+### 5. Deep dive files
+
+- **entire-logs/entire.log**: Structured JSON logs — hook lifecycle, session phases (`active` → `idle` → `ended`), warnings, errors. Key fields: `component`, `hook`, `strategy`, `session_id`.
+- **git-log.txt**: Commit graph showing main branch, `entire/checkpoints/v1`, checkpoint initialization.
+- **git-tree.txt**: Files at HEAD vs checkpoint branch (separated by `--- entire/checkpoints/v1 ---`).
+- **checkpoint-metadata/**: `metadata.json` has `checkpoint_id`, `strategy`, `files_touched`, `token_usage`, and `sessions` array. Session subdirs have per-session details.
+
+### 6. Report findings
+
+Identify whether the issue is in:
+- **CLI hooks** (prepare-commit-msg, commit-msg, post-commit)
+- **Session management** (phase transitions, session tracking)
+- **Checkpoint creation** (branch management, metadata writing)
+- **Attribution** (file tracking, prompt correlation)
+- **Strategy logic** (auto-commit vs manual-commit behavior)
+
+
+ARGUMENTS: /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T14-14-10
+
+---
+
+is the token refresh problem recoverable?
+
+---
+
+or do we just want to look for Error: in the string?
+
+---
+
+next run: /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T14-20-34
+
+---
+
+🤔 both opencode and our claude e2e tests use the same model...
+
+---
+
+commit this and let's see how CI goes
+
+---
+
+✗ TestSplitModificationsToExistingFiles (19.9s)
+  ✗ opencode             19.9s
+      split_commits_test.go:122: agent failed: opencode exited 0 but stderr indicates failure: Error: You must read file /private/var/folders/wl/8b8rnjvn6_jfl4wz9fw883qh0000gn/T/e2e-repo-1233030391/src/model.go before overwriting it. Use the Read tool first
+
+in /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T14-40-43
+
+Our error signalling is too sensitive methinks?
+
+---
+
+and those retrigger the test?
+
+---
+
+commit this fix then let's do the isolation piece
+
+---
+
+we just want to retry if there's a transient error, everything else will cause the test to fail right?

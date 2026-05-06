@@ -1,0 +1,183 @@
+use playground to help me understand how human vs AI code attribution works in this repo
+
+---
+
+Tool loaded.
+
+---
+
+Base directory for this skill: /Users/alisha/.claude/plugins/cache/claude-plugins-official/playground/205b6e0b3036/skills/playground
+
+# Playground Builder
+
+A playground is a self-contained HTML file with interactive controls on one side, a live preview on the other, and a prompt output at the bottom with a copy button. The user adjusts controls, explores visually, then copies the generated prompt back into Claude.
+
+## When to use this skill
+
+When the user asks for an interactive playground, explorer, or visual tool for a topic — especially when the input space is large, visual, or structural and hard to express as plain text.
+
+## How to use this skill
+
+1. **Identify the playground type** from the user's request
+2. **Load the matching template** from `templates/`:
+   - `templates/design-playground.md` — Visual design decisions (components, layouts, spacing, color, typography)
+   - `templates/data-explorer.md` — Data and query building (SQL, APIs, pipelines, regex)
+   - `templates/concept-map.md` — Learning and exploration (concept maps, knowledge gaps, scope mapping)
+   - `templates/document-critique.md` — Document review (suggestions with approve/reject/comment workflow)
+   - `templates/diff-review.md` — Code review (git diffs, commits, PRs with line-by-line commenting)
+   - `templates/code-map.md` — Codebase architecture (component relationships, data flow, layer diagrams)
+3. **Follow the template** to build the playground. If the topic doesn't fit any template cleanly, use the one closest and adapt.
+4. **Open in browser.** After writing the HTML file, run `open <filename>.html` to launch it in the user's default browser.
+
+## Core requirements (every playground)
+
+- **Single HTML file.** Inline all CSS and JS. No external dependencies.
+- **Live preview.** Updates instantly on every control change. No "Apply" button.
+- **Prompt output.** Natural language, not a value dump. Only mentions non-default choices. Includes enough context to act on without seeing the playground. Updates live.
+- **Copy button.** Clipboard copy with brief "Copied!" feedback.
+- **Sensible defaults + presets.** Looks good on first load. Include 3-5 named presets that snap all controls to a cohesive combination.
+- **Dark theme.** System font for UI, monospace for code/values. Minimal chrome.
+
+## State management pattern
+
+Keep a single state object. Every control writes to it, every render reads from it.
+
+```javascript
+const state = { /* all configurable values */ };
+
+function updateAll() {
+  renderPreview(); // update the visual
+  updatePrompt();  // rebuild the prompt text
+}
+// Every control calls updateAll() on change
+```
+
+## Prompt output pattern
+
+```javascript
+function updatePrompt() {
+  const parts = [];
+
+  // Only mention non-default values
+  if (state.borderRadius !== DEFAULTS.borderRadius) {
+    parts.push(`border-radius of ${state.borderRadius}px`);
+  }
+
+  // Use qualitative language alongside numbers
+  if (state.shadowBlur > 16) parts.push('a pronounced shadow');
+  else if (state.shadowBlur > 0) parts.push('a subtle shadow');
+
+  prompt.textContent = `Update the card to use ${parts.join(', ')}.`;
+}
+```
+
+## Common mistakes to avoid
+
+- Prompt output is just a value dump → write it as a natural instruction
+- Too many controls at once → group by concern, hide advanced in a collapsible section
+- Preview doesn't update instantly → every control change must trigger immediate re-render
+- No defaults or presets → starts empty or broken on load
+- External dependencies → if CDN is down, playground is dead
+- Prompt lacks context → include enough that it's actionable without the playground
+
+
+ARGUMENTS: Create an interactive playground that teaches how human vs AI code attribution works in the Entire CLI. The playground should simulate a coding session where an AI agent and human interleave edits, and show how the attribution algorithm calculates percentages.
+
+## Core Concept
+
+The CLI tracks what percentage of a commit was written by the AI agent vs the human. It does this by:
+1. **Capturing user edits at each prompt start** (before agent runs) — stored as `PromptAttribution` with per-file line counts
+2. **Calculating final attribution at commit time** — combining accumulated data with post-checkpoint diffs
+3. **Using a LIFO heuristic** — when users modify lines, assume they modify their own recent additions first (per-file pool tracking)
+
+## Playground Features
+
+### Timeline Simulator
+Show a visual timeline of a coding session with these steps:
+1. **Session Start** — base commit established (show a code editor with initial file content)
+2. **User edits** — user adds/removes lines (highlight in blue)
+3. **Prompt submitted** → `CalculatePromptAttribution()` runs, capturing user changes
+4. **Agent runs** — agent adds/removes lines (highlight in green), checkpoint saved to shadow branch
+5. **More user edits** — user modifies some lines (could be their own OR agent lines)
+6. **Another prompt** → captures user changes again
+7. **Agent runs again** → another checkpoint
+8. **Final user edits**
+9. **User commits** → `CalculateAttributionWithAccumulated()` runs
+
+### Interactive Controls
+- **File editor panel** showing code with color-coded authorship (blue = human, green = agent)
+- **Add/remove lines buttons** for both human and agent
+- Slider or step-through buttons to advance through the timeline
+- Toggle to switch between files (main.go, utils.go) to show per-file tracking
+
+### Live Calculation Display
+Show the running calculation as a breakdown:
+
+```
+═══ Attribution Calculation ═══
+
+Prompt Attributions (accumulated):
+  PromptAttribution #1: +5 user lines, +0 agent lines
+  PromptAttribution #2: +3 user lines, +10 agent lines
+
+Per-File User Additions:
+  main.go: 6 lines
+  utils.go: 2 lines
+
+Step 1: base → shadow diff
+  Total work in shadow: 18 lines added
+  
+Step 2: Subtract accumulated user edits to agent files
+  Agent work: 18 - 8 = 10 lines
+
+Step 3: shadow → head (post-checkpoint edits)
+  User added: 3, removed: 2
+
+Step 4: LIFO self-modification estimate
+  User removed 2 lines from main.go
+  User previously added 6 to main.go
+  Self-modified: min(2, 6) = 2
+  Modified agent lines: 0
+
+Step 5: Final calculation
+  Agent lines in commit: 10
+  Total committed: 15
+  Agent percentage: 66.7%
+```
+
+### LIFO Heuristic Demo
+A special interactive section where users can:
+- See a file with mixed human (blue) and agent (green) lines
+- Click to "remove" lines and see how the LIFO heuristic determines whether it was a human self-modification or an agent modification
+- Compare "with per-file tracking" vs "without" to see why per-file pools matter
+- Show the example from the docs: agent adds 10, user adds 5, user modifies 3 → 66.7% vs incorrect 46.7%
+
+### Visual Elements
+- Color coding: blue/indigo for human, green/emerald for agent, gray for unchanged base
+- Git-style diff visualization for each step
+- Animated transitions between steps
+- A "shadow branch" indicator showing checkpoint state vs working tree state
+- Flow diagram matching the one in attribution.md
+
+### Data Flow Diagram
+Show the three git trees and how they relate:
+```
+baseTree ──────────────────────── headTree
+    │                                │
+    │  (agent work + user edits      │  (post-checkpoint
+    │   captured in checkpoints)     │   user edits)
+    │                                │
+    └──────── shadowTree ────────────┘
+```
+
+### Presets
+Include preset scenarios:
+1. **Simple**: Agent writes everything, no human edits → 100%
+2. **Mixed**: Agent and human both contribute → ~60%
+3. **Heavy editing**: Human rewrites most of agent's code → ~20%
+4. **Self-modification**: Human modifies own code (LIFO kicks in) → agent % preserved
+5. **Multi-file**: Changes across multiple files showing per-file tracking
+
+---
+
+Tool loaded.

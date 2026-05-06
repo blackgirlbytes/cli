@@ -1,0 +1,64 @@
+Implement the following plan:
+
+# Plan: Auto-delete stale session state files
+
+## Context
+
+Session state files (`.git/entire-sessions/<session-id>.json`) accumulate over time. Sessions that ended more than 24 hours ago are no longer useful but remain on disk. This change makes stale sessions invisible to callers by deleting them transparently during load/list operations.
+
+## Approach
+
+Add an `IsStale()` method to `session.State` and integrate cleanup into the two code paths that read session state files: `StateStore.List()` and `strategy.LoadSessionState()`.
+
+### 1. Add staleness logic to `session/state.go`
+
+- Add constant `StaleSessionThreshold = 24 * time.Hour`
+- Add method `(s *State) IsStale() bool` — returns true when `EndedAt != nil && time.Since(*EndedAt) > StaleSessionThreshold`
+- Unconditional: no check on `StepCount` or condensation status
+
+### 2. Cleanup in `StateStore.List()` (`session/state.go`)
+
+After loading each state via `s.Load()`, check `state.IsStale()`. If stale:
+- Call `s.Clear(ctx, sessionID)` to delete the file
+- Log the deletion via `logging.Info`
+- Skip the entry (don't append to results)
+
+This makes `strategy.ListSessionStates()` and `strategy.FindMostRecentSession()` automatically exclude stale sessions.
+
+### 3. Cleanup in `strategy.LoadSessionState()` (`strategy/session_state.go`)
+
+After loading and unmarshalling, check `state.IsStale()`. If stale:
+- Call `ClearSessionState(sessionID)` to delete the file
+- Log the deletion
+- Return `(nil, nil)` — same as "not found"
+
+This makes all direct `LoadSessionState()` callers (lifecycle hooks, debug, reset, etc.) see stale sessions as non-existent.
+
+### 4. Tests
+
+- **`session/state_test.go`**: Test `IsStale()` with various `EndedAt` values (nil, recent, >24h)
+- **`session/state_test.go`**: Test `StateStore.List()` — create a stale session file, call `List()`, verify it's excluded and the file is deleted from disk
+- **`strategy/session_state_test.go`**: Test `LoadSessionState()` — create a stale session file, call `LoadSessionState()`, verify `(nil, nil)` returned and file deleted
+
+## Files to modify
+
+- `cmd/entire/cli/session/state.go` — add `StaleSessionThreshold`, `IsStale()`, modify `List()`
+- `cmd/entire/cli/strategy/session_state.go` — modify `LoadSessionState()`
+- `cmd/entire/cli/session/state_test.go` — new tests (or add to existing)
+- `cmd/entire/cli/strategy/session_state_test.go` — new tests (or add to existing, may need to create)
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci` — all pass
+2. Manual: create a session state file with `ended_at` set to >24h ago, run `entire status` or `entire doctor` — the session should not appear
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/paul/.claude/projects/-Users-paul-src-entireio-cli/fabdffd1-c820-4fde-b454-c5fd772ec65b.jsonl
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+commit

@@ -1,0 +1,156 @@
+/brainstorming how do we allow trails to support multiple (potentially stacked) PRs, and hence multiple branches?
+
+---
+
+I think in an ideal world we would like to support all these different use cases, while maintaining the same "Intent" for the Trail
+
+---
+
+yeah I think the flat list is fine for now. branch-PRs are natural units, though the PR part could in theory get discarded for a replacement?
+
+---
+
+1. remember also that branch refs themselves are not durable (and may not be available in the local repo)...so we may need to record more than that. To answer your question though I think the base needs to be per-branch/PR to support stacking.
+
+at least one branch/PR presumably comes from main...but as rebases happen the specific merge-base is mutable as well 😅
+
+2. it can just be inferred? are you asking when a branch should be added to a Trail? Let's keep it explicit for now, I don't know if there are any hooks available on the git branch command to track it!
+
+3. let's keep it flat and simple for now
+
+---
+
+Base: main@{sha}? what's the 'git native' way to express this?
+
+Let's run with this for now
+
+---
+
+1. the ux is a bit clunky, we currently 'auto-generate' a branch name but you can go back and edit it
+2. perhaps `entire trail branch add` adds this branch? I don't know how to avoid adding branches into multiple trails by accident though 😅 (maybe doesn't matter for now). We should also have a version where we can pass the branch.
+
+---
+
+I wonder if there is parallel development going on - would we start running into file concurrency issues?
+
+---
+
+tell me more about git update-ref?
+
+---
+
+essentially doing a `git commit` on the trails file?
+
+---
+
+so what you're saying is that we don't need to split the file as git will help us 'lock' on simultaneous changes?
+
+---
+
+ok
+
+---
+
+while we're here....
+Trail
++-- intent (typed reference — see below)
++-- checkpoints[] (linked checkpoints — the spine of the trail)
++--   summary (one per checkpoint, exists today in CLI)
++--   sessions[] (contributing agent sessions, reachable via checkpoint)
++-- amendments[] (spec changes with reasoning)
++-- summary (aggregated trail-level summary, rolled up from checkpoint summaries)
++-- report (aggregated verification report)
++-- ship reference (PR URL, merge commit — set at ship time)
+```
+
+### Intent reference (typed)
+
+The intent reference should be typed rather than a bare string, so tooling can
+resolve and display it appropriately. _(h/t evisdren)_
+
+```go
+type Intent struct {
+    Kind    string `json:"kind"`              // file, url, issue, inline
+    Value   string `json:"value"`             // path, URL, issue ID, inline text
+    Content string `json:"content,omitempty"` // resolved intent text (cached)
+}
+```
+
+This supports the full spectrum: formal spec file, Linear issue, URL, or inline
+one-liner. `Content` is optional — populated at trail creation or on first resolve
+to avoid repeated lookups.
+
+
+this is some thinking from elsewhere, we need to align both of these models...
+
+the elsewhere version didn't really consider branches or PRs, which I think is important now that we're seeing the rubber hit the road
+
+---
+
+1. we don't need to keep anything at top level
+2. I think having the title as a separate field is fine
+3. amendments might live under Intent?
+
+---
+
+shipped == status: "merged" or discarded (whatever that looks like)
+
+discussion - separate file but....part of the Trail model at top level?
+
+the multi-PRs have a bit of an impact on the verification report...
+
+---
+
+today it is a PR scoped bunch of github checks, pr-review activity and an "approval". I'm imagining a future where that also potentially extends to canary or post-release metrics, which makes it a bit tricky in terms of timeline
+
+but we need to be able to support a flow that has progressive release with potential rollback, and the trail isn't 'done' until we achieve full rollout I think (which is part of the verification in this case)
+
+---
+
+yes, the post-deployment stuff is just another type of 'verification'
+
+things like security/perf review are also verification types I think
+
+---
+
+do we need to have the status delineation between in_review -> merged -> deploying -> deployed -> done?
+
+a progressive rollout strategy could be modelled as either the tail of the review process or a 'validating' stage? Do we need to know the underlying mechanics of it?
+
+---
+
+the only reason I'd keep something in there is if there needs to be a specific trigger for human action, i.e. the "Trail Review".
+
+That said it that activity could happen at various points in the process and is perhaps a different type of Verification in itself...
+
+---
+
+good point, the design review is pretty critical. So yeah, it's a specific verification event, but we'd just need to work out how to signal it.
+
+re: migration let's not worry about it, we don't need to bring prior trails up to date in this scheme
+
+---
+
+do we take a leave out of the nvm book? our current console has the 'trail context' loaded?
+
+we could potentially switch when we move into different worktrees....
+
+---
+
+.git is a pointer in worktrees, not a folder?
+
+---
+
+we just need to be able to handle this when switching branches within a worktree :|
+
+---
+
+stateless lookup is the safest for now
+
+---
+
+yep
+
+---
+
+1

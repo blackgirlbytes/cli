@@ -1,0 +1,375 @@
+can we add e2e tests similar to those for gemini/claude (mise run test:e2e:claude)
+
+---
+
+ok, there are a lot of tests failing, can you run them one by one and let me know what the reason is?
+
+---
+
+can you search the repo/issues ?
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+quick question: did we run entire enable --agent opencode at the beginning of the tests so the right hooks are setup?
+
+---
+
+yes
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+wait: why are we writing to the tmp folder out side? or what is?
+
+---
+
+yeah but maybe we should just use a tmp directory inside the repo? to prevent these issues? I also feel there is a risk with this setting hiding other issues we might have.
+
+---
+
+could we add only the current tmp directory (and yes go back to t.TempDir()) top opencode.json ath the beginning? would that work instead of `*`
+
+---
+
+can you check if this would help with 1?
+
+---
+
+[Request interrupted by user]
+
+---
+
+can you check if this would help with 1? https://github.com/entireio/cli/pull/462
+
+---
+
+is there an alternative to session.idle?
+
+---
+
+yes
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. User asked to add E2E tests for OpenCode similar to Claude/Gemini (mise run test:e2e:claude)
+2. I explored the E2E test infrastructure thoroughly - understanding agent_runner.go, setup_test.go, testenv.go, mise.toml, and the OpenCode agent implementation
+3. I implemented the OpenCodeRunner in agent_runner.go, added it to the factory, and added mise task
+4. User asked to run tests one by one to find failures
+5. Ran TestE2E_BasicWorkflow - failed because 0 rewind points and no checkpoint trailer
+6. Ran TestE2E_CheckpointIDFormat and TestE2E_AutoCommitStrategy - same pattern
+7. I diagnosed: hooks weren't firing during `opencode run`
+8. User asked to search the repo/issues
+9. Searched anomalyco/opencode issues - found issue #3201 showing plugins DO fire in run mode
+10. User asked to add debug logging to investigate
+11. Created debug_opencode_test.go - initial compile error with OpenRepo method, fixed it
+12. Debug test revealed: `permission requested: external_directory (...); auto-rejecting` - OpenCode was rejecting file writes
+13. Also revealed hooks ARE firing (session-start and turn-start in logs)
+14. User asked "why are we writing to the tmp folder outside?"
+15. I explained it's because t.TempDir() creates in OS temp, OpenCode treats it as external
+16. User suggested using tmp directory inside the repo instead
+17. I implemented .tmp-e2e/ approach inside module root, added to .gitignore
+18. Still failed - same external_directory rejection even inside the repo
+19. I explained it's a known OpenCode bug where `run` mode auto-rejects ALL external_directory permissions
+20. User said "could we add only the current tmp directory to opencode.json?" and go back to t.TempDir()
+21. I reverted .tmp-e2e approach, added scoped opencode.json with specific path
+22. Still failed - opencode.json config was being overridden by run mode session preset (issue #13851)
+23. Added --print-logs --log-level DEBUG to see permission ruleset
+24. CRITICAL FINDING: The permission ruleset showed our allow rule IS present, but the pattern being evaluated had "Claude Code" injected into the path (path corruption bug), AND the catch-all "ask" rule was evaluated before our specific "allow"
+25. Tried `"external_directory": "allow"` (wildcard) - this worked to fix permission issue
+26. But hello.go still not created - file written to wrong relative path `../../TestE2E_DebugClaude CodeHooks.../001/hello.go`
+27. Also no turn-end hook firing - only session-start and turn-start
+28. User asked if PR #462 would help with the turn-end issue
+29. I analyzed PR #462 - it adds a cleanup watcher for session-end on process kill
+30. Checked phase.go state machine - ACTIVE + SessionStop → ENDED with only ActionUpdateLastInteraction, NO checkpoint save
+31. Concluded PR #462 would NOT help - session-end doesn't save checkpoints
+32. User asked "is there an alternative to session.idle?"
+33. I searched OpenCode docs and found session.status event
+34. Found in OpenCode source: session.idle is DEPRECATED, session.status with type="idle" is the replacement
+35. The run.ts command itself uses session.status to detect completion
+36. User asked me to update the plugin to use session.status
+37. Updated entire_plugin.ts: replaced session.idle case with session.status case
+38. Tested - session.status and session.idle events DO fire (confirmed via --print-logs)
+39. But the plugin's callHook still doesn't result in turn-end in the Entire logs
+40. Likely a race condition: opencode run exits immediately after session.status idle, before the plugin's async callHook completes
+
+Current state of files:
+- agent_runner.go: Has OpenCodeRunner with --print-logs flag (debug), external_directory allow in opencode.json
+- entire_plugin.ts: Updated to use session.status instead of session.idle
+- debug_opencode_test.go: Exists as temporary debug test
+- setup_test.go: Reverted to original (no .tmp-e2e)
+- testenv.go: Has opencode.json with external_directory allow
+- mise.toml: Has test:e2e:opencode task
+- .gitignore: Reverted (no .tmp-e2e)
+
+Two remaining issues:
+1. Race condition: opencode run exits before plugin's turn-end hook completes
+2. File path corruption: "Claude Code" injected into paths (OpenCode bug)
+
+Summary:
+1. Primary Request and Intent:
+   The user requested adding E2E tests for OpenCode agent similar to the existing E2E tests for Claude Code (`mise run test:e2e:claude`) and Gemini CLI (`mise run test:e2e:gemini`). The tests should use `opencode run` in non-interactive mode to execute prompts and verify the Entire CLI's checkpoint/rewind functionality works with OpenCode.
+
+2. Key Technical Concepts:
+   - **E2E test infrastructure**: Tests in `cmd/entire/cli/e2e_test/` that invoke real coding agents (Claude, Gemini, OpenCode) to verify checkpoint workflows
+   - **AgentRunner pattern**: Interface-based factory pattern for invoking different agents non-interactively
+   - **OpenCode `run` command**: Non-interactive mode (`opencode run "prompt"`) that auto-approves permissions
+   - **OpenCode plugin system**: TypeScript plugins in `.opencode/plugins/` that listen to bus events and call `entire hooks opencode <hook-name>`
+   - **Session lifecycle hooks**: session-start → turn-start → turn-end (saves checkpoint) → session-end
+   - **`session.idle` vs `session.status`**: `session.idle` is DEPRECATED in OpenCode. `session.status` with `status.type === "idle"` is the replacement. The `run.ts` command itself uses `session.status` to detect completion.
+   - **`external_directory` permission**: OpenCode's `run` mode defaults this to "ask" which becomes auto-reject. Config overrides via `opencode.json` are partially ignored due to rule evaluation order.
+   - **Phase state machine**: `ACTIVE + SessionStop → ENDED` only does `ActionUpdateLastInteraction`, NO checkpoint save. Checkpoints only happen via TurnEnd handler or GitCommit → ActionCondense.
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/e2e_test/agent_runner.go`** - Core file for agent runners
+     - Added `AgentNameOpenCode = "opencode"` constant
+     - Added `opencode` case to `NewAgentRunner` factory
+     - Added full `OpenCodeRunner` implementation
+     - Currently has `--print-logs` flag for debugging
+     ```go
+     const AgentNameOpenCode = "opencode"
+     
+     // In NewAgentRunner:
+     case AgentNameOpenCode:
+         return NewOpenCodeRunner(config)
+     
+     type OpenCodeRunner struct {
+         Model   string
+         Timeout time.Duration
+     }
+     
+     func NewOpenCodeRunner(config AgentRunnerConfig) *OpenCodeRunner {
+         model := config.Model
+         if model == "" {
+             model = os.Getenv("E2E_OPENCODE_MODEL")
+         }
+         timeout := config.Timeout
+         if timeout == 0 {
+             if envTimeout := os.Getenv("E2E_TIMEOUT"); envTimeout != "" {
+                 if parsed, err := time.ParseDuration(envTimeout); err == nil {
+                     timeout = parsed
+                 }
+             }
+             if timeout == 0 {
+                 timeout = 2 * time.Minute
+             }
+         }
+         return &OpenCodeRunner{Model: model, Timeout: timeout}
+     }
+     
+     func (r *OpenCodeRunner) IsAvailable() (bool, error) {
+         if _, err := exec.LookPath("opencode"); err != nil {
+             return false, fmt.Errorf("opencode CLI not found in PATH: %w", err)
+         }
+         ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+         defer cancel()
+         cmd := exec.CommandContext(ctx, "opencode", "--version")
+         if err := cmd.Run(); err != nil {
+             return false, fmt.Errorf("opencode CLI not working: %w", err)
+         }
+         return true, nil
+     }
+     
+     func (r *OpenCodeRunner) RunPromptWithTools(ctx context.Context, workDir string, prompt string, _ []string) (*AgentResult, error) {
+         args := []string{"run", "--print-logs"}  // NOTE: --print-logs is temporary for debugging
+         if r.Model != "" {
+             args = append(args, "--model", r.Model)
+         }
+         args = append(args, prompt)
+         ctx, cancel := context.WithTimeout(ctx, r.Timeout)
+         defer cancel()
+         cmd := exec.CommandContext(ctx, "opencode", args...)
+         cmd.Dir = workDir
+         // ... standard stdout/stderr capture and result handling
+     }
+     ```
+
+   - **`cmd/entire/cli/e2e_test/testenv.go`** - Test environment setup
+     - Added `opencode.json` creation in `NewFeatureBranchEnv` for OpenCode agent
+     ```go
+     // In NewFeatureBranchEnv, before RunEntireEnable:
+     if defaultAgent == AgentNameOpenCode {
+         env.WriteFile("opencode.json", `{
+       "permission": {
+         "external_directory": "allow"
+       }
+     }
+     `)
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/opencode/entire_plugin.ts`** - OpenCode plugin (embedded in Go binary)
+     - Changed `session.idle` handler to `session.status` handler
+     ```typescript
+     case "session.status": {
+       // session.status fires in both TUI and non-interactive (run) mode.
+       // session.idle is deprecated and not reliably emitted in run mode.
+       const props = (event as any).properties
+       if (props?.status?.type !== "idle") break
+       const sessionID = props?.sessionID
+       if (!sessionID) break
+       // Go hook handler will call `opencode export` to get the transcript
+       await callHook("turn-end", {
+         session_id: sessionID,
+       })
+       break
+     }
+     ```
+
+   - **`mise.toml`** - Added OpenCode E2E task
+     ```toml
+     [tasks."test:e2e:opencode"]
+     description = "Run E2E tests with OpenCode"
+     run = "E2E_AGENT=opencode go test -tags=e2e -count=1 -timeout=30m -v ./cmd/entire/cli/e2e_test/..."
+     ```
+
+   - **`cmd/entire/cli/e2e_test/setup_test.go`** - TestMain (reverted to original, no .tmp-e2e)
+
+   - **`.gitignore`** - Reverted (no .tmp-e2e entry)
+
+   - **`cmd/entire/cli/e2e_test/debug_opencode_test.go`** - Temporary debug test file that dumps plugin file, settings, logs, session state, git branches, and tests manual hook invocation after agent run
+
+   - **`cmd/entire/cli/session/phase.go`** - Analyzed to determine that `SessionStop` (session-end) does NOT trigger checkpoint saves. Only `TurnEnd` and `GitCommit` paths create checkpoints.
+
+   - **OpenCode source `packages/opencode/src/session/status.ts`** - Key discovery:
+     ```typescript
+     // session.idle is deprecated
+     Idle: BusEvent.define("session.idle", z.object({ sessionID: z.string() })),
+     // session.status is the replacement
+     if (status.type === "idle") {
+       Bus.publish(Event.Idle, { sessionID })  // deprecated
+     }
+     ```
+
+   - **OpenCode source `packages/opencode/src/cli/cmd/run.ts`** - Shows run command uses `session.status`:
+     ```typescript
+     if (event.type === "session.status" &&
+         event.properties.sessionID === sessionID &&
+         event.properties.status.type === "idle") {
+       break
+     }
+     ```
+
+4. Errors and fixes:
+   - **`env.OpenRepo undefined`**: debug_opencode_test.go used non-existent method. Fixed by replacing with `exec.Command("git", "branch", "-a")`.
+   - **`"fmt" imported and not used`**: Added `fmt` import for `fmt.Sprintf` in opencode.json generation, then removed it when switching to string literal. Fixed by removing the import.
+   - **`external_directory` auto-rejecting in `run` mode**: OpenCode rejects all file writes in non-interactive mode because `external_directory` defaults to "ask" which auto-rejects. Fixed with `"external_directory": "allow"` in `opencode.json`.
+   - **User rejected `.tmp-e2e` approach**: User said "maybe we should just use a tmp directory inside the repo? to prevent these issues?" — I implemented it but it didn't help because OpenCode's `external_directory` check isn't about the actual path location.
+   - **User rejected wildcard `*` in opencode.json**: User asked "could we add only the current tmp directory... instead of `*`?" — I implemented scoped path but it failed because OpenCode evaluates catch-all "ask" rule before specific "allow" rules. Had to fall back to wildcard `"allow"`.
+   - **Scoped opencode.json path didn't work**: Debug logs showed the permission evaluation matched `{"pattern":"*","action":"ask"}` before our specific allow rule. Additionally, the evaluated pattern had "Claude Code" injected into the path (OpenCode bug), so it wouldn't have matched anyway.
+   - **`go build -tags=e2e` fails**: `e2eRepoBaseDir` variable defined in `setup_test.go` (a `_test.go` file) not visible from `testenv.go` during `go build`. Not an actual issue — compiles fine under `go test`.
+
+5. Problem Solving:
+   - **Solved**: Added OpenCodeRunner to E2E test infrastructure
+   - **Solved**: Identified `external_directory` permission as the cause of file write failures — fixed with `opencode.json` config
+   - **Solved**: Identified `session.idle` as deprecated — replaced with `session.status` in plugin
+   - **Solved**: Confirmed PR #462 would NOT help (session-end doesn't save checkpoints)
+   - **Ongoing - Race condition**: `session.status` and `session.idle` events DO fire (confirmed via `--print-logs`), but the plugin's `callHook("turn-end", ...)` doesn't complete before `opencode run` exits. The last debug run showed `session.idle publishing` in OpenCode logs but NO `turn-end` entry in Entire's `.entire/logs/entire.log`. This is a race: `opencode run` detects `session.status idle` and exits immediately, killing the plugin's async `callHook` before it completes.
+   - **Ongoing - File path corruption**: OpenCode injects "Claude Code" (the model's agent type) into file paths, causing writes to wrong locations (e.g., `../../TestE2E_DebugClaude CodeHooks.../001/hello.go`).
+
+6. All user messages:
+   - "can we add e2e tests similar to those for gemini/claude (mise run test:e2e:claude)"
+   - "ok, there are a lot of tests failing, can you run them one by one and let me know what the reason is?"
+   - "can you search the repo/issues ?"
+   - "[Request interrupted by user for tool use] quick question: did we run entire enable --agent opencode at the beginning of the tests so the right hooks are setup?"
+   - "yes" (to adding debug logging)
+   - "wait: why are we writing to the tmp folder out side? or what is?"
+   - "yeah but maybe we should just use a tmp directory inside the repo? to prevent these issues? I also feel there is a risk with this setting hiding other issues we might have."
+   - "could we add only the current tmp directory (and yes go back to t.TempDir()) to opencode.json at the beginning? would that work instead of `*`"
+   - "can you check if this would help with 1? https://github.com/entireio/cli/pull/462"
+   - "is there an alternative to session.idle?"
+   - "yes" (to updating the plugin to use session.status)
+
+7. Pending Tasks:
+   - Fix the race condition: `turn-end` hook doesn't complete before `opencode run` exits — the `callHook` async function is killed mid-execution
+   - Fix the file path corruption issue (OpenCode bug where "Claude Code" is injected into paths)
+   - Remove `--print-logs` from `OpenCodeRunner` (added temporarily for debugging)
+   - Remove `debug_opencode_test.go` (temporary debug test)
+   - Run the actual E2E test suite once the above issues are resolved
+   - Clean up and verify all tests pass for Claude/Gemini still work (no regressions)
+
+8. Current Work:
+   We updated `entire_plugin.ts` to use `session.status` instead of `session.idle` and confirmed via `--print-logs` that both `session.status` and `session.idle` events DO fire during `opencode run`. However, the plugin's `callHook("turn-end", ...)` still doesn't result in a `turn-end` entry in Entire's logs. The last test output showed:
+   ```
+   INFO  2026-02-23T13:28:24 +0ms service=bus type=session.status publishing
+   INFO  2026-02-23T13:28:24 +0ms service=bus type=session.idle publishing
+   ```
+   But the Entire log only contains `session-start` and `turn-start` — no `turn-end`. This is likely a race condition where `opencode run` exits immediately after detecting the idle status, terminating the plugin before its async `callHook` shell command completes.
+
+9. Optional Next Step:
+   Investigate and fix the race condition where the plugin's `callHook("turn-end", ...)` is killed before completing. The most recent work was confirming `session.status` events fire but the plugin can't complete the hook call in time. Possible approaches:
+   - Make `callHook` synchronous using `Bun.spawnSync` instead of the async `Analysis:
+Let me chronologically analyze the conversation:
+
+1. User asked to add E2E tests for OpenCode similar to Claude/Gemini (mise run test:e2e:claude)
+2. I explored the E2E test infrastructure thoroughly - understanding agent_runner.go, setup_test.go, testenv.go, mise.toml, and the OpenCode agent implementation
+3. I implemented the OpenCodeRunner in agent_runner.go, added it to the factory, and added mise task
+4. User asked to run tests one by one to find failures
+5. Ran TestE2E_BasicWorkflow - failed because 0 rewind points and no checkpoint trailer
+6. Ran TestE2E_CheckpointIDFormat and TestE2E_AutoCommitStrategy - same pattern
+7. I diagnosed: hooks weren't firing during `opencode run`
+8. User asked to search the repo/issues
+9. Searched anomalyco/opencode issues - found issue #3201 showing plugins DO fire in run mode
+10. User asked to add debug logging to investigate
+11. Created debug_opencode_test.go - initial compile error with OpenRepo method, fixed it
+12. Debug test revealed: `permission requested: external_directory (...); auto-rejecting` - OpenCode was rejecting file writes
+13. Also revealed hooks ARE firing (session-start and turn-start in logs)
+14. User asked "why are we writing to the tmp folder outside?"
+15. I explained it's because t.TempDir() creates in OS temp, OpenCode treats it as external
+16. User suggested using tmp directory inside the repo instead
+17. I implemented .tmp-e2e/ approach inside module root, added to .gitignore
+18. Still failed - same external_directory rejection even inside the repo
+19. I explained it's a known OpenCode bug where `run` mode auto-rejects ALL external_directory permissions
+20. User said "could we add only the current tmp directory to opencode.json?" and go back to t.TempDir()
+21. I reverted .tmp-e2e approach, added scoped opencode.json with specific path
+22. Still failed - opencode.json config was being overridden by run mode session preset (issue #13851)
+23. Added --print-logs --log-level DEBUG to see permission ruleset
+24. CRITICAL FINDING: The permission ruleset showed our allow rule IS present, but the pattern being evaluated had "Claude Code" injected into the path (path corruption bug), AND the catch-all "ask" rule was evaluated before our specific "allow"
+25. Tried `"external_directory": "allow"` (wildcard) - this worked to fix permission issue
+26. But hello.go still not created - file written to wrong relative path `../../TestE2E_DebugClaude CodeHooks.../001/hello.go`
+27. Also no turn-end hook firing - only session-start and turn-start
+28. User asked if PR #462 would help with the turn-end issue
+29. I analyzed PR #462 - it adds a cleanup watcher for session-end on process kill
+30. Checked phase.go state machine - ACTIVE + SessionStop → ENDED with only ActionUpdateLastInteraction, NO checkpoint save
+31. Concluded PR #462 would NOT help - session-end doesn't save checkpoints
+32. User asked "is there an alternative to session.idle?"
+33. I searched OpenCode docs and found session.status event
+34. Found in OpenCode source: session.idle is DEPRECATED, session.status with type="idle" is the replacement
+35. The run.ts command itself uses session.status to detect completion
+36. User asked me to update the plugin to use session.status
+37. Updated entire_plugin.ts: replaced session.idle case with session.status case
+38. Tested - session.status and session.idle events DO fire (confirmed via --print-logs)
+39. But the plugin's callHook still doesn't result in turn-end in the Entire logs
+40. Likely a race condition: opencode run exits immediately after session.status idle, before the plugin's async callHook completes
+
+Current state of files:
+- agent_runner.go: Has OpenCodeRunner with --print-logs flag (debug), external_directory allow in opencode.json
+- entire_plugin.ts: Updated to use session.status instead of session.idle
+- debug_opencode_test.go: Exists as temporary debug test
+- setup_test.go: Reverted to original (no .tmp-e2e)
+- testenv.go: Has opencode.json with external_directory allow
+- mise.toml: Has test:e2e:opencode task
+- .gitignore: Reverted (no .tmp-e2e)
+
+Two remaining issues:
+1. Race condition: opencode run exits before plugin's turn-end hook completes
+2. File path corruption: "Claude Code" injected into paths (OpenCode bug)
+
+ shell template
+   - Use the cleanup watcher pattern from PR #462 to ensure turn-end fires even on process exit
+   - Add a small delay or use `process.on("beforeExit")` in the plugin to ensure hooks complete
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
