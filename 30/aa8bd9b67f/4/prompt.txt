@@ -1,0 +1,135 @@
+Implement the following plan:
+
+# Plan: Add Kiro IDE Hooks (.kiro/hooks/*.kiro.hook)
+
+## Context
+
+The Kiro agent currently installs hooks only in `.kiro/agents/entire.json` (CLI agent definition format). This works for `kiro-cli chat --agent entire` but **not** for the Kiro IDE (VS Code extension), which reads hooks from `.kiro/hooks/*.kiro.hook` files. We need to install IDE hooks there while keeping the existing CLI agent hooks.
+
+Key difference: CLI hooks receive JSON on stdin. IDE hooks pass data via environment variables (`USER_PROMPT` for promptSubmit) with **no stdin**. The lifecycle parsers must handle empty stdin gracefully.
+
+## Changes
+
+### 1. `cmd/entire/cli/agent/kiro/types.go` — Add IDE hook types
+
+Add 3 structs for the `.kiro.hook` file format:
+
+```go
+type kiroIDEHookFile struct {
+    Enabled     bool            `json:"enabled"`
+    Name        string          `json:"name"`
+    Description string          `json:"description"`
+    Version     string          `json:"version"`
+    When        kiroIDEHookWhen `json:"when"`
+    Then        kiroIDEHookThen `json:"then"`
+}
+
+type kiroIDEHookWhen struct {
+    Type string `json:"type"`
+}
+
+type kiroIDEHookThen struct {
+    Type    string `json:"type"`
+    Command string `json:"command"`
+}
+```
+
+### 2. `cmd/entire/cli/agent/kiro/hooks.go` — Install/uninstall/check IDE hooks
+
+**New constants and data:**
+- `ideHooksDir = "hooks"` — directory within `.kiro`
+- `ideHookFileSuffix = ".kiro.hook"`
+- `ideHookDefs` — slice of 4 definitions mapping filename → trigger type → CLI verb
+
+**IDE hooks to install (4 files):**
+
+| File | `when.type` | Command |
+|------|-------------|---------|
+| `entire-prompt-submit.kiro.hook` | `promptSubmit` | `entire hooks kiro user-prompt-submit` |
+| `entire-stop.kiro.hook` | `agentStop` | `entire hooks kiro stop` |
+| `entire-pre-tool-use.kiro.hook` | `preToolUse` | `entire hooks kiro pre-tool-use` |
+| `entire-post-tool-use.kiro.hook` | `postToolUse` | `entire hooks kiro post-tool-use` |
+
+No `agentSpawn` IDE hook (no IDE trigger exists). First `promptSubmit` serves as session start.
+
+**Modified functions:**
+- `InstallHooks`: After writing CLI agent file, also call `installIDEHooks()` to create 4 `.kiro.hook` files. Idempotency gate checks both CLI and IDE hooks. Returns 9 on fresh install (5 CLI + 4 IDE).
+- `UninstallHooks`: Also remove the 4 IDE hook files (idempotent, no error if missing).
+- `AreHooksInstalled`: Also check for IDE hook files — returns true if EITHER CLI or IDE hooks are present.
+
+**New helpers:**
+- `installIDEHooks(worktreeRoot, cmdPrefix) (int, error)` — creates `.kiro/hooks/` dir and writes 4 files
+- `allIDEHooksPresent(worktreeRoot string, localDev bool) bool` — checks all 4 IDE hook files exist and have correct commands
+- `isEntireIDEHook(hook kiroIDEHookFile) bool` — checks if IDE hook belongs to Entire
+
+### 3. `cmd/entire/cli/agent/kiro/lifecycle.go` — Handle empty stdin (IDE mode)
+
+Add a local helper `readHookInputOrEmpty(stdin)` that wraps `ReadAndParseHookInput` and returns a zero-value `hookInputRaw{}` on empty stdin (instead of erroring). Malformed JSON still returns errors.
+
+**Modified parsers:**
+- `parseAgentSpawn`: Use `readHookInputOrEmpty`. Empty stdin is fine — just generates session ID.
+- `parseUserPromptSubmit`: Use `readHookInputOrEmpty`. If `raw.Prompt` is empty, read `os.Getenv("USER_PROMPT")`. If `raw.CWD` is empty, use `paths.WorktreeRoot(ctx)`.
+- `parseStop`: Use `readHookInputOrEmpty`. If `raw.CWD` is empty, use `paths.WorktreeRoot(ctx)`.
+
+Note: `paths.WorktreeRoot(ctx)` used for CWD fallback (not `os.Getwd()` which is forbidden by linter).
+
+### 4. `cmd/entire/cli/agent/kiro/hooks_test.go` — Update and add tests
+
+**Updated existing tests** (count changes from 5 → 9):
+- `TestInstallHooks_FreshInstall`: expect count 9
+- `TestInstallHooks_LocalDevMode`: expect count 9
+- `TestInstallHooks_Idempotent`: first count = 9
+- `TestInstallHooks_ForceReinstall`: expect count 9
+- `TestInstallHooks_CountMatchesHookNames`: update to assert `count == len(ag.HookNames()) + len(ideHookDefs)`
+
+**New tests:**
+- `TestInstallHooks_CreatesIDEHookFiles` — verify all 4 files exist
+- `TestInstallHooks_IDEHooksValidJSON` — verify JSON structure, enabled, version, when.type, then.type, command
+- `TestInstallHooks_IDEHooksLocalDevMode` — verify local dev command prefix
+- `TestInstallHooks_IDEHooksFilePermissions` — verify 0600
+- `TestInstallHooks_IDEHooksAllTriggerTypes` — verify each file has correct when.type
+- `TestUninstallHooks_RemovesIDEHookFiles` — verify cleanup
+- `TestAreHooksInstalled_IDEOnlyHooks` — verify detection without CLI agent file
+- `TestInstallHooks_Idempotent_IncludesIDEHooks` — verify combined idempotency
+
+### 5. `cmd/entire/cli/agent/kiro/lifecycle_test.go` — Update empty-stdin tests
+
+**Updated existing tests** (empty stdin now succeeds instead of erroring):
+- `TestParseHookEvent_EmptyInput`: change to expect success (SessionStart event)
+- `TestParseHookEvent_EmptyInput_UserPromptSubmit`: change to expect success (TurnStart event)
+- `TestParseHookEvent_EmptyInput_Stop`: change to expect success (TurnEnd event)
+
+**New tests:**
+- `TestParseHookEvent_UserPromptSubmit_EmptyStdin_ReadsEnvVar` — verify `USER_PROMPT` env var fallback
+- `TestParseHookEvent_Stop_EmptyStdin_Succeeds` — verify stop works with empty stdin + mock DB
+
+### 6. `cmd/entire/cli/agent/kiro/AGENT.md` — Update docs
+
+Add "IDE Hook Configuration" section documenting:
+- `.kiro/hooks/` directory and file format
+- The 4 IDE hook files installed
+- Stdin vs environment variable data delivery difference
+- No agentSpawn IDE trigger
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Specific test commands:
+```bash
+go test ./cmd/entire/cli/agent/kiro/... -v -run "TestInstallHooks|TestUninstallHooks|TestAreHooksInstalled"
+go test ./cmd/entire/cli/agent/kiro/... -v -run "TestParseHookEvent_EmptyInput|TestParseHookEvent.*EmptyStdin"
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/8a949619-8aae-4f1a-a46c-6bbf236c34b3.jsonl
+
+---
+
+how to debug the kiro ide hooks not working? I don't see errors or any logs in the .entire folder
+
+---
+
+[Request interrupted by user for tool use]

@@ -1,0 +1,94 @@
+Implement the following plan:
+
+# Fix Two Cursor Bug Bot Comments on PR #554
+
+## Context
+Two cursor[bot] comments from ~7 min ago flagged bugs introduced on this branch. Both are valid and straightforward to fix.
+
+## Bug 1: Stdin timeout in shared function affects all agents
+**File:** `cmd/entire/cli/agent/event.go` (lines 156-182)
+
+**Problem:** `ReadAndParseHookInput` added a 500ms timeout around `io.ReadAll`. The bot correctly notes that `io.ReadAll` doesn't return until EOF — so if an agent's hook caller writes data but takes >500ms to close the pipe (send EOF), the timeout fires and discards the data, returning `ErrEmptyHookInput`.
+
+**Fix:** Instead of timing out the entire `io.ReadAll`, read into a buffer with a deadline-aware approach. However, the simpler and more correct fix: use a **two-phase approach** — set a short timeout for the *first byte* to detect "no data at all" (Kiro's case), but once data starts arriving, wait longer for EOF.
+
+Actually, the simplest correct fix: read with a buffer in a loop using a deadline on the reader if it supports it. But since `stdin` is just an `io.Reader`, the cleanest approach is:
+- Keep the goroutine + channel pattern
+- But after timeout, check if any data was partially read — not possible with `io.ReadAll`
+
+**Simplest correct fix:** Use `bufio.Reader.Peek(1)` with the timeout to detect empty stdin, then do `io.ReadAll` without timeout once we know data exists:
+
+```go
+func ReadAndParseHookInput[T any](stdin io.Reader) (*T, error) {
+    br := bufio.NewReader(stdin)
+
+    // Phase 1: Check if any data is available (with timeout for Kiro's open-pipe case)
+    ch := make(chan readResult, 1)
+    go func() {
+        _, err := br.Peek(1)
+        ch <- readResult{err: err}
+    }()
+
+    select {
+    case res := <-ch:
+        if res.err != nil {
+            if res.err == io.EOF {
+                return nil, ErrEmptyHookInput
+            }
+            return nil, fmt.Errorf("failed to read hook input: %w", res.err)
+        }
+    case <-time.After(stdinReadTimeout):
+        return nil, ErrEmptyHookInput
+    }
+
+    // Phase 2: Data available — read all of it (no timeout, wait for EOF)
+    data, err := io.ReadAll(br)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read hook input: %w", err)
+    }
+    if len(data) == 0 {
+        return nil, ErrEmptyHookInput
+    }
+
+    var result T
+    if err := json.Unmarshal(data, &result); err != nil {
+        return nil, fmt.Errorf("failed to parse hook input: %w", err)
+    }
+    return &result, nil
+}
+```
+
+This fixes the bug because: once we know data exists (Peek succeeds), we let `io.ReadAll` run to completion without a timeout. The timeout only applies to detecting "no data at all" — Kiro's open-pipe scenario.
+
+## Bug 2: Silent empty data masks errors for non-Kiro agents
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go` (lines 130-136)
+
+**Problem:** When `TranscriptPath == ""` and no shadow branch exists, the code creates empty `ExtractedSessionData{}`. This is correct for Kiro (deferred SQLite persistence) but would silently swallow errors for other agents.
+
+**Fix:** Guard with agent type check. The `agent` package is already imported and `state.AgentType` is available:
+
+```go
+if state.TranscriptPath == "" {
+    if state.AgentType != agent.AgentTypeKiro {
+        return nil, fmt.Errorf("shadow branch not found and no live transcript available for agent %s", state.AgentType)
+    }
+    // Kiro-specific: deferred SQLite persistence...
+    sessionData = &ExtractedSessionData{}
+}
+```
+
+## Files to modify
+1. `cmd/entire/cli/agent/event.go` — Two-phase stdin read (Peek with timeout, then ReadAll without timeout)
+2. `cmd/entire/cli/strategy/manual_commit_condensation.go` — Add agent type guard on empty session data
+
+## Verification
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/620d1caf-f25b-4f99-bf08-21ecc64a4440.jsonl
+
+---
+
+commit and push

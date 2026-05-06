@@ -1,0 +1,134 @@
+/superpowers:brainstorm I want to create aceagent but for entire cli. https://docs.aceagent.io/docs/getting-started/ace-cli . entire collects all this agent data and transcripts. need to figure out a way for users to improve their agent sessions, md files and context to make them more efficient and produce better code specific to the repo / org
+
+---
+
+interested in concept 1,2, and 3
+
+---
+
+1. a 2.c 3. d 4. project context files 5. a 6. do all so I can see which I like
+
+---
+
+how is all this data being stored? or traversed. teammate suggest sqlite "I still think the entire/checkpoints/v1 branch is the right idea but having a sqlite instead of the temporary shadow branches might be a good idea. I wonder if this work would also benefit from that."
+
+---
+
+<task-notification>
+<task-id>aa4bfcbe1ce6a23fc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/aa4bfcbe1ce6a23fc.output</output-file>
+<status>completed</status>
+<summary>Agent "Re-review fixed plan" completed</summary>
+<result>I cannot write the review file because plan mode restricts me to read-only actions. Let me provide the review content directly here instead.
+
+---
+
+# Review 02 - Agent Improvement Engine Implementation Plan
+
+**Status:** pending-dev | **Date:** 2026-03-24 | **Reviewer:** Code Review Agent | **Verdict:** APPROVE
+
+## Previous Review Status
+
+### Critical Issues from Review 01
+
+All five critical issues are **FIXED** and correct:
+
+1. **`ListCommitted()` / `cp.Sessions` mismatch** -- FIXED. Both `insights_cmd.go` (line 1306) and `improve_cmd.go` (line 2358) now call `store.ReadCommitted(ctx, cp.CheckpointID)` to get the `*CheckpointSummary`, then iterate `summary.Sessions` by index. This matches the actual API: `ListCommitted` returns `[]CommittedInfo`, `ReadCommitted` returns `*CheckpointSummary` which has `Sessions []SessionFilePaths`.
+
+2. **`ReadSessionContent` takes `sessionIndex int`** -- FIXED. Both call sites pass the loop variable `i`, e.g., `store.ReadSessionContent(ctx, cp.CheckpointID, i)`. Matches the signature at `committed.go:777`.
+
+3. **`SessionMetrics` field names** -- FIXED. The aggregator (line 477-479) uses `meta.SessionMetrics.TurnCount` and `meta.SessionMetrics.DurationMs`, matching the struct at `checkpoint.go:460-463`. The test (line 366) also uses the correct names.
+
+4. **`CommandRunner` signature** -- FIXED. `improve/generator.go` (line 1922) is now `func(ctx context.Context, name string, args ...string) *exec.Cmd`, matching `summarize.ClaudeGenerator` at `summarize/claude.go:66`. Default is `exec.CommandContext`.
+
+5. **Claude CLI response format** -- FIXED. Response parsing (lines 1956-1961) uses `{"result": "string"}` matching the existing summarize package.
+
+### Important Issues from Review 01
+
+- **Code duplication of styles** -- FIXED. Task 0 introduces the `termstyle` package with `New(w io.Writer)`, exported `ShouldUseColor`, `GetTerminalWidth`, `FormatTokenCount`, `TotalTokens`, `SectionRule`, and `HorizontalRule`. Both `insights/renderer.go` and `improve/differ.go` use `termstyle.New(w)` and `termstyle.Styles` throughout. Step 2 refactors `status_style.go` to delegate.
+
+- **Broken `contains` test helper** -- FIXED. All tests use `strings.Contains()` directly (e.g., `differ_test.go` lines 2155, 2158, 2172).
+
+- **`evolve.Config` duplicates `settings.EvolveSettings`** -- FIXED. The `evolve` package has an explicit comment "NOTE: Config lives in settings.EvolveSettings -- no duplicate type here" (line 2474). All functions use `settings.EvolveSettings` directly: `ShouldTrigger` (line 2554), `CheckAndNotify` (line 3055), and all tests.
+
+- **Missing state persistence** -- FIXED. Task 14b adds `evolve/state.go` with `LoadState`/`SaveState` using `.entire/evolve-state.json`. Tests cover round-trip and fresh state.
+
+- **No tests for command wiring** -- STILL OUTSTANDING. Tasks 6 and 12 still only have "Verify it compiles" as validation.
+
+## New Findings
+
+### Important (Should Fix)
+
+**[Task 16 `hook.go`] `CheckAndNotify` is defined but never wired into the session lifecycle.** The function exists and state persistence exists, but no task shows where `CheckAndNotify` is actually called from the existing hook handlers (e.g., `manual_commit_hooks.go`). The session phase state machine dispatches actions on `TurnEnd`/`SessionStop` events, and this is where the evolve trigger needs to be invoked. Without wiring, the evolve feature is complete but inert. The implementer will need to add a step that loads the evolve state, calls `CheckAndNotify`, and saves back -- likely in the `Stop` hook handler.
+
+**[Task 14b `state.go` line 2880] `SaveState` does not ensure `.entire/` directory exists.** `os.WriteFile` will fail if `.entire/` is missing. The test masks this by calling `os.MkdirAll` explicitly. `LoadState` handles missing files, but `SaveState` should either document the prerequisite or defensively create the directory. In practice `.entire/` usually exists, but the defensive approach is better.
+
+### Suggestions (Consider)
+
+**[Task 6 line 1327-1330] Score ordering assumes chronological results.** `runInsights` truncates with `scores[len(scores)-last:]` assuming newest-last. But `ListCommitted` walks git tree entries sharded by checkpoint ID prefix, which has no guaranteed time order. Scores should be sorted by date before truncating.
+
+**[Task 6 and 12] `ReadCommitted` returns `nil, nil` for missing checkpoints.** The plan handles this with `if err != nil || summary == nil { continue }`, which is correct, but silently skips failures. If many checkpoints are unreadable, users get partial results with no indication. A debug log would help diagnostics.
+
+### Praise
+
+- The fixes to all five critical issues are clean and correctly match the actual codebase APIs. The `ReadCommitted` + `ReadSessionContent` pattern accurately reflects the checkpoint store's contract.
+- The `termstyle` package is well-designed: `Styles` struct with `New(w io.Writer)` constructor, and `Render(style, text)` that degrades to plain text when color is off.
+- The explicit "NOTE: Config lives in settings.EvolveSettings" comment prevents future duplication.
+- `state.go` returns zero-value `*State` for both missing and corrupt files -- a safe default.
+
+## Summary
+
+**Overall assessment: APPROVE**
+
+All five critical issues and four of five important issues from review-01 are correctly addressed. The API call patterns, type signatures, field names, and response parsing all now match the actual codebase.
+
+**Remaining concerns (non-blocking):**
+1. The evolve hook (`CheckAndNotify`) is defined but never wired into session lifecycle handlers -- needs a wiring step during implementation
+2. Command wiring tests still absent (carried from review-01)
+3. `SaveState` should handle missing `.entire/` directory
+
+**Estimated effort:** ~1 hour during implementation to address the wiring gap and directory handling.
+
+---
+
+To write this review to `/Users/alisha/.superset/worktrees/cli/agent-improvements/docs/superpowers/plans/review-02.md`, I need write permission. Plan mode currently restricts me to read-only. Would you like to exit plan mode so I can save the file?</result>
+<usage><total_tokens>72089</total_tokens><tool_uses>32</tool_uses><duration_ms>184996</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/aa4bfcbe1ce6a23fc.output
+
+---
+
+sqllite seems like the right choice will this data be only stored locally or should we push it up so that the frontend can take advantage
+
+---
+
+when you say sync to backend what does that mean? is it stored in checkpoint branch?
+
+---
+
+what do you mean friction, learnings are already push in checkpoint branch?
+
+---
+
+okay so what is the current architecture we have for this?
+
+---
+
+yes both those things
+
+---
+
+is the summarize data really enough for the other new commands? if so what is the point of the sqlitedb. I thought improve would like query the sqllite for friction points and see what went wrong. seems like it needs to query the transcripts for that? or is it is smart and only queries sessions that has a high friction count?
+
+---
+
+okay and insights will work similarly?
+
+---
+
+I don't see how seed is that different than improve. so leave that out. i don't really understand the benchmark stuff and the I'm very interested in pre instruction effectiveness tracking
+
+---
+
+do it

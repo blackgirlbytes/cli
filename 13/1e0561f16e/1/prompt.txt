@@ -1,0 +1,109 @@
+Implement the following plan:
+
+# Plan: Fix Kiro IDE hook timeout — implement `HookResponseWriter`
+
+## Context
+
+Kiro IDE hook `entire-prompt-submit` (and likely all IDE hooks) fails with **"Command timed out with no output captured."** The Kiro IDE's `runCommand` hook executor expects commands to produce stdout output, but the `KiroAgent` does not implement the `HookResponseWriter` interface, so all hook commands return silently with zero stdout output, causing the IDE to time out.
+
+**Root cause:** `KiroAgent` is missing the `HookResponseWriter` interface that Claude Code and Factory AI Droid both implement. The lifecycle framework at `lifecycle.go:92` checks for this interface and only writes output if the agent implements it.
+
+**Affected hooks:** All 4 IDE hooks (`promptSubmit`, `agentStop`, `preToolUse`, `postToolUse`) produce no stdout. Additionally, `preToolUse` and `postToolUse` return `nil` events from `ParseHookEvent`, making them complete no-ops in `hook_registry.go:147-154` — they never even reach the lifecycle dispatcher.
+
+## Files to modify
+
+1. **`cmd/entire/cli/agent/kiro/lifecycle.go`** — Add `WriteHookResponse` method to `KiroAgent`
+2. **`cmd/entire/cli/hook_registry.go`** — Write minimal output for no-op hooks (nil event, no special handling) when agent implements `HookResponseWriter`
+3. **Tests** — Add test for `WriteHookResponse`
+
+## Implementation
+
+### 1. Add `WriteHookResponse` to `KiroAgent` (`lifecycle.go`)
+
+Follow the Factory AI Droid pattern (plain text to stdout, not JSON like Claude Code):
+
+```go
+var _ agent.HookResponseWriter = (*KiroAgent)(nil)
+
+func (k *KiroAgent) WriteHookResponse(message string) error {
+    if _, err := fmt.Fprintln(os.Stdout, message); err != nil {
+        return fmt.Errorf("failed to write hook response: %w", err)
+    }
+    return nil
+}
+```
+
+This ensures:
+- `handleLifecycleSessionStart` (agent-spawn) writes the "Powered by Entire" banner
+- `handleLifecycleTurnStart` (user-prompt-submit) does NOT currently call `WriteHookResponse` — see step 2
+- `handleLifecycleTurnEnd` (stop) does NOT currently call `WriteHookResponse` — see step 2
+
+### 2. Ensure all hooks produce output — handle no-op hooks in `hook_registry.go`
+
+The lifecycle handlers only call `WriteHookResponse` in `handleLifecycleSessionStart`. The `user-prompt-submit` (TurnStart), `stop` (TurnEnd), `pre-tool-use`, and `post-tool-use` hooks currently produce zero output even if the agent implements `HookResponseWriter`.
+
+In `hook_registry.go`, after `DispatchLifecycleEvent` returns (or for nil-event no-ops), write a minimal acknowledgment if the agent supports it:
+
+At line ~154 in `newAgentHookVerbCmdWithLogging`, after the lifecycle dispatch block:
+
+```go
+// For agents that need stdout acknowledgment (e.g., Kiro IDE hooks),
+// ensure every hook produces at least minimal output.
+if hookErr == nil {
+    if writer, ok := ag.(agent.HookResponseWriter); ok {
+        // Check if a response was already written (e.g., by handleLifecycleSessionStart).
+        // We track this via a context flag set by the lifecycle handlers.
+        if !hookResponseWritten(ctx) {
+            _ = writer.WriteHookResponse("") // empty string = minimal ack
+        }
+    }
+}
+```
+
+**Wait — this approach adds complexity with context flags.** Simpler alternative: just always write a newline for Kiro IDE hooks if no output was produced. But that would double-output for session-start.
+
+**Simplest approach:** Since the Kiro IDE just needs *any* stdout output to not timeout, and the session-start banner already handles that case (once `WriteHookResponse` is implemented), we need to add output for:
+- `handleLifecycleTurnStart` — add `WriteHookResponse` call
+- `handleLifecycleTurnEnd` — add `WriteHookResponse` call
+- No-op hooks (`preToolUse`, `postToolUse`) — add output in `hook_registry.go`
+
+**For TurnStart and TurnEnd in `lifecycle.go`:** Add a `WriteHookResponse("")` call at the end of `handleLifecycleTurnStart` and `handleLifecycleTurnEnd`. Empty string means the agent writes a minimal ack (for Kiro: just a newline; agents that don't implement the interface skip it silently).
+
+**For no-op hooks in `hook_registry.go`:** At line ~154, after the comment `// Other pass-through hooks (nil event, no special handling) are no-ops`, add:
+
+```go
+// Acknowledge no-op hooks for agents that require stdout output (e.g., Kiro IDE).
+if event == nil {
+    if writer, ok := ag.(agent.HookResponseWriter); ok {
+        _ = writer.WriteHookResponse("")
+    }
+}
+```
+
+**For `WriteHookResponse("")`:** The implementation should handle empty strings gracefully — either print nothing (just the newline from `Fprintln`) or skip entirely. A bare newline from `Fprintln("")` produces `\n` which is enough for the IDE to see output.
+
+### 3. Add test for `WriteHookResponse`
+
+In a test file (either existing `lifecycle_test.go` or hooks test), verify:
+- `KiroAgent` satisfies `agent.HookResponseWriter` (compile-time assertion already covers this)
+- `WriteHookResponse` writes to stdout
+
+## Key design decisions
+
+- **Plain text, not JSON** — Kiro IDE doesn't parse JSON hook responses like Claude Code does. Follow Factory AI Droid's pattern.
+- **Empty-string ack for non-banner hooks** — TurnStart, TurnEnd, and no-op hooks just need any stdout to prevent timeout. Empty `Fprintln("")` produces a `\n`.
+- **No-op hooks handled in `hook_registry.go`** — Since `preToolUse`/`postToolUse` return `nil` events and never reach the lifecycle dispatcher, their output must be added at the registry level.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Then manually test in the Kiro IDE:
+1. `entire enable --agent kiro` in a repo
+2. Start a Kiro conversation — verify `entire-prompt-submit` hook no longer times out
+3. Check that the "Powered by Entire" banner appears on session start
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/96a285b5-3eb1-4f66-8733-15f335183d35.jsonl

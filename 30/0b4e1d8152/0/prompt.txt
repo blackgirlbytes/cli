@@ -1,0 +1,56 @@
+/simplify
+
+---
+
+ok, can you now give me an overview how review works and what it does?
+
+---
+
+--track-only — write the marker without spawning the agent (for when you want to start the agent yourself).
+
+what marker is written?
+
+---
+
+why is the marker needed?
+
+---
+
+I wonder if it makes more sense to rather attach the session as review if you want to do a review manually then do `--track-only` and then make sure you run the session right after...
+
+---
+
+--atach would take a session id in the same way `entire attach` does
+
+---
+
+could we do `entire review attach` and map this to the `attach` code path somehow easily?
+
+---
+
+I'd do just both? like you can do `entire attach --review` but you can also do `entire review attach` and we set the `--review` flag when calling `runAttach`?
+
+---
+
+I also wonder if "skills" is to inflexible and "review_prompt" isn't better? Like you could just make it `"/skill"` and get the same, but you could also do mor complex things and then `entire review attach` could just take the first prompt from the session and use that as prompt
+
+---
+
+If you want the best of both, you could keep ReviewSkills as a derived/parsed field alongside ReviewPrompt — extract /slash-prefixed tokens from the prompt
+  at write time. But that's the kind of half-measure that usually ages badly.
+
+I like this, basically the user can do `review_skills` and we would still store the crafted prompt when it runs, for attach where it's hard to figure out what was made whe only store the prompt (but could also do prompt parsing later to extract any slash commands)
+
+---
+
+yes, split
+
+---
+
+1. High: the pending review marker can be claimed by the wrong session in the same worktree. `PendingReviewMarker` records both `AgentName` and `StartingSHA`, but `adoptPendingReviewMarkerInto` only checks `Kind == ""` and `WorktreePath` before tagging the session as `agent_review` and clearing the marker. That means any session that starts first in that worktree, even from a different agent or after HEAD has moved, can steal the marker and permanently attach the review metadata to the wrong checkpoint. See [review.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/review.go:47), [review.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/review.go:166), and the adoption call site in [lifecycle.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:265).
+
+2. Medium: `entire review --edit` can silently delete manual review configuration for agents the picker does not surface. `runReviewConfigPicker` only builds `selected` from installed agents that have curated entries, then `saveReviewConfig` replaces `s.Review` wholesale with that reduced map. Any manually configured entries for external agents, uncurated agents, or temporarily uninstalled agents are dropped on save, despite the command comments saying those agents should be configured by editing `settings.json` directly. See [review.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/review.go:201), [review.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/review.go:259), and [review.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/review.go:780).
+
+3. Medium: `--track-only` review markers are not bound to the commit they were created for, so delayed/manual review runs can be attached to the wrong code state. The marker stores `StartingSHA` when `entire review` runs, but adoption never verifies that the session still starts from that commit. If the user commits, rebases, or otherwise moves HEAD before the manual agent session begins, the later session is still tagged as the earlier review request and will condense onto a different checkpoint than the one the command was invoked for. The field is written in [review.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/review.go:483) and never consulted in [review.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/review.go:166).
+
+Focused Go tests around `review`, `attach`, lifecycle adoption, checkpoint readers, and strategy compaction passed locally.

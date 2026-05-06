@@ -1,0 +1,77 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "978e54e8979e",
+  "session_id": "90f3ff3b-83c8-4125-bbc4-c02734981f54",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T19:26:11.443834Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "fb3364d7c941",
+  "token_usage": {
+    "input_tokens": 343,
+    "cache_creation_tokens": 565389,
+    "cache_read_tokens": 38648691,
+    "output_tokens": 80012,
+    "api_call_count": 255
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "summary": {
+    "intent": "The user wanted to enhance the summary TUI detail pane to show all available session data (scores, stats, files touched, tool usage, implementation rationale, tradeoffs, codebase patterns, and all facet evidence), and also fix the repo filter showing nothing.",
+    "outcome": "Enhanced the detail pane with 4 grouped boxes (SUMMARY, CODE, LEARNINGS, SIGNALS) showing all previously missing data with evidence rendering; fixed the repo filter by loading repo sessions independently via a new DB query method; implemented a simple huh form for the memory loop wizard edit intent.",
+    "learnings": {
+      "repo": [
+        "The summary TUI loads only the 200 most recent sessions from insightsdb; when on a feature branch, these 200 rows are all from that branch, so the repo filter (which checks against main-reachable checkpoint IDs) finds zero matches.",
+        "Facets are extracted per-session by sending condensed transcripts to an LLM; sessions start with has_facets=0 and are backfilled lazily during improve/insights/memory-loop runs.",
+        "The WizardIntentEdit case was missing from the wizard handler switch in memory_loop_cmd.go; the TUI sent the intent but the backend returned 'invalid wizard intent: edit'.",
+        "The interactive edit flow in the CLI was explicitly left unimplemented (comment: 'Interactive edit mode not yet implemented') before this session.",
+        "insightsdb.SessionRow already contained all the data needed for the enhanced TUI; no schema changes were required.",
+        "The Codex companion script fails with ENOBUFS on large repos due to an internal buffer overflow when running git diff."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/summarytui/detail_page.go",
+          "finding": "renderSubSection was added as a helper that prepends a blank line when currentLen > 0, enabling spacing between sub-sections within a box."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "finding": "Model was refactored from a single m.rows slice to separate m.branchRows and m.repoRows slices; applyFilter selects the source slice based on branchFilter value."
+        },
+        {
+          "path": "cmd/entire/cli/insightsdb/queries.go",
+          "finding": "New QueryByCheckpointIDs method added to load sessions filtered to a specific set of checkpoint IDs, used to load repo-reachable sessions independently."
+        },
+        {
+          "path": "cmd/entire/cli/summary_cmd.go",
+          "finding": "loadRepoSessions added: walks git log for Entire-Checkpoint trailers on main, then queries DB for matching sessions up to maxSummaryRecentSessions."
+        },
+        {
+          "path": "cmd/entire/cli/memory_loop_cmd.go",
+          "finding": "editMemoryLoopWizardRequest added: finds record by ID in state, pre-populates huh form with current title/keywords/body, calls EditRecord on confirm."
+        }
+      ],
+      "workflow": [
+        "Brainstorming skill with visual companion can generate HTML mockups served at localhost:65000 for TUI layout design.",
+        "Subagent-driven development works well for parallelizable implementation tasks but the orchestrator should handle integration tasks (Task 5) directly to coordinate cross-file changes.",
+        "When a replace_all edit corrupts call sites (wrong parameter order), revert and do targeted edits instead.",
+        "After changing a function signature, grep all call sites before running tests to catch missed updates."
+      ]
+    },
+    "friction": [
+      "Codex adversarial review failed with ENOBUFS on both foreground and background runs due to the repo's git diff being too large for the companion's internal buffer.",
+      "replace_all on renderSubSection call sites corrupted the parameter order (swapped title and currentLen), requiring manual diagnosis and targeted fixes.",
+      "The visual companion server required checking whether it was already running before starting, adding a small coordination step.",
+      "newRootModel call sites in tests needed individual inspection to determine which ones used filterRepo and needed repoRows populated vs which used branch filtering and were fine with nil."
+    ],
+    "open_items": [
+      "The memory loop wizard edit form is now a simple huh form but the original design mentioned an interactive form for title, keywords, and body — may need richer UX (e.g., multi-line body editing) in the future.",
+      "The Codex adversarial review could not run against this repo; the spec was not adversarially reviewed.",
+      "The suggestions table in insightsdb has 0 rows — appears unused or not yet populated.",
+      "The editMemoryMsg type was defined but never used before this session; the broader edit flow integration with TUI state (editMemoryMsg) may still be incomplete."
+    ]
+  }
+}

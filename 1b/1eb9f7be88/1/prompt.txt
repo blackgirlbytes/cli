@@ -1,0 +1,171 @@
+Implement the following plan:
+
+# Plan: Address PR #498 Review Comments
+
+## Context
+PR #498 (`alisha/agent-integration-skill`) adds agent integration skill files under `.claude/skills/agent-integration/`. Copilot and Cursor bot left 10 review comments identifying factual inaccuracies (wrong method counts, nonexistent directories, incorrect function signatures) and a markdown formatting bug. All changes are in prompt/documentation files — no Go code changes.
+
+## Files to modify
+- `.claude/skills/agent-integration/probe-prompt.md`
+- `.claude/skills/agent-integration/e2e-test-prompt.md`
+- `.claude/skills/agent-integration/implement-prompt.md`
+
+## Changes
+
+### 1. `probe-prompt.md` — 3 fixes
+
+**Line 13: Wrong method count**
+- Current: `(19 methods + 6 optional interfaces)`
+- Fix: `(core methods + 6 optional capability interfaces)`
+- Rationale: Agent interface has 15 methods, not 19. Use description instead of hardcoded count to avoid future drift.
+
+**Line 23: Nonexistent `factoryaidroid/` reference**
+- Current: `- cmd/entire/cli/agent/factoryaidroid/ — Newer, simpler pattern`
+- Fix: Remove this line entirely
+- Rationale: No `factoryaidroid/` directory exists in the repo. Only `claudecode/`, `geminicli/`, `opencode/`.
+
+**Lines 148-149: Unclosed markdown code fence**
+- The ` ```markdown ` fence opened at line 89 is never closed
+- This causes `## Blocker Handling` and `## Constraints` (lines 150-164) to render inside the code block instead of as active instructions
+- Fix: Add closing ` ``` ` after line 148 (after the `## Artifacts` section content)
+
+### 2. `e2e-test-prompt.md` — 2 fixes
+
+**Line 18: Nonexistent `FactoryAIDroidRunner`**
+- Current: `existing runners (ClaudeCodeRunner, GeminiCLIRunner, FactoryAIDroidRunner, OpenCodeRunner)`
+- Fix: `existing runners (ClaudeCodeRunner, GeminiCLIRunner, OpenCodeRunner)`
+
+**Line 96: Compile check command always fails**
+- Current: `go build ./cmd/entire/cli/e2e_test/...` — this fails because all files have `//go:build e2e`
+- Fix: `go test -c -tags=e2e ./cmd/entire/cli/e2e_test` — compile-only with the tag
+
+### 3. `implement-prompt.md` — 5 fixes
+
+**Lines 28-31: Nonexistent `factoryaidroid/` in template table**
+- Remove the `factoryaidroid/` row from the template selection table
+- Merge its description into the `claudecode/` row:
+  ```
+  | JSON config hook mechanism (e.g., `.claude/settings.json` or `.factory/settings.json`) | `claudecode/` |
+  ```
+
+**Lines 107-108: Wrong `agent.Register` call**
+- Current: `agent.Register(New())`
+- Fix: `agent.Register(agent.AgentName("$AGENT_SLUG"), New)`
+- Rationale: `Register` takes `(name AgentName, factory Factory)` per `registry.go:19`. Must pass factory function reference, not call result.
+
+**Line 113+115: Wrong constructor return type and method count**
+- Fix `New() *Agent` → `New() agent.Agent` to match factory type `func() Agent`
+- Remove hardcoded "19" from "Implement all 19 Agent interface methods" comment
+
+**Lines 178-180: Wrong HookSupport method signatures**
+- `InstallHooks` returns `(int, error)` not just `error` — the int is the hook count
+- `AreHooksInstalled` returns `bool` not `(bool, error)`
+- Fix to match `agent.go` lines 101 and 107
+
+**Lines 226-227: Wrong file path and registration call**
+- Path `cmd/entire/cli/commands/hooks.go` doesn't exist
+- Fix: `cmd/entire/cli/` with a note to search for hook subcommand registration
+- Fix `agent.Register(New())` → `agent.Register(agent.AgentName("$AGENT_SLUG"), New)`
+
+## Verification
+
+After edits:
+- Visually inspect each file for consistent markdown rendering
+- Grep for any remaining `factoryaidroid` references: `grep -r factoryaidroid .claude/skills/`
+- Grep for any remaining `19 method` references: `grep -rn "19" .claude/skills/agent-integration/`
+- Verify the unclosed fence is fixed by checking that `## Blocker Handling` and `## Constraints` are outside any code block
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/8a4cc6bc-9c51-48f3-8cff-5188af7d5b7c.jsonl
+
+---
+
+Base directory for this skill: /Users/alisha/.claude/plugins/cache/claude-plugins-official/superpowers/4.3.1/skills/executing-plans
+
+# Executing Plans
+
+## Overview
+
+Load plan, review critically, execute tasks in batches, report for review between batches.
+
+**Core principle:** Batch execution with checkpoints for architect review.
+
+**Announce at start:** "I'm using the executing-plans skill to implement this plan."
+
+## The Process
+
+### Step 1: Load and Review Plan
+1. Read plan file
+2. Review critically - identify any questions or concerns about the plan
+3. If concerns: Raise them with your human partner before starting
+4. If no concerns: Create TodoWrite and proceed
+
+### Step 2: Execute Batch
+**Default: First 3 tasks**
+
+For each task:
+1. Mark as in_progress
+2. Follow each step exactly (plan has bite-sized steps)
+3. Run verifications as specified
+4. Mark as completed
+
+### Step 3: Report
+When batch complete:
+- Show what was implemented
+- Show verification output
+- Say: "Ready for feedback."
+
+### Step 4: Continue
+Based on feedback:
+- Apply changes if needed
+- Execute next batch
+- Repeat until complete
+
+### Step 5: Complete Development
+
+After all tasks complete and verified:
+- Announce: "I'm using the finishing-a-development-branch skill to complete this work."
+- **REQUIRED SUB-SKILL:** Use superpowers:finishing-a-development-branch
+- Follow that skill to verify tests, present options, execute choice
+
+## When to Stop and Ask for Help
+
+**STOP executing immediately when:**
+- Hit a blocker mid-batch (missing dependency, test fails, instruction unclear)
+- Plan has critical gaps preventing starting
+- You don't understand an instruction
+- Verification fails repeatedly
+
+**Ask for clarification rather than guessing.**
+
+## When to Revisit Earlier Steps
+
+**Return to Review (Step 1) when:**
+- Partner updates the plan based on your feedback
+- Fundamental approach needs rethinking
+
+**Don't force through blockers** - stop and ask.
+
+## Remember
+- Review plan critically first
+- Follow plan steps exactly
+- Don't skip verifications
+- Reference skills when plan says to
+- Between batches: just report and wait
+- Stop when blocked, don't guess
+- Never start implementation on main/master branch without explicit user consent
+
+## Integration
+
+**Required workflow skills:**
+- **superpowers:using-git-worktrees** - REQUIRED: Set up isolated workspace before starting
+- **superpowers:writing-plans** - Creates the plan this skill executes
+- **superpowers:finishing-a-development-branch** - Complete development after all tasks
+
+---
+
+can you clean up skill. make it less dependent on exact file paths
+
+---
+
+[Request interrupted by user for tool use]

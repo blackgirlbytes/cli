@@ -1,0 +1,57 @@
+I recently saw a report from a coworker that they saw duplicate full transcripts in the `/full/current` git ref after running `entire migrate`:
+
+85/1fcec4a874/0/full.jsonl
+85/1fcec4a874/0/raw_transcript
+85/1fcec4a874/0/raw_transcript_hash.txt
+
+Can you check whether we're writing the full transcript redundantly for some reason?
+
+---
+
+Well, in a recent version of the cli, there's still a `full.jsonl` after running a migration. Can you verify that we're not writing a `full.jsonl` at all during migration? Maybe we're copying it over from the v1 branch?
+
+---
+
+As far as I can tell, the checkpoints in question didn't exist prior to the migration.
+
+---
+
+When was a3cd77122 merged?
+
+---
+
+One interesting tidbit: The coworker had BOTH files: `full.jsonl` and `raw_transcript`. They only ran the migration command today. If I'm not mistaken it should be either one or the other.
+
+---
+
+Can you thoroughly trace all the code paths involved? I have a gut feeling that you're missing something.
+
+---
+
+The issue is in updateCommittedFullTranscript in v2_committed.go. Let me show you.
+
+  writeCommittedFullTranscript (the initial write) correctly clears all entries at the session path before writing:
+
+  // v2_committed.go:539-543
+  for key := range entries {
+      if strings.HasPrefix(key, sessionPath) {
+          delete(entries, key)
+      }
+  }
+
+  But updateCommittedFullTranscript (used by finalization and migration repair) only clears v2-named files:
+
+  // v2_committed.go:246-255
+  for key := range entries {
+      switch {
+      case key == rawTranscriptPath:           // raw_transcript
+          delete(entries, key)
+      case strings.HasPrefix(key, rawTranscriptPath+"."): // raw_transcript.001, etc
+          delete(entries, key)
+      case key == rawHashPath:                 // raw_transcript_hash.txt
+          delete(entries, key)
+      }
+  }
+
+  This doesn't clean up v1-named files (full.jsonl, full.jsonl.001, content_hash.txt). If an older version of the code wrote full.jsonl to /full/current, any
+  subsequent UpdateCommitted call would write raw_transcript alongside the existing full.jsonl without removing it.

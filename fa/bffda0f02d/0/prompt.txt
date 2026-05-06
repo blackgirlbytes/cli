@@ -1,0 +1,190 @@
+<task-notification>
+<task-id>a02b9e1f8ccebdebc</task-id>
+<tool-use-id>toolu_018mnxSnjo8X9YRzwGfL12u6</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/a02b9e1f8ccebdebc.output</output-file>
+<status>completed</status>
+<summary>Agent "Spec review: Task 6 streaming" completed</summary>
+<result>Now I have all the information needed for a thorough compliance review. Let me summarize:
+
+---
+
+## Spec Compliance Review for Task 6 (commit `8105def67`)
+
+### Requirement 1: CLI flags switch
+**Spec:** `--output-format json` -&gt; `--output-format stream-json --include-partial-messages --verbose`
+
+**Status:** ✅ Compliant. `generate.go` lines 46-50 contain:
+```
+"--output-format", "stream-json",
+"--include-partial-messages",
+"--verbose",
+```
+
+### Requirement 2: `GenerateTextStreaming` signature
+**Spec:** `GenerateTextStreaming(ctx, prompt, model string, progress ProgressFn) (string, error)` that pipes stdout through `streamClaudeResponse` and a progress dispatcher.
+
+**Status:** ✅ Compliant. Signature at `generate.go:28-31` matches exactly. Implementation uses `cmd.StdoutPipe()` -&gt; `streamClaudeResponse(stdout, makeProgressDispatcher(progress))`.
+
+### Requirement 3: `GenerateText` thin wrapper
+**Spec:** `return c.GenerateTextStreaming(ctx, prompt, model, nil)`
+
+**Status:** ✅ Compliant. `generate.go:20` is exactly `return c.GenerateTextStreaming(ctx, prompt, model, nil)`.
+
+### Requirement 4: Error classification
+**Spec:**
+- `is_error: true` envelope -&gt; `classifyEnvelopeError`
+- Non-zero exit with no envelope -&gt; `classifyStderrError`
+- `*exec.Error` -&gt; `ClaudeError{Kind: CLIMissing}`
+- Context cancel/deadline -&gt; sentinel passthrough
+
+**Status:** ✅ Compliant.
+- Envelope error path at `generate.go:96-105`: `classifyEnvelopeError(result, final.APIErrorStatus, exitCode)`
+- No-envelope stderr path at `generate.go:108-116`: `classifyStderrError(stderr.String(), exitCode)`
+- `*exec.Error` at `generate.go:66-68` (Start) and `generate.go:109-111` (Wait): `ClaudeError{Kind: ClaudeErrorCLIMissing, Cause: err}`
+- Context sentinels at `generate.go:75-80`: `context.DeadlineExceeded` and `context.Canceled` returned directly
+
+### Requirement 5: `PhaseDone` with OutputTokens and DurationMs
+**Spec:** `PhaseDone` event emitted with final OutputTokens and DurationMs.
+
+**Status:** ✅ Compliant. `generate.go:87-91`:
+```go
+progress(agent.GenerationProgress{
+    Phase:        agent.PhaseDone,
+    OutputTokens: outputTokensFromUsage(final.Usage),
+    DurationMs:   final.DurationMs,
+})
+```
+
+### Requirement 6: DELETE `parseGenerateTextResponse` from response.go
+**Status:** ✅ Compliant. The function and its 35 lines are fully removed from `response.go`. Confirmed via grep returning no matches.
+
+### Requirement 7: DELETE 4 shim tests from response_test.go
+**Spec:** `TestParseGenerateTextResponse_LegacyObject`, `TestParseGenerateTextResponse_LegacyArray`, `TestParseGenerateTextResponse_StreamJSON`, `TestParseGenerateTextResponse_InvalidJSON`
+
+**Status:** ✅ Compliant. All 4 tests removed. `response_test.go` retained its pre-existing `TestStreamClaudeResponse_*` tests (which are not shim tests).
+
+### Requirement 8: DELETE `TestGenerateText_ArrayResponse` from claude_test.go
+**Status:** ✅ Compliant. Grep confirmed it is gone.
+
+### Requirement 9: 5 new tests with `t.Parallel()`
+**Spec:** SuccessEmitsPhases, EnvelopeErrorReturnsClaudeError, StderrAuthFallback, CLIMissing, DelegatesToStreaming
+
+**Status:** ✅ Compliant. All 5 tests are present in `claude_test.go`:
+- `TestGenerateTextStreaming_SuccessEmitsPhases` (line 32) -- `t.Parallel()` present
+- `TestGenerateTextStreaming_EnvelopeErrorReturnsClaudeError` (line 56) -- `t.Parallel()` present
+- `TestGenerateTextStreaming_StderrAuthFallback` (line 72) -- `t.Parallel()` present
+- `TestGenerateTextStreaming_CLIMissing` (line 87) -- `t.Parallel()` present
+- `TestGenerateText_DelegatesToStreaming` (line 101) -- `t.Parallel()` present
+
+### Progress dispatcher mapping verification
+**Spec:** `system/status:requesting` -&gt; Connecting, `stream_event/message_start` -&gt; FirstToken, `stream_event/content_block_delta` -&gt; Generating, final result -&gt; Done
+
+**Status:** ✅ Compliant. `makeProgressDispatcher` at `generate.go:127-152` maps:
+- `ev.Type == "system" &amp;&amp; ev.Subtype == "status" &amp;&amp; ev.Status == "requesting"` -&gt; `PhaseConnecting`
+- `ev.Type == "stream_event" &amp;&amp; ev.Event.Type == "message_start"` -&gt; `PhaseFirstToken`
+- `ev.Type == "stream_event" &amp;&amp; ev.Event.Type == "content_block_delta"` -&gt; `PhaseGenerating`
+- Final result -&gt; `PhaseDone` (emitted in the success path, not in the dispatcher)
+
+The SuccessEmitsPhases test validates the full phase sequence `[Connecting, FirstToken, Generating, Done]`.
+
+---
+
+**Verdict: ✅ Spec compliant.** All 9 requirements are satisfied. Deletions are clean, additions match the specified signatures, error classification follows the specified dispatch table, progress phases map as required, and all 5 new tests include `t.Parallel()`.</result>
+<usage><total_tokens>36156</total_tokens><tool_uses>18</tool_uses><duration_ms>74154</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>afdbcb82f4efe6cd4</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/afdbcb82f4efe6cd4.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review: Task 6" completed</summary>
+<result>The `os.ErrNotExist` check: on macOS/Linux, when you call `exec.CommandContext` with an absolute path like `/nonexistent/binary/that/does/not/exist`, `cmd.Start()` returns a `*fs.PathError` wrapping `os.ErrNotExist`. The `exec.Error` type (which wraps `exec.ErrNotFound`) is returned for PATH-based lookup failures. The `errors.Is(err, exec.ErrNotFound)` check is actually redundant here because `exec.Error` always wraps `exec.ErrNotFound`, and the `errors.As(err, &amp;execErr)` check above already catches `*exec.Error`. But redundancy for safety is fine.
+
+The concern about false positives on `os.ErrNotExist`: could a non-exec-related `PathError` wrapping `os.ErrNotExist` leak through to this function? The only callers are `cmd.Start()` and `cmd.Wait()`. After `cmd.Start()` succeeds, `cmd.Wait()` won't return `os.ErrNotExist`. So for `cmd.Start()` errors, yes, `os.ErrNotExist` reliably means "binary not found." For `cmd.Wait()` errors (line 110), this path is inside `if waitErr != nil` after a successful `Start()`, so `os.ErrNotExist` from `Wait()` would be very unusual -- but the function correctly handles it.
+
+Now I have enough information for a thorough review. Let me compile my findings.
+
+---
+
+## Code Review: Task 6 -- `GenerateTextStreaming` on `ClaudeCodeAgent`
+
+### Plan Alignment
+
+The implementation closely follows the plan with a few justified deviations. All planned functionality is present: `GenerateTextStreaming` with streaming flags, progress dispatch, typed error classification, `GenerateText` delegation, and dead code cleanup.
+
+**Deviations from plan (all beneficial or neutral):**
+
+1. **Removed the intermediate `isExecError(waitErr)` check** (plan lines 1209-1213) that would fire between the context-error check and the envelope check. This is dead code: after `cmd.Start()` succeeds, `cmd.Wait()` cannot return `*exec.Error` or `exec.ErrNotFound`. The `isExecError` check at line 110 (no-envelope fallback) still covers the theoretical edge case. Correct deviation.
+
+2. **`outputTokensFromUsage` uses `*messageUsage` instead of plan's `*Usage`**. The package has no `Usage` type; only `messageUsage` exists in `types.go`. The plan had a type name error. Implementation is correct.
+
+3. **Removed the `io` blank import and `var _ = io.EOF` placeholder** that the plan included as a hedge. The implementation correctly omits it since `io` is not needed. This avoids a lint violation.
+
+4. **`isExecError` includes `os.ErrNotExist` check** beyond the plan's `exec.Error` + `exec.ErrNotFound`. This is necessary for macOS/Linux where absolute-path failures (like `/nonexistent/binary`) produce `*fs.PathError` wrapping `os.ErrNotExist` rather than `*exec.Error`. The `CLIMissing` test (`TestGenerateTextStreaming_CLIMissing`) uses exactly this pattern, so the check is required for the test to pass.
+
+5. **Heredoc delimiter changed from `EOF` to `ENDOFSTREAM`**. Defensive rename to avoid potential (however unlikely) collisions with test body content. Non-issue.
+
+6. **Context error handling uses `errors.Is(ctx.Err(), context.DeadlineExceeded)` branching** instead of the plan's simpler `return "", ctxErr` passthrough. This is more explicit but functionally equivalent since `ctx.Err()` only returns `context.DeadlineExceeded` or `context.Canceled`. The extra branch is unnecessary but harmless.
+
+### Subprocess Lifecycle (Review Focus 1)
+
+**Correct.** The pipe is read (`streamClaudeResponse(stdout, ...)` at line 70) before `cmd.Wait()` (line 71). Go's documentation states that callers must drain stdout before calling `Wait` when using `StdoutPipe`, and this ordering satisfies that requirement. The `streamClaudeResponse` function reads until EOF (via `bufio.Scanner`), which coincides with the subprocess closing stdout.
+
+### Error Classification Precedence (Review Focus 2)
+
+The error precedence is:
+
+1. Context error (deadline/cancel) -- returned as sentinel (lines 75-80)
+2. Envelope present + success: return result (lines 83-94)
+3. Envelope present + error: classify via `classifyEnvelopeError` (lines 96-105)
+4. No envelope + waitErr: classify via `classifyStderrError` (lines 108-118)
+5. No envelope + parseErr: wrap as `ClaudeErrorUnknown` (lines 120-121)
+6. Fallback: "exited without producing a result" (line 123)
+
+**Correct.** The envelope success path correctly checks `IsError` first, then `Result == nil`. The only scenario where `IsError == false` but `Result == nil` is a malformed envelope, which correctly returns `ClaudeErrorUnknown` with "claude returned empty result". No misclassification risk.
+
+### Progress Dispatcher (Review Focus 3)
+
+**Correct.** `makeProgressDispatcher(nil)` returns `func(StreamEvent) {}` -- a no-op function, not `nil`. This is safe to call from `streamClaudeResponse`. The chars/4 heuristic for token estimation during `PhaseGenerating` is documented as rough. The `PhaseDone` event at lines 86-93 uses actual `Usage.OutputTokens` from the result envelope, which overrides the estimate.
+
+### isExecError Helper (Review Focus 4)
+
+**Correct with one observation.** The three checks (`*exec.Error`, `exec.ErrNotFound`, `os.ErrNotExist`) cover the documented cases. The `exec.ErrNotFound` check is technically redundant with `*exec.Error` (since `exec.Error` wraps `exec.ErrNotFound`), but redundancy for safety is acceptable. The `os.ErrNotExist` check correctly handles macOS/Linux absolute-path failures. No false-positive risk in practice because the only callers pass errors from `cmd.Start()` or `cmd.Wait()`, neither of which produces `os.ErrNotExist` for non-binary-related reasons.
+
+### Dead Code Cleanup (Review Focus 5)
+
+**Complete.** `parseGenerateTextResponse` is removed from `response.go` (lines 87-121 in the old file). Its four tests (`TestParseGenerateTextResponse_*`) are removed from `response_test.go`. No references to `parseGenerateTextResponse` remain anywhere in the codebase. The stream parser (`streamClaudeResponse`) and its tests are correctly preserved.
+
+### Issues
+
+**Important (should fix):**
+
+None identified. The implementation is clean and well-structured.
+
+**Suggestions (nice to have):**
+
+1. `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go` line 76: The `errors.Is(ctx.Err(), context.DeadlineExceeded)` branch is unnecessary. `ctx.Err()` returns exactly `context.DeadlineExceeded` or `context.Canceled` (or nil, which is handled by the outer `if`). You could simplify to `return "", ctx.Err()`. However, the current code is explicit and correct, so this is purely a style preference.
+
+2. `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go` line 171: The `errors.Is(err, exec.ErrNotFound)` check is redundant with the `errors.As(err, &amp;execErr)` check above it (since `exec.Error` always wraps `exec.ErrNotFound`). Could be removed for clarity, but the redundancy is harmless.
+
+3. `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/claude_test.go`: The `equalPhases` helper could use `slices.Equal` from the standard library (Go 1.21+), but the manual implementation is fine for a test utility.
+
+### What Was Done Well
+
+- The pipe-before-wait ordering is correct and follows Go subprocess best practices.
+- The no-op dispatcher pattern (returning a function, not nil) eliminates nil-check boilerplate in `streamClaudeResponse`.
+- The `GenerateText` -&gt; `GenerateTextStreaming(nil)` delegation is clean and preserves the existing `TextGenerator` contract without duplication.
+- Error classification has clear precedence with well-separated concerns (envelope vs stderr vs parse error).
+- The `PhaseDone` progress event correctly uses actual token counts rather than the chars/4 estimate.
+- The commit message accurately describes the changes and mentions the shim removal.
+- All plan deviations are improvements over the plan's code.
+- Test coverage hits all four error paths (success, envelope error, stderr fallback, CLI missing) plus the delegation test.
+
+### Summary
+
+This is a high-quality implementation that faithfully executes Task 6 of the plan. The few deviations from the plan are all justified improvements (removing dead code from the plan, fixing a type name error, adding platform-specific error detection for the test to pass). No critical or important issues found. The code is ready to proceed.</result>
+<usage><total_tokens>64214</total_tokens><tool_uses>38</tool_uses><duration_ms>200674</duration_ms></usage>
+</task-notification>

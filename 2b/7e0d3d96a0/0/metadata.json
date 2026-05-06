@@ -1,0 +1,95 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "2b7e0d3d96a0",
+  "session_id": "90f3ff3b-83c8-4125-bbc4-c02734981f54",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T19:57:35.317634Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "README.md"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "4f884cf1e326",
+  "token_usage": {
+    "input_tokens": 421,
+    "cache_creation_tokens": 810574,
+    "cache_read_tokens": 54417973,
+    "output_tokens": 93617,
+    "api_call_count": 321
+  },
+  "session_metrics": {
+    "turn_count": 5
+  },
+  "summary": {
+    "intent": "Enhance the summary TUI detail pane to show all available session data (scores, stats, files touched, tool usage, implementation rationale, tradeoffs, codebase patterns, and all facet types with evidence), then fix a repo filter bug where it showed no results, implement a memory-loop wizard edit action, and resolve copy/scroll conflicts in the TUI.",
+    "outcome": "Successfully delivered: (1) enhanced summary TUI detail pane with 4 grouped boxes (SUMMARY, CODE, LEARNINGS, SIGNALS) showing all previously hidden data; (2) fixed repo filter to load its own 200 sessions independently from branch view; (3) implemented huh form for memory-loop wizard edit action; (4) removed mouse capture to allow highlight-copy while preserving keyboard scroll (pgup/pgdn/ctrl+u/ctrl+d) for the detail pane.",
+    "learnings": {
+      "repo": [
+        "The insights.db has 16 tables: sessions (2633 rows), tool_calls (16029), files_touched (10788), learnings (2269), friction (616), codebase_patterns (422), implementation_rationale (333), tradeoffs (248), review_rule_signals (212), missing_context_signals (189), repeated_user_instructions (103), failure_loops (102), skill_signals (55), suggestions (0), cache_meta (1).",
+        "Facet backfilling: sessions are cached with has_facets=0; memory-loop/improve/insights commands find unfaceted sessions, condense transcripts, call LLM for extraction, write to facet tables, then set has_facets=1.",
+        "loadSummarySessions has a 200-session cap (maxSummaryRecentSessions). The repo filter was checking those 200 most-recent sessions against main-reachable checkpoint IDs — zero overlap when working on feature branches.",
+        "Repo filter requires a separate QueryByCheckpointIDs query; repoRows and branchRows are now separate slices swapped in applyFilter, not a merged set.",
+        "tea.WithMouseCellMotion() intercepts all mouse events including text selection; Option/Shift bypass does not work in this terminal setup. Removing mouse capture restores highlight-copy while keyboard scroll (pgup/pgdn/ctrl+u/ctrl+d) still works via viewport fallthrough.",
+        "WizardIntentEdit existed in the TUI wizard but had no handler in memory_loop_cmd.go; the editMemoryMsg type was defined but never used.",
+        "The CLI edit command (line ~1598 in memory_loop_cmd.go) had a comment 'Interactive edit mode not yet implemented' before this session."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/summarytui/detail_page.go",
+          "finding": "renderSubSection now takes a currentLen int param to insert blank separator lines between sub-sections; all callers pass len(allLines) before appending."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "line": 181,
+          "end_line": 184,
+          "finding": "Unhandled keys fall through to the viewport, so pgup/pgdn/ctrl+u/ctrl+d scroll the detail pane without explicit handling; up/down arrows are intercepted for list nav only."
+        },
+        {
+          "path": "cmd/entire/cli/insightsdb/queries.go",
+          "finding": "New QueryByCheckpointIDs method added to load sessions filtered to a specific set of checkpoint IDs, used for the repo filter view."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "finding": "Model now has branchRows and repoRows as separate slices; applyFilter swaps between them based on branchFilter value, not a merged m.rows."
+        },
+        {
+          "path": "cmd/entire/cli/memory_loop_cmd.go",
+          "finding": "editMemoryLoopWizardRequest function added: finds record by ID in state, pre-populates huh form with title/body/keywords, calls EditRecord on submit."
+        }
+      ],
+      "workflow": [
+        "Codex adversarial review companion hits ENOBUFS on large repos — the git diff is too large for its internal buffer; this is a tooling limitation not a spec issue.",
+        "When designing TUI layout, compact grouped boxes (B option) were preferred over separate-box-per-section or hybrid header approaches.",
+        "Subagent-driven development was used for Tasks 1-4; the orchestrator took over Task 5 (integration) directly because it required coordinating changes across multiple files simultaneously.",
+        "The brainstorming skill generated a visual companion at localhost:65000 for TUI layout mockups before implementation."
+      ]
+    },
+    "friction": [
+      "Codex adversarial review companion failed with ENOBUFS on both foreground and background runs — repo git diff too large for its buffer.",
+      "Mouse capture (tea.WithMouseCellMotion) vs text selection conflict required multiple iterations: first removed scroll, then re-added scroll with copy key, then user clarified they wanted highlight-copy not full-copy, requiring a third iteration to remove mouse capture entirely.",
+      "replace_all was used on short literals and required careful handling to avoid corrupting backtick strings (existing anti-pattern in memory).",
+      "The repo filter showing nothing was a silent failure — no error, just empty results — making root cause non-obvious until querying the DB directly.",
+      "newRootModel signature change required updating many test call sites individually since nil is valid for both map[string]struct{} and []SessionRow but the semantics changed."
+    ],
+    "open_items": [
+      "The memory-loop edit wizard only handles pre-populated huh form; the editMemoryMsg type and TUI-internal edit flow (defined but unused) are still orphaned.",
+      "suggestions table in insights.db has 0 rows — unclear if this is expected or a bug in suggestion generation.",
+      "Codex adversarial review cannot run against this repo due to ENOBUFS buffer limits; no workaround identified.",
+      "The y-copy (copy entire detail pane to clipboard) feature was implemented then removed; clipboard access is now only via highlight-copy which requires no mouse capture — this is acceptable but the plain text renderer (renderDetailPlainText) added then removed could be useful later.",
+      "Manual memory scope fix and memory loop prompt normalization changes were committed at end of session without full review of what changed in lifecycle.go and memoryloop.go."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-03T19:56:39.053396Z",
+    "agent_lines": 25,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 25,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

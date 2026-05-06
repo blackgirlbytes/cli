@@ -1,0 +1,912 @@
+can you review the last commit through multiple agents based of PLAN.md
+
+---
+
+<task-notification>
+<task-id>a97e1a0</task-id>
+<status>completed</status>
+<summary>Agent "Review strategy interface changes" completed</summary>
+<result>All the usages are consistent with the current interface names. Now let me summarize my findings.
+
+---
+
+## Summary: Phase 2 Review for Terminology Consistency
+
+### Findings
+
+**Phase 2 (commit d1902ae7) correctly uses the current interface terminology:**
+
+1. **`lifecycle.go`** properly uses:
+   - `strategy.SaveContext` (line 326) - correct current name
+   - `strat.SaveChanges(ctx)` (line 343) - correct current name
+   - `strategy.TaskCheckpointContext` (line 527) - correct current name
+   - `strat.SaveTaskCheckpoint(ctx)` (line 544) - correct current name
+
+2. **`strategy/strategy.go`** still defines the current interface:
+   - `type SaveContext struct` (line 148)
+   - `SaveChanges(ctx SaveContext) error` (line 331)
+   - `type TaskCheckpointContext struct` (line 193)
+   - `SaveTaskCheckpoint(ctx TaskCheckpointContext) error` (line 339)
+
+3. **Strategy implementations** (`auto_commit.go`, `manual_commit_git.go`) implement:
+   - `SaveChanges(ctx SaveContext) error`
+   - `SaveTaskCheckpoint(ctx TaskCheckpointContext) error`
+
+### Verification: Phase 4c Renames NOT Applied
+
+According to PLAN.md Phase 4c, the following renames should occur:
+- `SaveChanges` -> `SaveStep`
+- `SaveContext` -> `StepContext`
+- `SaveTaskCheckpoint` -> `SaveTaskStep`
+- `TaskCheckpointContext` -> `TaskStepContext`
+
+**Confirmed:** None of these renames have been applied in Phase 2, which is correct. The PLAN.md explicitly states:
+- Phase 1-2 are "additive"
+- Phase 4c is where the Step/Checkpoint terminology rename should happen
+
+### Changes in Phase 2 to Strategy Files
+
+The only changes in Phase 2 to strategy files were minor linting fixes - removing `//nolint:ireturn` comments from:
+- `auto_commit.go:NewAutoCommitStrategy()`
+- `manual_commit.go:NewManualCommitStrategy()`, `NewShadowStrategy()`
+- `registry.go:Get()`, `Default()`
+
+These are cosmetic changes unrelated to the terminology.
+
+### Conclusion
+
+**No inconsistencies found.** Phase 2:
+1. Correctly introduces `lifecycle.go` using the current interface names (`SaveChanges`, `SaveContext`, `SaveTaskCheckpoint`, `TaskCheckpointContext`)
+2. Does NOT prematurely apply Phase 4c renames
+3. Maintains consistency with the existing strategy interface definitions
+
+The terminology renames are correctly deferred to Phase 4c as specified in the plan.</result>
+</task-notification>
+Full transcript available at: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/a97e1a0.output
+
+---
+
+<task-notification>
+<task-id>afdf134</task-id>
+<status>completed</status>
+<summary>Agent "Review test coverage changes" completed</summary>
+<result>Since I cannot create directories, I'll provide the review analysis directly in my response.
+
+Based on my analysis of commit d1902ae7 (Phase 2), here is a comprehensive test coverage review:
+
+---
+
+# Test Coverage Review: Phase 2 Lifecycle Dispatcher
+
+## Summary
+
+The Phase 2 commit introduces a significant architectural change - a new `lifecycle.go` dispatcher that routes normalized events from agents to appropriate handlers. The commit also refactors `state.go` to unify transcript offset handling across agents.
+
+**Overall Assessment: REQUEST CHANGES**
+
+There is a critical gap: the new 636-line `lifecycle.go` file has **zero dedicated unit tests**. While integration tests provide some coverage via `SimulateUserPromptSubmit` and `SimulateStop`, the unit-level behavior of the dispatcher is untested.
+
+---
+
+## 1. state.go Changes - Test Coverage Analysis
+
+### What Changed
+- `PrePromptState` struct: Added `TranscriptOffset` field, deprecated `StepTranscriptStart` and `StartMessageIndex`
+- `CapturePrePromptState`: Signature changed from `(sessionID, transcriptPath string)` to `(ag agent.Agent, sessionID, sessionRef string)`
+- `normalizePrePromptState`: Extended to migrate all three deprecated formats to `TranscriptOffset`
+- Removed `CaptureGeminiPrePromptState` (consolidated into unified function)
+
+### Test Coverage Status: ADEQUATE
+
+**state_test.go adequately covers these changes:**
+
+| Test | Coverage |
+|------|----------|
+| `TestPrePromptState_BackwardCompat_LastTranscriptLineCount` | Tests all 4 migration paths (oldest -> step -> gemini -> new format) |
+| `TestPrePromptState_WithTranscriptPosition` | Tests `CapturePrePromptState` with Claude agent |
+| `TestPrePromptState_WithEmptyTranscriptPath` | Tests empty transcript path handling |
+| `TestPrePromptState_WithSummaryOnlyTranscript` | Tests JSONL without user/assistant messages |
+
+**Positive:** The backward compatibility test (`TestPrePromptState_BackwardCompat_LastTranscriptLineCount`) was significantly expanded to cover all four JSON format variations. This is thorough and follows good practices.
+
+### Minor Gap: No Gemini Agent Test
+
+The test file only uses `claudecode.NewClaudeCodeAgent()`. While the code is agent-agnostic, testing with at least one other agent (Gemini) would verify the `TranscriptAnalyzer` interface works for JSON format transcripts.
+
+**Recommendation:** Add a test case using the Gemini agent to verify transcript offset extraction from JSON format.
+
+---
+
+## 2. lifecycle.go - Test Coverage Analysis
+
+### What Was Added
+The file contains 636 lines with 7 handler functions:
+- `DispatchLifecycleEvent` - main dispatcher (switch statement)
+- `handleLifecycleSessionStart` - banner, concurrent session check, state transition
+- `handleLifecycleTurnStart` - capture pre-prompt state, initialize session
+- `handleLifecycleTurnEnd` - 150+ lines of transcript processing, file detection, checkpoint save
+- `handleLifecycleCompaction` - delegates to TurnEnd, resets transcript offset
+- `handleLifecycleSessionEnd` - marks session ended
+- `handleLifecycleSubagentStart` / `handleLifecycleSubagentEnd` - task checkpoint handling
+
+Plus 4 helper functions:
+- `resolveTranscriptOffset`
+- `updateAutoCommitTranscriptPosition`
+- `createContextFile`
+- `parseTranscriptForCheckpointUUID`
+
+### Test Coverage Status: CRITICAL GAP
+
+**There is no `lifecycle_test.go` file.** This is the most significant finding.
+
+### What Integration Tests Cover
+
+The integration tests in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/integration_test/hooks_test.go` provide end-to-end coverage:
+
+| Integration Test | Events Covered |
+|-----------------|----------------|
+| `TestHookRunner_SimulateUserPromptSubmit` | TurnStart |
+| `TestHookRunner_SimulateStop` | TurnEnd |
+| `TestHookRunner_SimulateStop_AlreadyCommitted` | TurnEnd edge case |
+| `TestHookRunner_SimulateStop_SubagentOnlyChanges` | TurnEnd with subagent |
+| `TestUserPromptSubmit_ReinstallsOverwrittenHooks` | TurnStart |
+
+**NOT covered by integration tests:**
+- `SessionStart` event
+- `SessionEnd` event
+- `Compaction` event
+- `SubagentStart` event
+- `SubagentEnd` event (only indirectly via subagent transcript in `TestHookRunner_SimulateStop_SubagentOnlyChanges`)
+
+### Critical Missing Unit Tests
+
+1. **DispatchLifecycleEvent switch cases:**
+   ```go
+   func TestDispatchLifecycleEvent_UnknownEventType(t *testing.T) {
+       // Should return error for unknown event type
+   }
+   
+   func TestDispatchLifecycleEvent_RoutesToCorrectHandler(t *testing.T) {
+       // Verify each EventType routes to correct handler
+   }
+   ```
+
+2. **handleLifecycleSessionStart:**
+   ```go
+   func TestHandleLifecycleSessionStart_EmptySessionID(t *testing.T) {
+       // Should return error when SessionID is empty
+   }
+   
+   func TestHandleLifecycleSessionStart_ConcurrentSessionMessage(t *testing.T) {
+       // Should include concurrent session count in message
+   }
+   ```
+
+3. **handleLifecycleTurnStart:**
+   ```go
+   func TestHandleLifecycleTurnStart_CapturesPrePromptState(t *testing.T) {
+       // Verify CapturePrePromptState is called
+   }
+   
+   func TestHandleLifecycleTurnStart_InitializesSession(t *testing.T) {
+       // Verify SessionInitializer is called
+   }
+   ```
+
+4. **handleLifecycleTurnEnd edge cases:**
+   ```go
+   func TestHandleLifecycleTurnEnd_MissingTranscript(t *testing.T) {
+       // Should return error when transcript file not found
+   }
+   
+   func TestHandleLifecycleTurnEnd_EmptyRepository(t *testing.T) {
+       // Should return SilentError for empty repo
+   }
+   
+   func TestHandleLifecycleTurnEnd_NoChanges(t *testing.T) {
+       // Should skip checkpoint when no files modified
+   }
+   ```
+
+5. **handleLifecycleCompaction:**
+   ```go
+   func TestHandleLifecycleCompaction_ResetsTranscriptOffset(t *testing.T) {
+       // Verify CheckpointTranscriptStart is reset to 0
+   }
+   ```
+
+6. **Helper functions:**
+   ```go
+   func TestResolveTranscriptOffset_PrefersPrePromptState(t *testing.T) {
+       // PrePromptState offset should take precedence
+   }
+   
+   func TestResolveTranscriptOffset_FallsBackToSessionState(t *testing.T) {
+       // Should use session state when no pre-prompt state
+   }
+   
+   func TestCreateContextFile_Format(t *testing.T) {
+       // Verify markdown structure
+   }
+   ```
+
+---
+
+## 3. Test Patterns Not Followed
+
+### Pattern: Parallel Tests
+
+The CLAUDE.md states "Always use `t.Parallel()` in tests." Existing tests in `state_test.go` do NOT use `t.Parallel()`:
+
+```go
+func TestPreTaskStateFile(t *testing.T) {
+    // Missing: t.Parallel()
+    ...
+}
+```
+
+**However:** Tests using `t.Chdir()` cannot use `t.Parallel()` (Go will panic). Since many state tests need to set up a git repo and change directory, this is acceptable.
+
+### Pattern: Table-Driven Tests
+
+The backward compat test is well-structured but the transcript tests (`TestPrePromptState_WithTranscriptPosition`, etc.) are NOT table-driven despite testing similar scenarios. Consider consolidating.
+
+### Pattern: Error Path Testing
+
+The `lifecycle.go` handlers have many error paths (missing session ID, missing transcript, strategy failures) that are only logged as warnings, not tested.
+
+---
+
+## 4. Specific Recommendations
+
+### Critical (Must Fix)
+
+1. **[lifecycle.go] Create lifecycle_test.go with unit tests for:**
+   - `DispatchLifecycleEvent` dispatch routing
+   - Each handler's required parameter validation (empty session ID, missing transcript)
+   - `handleLifecycleCompaction` transcript offset reset
+   - `resolveTranscriptOffset` preference logic
+
+2. **[integration_test/] Add integration tests for missing events:**
+   - `SimulateSessionStart` (fires `SessionStart` event)
+   - `SimulateSessionEnd` (fires `SessionEnd` event)
+   - `SimulateCompaction` (fires `Compaction` event)
+   - `SimulateSubagentStart`/`SimulateSubagentEnd`
+
+### Important (Should Fix)
+
+3. **[state_test.go:327] Add Gemini agent test case:**
+   ```go
+   func TestPrePromptState_WithGeminiTranscript(t *testing.T) {
+       // Test with geminicli.NewGeminiAgent() to verify JSON parsing
+   }
+   ```
+
+4. **[lifecycle.go:151] Test empty repository early exit:**
+   The `IsEmptyRepository` check returns a `SilentError` but no test verifies this behavior.
+
+### Suggestions (Consider)
+
+5. **Mock agent for unit tests:** Create a mock `agent.Agent` implementation for testing lifecycle handlers without needing real transcript files.
+
+6. **Extract testable functions:** The `handleLifecycleTurnEnd` function is 150+ lines. Consider extracting more helper functions that can be unit tested independently.
+
+---
+
+## Summary
+
+| Category | state.go | lifecycle.go |
+|----------|----------|--------------|
+| Unit tests | Adequate | **Missing** |
+| Integration tests | Covered | Partially covered |
+| Edge cases | Good | Untested |
+| Backward compat | Excellent | N/A |
+
+**Estimated effort to address feedback:** 4-6 hours
+
+- Creating `lifecycle_test.go`: 2-3 hours
+- Adding missing integration test scenarios: 1-2 hours  
+- Adding Gemini agent test case: 30 minutes
+
+---
+
+**Verdict: REQUEST CHANGES**
+
+The `lifecycle.go` dispatcher is the core of the Phase 2 refactor and lacks any dedicated test coverage. Unit tests are needed to ensure the dispatcher correctly routes events and handles error conditions. Integration tests should be expanded to cover all event types, not just TurnStart/TurnEnd.</result>
+</task-notification>
+Full transcript available at: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/afdf134.output
+
+---
+
+<task-notification>
+<task-id>a7a8efa</task-id>
+<status>completed</status>
+<summary>Agent "Review code quality and errors" completed</summary>
+<result>I'm unable to write the review file due to permission constraints. Let me provide the complete review in my response instead.
+
+---
+
+# Review 01
+
+> Status: pending-dev
+> Date: 2026-02-16
+> Reviewer: Code Review Agent
+> Verdict: REQUEST CHANGES
+
+## Scope
+
+This review covers the Phase 2 implementation in commit d1902ae7, focusing on:
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/state.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/hooks_claudecode_handlers.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/hooks_geminicli_handlers.go`
+
+## Previous Review Status
+
+N/A - This is the first review for this feature.
+
+## New Findings
+
+### Critical (Must Fix)
+
+1. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:28] Nil agent not validated in DispatchLifecycleEvent**
+
+   The function accepts `ag agent.Agent` but never validates it is non-nil before calling methods like `ag.Name()`. If a caller passes nil (e.g., from a failed `GetCurrentHookAgent()` call where the error was ignored), this will panic.
+
+   ```go
+   func DispatchLifecycleEvent(ag agent.Agent, event *agent.Event) error {
+       // No nil check on ag
+       switch event.Type {
+       case agent.SessionStart:
+           return handleLifecycleSessionStart(ag, event)  // passes potentially nil ag
+   ```
+
+   **Suggested fix**: Add validation at the top of `DispatchLifecycleEvent`:
+   ```go
+   if ag == nil {
+       return errors.New("agent cannot be nil")
+   }
+   if event == nil {
+       return errors.New("event cannot be nil")
+   }
+   ```
+
+2. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:505-515] Dead code and unused variable**
+
+   Lines 505-515 contain code that declares `checkpointUUID` and attempts to find it, but the UUID lookup via analyzer is effectively a no-op:
+
+   ```go
+   var checkpointUUID string
+   if analyzer, ok := ag.(agent.TranscriptAnalyzer); ok {
+       // Use ExtractModifiedFilesFromOffset on the main transcript to get position info
+       // and then look for checkpoint UUID via the legacy path
+       _ = analyzer // UUID lookup requires transcript parsing - delegate to existing helper
+   }
+   // Fall back to the existing CLI-level checkpoint UUID finder
+   mainLines, _, _ := parseTranscriptForCheckpointUUID(event.SessionRef) //nolint:errcheck // best-effort
+   ```
+
+   The first branch does nothing (`_ = analyzer`). This is confusing and should either be implemented or removed with a TODO comment explaining the intent.
+
+3. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:150-151] Empty sessionRef check could allow whitespace-only strings**
+
+   The check `if transcriptRef == "" || !fileExists(transcriptRef)` catches empty strings but if `event.SessionRef` is whitespace-only, it would pass the empty check and fail `fileExists`. This edge case could produce a confusing error message.
+
+   **Suggested fix**:
+   ```go
+   transcriptRef := strings.TrimSpace(event.SessionRef)
+   if transcriptRef == "" {
+       return fmt.Errorf("session reference is empty")
+   }
+   if !fileExists(transcriptRef) {
+       return fmt.Errorf("transcript file not found: %s", transcriptRef)
+   }
+   ```
+
+### Important (Should Fix)
+
+1. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:136] maintidx nolint directive indicates overly complex function**
+
+   The `//nolint:maintidx` comment indicates this function is too complex. At 222 lines, `handleLifecycleTurnEnd` should be refactored into smaller helper functions. The comment says "consolidated from two large handlers" but the resulting function is still too large.
+
+   Consider extracting:
+   - Transcript validation and copying (lines 150-186)
+   - Metadata extraction (lines 198-225)
+   - File change detection (lines 260-287)
+   - Context file creation (lines 289-294)
+
+2. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/hooks_claudecode_handlers.go:99-401] Duplicate logic with lifecycle.go**
+
+   `commitWithMetadata()` (lines 99-401) duplicates most of the logic in `lifecycle.go:handleLifecycleTurnEnd()`. This appears to be the legacy handler that should eventually be removed. The comment at line 99 `//nolint:maintidx // already present in codebase` suggests this is known tech debt.
+
+   **Recommendation**: Add a TODO or deprecation comment indicating this is the legacy path and `handleLifecycleTurnEnd` is the preferred implementation.
+
+3. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/hooks_geminicli_handlers.go:22] Exported error but only used internally**
+
+   `ErrSessionSkipped` is exported (capital E) but only used within this file. Either make it unexported (`errSessionSkipped`) or document why it needs to be exported.
+
+4. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:84, 87, 89, 91] Warning messages swallow important context**
+
+   Multiple places use `fmt.Fprintf(os.Stderr, "Warning: ...")` but don't include all available context. For example:
+
+   ```go
+   if state, loadErr := strategy.LoadSessionState(event.SessionID); loadErr != nil {
+       fmt.Fprintf(os.Stderr, "Warning: failed to load session state on start: %v\n", loadErr)
+   ```
+
+   Should include the session ID in the warning for debugging:
+   ```go
+   fmt.Fprintf(os.Stderr, "Warning: failed to load session state for session %s on start: %v\n", event.SessionID, loadErr)
+   ```
+
+5. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:52-57, 100-105, 137-142, etc.] Inconsistent logging context creation**
+
+   The logging context is created the same way in every handler:
+   ```go
+   logCtx := logging.WithAgent(logging.WithComponent(context.Background(), "lifecycle"), ag.Name())
+   ```
+
+   This should be extracted to a helper function to reduce duplication:
+   ```go
+   func lifecycleLogCtx(ag agent.Agent) context.Context {
+       return logging.WithAgent(logging.WithComponent(context.Background(), "lifecycle"), ag.Name())
+   }
+   ```
+
+6. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/state.go:65-82] Complex migration logic lacks documentation**
+
+   The migration logic handles three deprecated field names with cascading fallbacks. This is correct but could benefit from a comment explaining the migration history:
+
+   ```go
+   // Migration history:
+   // - v1: LastTranscriptLineCount (oldest)
+   // - v2: StepTranscriptStart (intermediate, also StartMessageIndex for Gemini)
+   // - v3: TranscriptOffset (current unified field)
+   ```
+
+### Suggestions (Consider)
+
+1. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:146] Consider using unknownSessionID constant consistently**
+
+   At line 146, if sessionID is empty, it's set to `unknownSessionID`. But in `handleLifecycleSessionStart` at line 59, an empty sessionID returns an error instead. This inconsistency could cause confusion. Consider documenting when empty sessionID is allowed vs. when it's an error.
+
+2. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/state.go:154] nilnil linter directive**
+
+   The `//nolint:nilnil // already present in codebase` comment suggests this pattern was grandfathered in. Consider using a sentinel error like `ErrNoStateFile` instead of returning `(nil, nil)` for missing state files. This would make the API clearer.
+
+3. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/hooks_claudecode_handlers.go:519] Magic number in truncation**
+
+   ```go
+   taskToolUseID[:min(12, len(taskToolUseID))]
+   ```
+
+   The `12` is a magic number. Consider extracting to a named constant like `const toolUseIDPreviewLength = 12`.
+
+4. **[/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/hooks_geminicli_handlers.go:285-303] createContextFileForGemini duplicates createContextFile**
+
+   `createContextFileForGemini` in hooks_geminicli_handlers.go and `createContextFile` in lifecycle.go are nearly identical. Consider consolidating to a single shared function.
+
+5. **No import cycle issues detected**
+
+   The imports in lifecycle.go are well-structured: it imports from `agent`, `logging`, `paths`, `session`, `strategy`, and `transcript` packages. None of these packages import back from `cli`, so there are no import cycles.
+
+### Praise
+
+1. **Good separation of concerns** - The lifecycle dispatcher cleanly separates event routing from event handling, making it easy to add new event types.
+
+2. **Consistent error handling pattern** - Errors are properly wrapped with `fmt.Errorf("...: %w", err)` throughout, providing good stack traces.
+
+3. **Thoughtful nil receiver handling** - The `PreUntrackedFiles()` method on `PrePromptState` and `PreTaskState` handles nil receivers gracefully, which simplifies calling code.
+
+4. **Clear logging discipline** - The code follows the CLAUDE.md pattern of using `logging.*` for operational logging and `fmt.Fprintf(os.Stderr, ...)` for user-facing messages.
+
+5. **Type assertions for optional interfaces** - Good use of type assertions for optional agent interfaces like `TranscriptAnalyzer` and `TranscriptPreparer`, allowing agents to opt into richer functionality.
+
+## Summary
+
+**Overall assessment**: REQUEST CHANGES
+
+**Key concerns**:
+1. Nil agent validation missing in `DispatchLifecycleEvent` - could cause panic
+2. Dead code / no-op in subagent UUID lookup (lines 505-515)
+3. Significant code duplication between lifecycle.go and hooks_claudecode_handlers.go (acceptable tech debt but should be documented)
+4. `handleLifecycleTurnEnd` is too complex (222 lines) and should be refactored
+
+**Estimated effort to address feedback**: 2-4 hours
+
+The Phase 2 implementation establishes a solid foundation for the agent-agnostic lifecycle dispatcher. The critical nil validation issue should be addressed before merge. The duplication with the legacy Claude Code handlers is acceptable technical debt for now but should be tracked for future cleanup.</result>
+</task-notification>
+Full transcript available at: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/a7a8efa.output
+
+---
+
+<task-notification>
+<task-id>a862caf</task-id>
+<status>completed</status>
+<summary>Agent "Review lifecycle dispatcher design" completed</summary>
+<result>I'll provide the review directly in my response since I cannot write to files.
+
+---
+
+# Review of Phase 2 Implementation (Commit d1902ae7)
+
+## Overview
+
+This review examines the Phase 2 implementation of the agent interface refactoring plan. Phase 2 introduces the generic lifecycle event dispatcher (`lifecycle.go`) and integrates it with the hook registry.
+
+**Files reviewed:**
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go` (new file, 635 lines)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/hook_registry.go` (modified)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/state.go` (modified)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/event.go` (new file from Phase 1)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/claudecode/lifecycle.go`
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/geminicli/lifecycle.go`
+- `/Users/soph/Work/entire/devenv/cli/PLAN.md` (sections 2a, 2b, 2c)
+
+---
+
+## What's Implemented Correctly
+
+### 1. All 7 Event Types Handled
+
+`DispatchLifecycleEvent` correctly routes all event types from PLAN.md:
+
+```go
+func DispatchLifecycleEvent(ag agent.Agent, event *agent.Event) error {
+    switch event.Type {
+    case agent.SessionStart:
+        return handleLifecycleSessionStart(ag, event)
+    case agent.TurnStart:
+        return handleLifecycleTurnStart(ag, event)
+    case agent.TurnEnd:
+        return handleLifecycleTurnEnd(ag, event)
+    case agent.Compaction:
+        return handleLifecycleCompaction(ag, event)
+    case agent.SessionEnd:
+        return handleLifecycleSessionEnd(ag, event)
+    case agent.SubagentStart:
+        return handleLifecycleSubagentStart(ag, event)
+    case agent.SubagentEnd:
+        return handleLifecycleSubagentEnd(ag, event)
+    default:
+        return fmt.Errorf("unknown lifecycle event type: %d", event.Type)
+    }
+}
+```
+
+### 2. Hook Registry Integration Works Correctly
+
+`/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/hook_registry.go` lines 305-331 implement the `ParseHookEvent -> DispatchLifecycleEvent` flow:
+
+```go
+ag, agentErr := agent.Get(agentName)
+if agentErr == nil {
+    event, parseErr := ag.ParseHookEvent(hookName, os.Stdin)
+    if parseErr != nil {
+        return fmt.Errorf("failed to parse hook event: %w", parseErr)
+    }
+    if event != nil {
+        // Lifecycle event -- use the generic dispatcher
+        hookErr = DispatchLifecycleEvent(ag, event)
+    } else {
+        // No lifecycle event -- fall back to registered handler (e.g., PostTodo)
+        handler := GetHookHandler(agentName, hookName)
+        if handler != nil {
+            hookErr = handler()
+        }
+    }
+}
+```
+
+This correctly:
+- Uses the agent to parse the native hook into a normalized event
+- Routes lifecycle events through the generic dispatcher
+- Falls back to legacy handlers for hooks that return `nil` (e.g., PostTodo)
+
+### 3. Framework Calls Agent for Data (Inverted Control)
+
+The `handleLifecycleTurnEnd` function correctly inverts control -- the framework orchestrates and calls agent methods for data:
+
+```go
+// Line 171-175: TranscriptPreparer (optional interface)
+if preparer, ok := ag.(agent.TranscriptPreparer); ok {
+    if err := preparer.PrepareTranscript(transcriptRef); err != nil {
+        fmt.Fprintf(os.Stderr, "Warning: failed to prepare transcript: %v\n", err)
+    }
+}
+
+// Line 178-185: ReadTranscript (core interface)
+transcriptData, err := ag.ReadTranscript(transcriptRef)
+
+// Line 203-224: TranscriptAnalyzer (optional interface)
+if analyzer, ok := ag.(agent.TranscriptAnalyzer); ok {
+    // Extract prompts, summary, modified files
+}
+
+// Line 316-323: TokenCalculator (optional interface)
+if calculator, ok := ag.(agent.TokenCalculator); ok {
+    usage, tokenErr := calculator.CalculateTokenUsage(transcriptRef, transcriptLinesAtStart)
+}
+```
+
+### 4. Unified CapturePrePromptState
+
+`/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/state.go` lines 84-146 now use the `TranscriptAnalyzer` interface instead of agent-specific functions:
+
+```go
+func CapturePrePromptState(ag agent.Agent, sessionID, sessionRef string) error {
+    // ...
+    if analyzer, ok := ag.(agent.TranscriptAnalyzer); ok && sessionRef != "" {
+        pos, posErr := analyzer.GetTranscriptPosition(sessionRef)
+        if posErr != nil {
+            fmt.Fprintf(os.Stderr, "Warning: failed to get transcript position: %v\n", posErr)
+        } else {
+            transcriptOffset = pos
+        }
+    }
+    // ...
+}
+```
+
+The `PrePromptState` struct now has a unified `TranscriptOffset` field with migration from deprecated fields (`StartMessageIndex`, `StepTranscriptStart`).
+
+### 5. Agent ParseHookEvent Implementations
+
+Both agents correctly implement `ParseHookEvent`:
+
+**Claude Code** (`/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/claudecode/lifecycle.go`):
+- Maps `HookNameSessionStart` -> `agent.SessionStart`
+- Maps `HookNameUserPromptSubmit` -> `agent.TurnStart`
+- Maps `HookNameStop` -> `agent.TurnEnd`
+- Maps `HookNameSessionEnd` -> `agent.SessionEnd`
+- Maps `HookNamePreTask` -> `agent.SubagentStart`
+- Maps `HookNamePostTask` -> `agent.SubagentEnd`
+- Returns `nil` for `HookNamePostTodo` (agent-specific, handled outside dispatcher)
+
+**Gemini CLI** (`/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/geminicli/lifecycle.go`):
+- Maps `HookNameSessionStart` -> `agent.SessionStart`
+- Maps `HookNameBeforeAgent` -> `agent.TurnStart`
+- Maps `HookNameAfterAgent` -> `agent.TurnEnd`
+- Maps `HookNameSessionEnd` -> `agent.SessionEnd`
+- Maps `HookNamePreCompress` -> `agent.Compaction`
+- Returns `nil` for pass-through hooks (BeforeTool, AfterTool, BeforeModel, AfterModel, BeforeToolSelection, Notification)
+
+---
+
+## What Differs from PLAN.md
+
+### 1. handleTurnEnd Step Count
+
+PLAN.md section 2b specifies a 17-step flow. Comparing against the implementation:
+
+| PLAN.md Step | Implementation | Status |
+|--------------|----------------|--------|
+| 1. Validate transcript exists | Lines 150-152 | DONE |
+| 2. TranscriptPreparer.PrepareTranscript | Lines 171-175 | DONE |
+| 3. Create session metadata directory | Lines 161-168 | DONE |
+| 4. ReadTranscript | Lines 178-185 | DONE |
+| 5. Load pre-prompt state | Lines 188-191 | DONE |
+| 6. ExtractModifiedFiles | Lines 219-224 | DONE |
+| 7. ExtractPrompts | Lines 205-209 | DONE |
+| 8. ExtractSummary | Lines 212-216 | DONE |
+| 9. DetectFileChanges (git status) | Lines 261-264 | DONE |
+| 10. Filter and normalize paths | Lines 267-272 | DONE |
+| 11. No changes: transition + return | Lines 276-284 | DONE |
+| 12. Create context file | Lines 290-294 | DONE |
+| 13. TokenCalculator.CalculateTokenUsage | Lines 316-323 | DONE |
+| 14. Build SaveContext, call SaveChanges | Lines 326-345 | DONE |
+| 15. Persist checkpoint to entire/checkpoints/v1 | --- | **MISSING/IMPLICIT** |
+| 16. Transition session phase (TurnEnd) | Line 353 | DONE |
+| 17. Clean up pre-prompt state | Lines 354-356 | DONE |
+
+**Step 15 clarification:** The PLAN.md says "Persist checkpoint to `entire/checkpoints/v1` -- **Checkpoint action**". In the implementation, this is handled inside `strat.SaveChanges()`:
+- **auto-commit**: Calls `checkpoint.WriteCommitted()` to persist to the branch
+- **manual-commit**: Does NOT persist to `entire/checkpoints/v1` on TurnEnd -- only writes to shadow branch. Condensation to `entire/checkpoints/v1` happens on git commit.
+
+This matches existing behavior and may be intentional, but differs from a literal reading of PLAN.md.
+
+### 2. Legacy Handlers Not Removed
+
+PLAN.md Phase 4a says:
+> **Remove** `hookRegistry` map and string-based registration from `hook_registry.go`
+
+However, the Phase 2 implementation keeps the `init()` function that registers all legacy handlers (lines 48-193 of `hook_registry.go`). This is correct for incremental migration (Phase 3 hasn't happened yet), but should be tracked for Phase 4 cleanup.
+
+### 3. Step/Checkpoint Terminology Not Renamed
+
+PLAN.md Phase 4c specifies renaming:
+- `SaveChanges` -> `SaveStep`
+- `SaveContext` -> `StepContext`
+- `SaveTaskCheckpoint` -> `SaveTaskStep`
+- `TaskCheckpointContext` -> `TaskStepContext`
+
+The current implementation uses the old names. This is correct (Phase 4 not implemented yet).
+
+---
+
+## Design Concerns
+
+### 1. Defensive EnsureSetup Missing in handleTurnEnd
+
+`handleLifecycleTurnStart` calls `strat.EnsureSetup()`, but `handleLifecycleTurnEnd` does not. If a TurnEnd event arrives without a preceding TurnStart (e.g., process restart, missed hook), `EnsureSetup()` won't have been called.
+
+The old `commitWithMetadata()` function calls `EnsureSetup()` directly. Consider adding it to `handleLifecycleTurnEnd` as a defensive measure.
+
+### 2. Duplicate IsEnabled Checks
+
+The `newAgentHookVerbCmdWithLogging` function checks `IsEnabled()` at lines 278-281. But the legacy handlers registered in `init()` also check `IsEnabled()` (e.g., lines 51-54). This results in double-checking when falling back to legacy handlers. Not a bug, but could be clarified.
+
+### 3. Checkpoint UUID Lookup Uses CLI-Level Parsing
+
+`handleLifecycleSubagentEnd` calls `parseTranscriptForCheckpointUUID` (line 512-514), which uses `transcript.ParseFromFileAtLine` directly rather than going through the agent interface. This is inconsistent with the "agent provides data" principle, but may be intentional since checkpoint UUID lookup is framework-specific, not agent-specific.
+
+---
+
+## Verification Summary
+
+| Question | Answer |
+|----------|--------|
+| Does `DispatchLifecycleEvent` handle all 7 event types? | **Yes** - SessionStart, TurnStart, TurnEnd, Compaction, SessionEnd, SubagentStart, SubagentEnd |
+| Does `handleTurnEnd` follow the 17-step flow? | **Mostly** - Steps 1-14, 16-17 implemented; step 15 is implicit in strategy |
+| Does framework call agent for data? | **Yes** - Uses TranscriptAnalyzer, TranscriptPreparer, TokenCalculator, ReadTranscript |
+| Does `ParseHookEvent -> DispatchLifecycleEvent` work? | **Yes** - hook_registry.go correctly routes through dispatcher |
+
+---
+
+## Suggestions
+
+1. **Add defensive EnsureSetup to handleTurnEnd**: Protects against missed TurnStart events.
+
+2. **Document the Phase 3/4 migration plan in comments**: The legacy handlers in `init()` should have a comment explaining they're kept for incremental migration.
+
+3. **Consider moving checkpoint UUID lookup to agent interface or separate helper**: The current `parseTranscriptForCheckpointUUID` function breaks the "agent provides data" pattern.
+
+4. **Add integration test for full lifecycle flow**: Test the path from `ParseHookEvent` through `DispatchLifecycleEvent` to `SaveChanges` with mock agents.
+
+---
+
+## Conclusion
+
+The Phase 2 implementation is well-executed and achieves the core design goal: inverting control so the framework orchestrates and agents provide data. The `DispatchLifecycleEvent` dispatcher correctly handles all lifecycle events, and the hook registry integration works as designed.
+
+The main gaps are:
+1. Step 15 (checkpoint persist) behavior is strategy-dependent and may not match PLAN.md's literal description
+2. Missing defensive `EnsureSetup()` in `handleTurnEnd`
+3. Legacy handlers remain registered (correct for now, needs Phase 4 cleanup)
+
+These are minor issues that don't block functionality. The implementation is ready for Phase 3 (agent migration) with the understanding that Phase 4 will clean up the remaining legacy code.</result>
+</task-notification>
+Full transcript available at: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/a862caf.output
+
+---
+
+let's do: 
+
+  1. Nil validation in DispatchLifecycleEvent (5 min fix)
+  2. Create lifecycle_test.go with unit tests (2-3 hours)
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. **Initial Request**: User asked to review the last commit through multiple agents based on PLAN.md
+
+2. **Context Gathering**: I read PLAN.md (a detailed plan for agent interface refactoring) and checked the last commit (d1902ae7 - "Phase 2")
+
+3. **Multi-Agent Review**: I launched 4 reviewer agents:
+   - Lifecycle dispatcher design review
+   - Code quality and errors review
+   - Test coverage review
+   - Strategy interface changes review
+
+4. **Review Results Summary**:
+   - **Lifecycle dispatcher design**: PASS with minor issues (missing defensive EnsureSetup, step 15 is strategy-dependent)
+   - **Code quality**: REQUEST CHANGES (nil validation missing, dead code, complex functions)
+   - **Test coverage**: REQUEST CHANGES (critical gap - lifecycle.go has zero unit tests)
+   - **Strategy interface**: PASS (correctly uses current terminology, no premature Phase 4c renames)
+
+5. **User's Action Items Request**: User asked to do:
+   - Nil validation in DispatchLifecycleEvent (5 min fix)
+   - Create lifecycle_test.go with unit tests (2-3 hours)
+
+6. **Implementation Started**:
+   - Added nil validation to DispatchLifecycleEvent
+   - Created lifecycle_test.go with comprehensive tests
+   - Currently fixing compilation errors due to incomplete mock agent interface implementation
+
+7. **Current Error**: The mockLifecycleAgent is missing methods required by the Agent interface (FormatResumeCommand, WriteSession, ReadSession, ResolveSessionFile, GetSessionDir)
+
+Summary:
+1. Primary Request and Intent:
+   - User requested a multi-agent review of the last commit (Phase 2 of agent interface refactoring) based on PLAN.md
+   - After receiving reviews, user asked to implement two fixes:
+     1. Add nil validation to DispatchLifecycleEvent (5 min fix)
+     2. Create lifecycle_test.go with unit tests (2-3 hours)
+
+2. Key Technical Concepts:
+   - Agent interface refactoring (PLAN.md Phases 1-5)
+   - Lifecycle event dispatcher pattern (DispatchLifecycleEvent routing events to handlers)
+   - 7 lifecycle event types: SessionStart, TurnStart, TurnEnd, Compaction, SessionEnd, SubagentStart, SubagentEnd
+   - Optional agent interfaces: TranscriptAnalyzer, TranscriptPreparer, TokenCalculator
+   - Strategy pattern: SaveChanges, SaveContext, SaveTaskCheckpoint
+   - Mock agent implementation for testing
+
+3. Files and Code Sections:
+   - `/Users/soph/Work/entire/devenv/cli/PLAN.md` - Comprehensive refactoring plan defining lifecycle events and dispatcher design
+   
+   - `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go` - Main file being tested
+     - Added nil validation at top of DispatchLifecycleEvent:
+     ```go
+     func DispatchLifecycleEvent(ag agent.Agent, event *agent.Event) error {
+         if ag == nil {
+             return fmt.Errorf("agent cannot be nil")
+         }
+         if event == nil {
+             return fmt.Errorf("event cannot be nil")
+         }
+         // ... rest of switch statement
+     }
+     ```
+   
+   - `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle_test.go` - NEW FILE created with tests
+     - Mock agent implementation (incomplete - missing interface methods)
+     - Tests for: DispatchLifecycleEvent (nil agent, nil event, unknown type, routing)
+     - Tests for: handleLifecycleSessionStart, handleLifecycleTurnStart, handleLifecycleTurnEnd
+     - Tests for: handleLifecycleCompaction, handleLifecycleSessionEnd
+     - Tests for: resolveTranscriptOffset, createContextFile helpers
+
+   - `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/event.go` - Event types definition
+   
+   - `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/agent_test.go` - Reference for mock agent pattern
+
+4. Errors and fixes:
+   - **Current Error**: mockLifecycleAgent doesn't implement agent.Agent interface
+     - Missing methods: FormatResumeCommand, WriteSession, ReadSession, ResolveSessionFile, GetSessionDir
+     - Fix in progress: Need to add these methods to mockLifecycleAgent struct
+
+5. Problem Solving:
+   - Successfully completed nil validation fix
+   - Created comprehensive test file structure
+   - Currently resolving mock agent interface compliance issue
+
+6. All user messages:
+   - "can you review the last commit through multiple agents based of PLAN.md"
+   - "let's do: 1. Nil validation in DispatchLifecycleEvent (5 min fix) 2. Create lifecycle_test.go with unit tests (2-3 hours)"
+
+7. Pending Tasks:
+   - Complete mockLifecycleAgent implementation (add missing interface methods)
+   - Run tests to verify they pass
+   - Potentially address other review findings (defensive EnsureSetup, dead code cleanup, etc.)
+
+8. Current Work:
+   Just created lifecycle_test.go but encountered compilation errors because mockLifecycleAgent is missing 5 methods required by the Agent interface:
+   - `GetSessionDir(repoPath string) (string, error)`
+   - `ResolveSessionFile(sessionDir, agentSessionID string) string`
+   - `ReadSession(input *HookInput) (*AgentSession, error)`
+   - `WriteSession(session *AgentSession) error`
+   - `FormatResumeCommand(sessionID string) string`
+
+   The error message shows:
+   ```
+   cannot use (*mockLifecycleAgent)(nil) (value of type *mockLifecycleAgent) as agent.Agent value in variable declaration: *mockLifecycleAgent does not implement agent.Agent (missing method FormatResumeCommand)
+   ```
+
+9. Optional Next Step:
+   Add the missing methods to mockLifecycleAgent in lifecycle_test.go to complete the Agent interface implementation:
+   ```go
+   func (m *mockLifecycleAgent) GetSessionDir(_ string) (string, error) { return "", nil }
+   func (m *mockLifecycleAgent) ResolveSessionFile(sessionDir, agentSessionID string) string {
+       return sessionDir + "/" + agentSessionID + ".jsonl"
+   }
+   func (m *mockLifecycleAgent) ReadSession(_ *agent.HookInput) (*agent.AgentSession, error) { return nil, nil }
+   func (m *mockLifecycleAgent) WriteSession(_ *agent.AgentSession) error { return nil }
+   func (m *mockLifecycleAgent) FormatResumeCommand(_ string) string { return "" }
+   ```
+   
+   This directly continues the user's request: "let's do: 1. Nil validation in DispatchLifecycleEvent (5 min fix) 2. Create lifecycle_test.go with unit tests (2-3 hours)"
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.

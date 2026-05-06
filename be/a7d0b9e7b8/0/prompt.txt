@@ -1,0 +1,37 @@
+you're on a PR right now that refactored the agent hook system to make it easier to add new agents. This is the PR: https://github.com/entireio/cli/pull/360. I want to add in support for codex from openai, here is the documentation:https://developers.openai.com/codex/changelog/?type=codex-cli. They mention hooks in this change log: https://developers.openai.com/codex/changelog/?type=codex-cli. Search to see if the hooks are ready to implement and what state they're in.
+
+---
+
+no not yet. i want to focus on another issue. somebody on github posted taht they were trying to use homebrew to install  our CLI:
+
+I installed entire using brew, but when I try running entire enable on a repo I see this dialog and it fails with zsh: killed     entire enable.
+
+
+and got a malware detection issue. 
+
+evaluate the claim and what could have caused this
+
+---
+
+i got this feedeback for a flaky test: TestDetectOrSelectAgent_NoDetection_WithTTY_ShowsPromptMessages calls detectOrSelectAgent() with ENTIRE_TEST_TTY=1, which will run form.Run() and can block waiting for interactive input when tests are executed from a real terminal (or behave differently under ACCESSIBLE mode). This makes the unit test potentially hanging/flaky. To keep tests non-interactive, consider refactoring detectOrSelectAgent to inject/mock the selection prompt, or avoid executing form.Run() in unit tests (e.g., gate prompting behind a test-only flag and test the prompt path via integration tests with a pty).
+
+
+fix this adn then give me a way to test this manually locally
+
+---
+
+i got this feedback on your fix:
+
+This fixes the two hanging tests but doesn't address the smell you raised. A few observations:
+
+1. **`TestRunEnableWithStrategy_Preserves*` still needs `ENTIRE_TEST_TTY=0`** — the package-level mock only helps tests that explicitly set it. Any test calling `runEnableWithStrategy` → `detectOrSelectAgent` still hits the TTY check unless it either sets the env var or sets the mock.
+
+2. **Package-level mutable state** — `agentPromptFunc` is a global var that tests mutate. These particular tests can't use `t.Parallel()` anyway (due to `t.Chdir`/`t.Setenv`), but it's still a fragile pattern. If someone adds a parallel test that calls `detectOrSelectAgent`, they'll get a race.
+
+3. **Mock doesn't receive `options`** — the `agentPromptFunc` signature is `func() ([]string, error)`, so the mock can return agent names that weren't even in the options list. The real form constrains selection to available options.
+
+4. **Tests no longer verify the error path** — the old tests (while broken) at least tried to verify form cancellation produced the right error. The new tests only check the happy path with a mock.
+
+The cleaner fix would be what we discussed — pull `detectOrSelectAgent` out of `runEnableWithStrategy` so the caller passes agents in. That eliminates the TTY concern for all unrelated tests without needing mocks or env vars. Want me to comment that on the PR, or is this something you'd rather discuss with them directly?
+
+let's address tihs so we test it correctly and handle the env var

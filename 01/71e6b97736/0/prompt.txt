@@ -1,0 +1,62 @@
+/simplify
+
+---
+
+1. cmd/entire/cli/plugin.go:74
+     A non-executable entire-<name> on PATH is treated as “no plugin found”, so the user falls through to Cobra’s generic unknown-command path instead of
+     getting the intended plugin launch error. exec.LookPath returns an error for this case, and resolvePlugin currently collapses that into ok=false. I
+     verified the behavior locally: a 0644 entire-bad file on PATH makes LookPath("entire-bad") return exec: "entire-bad": executable file not found in $PATH.
+     That means the current comment on MaybeDispatchPlugin is not actually true for one of the main launch-failure cases it calls out.
+  2. cmd/entire/main.go:36, cmd/entire/cli/root.go:45
+     Plugin invocations bypass rootCmd.ExecuteContext, so PersistentPostRun never runs for them. Today that drops versioncheck.CheckAndNotify(...) entirely for
+     plugin commands, which is a user-visible regression compared with every built-in top-level command. It also means any future shared post-run behavior
+     added at the root will silently not apply to plugins unless it is duplicated in the early-dispatch path.
+  3. cmd/entire/cli/plugin.go:40
+     Plugin telemetry is emitted unconditionally after runPlugin, even when the plugin failed to launch or exited non-zero. That differs from built-in command
+     telemetry, which is sent from PersistentPostRun and therefore only after successful Cobra execution. For allowlisted plugins this will inflate usage with
+     failed/crashing invocations and make plugin telemetry semantically different from the existing command event stream.
+
+---
+
+did you do meaningful commits?
+
+---
+
+should we add a file docs/architecture explaining this?
+
+---
+
+yes, let's draft one
+
+---
+
+1. Medium: the comparison table overstates how external-agent discovery works. docs/architecture/plugin-dispatch.md:82 says agent-protocol discovery is
+     “Eager scan during init (or lazy for hooks)”, but the implementation is more conditional and command-specific: normal discovery is gated by
+     external_agents in cmd/entire/cli/agent/external/discovery.go:26, several commands trigger it lazily at runtime (cmd/entire/cli/attach.go:66, cmd/entire/
+     cli/resume.go:57, cmd/entire/cli/rewind.go:76, cmd/entire/cli/hooks_cmd.go:44), and setup paths bypass the setting entirely with DiscoverAndRegisterAlways
+     (cmd/entire/cli/setup.go:343, cmd/entire/cli/setup.go:773). As written, the doc gives plugin authors a misleading mental model of when agent binaries are
+     actually discovered.
+  2. Low: the new doc promotes ENTIRE_REPO_ROOT to part of the plugin contract, but the integration coverage only asserts ENTIRE_CLI_VERSION forwarding. See
+     the contract in docs/architecture/plugin-dispatch.md:22 and the implementation in cmd/entire/cli/plugin.go:154. The current integration test at cmd/
+     entire/cli/integration_test/plugin_dispatch_test.go:211 checks only ENTIRE_CLI_VERSION, so a regression in repo-root propagation would now contradict the
+     documented public behavior without failing tests.
+
+---
+
+can you give me a short PR description
+
+---
+
+can we use a different word then "dispatch" I'm pretty sure that causes confusion with some folks because we have "entire dispatch"
+
+---
+
+2
+
+---
+
+Low Severity
+
+All new CLI subprocess invocations in plugin_dispatch_test.go (lines 64, 93, 118, 140, 165, 195, 241, 294) and plugin_dispatch_signal_unix_test.go (line 40) use raw exec.Command(getTestBinary(), ...) instead of execx.NonInteractive(ctx, getTestBinary(), ...). The established pattern in the same package — RunCLIWithError in testenv.go — uses execx.NonInteractive to detach from the controlling TTY. The signal test may have a legitimate reason (it sends os.Interrupt to the process), but the other seven tests in plugin_dispatch_test.go have no such need.
+
+Additional Locations (2)

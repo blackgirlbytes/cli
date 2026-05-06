@@ -1,0 +1,710 @@
+/superpowers:brainstorming Please read the project plan in ~/entire/cli/docs/superpowers/specs/2026-03-19-checkpoints-v2-design.md and the RFD in
+~/entire/company-knowledge/rfds/rfd-009-transcript-compaction.md. I'd like to update the `entire resume` command in a way that it will support the new
+checkpoints v2 ref format.
+
+---
+
+When IsCheckpointsV2Enabled() returns true, it should first try to read from the checkpoints v2 ref (metadata from `/main` and full transcripts from `/full/*`. If that doesn't find anything fall back to the v1 paths accordingly. Is that compatible with the text in the RFD?
+
+---
+
+The tasks in the design doc are vague guidelines so if it's necessary to implement something that had its own task, inline that task and update the plan accordingly. To be concrete: ResolveTranscript can be implemented now and we can remove the A8 task.
+
+---
+
+Follow the same pattern as before but remember to only ever invoke code related to v2 when CheckpointsV2 (IsCheckpointsV2Enabled) is enabled.
+
+---
+
+Use A
+
+---
+
+Yes
+
+---
+
+Sounds good
+
+---
+
+Yes
+
+---
+
+What does parallel mean in this context? Run in a different go routine or something else?
+
+---
+
+Yes
+
+---
+
+A few design suggestions:
+
+Adding the version to a function name is quite inelegant. Could we solve that by adding new functions related to checkpoints v2 into their own package? I don't want to just be bolting on v2 functions onto existing code.
+
+---
+
+Could we create a checkpoint/v2 package in which v2 specific code lives instead?
+
+---
+
+Sounds good
+
+---
+
+We should use the same struct type names in v2 as in v1: Store should be GitStore, if I'm not mistaken.
+
+---
+
+Yes
+
+---
+
+One other thing: Having a V2GitStore and a v2.GitStore isn't great. Maybe we can begin by moving the v2 related Store code into the v2 package as well.
+
+---
+
+Go ahead for now.
+
+---
+
+Just to confirm: I want to check and inspect the changes after each step before comitting. Is a subagent helping in such a case?
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+Wait. Functions that only belong to a package but not to a particular Struct can be shared via a common internal package in the checkpoint package, right?
+
+---
+
+Let's do that, then.
+
+---
+
+Yes
+
+---
+
+Is there a particular reason why the generic checkpoint calls can't just all live in checkpoint/internal? I mean specifically, everything that's independent from checkpoint v1 or v2 code.
+
+---
+
+Let's do 2 for now
+
+---
+
+I've had a few seconds to think about this plan and I hate it!
+
+- Inlining all of these helpers that aren't related to the v1/v2 structure is plain wrong
+- Having v1 code still in checkpoint but creating new v2 code under a new package structure is super inconsistent
+
+What other options do we have?
+
+---
+
+Let's do B
+
+---
+
+Yes
+
+---
+
+Commit and continue
+
+---
+
+Commit
+
+---
+
+Where are the tests for this?
+
+---
+
+1
+
+---
+
+Please commit
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a211f4739d872b074</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-entire-status/1344c386-09de-4f26-9534-c2d2ed02aa28/tasks/a211f4739d872b074.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>I apologize, but I'm unable to access the file contents in this session due to permission restrictions. The Read tool and Bash tool are both restricted from reading these files.
+
+To help you complete this efficiency review, I would need one of the following:
+
+1. **Permission to read these files** - The access controls would need to be relaxed so I can view the Go source files
+2. **Direct file content** - You could paste the contents of these files directly in the chat
+3. **Alternative format** - The files could be provided through a different mechanism
+
+The specific files I need to review are:
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/checkpoint/v2_read.go`
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/checkpoint/v2_resolve.go`
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/resume.go`
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/manual_commit_rewind.go`
+
+Once I can access the content, I'll be able to provide a thorough analysis of the efficiency concerns you've outlined, particularly around:
+1. Duplicate ref resolution in ReadCommitted/ReadSessionContent
+2. Redundant repo opens in resumeSingleSession
+3. N+1 patterns in RestoreLogsOnly
+4. Generation search performance
+5. Hot path latency for the v2-first + v1-fallback pattern
+
+Would you be able to share the file contents or adjust the permissions?</result>
+<usage><total_tokens>12321</total_tokens><tool_uses>8</tool_uses><duration_ms>7915</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-entire-status/1344c386-09de-4f26-9534-c2d2ed02aa28/tasks/a211f4739d872b074.output
+
+---
+
+<task-notification>
+<task-id>ae54633e926078c05</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-entire-status/1344c386-09de-4f26-9534-c2d2ed02aa28/tasks/ae54633e926078c05.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Now I have enough information to write the analysis report. Let me compile all my findings:
+
+## Code Quality Review Report
+
+I've completed a thorough review of the v2 checkpoint implementation. Here are the code quality issues I found:
+
+### 1. **Redundant State in ManualCommitStrategy** ⚠️ MODERATE CONCERN
+
+**Location:** `cmd/entire/cli/strategy/manual_commit.go` (lines 34-37)
+
+The `v2CheckpointStore` field duplicates state that could be derived:
+
+```go
+v2CheckpointStore     *checkpoint.V2GitStore
+v2CheckpointStoreOnce sync.Once
+v2CheckpointStoreErr  error
+```
+
+**Issue:** This mirrors the existing `checkpointStore` pattern (lines 23-28) exactly. The `getV2CheckpointStore()` method (lines 74-84) opens a fresh repository every time it's called, creating a `V2GitStore` that wraps this repo.
+
+**Problem:** In `RestoreLogsOnly()` (manual_commit_rewind.go:635), the code calls `getV2CheckpointStore()` twice:
+- Line 635: `v2Store, v2Err := s.getV2CheckpointStore()`
+- Line 692: `v2Store, v2Err := s.getV2CheckpointStore()` (in the restore loop)
+
+Since both stores reference the same repository object (by the time they're created), there's unnecessary duplication. However, this isn't as severe as it first appears because the lazy initialization pattern is thread-safe and intentional.
+
+**Mitigation:** This pattern is actually acceptable given the need for separate v1/v2 stores with different repository instances. The redundancy is minimal.
+
+---
+
+### 2. **Copy-Paste with Slight Variation in resume.go** ⚠️ MODERATE CONCERN
+
+**Locations:**
+- `resumeFromCurrentBranch()` (lines 204-217): v2 first block
+- `resolveLatestCheckpoint()` (lines 311-318): v2 first block  
+- `checkRemoteMetadata()` (lines 634-655): v2 first block
+
+**Pattern:**
+```go
+// Try v2 first when enabled
+if settings.IsCheckpointsV2Enabled(ctx) {
+    v2Tree/v2Store, v2Repo/v2Err, v2Err := getV2MetadataTree/getV2CheckpointStore(ctx)
+    if v2Err == nil {
+        // use v2
+        return ...
+    }
+    // logging.Debug with v2 fallback message
+}
+// Fall back to v1
+```
+
+This pattern appears ~3-4 times with identical structure:
+
+1. **resumeFromCurrentBranch (204-217):** Gets v2 tree, logs if unavailable
+2. **resolveLatestCheckpoint (311-327):** Gets v2 tree, silently falls back
+3. **checkRemoteMetadata (634-655):** Gets v2 tree, logs before v1
+4. **RestoreLogsOnly (631-645):** Gets v2 store summary, logs before v1
+
+**Issue:** While the pattern is intentional for feature gating, extracting it to a helper would improve maintainability:
+
+```go
+// Hypothetical helper (not present)
+func tryGetV2MetadataOrFallback(ctx context.Context) (*object.Tree, *git.Repository, error) {
+    if !settings.IsCheckpointsV2Enabled(ctx) {
+        return nil, nil, errors.New("v2 disabled")
+    }
+    return getV2MetadataTree(ctx)
+}
+```
+
+**Current approach:** No extraction; the pattern is repeated. This increases cognitive load when reading the code and creates update burden if the fallback strategy changes.
+
+---
+
+### 3. **Leaky Abstractions: ResolveTranscript Interface** ⚠️ MODERATE CONCERN
+
+**Location:** `cmd/entire/cli/checkpoint/v2_resolve.go:22`
+
+```go
+func ResolveTranscript(ctx context.Context, repo *git.Repository, cpID id.CheckpointID, sessionIndex int, v2Enabled bool) (*SessionContent, error)
+```
+
+**Issue:** This function takes a `*git.Repository` as a parameter but internally creates new stores:
+
+```go
+v2Store := NewV2GitStore(repo)        // Creates new store from passed repo
+v1Store := NewGitStore(repo)          // Creates new store from passed repo
+```
+
+The caller must manage the repository lifecycle, but the function doesn't document whether it's safe to close the repo after the call (it is, since stores don't hold references beyond the call).
+
+**Comparison with GetV2MetadataTree (v2_resolve.go:43):**
+```go
+func GetV2MetadataTree(ctx context.Context, treelessFetchFn, fullFetchFn FetchRefFunc, openRepoFn func(context.Context) (*git.Repository, error)) (*object.Tree, *git.Repository, error)
+```
+
+`GetV2MetadataTree` uses dependency injection with `openRepoFn`, allowing the caller to control repository lifecycle. `ResolveTranscript` doesn't follow this pattern—it expects the caller to provide an already-open repo.
+
+**Current behavior:** This inconsistency is acceptable but could be clearer. The function works correctly and the contract is implicit (repo is read-only during the call).
+
+---
+
+### 4. **Unnecessary Comments** ⚠️ MINOR CONCERN
+
+**Locations:**
+
+1. **v2_read.go:19-20:**
+```go
+// ReadCommitted reads the checkpoint summary from the v2 /main ref.
+// Returns nil, nil if the checkpoint doesn't exist (same contract as GitStore.ReadCommitted).
+```
+The second sentence restates the return type. Could be: "Returns nil, nil if the checkpoint doesn't exist (to match v1 GitStore.ReadCommitted behavior)."
+
+2. **v2_read.go:60-63:**
+```go
+// ReadSessionContent reads a session's metadata and prompts from the v2 /main ref,
+// and the raw transcript from /full/* refs (current + archived generations).
+// If the transcript is not found in any /full/* ref, the returned SessionContent
+// has an empty Transcript field — metadata and prompts are still populated.
+```
+The last two sentences restate implementation details that could be clearer: "Transcripts are optional; missing transcripts are not an error."
+
+3. **v2_resolve.go:35-39:**
+```go
+// GetV2MetadataTree resolves the v2 /main ref tree with fetch fallback.
+// Follows the same pattern as getMetadataTree() in resume.go:
+//  1. Treeless fetch → open fresh repo → read /main ref tree
+//  2. Local ref lookup
+//  3. Full fetch → read tree
+```
+The nested bullet points should clarify step 2 is "local ref lookup without fetch."
+
+These are stylistic; the comments work but could be more concise.
+
+---
+
+### 5. **Parameter Sprawl in GetV2MetadataTree** ⚠️ LOW CONCERN
+
+**Location:** `cmd/entire/cli/checkpoint/v2_resolve.go:43`
+
+```go
+func GetV2MetadataTree(ctx context.Context, treelessFetchFn, fullFetchFn FetchRefFunc, openRepoFn func(context.Context) (*git.Repository, error)) (*object.Tree, *git.Repository, error)
+```
+
+**Parameters:** 4 parameters (including context). The three function parameters are dependency injection to break circular imports.
+
+**Comparison with getMetadataTree (resume.go:371):** 
+```go
+func getMetadataTree(ctx context.Context) (*object.Tree, *git.Repository, error)
+```
+
+`getMetadataTree` is simpler because it's in the same package and can call `FetchMetadataTreeOnly()`, `FetchMetadataBranch()`, and `openRepository()` directly. `GetV2MetadataTree` requires three function parameters because:
+
+1. It's in the `checkpoint` package
+2. It needs to call fetch functions in the `cli` package
+3. It needs to open repositories (which requires CLI setup)
+
+This is actually **good design**—the parameter count is necessary to avoid circular imports. The FetchRefFunc type alias (line 18) makes the interface clearer.
+
+**No issue here.** This is appropriate dependency injection.
+
+---
+
+### 6. **Error Handling Consistency: v2 vs v1 Read Methods** ✅ GOOD
+
+**Location:** Comparing `v2_read.go` vs `committed.go`
+
+Both implementations handle errors consistently:
+
+**v2 ReadCommitted (v2_read.go:21-58):**
+```go
+if err != nil {
+    return nil, nil //nolint:nilnil,nilerr // Ref doesn't exist means no checkpoint
+}
+```
+Returns `(nil, nil)` for not-found cases; returns wrapped error for parse failures.
+
+**v1 ReadCommitted (committed.go:738-771):**
+```go
+if err != nil {
+    return nil, nil //nolint:nilnil,nilerr // No sessions branch means no checkpoint exists
+}
+```
+Identical pattern.
+
+**v2 ReadSessionContent (v2_read.go:64-111):**
+- Returns `ErrCheckpointNotFound` for missing checkpoints
+- Returns wrapped errors for parse/read failures
+
+**v1 ReadSessionContent (committed.go:777-825):**
+- Returns `ErrCheckpointNotFound` for missing checkpoints
+- Gracefully handles missing metadata/prompts (empty fields, not errors)
+
+**Minor inconsistency:** 
+- v1 at lines 804-810 silently skips missing session metadata with nested error handling
+- v2 at lines 93-105 does the same but less explicitly
+
+The inconsistency is in comment clarity, not behavior. Both are correct.
+
+---
+
+## Summary
+
+| Issue | Severity | Status |
+|-------|----------|--------|
+| Redundant v2CheckpointStore state | Moderate | Acceptable (intentional pattern) |
+| Copy-paste v2-first blocks | Moderate | Could extract helper, not urgent |
+| ResolveTranscript interface | Moderate | Works correctly, could document better |
+| Unnecessary comments | Minor | Polish only |
+| Parameter sprawl | Low | Good design (dependency injection) |
+| Error handling consistency | None | Both implementations consistent |
+
+**Recommendations:**
+1. Consider extracting the `settings.IsCheckpointsV2Enabled() + try-v2-then-v1` pattern into a helper function to reduce duplication
+2. Add a comment to `ResolveTranscript()` clarifying repository lifecycle (it's safe to close after the call)
+3. Improve wording of documentation comments (minor polish)
+4. The implementation is fundamentally sound with no blocking issues</result>
+<usage><total_tokens>61890</total_tokens><tool_uses>26</tool_uses><duration_ms>59599</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-entire-status/1344c386-09de-4f26-9534-c2d2ed02aa28/tasks/ae54633e926078c05.output
+
+---
+
+<task-notification>
+<task-id>aa969842992568132</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-entire-status/1344c386-09de-4f26-9534-c2d2ed02aa28/tasks/aa969842992568132.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>Now I have enough information. Let me create a comprehensive analysis report:
+
+## Code Reuse Opportunities Analysis for v2 Resume Read Path
+
+Based on my analysis of the diff, I've identified several significant opportunities for code reuse. Here are my findings:
+
+---
+
+### 1. **`readChunkedTranscriptFromTree` vs `readTranscriptFromTree`**
+
+**Location:** `v2_read.go:171-213` vs `committed.go:1544-1619`
+
+**Status:** SIGNIFICANT DUPLICATION - but with constraints
+
+The new `readChunkedTranscriptFromTree(tree *object.Tree)` in v2_read.go reads and reassembles chunked transcript files (e.g., `full.jsonl.001`, `full.jsonl.002`). The existing `readTranscriptFromTree(ctx, tree *FetchingTree, agentType)` in committed.go does similar work but with key differences:
+
+**Key Differences:**
+- **Input type:** v2 uses raw `*object.Tree`, v1 uses `*FetchingTree` (wraps Tree with on-demand blob fetching + auto-fallback to git cat-file)
+- **Agent-aware reassembly:** v1 calls `agent.ReassembleTranscript(chunks, agentType)` for custom reassembly logic based on agent type; v2 just concatenates bytes
+- **Logging:** v1 has structured logging with warnings for partial failures; v2 has no logging
+- **Supported file names:** v1 checks for legacy filename variants; v2 only checks `paths.TranscriptFileName`
+
+**Recommendation:** These functions are **not direct replacements**. However, consider:
+- Extract a shared helper: `readChunkedFilesFromTree(tree TreeLike, filePrefix string, sortFn ChunkSortFunc) ([][]byte, error)` that both can call
+- This would require abstracting over the `tree.File()` interface, which both `*object.Tree` and `*FetchingTree` support
+- **Watch out:** v2 uses a simpler sorting strategy; v1 uses `agent.SortChunkFiles()` which may be agent-specific
+
+---
+
+### 2. **`getV2RefTree` vs `GetMetadataBranchTree` vs `GetRemoteMetadataBranchTree`**
+
+**Location:** `v2_resolve.go:82-98` vs `strategy/common.go:611-626` vs `strategy/common.go:795-812`
+
+**Status:** STRONG CODE DUPLICATION - good refactoring candidate
+
+All three follow the exact same pattern:
+```
+ref → commit → tree
+```
+
+**Current Code:**
+```go
+// getV2RefTree (v2_resolve.go - private, custom refspec)
+func getV2RefTree(repo *git.Repository, refName plumbing.ReferenceName) (*object.Tree, error)
+
+// GetMetadataBranchTree (strategy/common.go - public, hardcoded branch)
+func GetMetadataBranchTree(repo *git.Repository) (*object.Tree, error)
+
+// GetRemoteMetadataBranchTree (strategy/common.go - public, hardcoded remote branch)
+func GetRemoteMetadataBranchTree(repo *git.Repository) (*object.Tree, error)
+```
+
+**Recommendation:** Create a shared generic helper in `strategy/common.go`:
+
+```go
+// RefToTree takes any reference name and returns its tree object
+func RefToTree(repo *git.Repository, refName plumbing.ReferenceName) (*object.Tree, error) {
+    ref, err := repo.Reference(refName, true)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get reference: %w", err)
+    }
+    commit, err := repo.CommitObject(ref.Hash())
+    if err != nil {
+        return nil, fmt.Errorf("failed to get commit: %w", err)
+    }
+    tree, err := commit.Tree()
+    if err != nil {
+        return nil, fmt.Errorf("failed to get tree: %w", err)
+    }
+    return tree, nil
+}
+```
+
+Then replace:
+- `getV2RefTree` → call `RefToTree` with custom refspec
+- `GetMetadataBranchTree` → call `RefToTree` with `plumbing.NewBranchReferenceName(paths.MetadataBranchName)`
+- `GetRemoteMetadataBranchTree` → call `RefToTree` with `plumbing.NewRemoteReferenceName("origin", paths.MetadataBranchName)`
+
+---
+
+### 3. **Metadata Tree Reading Pattern: `ReadCommitted` Duplication**
+
+**Location:** `v2_read.go:21-58` vs `committed.go:738-771`
+
+**Status:** MODERATE DUPLICATION - but v2 is significantly simpler
+
+Both read checkpoint metadata via the same pattern:
+```
+ref → tree → checkpoint subtree → metadata.json → JSON unmarshal → CheckpointSummary
+```
+
+**Differences:**
+- **v1 uses:** `FetchingTree` (with blob fetching fallback) + `getFetchingTree()` context helper
+- **v2 uses:** Direct `*object.Tree` from repo + manual ref→tree navigation
+- **Error handling:** v1 returns `nil, nil` for not-found; v2 also returns `nil, nil`, maintaining same contract ✓
+
+**Observation:** v2's approach is intentionally simpler because it operates on freshly-fetched refs. v1's `FetchingTree` complexity exists because v1 works with the metadata branch which requires lazy blob fetching after treeless fetch.
+
+**Recommendation:** **Keep separate**. However, consider extracting the "checkpoint tree navigation" logic:
+```go
+// Shared helper to locate checkpoint within a tree
+func getCheckpointTreeFromRoot(rootTree *object.Tree, cpID id.CheckpointID) (*object.Tree, error)
+```
+Both implementations could call this.
+
+---
+
+### 4. **`FetchV2MainTreeOnly` vs `FetchMetadataTreeOnly` (and full variants)**
+
+**Location:** `git_operations.go:420-454` (FetchMetadataTreeOnly) vs `git_operations.go:460-475` (FetchV2MainTreeOnly) vs `git_operations.go:377-412` (FetchMetadataBranch) vs `git_operations.go:479-494` (FetchV2MainRef)
+
+**Status:** CRITICAL DUPLICATION - high-value refactoring opportunity
+
+All four functions follow identical structure but differ only in refspec:
+
+```go
+// FetchMetadataBranch
+refSpec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", branchName, branchName)
+fetchCmd := exec.CommandContext(ctx, "git", "fetch", "origin", refSpec)
+
+// FetchMetadataTreeOnly
+refSpec := fmt.Sprintf("+refs/heads/%s:refs/remotes/origin/%s", branchName, branchName)
+fetchCmd := exec.CommandContext(ctx, "git", "fetch", "--depth=1", "--filter=blob:none", "origin", refSpec)
+
+// FetchV2MainRef
+refSpec := fmt.Sprintf("+%s:%s", paths.V2MainRefName, paths.V2MainRefName)
+fetchCmd := exec.CommandContext(ctx, "git", "fetch", "origin", refSpec)
+
+// FetchV2MainTreeOnly
+refSpec := fmt.Sprintf("+%s:%s", paths.V2MainRefName, paths.V2MainRefName)
+fetchCmd := exec.CommandContext(ctx, "git", "fetch", "--depth=1", "--filter=blob:none", "origin", refSpec)
+```
+
+**Recommendation:** Create a shared helper:
+
+```go
+// FetchRefWithOptions allows fetching any ref with custom flags
+func FetchRefWithOptions(ctx context.Context, refName string, treeOnly bool) error {
+    ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+    defer cancel()
+    
+    refSpec := fmt.Sprintf("+%s:%s", refName, refName)
+    
+    args := []string{"fetch"}
+    if treeOnly {
+        args = append(args, "--depth=1", "--filter=blob:none")
+    }
+    args = append(args, "origin", refSpec)
+    
+    fetchCmd := exec.CommandContext(ctx, "git", args...)
+    // ... error handling
+}
+```
+
+Then replace all four with:
+- `FetchMetadataBranch` → `FetchRefWithOptions(ctx, "refs/heads/entire/checkpoints/v1", false)`
+- `FetchMetadataTreeOnly` → `FetchRefWithOptions(ctx, "refs/heads/entire/checkpoints/v1", true)`
+- `FetchV2MainRef` → `FetchRefWithOptions(ctx, paths.V2MainRefName, false)`
+- `FetchV2MainTreeOnly` → `FetchRefWithOptions(ctx, paths.V2MainRefName, true)`
+
+**Additional benefit:** Error messages could be parameterized for clarity.
+
+---
+
+### 5. **`GetV2MetadataTree` Wrapper Pattern**
+
+**Location:** `v2_resolve.go:35-79`
+
+**Status:** GOOD DESIGN - no refactoring needed
+
+This function cleverly mirrors `getMetadataTree()` in resume.go (lines 371-466) with the same fallback strategy: treeless fetch → local → full fetch. The structure is sound and the naming convention follows established patterns.
+
+**Note:** `GetV2MetadataTree` is public and accepts `FetchRefFunc` dependencies, allowing resume.go to inject `FetchV2MainTreeOnly` and `FetchV2MainRef`. This is a well-designed dependency injection pattern.
+
+---
+
+## Summary Table
+
+| Function | Duplication | Severity | Recommended Action |
+|----------|-----------|----------|-------------------|
+| `readChunkedTranscriptFromTree` vs `readTranscriptFromTree` | Partial (different input types, different reassembly) | Medium | Extract shared chunk-reading helper; keep reassembly separate due to agent-specific logic |
+| `getV2RefTree` vs `GetMetadataBranchTree` vs `GetRemoteMetadataBranchTree` | Full (identical pattern, different refs) | High | Create generic `RefToTree(repo, refName)` helper; replace all three |
+| `ReadCommitted` (v2 vs v1) | Moderate (same pattern, different tree types) | Low | Keep separate; optionally extract "checkpoint tree navigation" sub-pattern |
+| `FetchV2MainTreeOnly` vs `FetchV2MainRef` vs `FetchMetadataTreeOnly` vs `FetchMetadataBranch` | Full (identical git CLI structure, different flags/refspecs) | **Critical** | Create parameterized `FetchRefWithOptions(refName, treeOnly)` helper; replace all four |
+| `GetV2MetadataTree` | None (mirrors established pattern) | None | Keep as-is; good design |
+
+---
+
+## Implementation Priority
+
+1. **High-priority (quick win):** Refactor the four `Fetch*` functions → save ~80 lines of code
+2. **High-priority (medium effort):** Create `RefToTree` helper → save ~30 lines, improve maintainability
+3. **Medium-priority:** Extract chunk-reading helper → requires abstracting tree interface
+4. **Low-priority:** Extract checkpoint subtree navigation → minor savings, good for consistency</result>
+<usage><total_tokens>39314</total_tokens><tool_uses>31</tool_uses><duration_ms>70879</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-entire-status/1344c386-09de-4f26-9534-c2d2ed02aa28/tasks/aa969842992568132.output
+
+---
+
+- fetchRef() doesn't seem 100% appropriate as a name. Maybe `fetchRefSpec()`
+- Bolting on additional boolean logic just because a function looks like it's reusable is asking for trouble.
+
+---
+
+We now have two private helpers which are called by only one function each. This isn't better, it's worse.
+
+---
+
+Okay, cool
+
+---
+
+/review
+
+---
+
+Only review the files changes in this branch
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+Can you commit the changes and open a PR for me?
+
+---
+
+The current branch name doesn't reflect what's done here anymore. Can we update it to something like feat/checkpoints-v2-entire-resume?
+
+---
+
+/review
+
+---
+
+You reviewed this code yesterday when you were in a degraded state!
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+/pr-feedback
+
+---
+
+Address all of them one by one. Pause before comitting to allow me to review the changes.
+
+---
+
+If a function is currently unused, remove it! If it needs to be re-added for subsequent commands, we'll add it when we need it.
+
+---
+
+What about tests for `GetV2MetadataTree`?
+
+---
+
+Shouldn't we at least debug log the fact that we encountered an error on this line?
+
+logContent, _, _ = v2Store.GetSessionLog(ctx, checkpointID) //nolint:errcheck // v2 miss is expected, fall through to v1
+
+---
+
+Commit and continue
+
+---
+
+Are there any tests for this that need to be updated to validate these changes?
+
+---
+
+Commit and continue
+
+---
+
+Commit and continue

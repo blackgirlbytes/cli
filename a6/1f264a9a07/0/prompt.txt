@@ -1,0 +1,44 @@
+I have the pi agent enabled, I have entire-agent-pi external agent in the path, when I run "entire configure" pi is shown, but when I run this: 
+
+❯ entire attach 2026-04-18T12-58-15-201Z_019da0ab-9f20-76e8-9d42-3fde97e3d9b9 --agent pi
+agent "pi" not available: unknown agent: pi (available: [claude-code codex copilot-cli cursor factoryai-droid gemini opencode vogon])
+
+It doesn't know about pi
+
+---
+
+go-git-api on  autoresearch/progressive-resumed-widening-rust/01-progressive-resumed-widening [$⇡] via 🐹 v1.25.2
+❯ entire attach 2026-04-18T12-58-15-201Z_019da0ab-9f20-76e8-9d42-3fde97e3d9b9 --agent pi
+transcript not found for agent "pi" with session 2026-04-18T12-58-15-201Z_019da0ab-9f20-76e8-9d42-3fde97e3d9b9; is the session ID correct? (also tried auto-detecting other agents: transcript not found for any registered agent)
+
+go-git-api on  autoresearch/progressive-resumed-widening-rust/01-progressive-resumed-widening [$⇡] via 🐹 v1.25.2
+❯ entire attach 019da0ab-9f20-76e8-9d42-3fde97e3d9b9 --agent pi
+transcript not found for agent "pi" with session 019da0ab-9f20-76e8-9d42-3fde97e3d9b9; is the session ID correct? (also tried auto-detecting other agents: transcript not found for any registered agent)
+
+---
+
+the point of attach is a bit, that entire didn't work, so searching in entire folders make no sense, the pi project dir seem to be in ls -al ~/.pi/agent/sessions/--Users-soph-Work-entire-devenv-go-git-api--/
+
+can you check the pi source code in ../external-agents
+
+---
+
+can you check if kiro has a similar issue?
+
+---
+
+on the pi changes, what are your thoughts on: 
+
+Findings:
+
+1. `agents/entire-agent-pi/internal/pi/paths.go:33` breaks the `resolve-session-file` protocol contract by ignoring the `sessionDir` argument for live-file fallback and instead using `protocol.RepoRoot()`. The protocol handler only passes `--session-dir` and `--session-id` ([protocol.go:107]( /Users/soph/Work/entire/devenv/external-agents/agents/entire-agent-pi/internal/protocol/protocol.go:107 )), so callers can legally ask the binary to resolve a session for a repo other than the process cwd. In that case this change searches `~/.pi/agent/sessions` under the wrong repo key and returns a false miss. The new tests only cover the case where `ENTIRE_REPO_ROOT == repoPath`, so this regression is currently untested. The fallback should derive the repo root from `sessionDir` instead of global process state.
+
+2. `agents/entire-agent-pi/internal/pi/paths.go:99` can panic if `DirEntry.Info()` fails while sorting matches. That can happen if Pi is rotating/deleting session files between `os.ReadDir` and the later stat calls. Right now both errors are ignored and `ii.ModTime()` / `jj.ModTime()` will dereference `nil`. Since this code is explicitly reading a live session directory, it should treat `Info()` failure as a soft miss and continue, not crash `entire attach`.
+
+Open question:
+
+- Was the intent that `resolve-session-file` only ever runs from the target repo root? If so, the protocol surface does not enforce that today, and the Pi implementation is now depending on an implicit condition that the generic handler does not provide.
+
+Validation:
+
+- `go test ./...` in `agents/entire-agent-pi` currently fails, but due to an unrelated pre-existing mismatch in `TestGenerateExtension`, not this patch.

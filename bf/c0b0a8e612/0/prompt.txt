@@ -1,0 +1,179 @@
+Implement the following plan:
+
+# Fix: Droid Token Usage Offset Mismatch
+
+## Context
+
+`calculateTokenUsage` in `manual_commit_condensation.go` has a bug for Droid transcripts. The `startOffset` parameter is a raw JSONL line count (from `countTranscriptItems`), but it's used as an index into the array returned by `ParseDroidTranscriptFromBytes`, which filters out non-message entries (`session_start`, `session_event`, etc.). This causes incorrect token counting — either under-counting (off by N non-message entries) or over-counting all tokens when the offset exceeds the filtered array length.
+
+The file-based `ParseDroidTranscript(path, startLine)` already handles this correctly by applying the offset at the raw line level before filtering. The byte-based `ParseDroidTranscriptFromBytes` does not accept an offset parameter.
+
+## Approach: Add `startLine` parameter to `ParseDroidTranscriptFromBytes`
+
+This mirrors the existing `ParseDroidTranscript(path, startLine)` API. All existing callers pass `0` (no behavioral change), and the bug site passes `startOffset`.
+
+Option B (changing `countTranscriptItems` to count only messages for Droid) was rejected because it would break `transcript.SliceFromLine` scoping (line 230) and `sessionHasNewContent` comparisons (line 1036), which both depend on raw line counts.
+
+## Steps
+
+### 1. Modify `ParseDroidTranscriptFromBytes` signature
+
+**File:** `cmd/entire/cli/agent/factoryaidroid/transcript.go`
+
+Change:
+```go
+func ParseDroidTranscriptFromBytes(content []byte) ([]transcript.Line, error) {
+    lines, _, err := parseDroidTranscriptFromReader(bytes.NewReader(content), 0)
+    return lines, err
+}
+```
+To:
+```go
+func ParseDroidTranscriptFromBytes(content []byte, startLine int) ([]transcript.Line, error) {
+    lines, _, err := parseDroidTranscriptFromReader(bytes.NewReader(content), startLine)
+    return lines, err
+}
+```
+
+### 2. Fix `calculateTokenUsage` for Droid
+
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go` (lines 620-628)
+
+Change:
+```go
+if agentType == agent.AgentTypeFactoryAIDroid {
+    lines, err := factoryaidroid.ParseDroidTranscriptFromBytes(data)
+    if err != nil || len(lines) == 0 {
+        return &agent.TokenUsage{}
+    }
+    if startOffset > 0 && startOffset < len(lines) {
+        lines = lines[startOffset:]
+    }
+    return factoryaidroid.CalculateTokenUsage(lines)
+}
+```
+To:
+```go
+if agentType == agent.AgentTypeFactoryAIDroid {
+    lines, err := factoryaidroid.ParseDroidTranscriptFromBytes(data, startOffset)
+    if err != nil || len(lines) == 0 {
+        return &agent.TokenUsage{}
+    }
+    return factoryaidroid.CalculateTokenUsage(lines)
+}
+```
+
+### 3. Update all other callers to pass `, 0`
+
+Mechanical changes — add `, 0` as second arg:
+
+| File | Line | Context |
+|------|------|---------|
+| `cmd/entire/cli/strategy/manual_commit_condensation.go` | 553 | `extractUserPrompts` |
+| `cmd/entire/cli/summarize/summarize.go` | 221 | `buildCondensedTranscriptFromDroid` |
+| `cmd/entire/cli/agent/factoryaidroid/lifecycle.go` | 100 | `ExtractSummary` |
+| `cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go` | 145 | `ReadSession` |
+| `cmd/entire/cli/agent/factoryaidroid/transcript_test.go` | lines 46, 123, 152, 186, 207, 1103 | Various tests |
+
+### 4. Add regression tests
+
+**a) In `cmd/entire/cli/agent/factoryaidroid/transcript_test.go`:**
+
+Test `ParseDroidTranscriptFromBytes` with non-message entries and a non-zero offset. Transcript with `session_start` + messages + `session_event` + messages. Verify that offset correctly skips raw lines and only returns messages after the offset.
+
+**b) In `cmd/entire/cli/strategy/manual_commit_condensation_test.go` (or `manual_commit_test.go`):**
+
+Test `calculateTokenUsage` with `AgentTypeFactoryAIDroid`, a transcript containing non-message lines, and a `startOffset` that includes those non-message lines. Verify only tokens from messages after the raw offset are counted.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-factoryai-agent/31127453-06f8-4d32-ae50-5c232ad08033.jsonl
+
+---
+
+Base directory for this skill: /Users/alisha/.claude/plugins/cache/claude-plugins-official/superpowers/4.3.1/skills/executing-plans
+
+# Executing Plans
+
+## Overview
+
+Load plan, review critically, execute tasks in batches, report for review between batches.
+
+**Core principle:** Batch execution with checkpoints for architect review.
+
+**Announce at start:** "I'm using the executing-plans skill to implement this plan."
+
+## The Process
+
+### Step 1: Load and Review Plan
+1. Read plan file
+2. Review critically - identify any questions or concerns about the plan
+3. If concerns: Raise them with your human partner before starting
+4. If no concerns: Create TodoWrite and proceed
+
+### Step 2: Execute Batch
+**Default: First 3 tasks**
+
+For each task:
+1. Mark as in_progress
+2. Follow each step exactly (plan has bite-sized steps)
+3. Run verifications as specified
+4. Mark as completed
+
+### Step 3: Report
+When batch complete:
+- Show what was implemented
+- Show verification output
+- Say: "Ready for feedback."
+
+### Step 4: Continue
+Based on feedback:
+- Apply changes if needed
+- Execute next batch
+- Repeat until complete
+
+### Step 5: Complete Development
+
+After all tasks complete and verified:
+- Announce: "I'm using the finishing-a-development-branch skill to complete this work."
+- **REQUIRED SUB-SKILL:** Use superpowers:finishing-a-development-branch
+- Follow that skill to verify tests, present options, execute choice
+
+## When to Stop and Ask for Help
+
+**STOP executing immediately when:**
+- Hit a blocker mid-batch (missing dependency, test fails, instruction unclear)
+- Plan has critical gaps preventing starting
+- You don't understand an instruction
+- Verification fails repeatedly
+
+**Ask for clarification rather than guessing.**
+
+## When to Revisit Earlier Steps
+
+**Return to Review (Step 1) when:**
+- Partner updates the plan based on your feedback
+- Fundamental approach needs rethinking
+
+**Don't force through blockers** - stop and ask.
+
+## Remember
+- Review plan critically first
+- Follow plan steps exactly
+- Don't skip verifications
+- Reference skills when plan says to
+- Between batches: just report and wait
+- Stop when blocked, don't guess
+- Never start implementation on main/master branch without explicit user consent
+
+## Integration
+
+**Required workflow skills:**
+- **superpowers:using-git-worktrees** - REQUIRED: Set up isolated workspace before starting
+- **superpowers:writing-plans** - Creates the plan this skill executes
+- **superpowers:finishing-a-development-branch** - Complete development after all tasks

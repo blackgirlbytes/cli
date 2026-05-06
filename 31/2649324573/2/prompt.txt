@@ -1,0 +1,68 @@
+Implement the following plan:
+
+# Fix Droid E2E Remaining Timeout Failures
+
+## Context
+
+The tmux resize fix (already applied in `e2e/agents/droid.go`) solved the **startup** timeout issue (8/37 → 4/37 failures). The remaining 4 failures are a different problem: **agent processing timeouts**.
+
+### Failure analysis
+
+| Test | Duration | Timeout | Root Cause |
+|------|----------|---------|------------|
+| TestShadowBranchCleanedAfterAgentCommit | 112s | WaitFor 90s | Hardcoded 90s WaitFor not scaled by TimeoutMultiplier |
+| TestAgentContinuesAfterCommit | 289s | ctx 270s (3min×1.5) | Overall ctx too short for 2 RunPrompts |
+| TestMultiSessionSequential | 298s | ctx 270s (3min×1.5) | Overall ctx too short for 2 RunPrompts |
+| TestSingleSessionSubagentCommitInTurn | 208s | ctx 180s (2min×1.5) | Overall ctx too short for subagent task |
+
+### Root causes
+
+1. **Droid's TimeoutMultiplier (1.5) is too low** — `ForEachAgent` scales the overall test timeout, but 1.5× isn't enough for multi-prompt tests or subagent tasks with droid. Compare: Gemini uses 2.5×, OpenCode uses 2.0×.
+
+2. **`RepoState.WaitFor` doesn't scale timeouts** — The hardcoded 90s timeout in TestShadowBranchCleanedAfterAgentCommit isn't multiplied by the agent's TimeoutMultiplier, even though ForEachAgent scales the overall ctx. This means interactive WaitFor calls are the same duration regardless of agent speed.
+
+## Changes
+
+### 1. `e2e/agents/droid.go` — Increase TimeoutMultiplier from 1.5 to 2.0
+
+This scales all ForEachAgent timeouts:
+- 3min tests: 3×2.0 = 6min = 360s (covers 298s observed max)
+- 2min tests: 2×2.0 = 4min = 240s (covers 208s observed max)
+
+```go
+func (d *Droid) TimeoutMultiplier() float64 { return 2.0 }
+```
+
+### 2. `e2e/testutil/repo.go` — Scale WaitFor by TimeoutMultiplier
+
+`RepoState.WaitFor` already has access to `s.Agent`. Scale the timeout:
+
+```go
+func (s *RepoState) WaitFor(t *testing.T, session agents.Session, pattern string, timeout time.Duration) {
+    t.Helper()
+    scaled := time.Duration(float64(timeout) * s.Agent.TimeoutMultiplier())
+    content, err := session.WaitFor(pattern, scaled)
+    fmt.Fprintf(s.ConsoleLog, "> pane after WaitFor(%q):\n%s\n", pattern, content)
+    if err != nil {
+        t.Fatalf("WaitFor(%q): %v", pattern, err)
+    }
+}
+```
+
+This fixes TestShadowBranchCleanedAfterAgentCommit: 90s × 2.0 = 180s (well above the 89s observed).
+
+## Files to modify
+
+- `e2e/agents/droid.go:34` — change `return 1.5` → `return 2.0`
+- `e2e/testutil/repo.go:366-373` — scale timeout by `s.Agent.TimeoutMultiplier()`
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Then push and run droid E2E tests to confirm 37/37 pass.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/1a281077-0024-43fd-8db3-dbce5f3e3962.jsonl

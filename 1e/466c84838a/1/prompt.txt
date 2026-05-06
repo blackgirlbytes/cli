@@ -1,0 +1,177 @@
+Implement the following plan:
+
+# Plan: Fix dashboard code review issues
+
+## Context
+
+The `entire dashboard` TUI has been implemented (10 new files, 2 modified files). A strict code review identified CI blockers, a critical safety issue, and several quality issues. This plan addresses only the issues found in the review, scoped to dashboard files.
+
+**Note:** The `ireturn` lint failures in `strategy/` are pre-existing (never had `//nolint` directives) and are NOT caused by our changes. No fix needed.
+
+## Fixes
+
+### 1. Run `go mod tidy` (CI blocker)
+
+The gomod linter fails because go.mod was modified without running `go mod tidy`.
+
+- Run `go mod tidy` to sync go.mod/go.sum
+
+### 2. Remove unused `RunAccessible` parameter (CI blocker)
+
+**File:** `cmd/entire/cli/dashboard/accessible.go:19`
+
+Current: `func RunAccessible(w io.Writer, _ io.Writer) error`
+Fix: `func RunAccessible(w io.Writer) error`
+
+Also update the caller in `cmd/entire/cli/dashboard_cmd.go` to pass only one arg.
+
+### 3. Add `PreviewRewind` safety check (critical)
+
+**File:** `cmd/entire/cli/dashboard_cmd.go:59-107` (`performRewindFromDashboard`)
+
+The existing `rewind.go` calls `strat.PreviewRewind()` to warn about untracked files that will be deleted. The dashboard skips this entirely.
+
+Add the same pattern used in `rewind.go:205-212`:
+```go
+preview, previewErr := strat.PreviewRewind(*target)
+if previewErr == nil && preview != nil && len(preview.FilesToDelete) > 0 {
+    fmt.Fprintf(cmd.ErrOrStderr(), "\nWarning: The following untracked files will be DELETED:\n")
+    for _, f := range preview.FilesToDelete {
+        fmt.Fprintf(cmd.ErrOrStderr(), "  - %s\n", f)
+    }
+    fmt.Fprintf(cmd.ErrOrStderr(), "\n")
+}
+```
+
+Insert this before the `strat.Rewind(*target)` call.
+
+### 4. Remove dead `keys.go` file
+
+**File:** `cmd/entire/cli/dashboard/keys.go` (delete entire file)
+**File:** `cmd/entire/cli/dashboard/dashboard.go:59-60,69-70`
+
+The `keyMap` struct and `newKeyMap()` are defined but never used for actual key matching. All key handling uses string constants. Remove:
+- Delete `keys.go` entirely
+- Remove `keys keyMap` field from `Model` struct
+- Remove `keys: newKeyMap()` from `newModel()`
+- Remove `"github.com/charmbracelet/bubbles/key"` import (now unused)
+
+### 5. Fix rune-unsafe filter input (both tabs)
+
+**Files:**
+- `cmd/entire/cli/dashboard/sessions_tab.go:74-83`
+- `cmd/entire/cli/dashboard/checkpoints_tab.go:94-104`
+
+Backspace slices bytes (`m.filter[:len(m.filter)-1]`), breaking on multi-byte chars. Fix both to use runes:
+
+```go
+case keyBackspace:
+    runes := []rune(m.filter)
+    if len(runes) > 0 {
+        m.filter = string(runes[:len(runes)-1])
+        m.applyFilter()
+    }
+```
+
+Also fix the single-char input check to accept multi-byte runes:
+```go
+default:
+    r := []rune(keyMsg.String())
+    if len(r) == 1 && r[0] >= 32 {
+        m.filter += keyMsg.String()
+        m.applyFilter()
+    }
+```
+
+### 6. Fix active tab scroll to pin headers
+
+**File:** `cmd/entire/cli/dashboard/active_tab.go:144-155`
+
+Current scroll logic scrolls headers off-screen, unlike sessions/checkpoints tabs. Replace with header-pinning pattern:
+
+```go
+// Scroll data lines, keeping header pinned
+headerLines := 4 // title + blank + header + separator
+maxVisible := height - headerLines
+if maxVisible < 1 {
+    maxVisible = 1
+}
+
+visibleStart := 0
+if m.cursor-visibleStart >= maxVisible {
+    visibleStart = m.cursor - maxVisible + 1
+}
+
+result := lines[:headerLines]
+dataLines := lines[headerLines:]
+end := visibleStart + maxVisible
+if end > len(dataLines) {
+    end = len(dataLines)
+}
+if visibleStart < len(dataLines) {
+    result = append(result, dataLines[visibleStart:end]...)
+}
+
+return strings.Join(result, "\n")
+```
+
+### 7. Fix active tab column width mismatch
+
+**File:** `cmd/entire/cli/dashboard/active_tab.go:97,134`
+
+Header uses `%-8s` for Phase but data rows use `%-18s` (because ANSI color codes inflate string length). Fix header to match:
+
+Line 97: Change `%-8s` to `%-18s`
+
+### 8. Replace `dataLoaded [4]bool` magic number
+
+**File:** `cmd/entire/cli/dashboard/dashboard.go:63`
+
+Change from fixed-size array to map:
+```go
+dataLoaded map[int]bool
+```
+
+Initialize in `newModel()`:
+```go
+dataLoaded: make(map[int]bool),
+```
+
+## Files to modify
+
+| File | Changes |
+|------|---------|
+| `go.mod` / `go.sum` | Run `go mod tidy` |
+| `dashboard/accessible.go:19` | Remove unused second parameter |
+| `dashboard_cmd.go:59-107` | Add PreviewRewind call before Rewind |
+| `dashboard/keys.go` | Delete file |
+| `dashboard/dashboard.go` | Remove `keys` field, remove import, change `dataLoaded` to map |
+| `dashboard/sessions_tab.go:74-83` | Fix rune-unsafe backspace + input |
+| `dashboard/checkpoints_tab.go:94-104` | Fix rune-unsafe backspace + input |
+| `dashboard/active_tab.go:97,134,144-155` | Fix header width, fix scroll to pin headers |
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+go build ./cmd/entire/ && ./entire dashboard
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/sakamotoyasuaki/.REDACTED.jsonl
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+続けて
+
+---
+
+これでPR出来るレベル?
+
+---
+
+ではブランチ切ってPR

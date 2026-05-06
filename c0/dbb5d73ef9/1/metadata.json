@@ -1,0 +1,99 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "c0dbb5d73ef9",
+  "session_id": "b1d0d1ce-0e93-48b0-b258-af36929f6314",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-01T01:15:37.948698Z",
+  "branch": "fix/tests-hang",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "cmd/entire/cli/attach.go",
+    "cmd/entire/cli/attach_test.go",
+    "cmd/entire/cli/strategy/mid_turn_commit_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "147d9f0323f6",
+  "checkpoint_transcript_start": 76,
+  "token_usage": {
+    "input_tokens": 96,
+    "cache_creation_tokens": 50219,
+    "cache_read_tokens": 8125242,
+    "output_tokens": 18785,
+    "api_call_count": 83
+  },
+  "session_metrics": {
+    "turn_count": 8
+  },
+  "summary": {
+    "intent": "Investigate and fix slow unit test performance in the `cli` and `strategy` packages of the entireio/cli Go project.",
+    "outcome": "Reduced `cli` package test time from ~34s to ~7.8s and `strategy` package from ~20.5s to ~16.4s by backdating transcript file mtimes in test helpers and skipping `PrepareTranscript` on non-existent files during agent auto-detection. Changes merged into PR #823.",
+    "learnings": {
+      "repo": [
+        "Global git config has `commit.gpgsign=true` with SSH signing; system `git` CLI commands in tests pick this up even when the test repo has `gpgsign=false` set locally via go-git.",
+        "`waitForTranscriptFlush` in claudecode/lifecycle.go polls for up to 3s (`maxWait = 3 * time.Second`) when a transcript file exists and is fresh (< 2 min old), designed for live sessions.",
+        "Cursor's `PrepareTranscript` lacks the fast-path for non-existent files that Claude Code has — it polls for the full 3s even when the file will never appear.",
+        "`detectAgentByTranscript` iterates all registered agents and calls `resolveAndValidateTranscript` for each, meaning any agent with a blocking `PrepareTranscript` multiplies test latency.",
+        "`TestListSessionsFunctionsWithoutRepo` in the strategy package runs against the real repo without changing CWD, making it inherently slow (~4s) as it reads real checkpoint data.",
+        "The attach test suite uses `t.Chdir`, preventing parallelization; sequential execution means per-test latency compounds directly into total suite time.",
+        "Test helpers like `setupClaudeTranscript` create fresh transcript files which inadvertently trigger the live-session polling path in `PrepareTranscript`."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/agent/claudecode/lifecycle.go",
+          "line": 197,
+          "end_line": 215,
+          "finding": "`waitForTranscriptFlush` has a fast-path: if `os.Stat` fails (file doesn't exist), it returns immediately. But if the file exists and is fresh, it polls for up to `maxWait = 3 * time.Second`."
+        },
+        {
+          "path": "cmd/entire/cli/agent/cursor/cursor.go",
+          "finding": "Cursor's `PrepareTranscript` polls for 3s even when the file doesn't exist — no fast-path on initial `os.Stat` failure, unlike Claude Code's implementation."
+        },
+        {
+          "path": "cmd/entire/cli/attach.go",
+          "line": 328,
+          "end_line": 332,
+          "finding": "`PrepareTranscript` was called unconditionally before the file-existence check. Fix: move the call inside the file-exists guard so it's only invoked when the transcript file is already present."
+        },
+        {
+          "path": "cmd/entire/cli/attach_test.go",
+          "finding": "`setupClaudeTranscript` creates transcript files with current mtime. Fix: backdate mtime by 3+ minutes so `waitForTranscriptFlush` treats them as stale and skips polling."
+        },
+        {
+          "path": "cmd/entire/cli/strategy/mid_turn_commit_test.go",
+          "finding": "Both `TestSessionHasNewContent*` tests write fresh transcript files, triggering the 3s poll. Fixed by backdating mtime after write."
+        }
+      ],
+      "workflow": [
+        "CPU profiling (only 60ms CPU in a 3.1s test) quickly revealed the bottleneck was I/O wait / sleep, not computation — narrowing the investigation to polling/sleep calls.",
+        "Comparing test timing across agents (Gemini: 0.06s vs Claude Code: 3s) was an effective differential diagnosis technique to isolate which agent's code path introduced the delay.",
+        "The `t.Chdir` constraint preventing test parallelization means per-test latency has a direct 1:1 impact on suite runtime — fixing individual test latency is the only lever.",
+        "GPG signing via SSH agent can silently slow down tests that shell out to `git commit` even with local repo config overrides, if the global config isn't overridden by the test environment."
+      ]
+    },
+    "friction": [
+      "Three user interruptions mid-investigation required 'Continue' prompts, breaking flow during critical reasoning steps.",
+      "Multiple rounds of indirect investigation (CPU profiling, tracing, grepping for sleeps, checking hooks) before isolating the root cause to `waitForTranscriptFlush`.",
+      "go-git's `SetConfig` writes to `.git/config` correctly but the mental model that system `git` CLI would respect it caused an early false lead on GPG signing as the root cause.",
+      "Cursor's `PrepareTranscript` lacking the Claude Code fast-path was a non-obvious second source of latency discovered only after the primary fix.",
+      "GPG signing was unavailable during commit (1Password agent), requiring `--no-gpg-sign` flag."
+    ],
+    "open_items": [
+      "`TestListSessionsFunctionsWithoutRepo` in the strategy package runs against the real repo without CWD isolation — should be refactored to use a temp repo, but was deferred as a separate fix.",
+      "Cursor's `PrepareTranscript` still lacks a fast-path for non-existent files; only the call site in `attach.go` was guarded. Cursor's implementation itself could be improved.",
+      "The `strategy` package still takes ~16.4s; the remaining time is dominated by legitimate git-heavy tests that weren't addressed in this session.",
+      "The attach test suite can't be parallelized due to `t.Chdir` usage — if further speedup is needed, tests would need to be refactored to avoid directory changes."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-01T01:15:37.782419Z",
+    "agent_lines": 23,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 23,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

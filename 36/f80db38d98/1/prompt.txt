@@ -1,0 +1,78 @@
+can you explore the ../entire.io repo and especially what drives the https://entire.io/overview page, there are stats shown on that page, can you gather which APIs are used there. Now let's say we would want to rebuild this as a UI in the cli, what would we need to do?
+[Image #2]
+
+---
+
+static for now, timeframe is the same as on the UI so I'd keep it hardcoded to the same, first no offline/local mode
+
+---
+
+I changed the endpoints to:
+
+  - Endpoints:
+    - GET /api/v1/stats/checkpoints — same logic as the cache checkpoints handler
+    - GET /api/v1/stats/commits — same logic as the cache commits handler
+
+---
+
+what tests do we have on this now?
+
+---
+
+/simplify
+
+---
+
+**Findings**
+
+1. Medium: the `ITERATION` card is labeled as “Avg steps/checkpoint”, but the value is actually computed from `session_count`, not `steps`. That means the CLI can show a materially wrong metric whenever checkpoints have multiple steps in one session. See [stats_cmd.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/stats_cmd.go:143), [stats_cmd.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/stats_cmd.go:152), [stats_types.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/stats_types.go:69), and [stats_render.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/stats_render.go:119).
+
+2. Medium: commit agent badges ignore the singular `agent` field entirely. The API model includes both `agent` and `agents`, but `uniqueCommitAgents` only reads `Agents`. If the backend returns only `agent` for some rows, the commit list silently drops agent attribution. See [stats_types.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/stats_types.go:36) and [stats_render.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/stats_render.go:346).
+
+3. Low: commits with missing or unparsable dates are grouped under `"unknown"` and then reverse-sorted with real dates. Lexicographically, `"unknown"` sorts above `2026-…`, so bad data bubbles to the top of the “recent commits” section. See [stats_cmd.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/stats_cmd.go:246).
+
+**Tests I’d add**
+
+There are currently no `stats` tests in `cmd/entire/cli/`. I’d add them in two files:
+
+- `cmd/entire/cli/stats_cmd_test.go`
+- `cmd/entire/cli/stats_render_test.go`
+
+Most valuable cases:
+
+- `computeContributionStats`
+  - verifies throughput uses tokens
+  - verifies iteration uses the intended field
+  - verifies continuity uses max `steps`
+  - nil token/session/step fields default correctly
+
+- `computeStreaks`
+  - dedupes multiple timestamps on one day
+  - handles invalid timestamps
+  - current streak starts from today or yesterday only
+
+- `normalizeAgentString`
+  - `Claude Code`, `copilot-cli`, `factoryai-droid`, unknown values
+
+- `groupCommitsByDay`
+  - valid dates sort newest first
+  - `unknown` bucket is forced last
+
+- `uniqueCommitAgents` / `renderCommitList`
+  - falls back to `agent` when `agents` is empty
+  - dedupes and sorts badges
+  - handles nil commit message, singular/plural file/checkpoint wording
+
+- `formatCommitDate`
+  - today
+  - yesterday
+  - older date
+  - future date should not be labeled today/yesterday
+
+**Recommendation**
+
+Yes, add more tests here. The highest ROI is pure table-driven coverage around the new stats helpers and renderer, because almost all of this logic is deterministic and currently unprotected. If you want command-level coverage too, I’d first make `runStats` accept an injectable client factory so login failure and API error paths can be tested cleanly.
+
+---
+
+can you do meaningful commits
