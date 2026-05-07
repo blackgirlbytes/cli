@@ -2,12 +2,6 @@ name: Release Summary to Slack V2
 
 on:
   workflow_dispatch:
-    inputs:
-      since:
-        description: "Dispatch window start, for example 7d or 2026-04-01"
-        required: false
-        default: "7d"
-        type: string
   schedule:
     # Weekdays at 10am PT during daylight time (17:00 UTC).
     - cron: "0 17 * * 1-5"
@@ -27,20 +21,35 @@ jobs:
     steps:
       - name: Resolve dispatch window
         id: window
+        env:
+          GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
         run: |
-          SINCE="${{ inputs.since }}"
-          echo "since=${SINCE}" >> "$GITHUB_OUTPUT"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/entirehq/entire.io.git" /tmp/entire-io
 
-          if [[ "$SINCE" =~ ^[0-9]+d$ ]]; then
-            DAYS="${SINCE%d}"
-            GITHUB_SINCE=$(date -u -d "${DAYS} days ago" +"%Y-%m-%d")
-          elif [[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            GITHUB_SINCE="$SINCE"
-          else
-            GITHUB_SINCE=$(date -u -d "7 days ago" +"%Y-%m-%d")
-            echo "::warning::Could not convert '${SINCE}' to a GitHub search date; using ${GITHUB_SINCE} for PR metadata."
+          DISPATCH_DIR="/tmp/entire-io/website/src/routes/_content/blog/-content"
+          LATEST_DISPATCH=$(ls -1 "$DISPATCH_DIR"/*dispatch*.md 2>/dev/null | sort | tail -1)
+
+          if [ -z "$LATEST_DISPATCH" ]; then
+            echo "::error::No dispatch posts found in ${DISPATCH_DIR}"
+            exit 1
           fi
-          echo "github_since=${GITHUB_SINCE}" >> "$GITHUB_OUTPUT"
+
+          FILENAME=$(basename "$LATEST_DISPATCH")
+          SINCE=$(echo "$FILENAME" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+
+          if [ -z "$SINCE" ]; then
+            echo "::error::Could not extract dispatch date from ${FILENAME}"
+            exit 1
+          fi
+
+          echo "since=${SINCE}" >> "$GITHUB_OUTPUT"
+          echo "github_since=${SINCE}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Using latest dispatch ${FILENAME}; collecting changes since ${SINCE}."
+
+          mkdir -p /tmp/dispatch-examples
+          ls -1 "$DISPATCH_DIR"/*dispatch*.md | sort | tail -3 | while read -r f; do
+            cp "$f" /tmp/dispatch-examples/
+          done
 
       - name: Build repo matrix
         id: repos
@@ -55,18 +64,6 @@ jobs:
             ]
           }' | tee /tmp/matrix.json
           echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
-
-      - name: Clone entire.io for dispatch examples
-        env:
-          GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
-        run: |
-          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/entirehq/entire.io.git" /tmp/entire-io
-
-          mkdir -p /tmp/dispatch-examples
-          DISPATCH_DIR="/tmp/entire-io/website/src/routes/_content/blog/-content"
-          ls -1 "$DISPATCH_DIR"/*dispatch*.md | sort | tail -3 | while read -r f; do
-            cp "$f" /tmp/dispatch-examples/
-          done
 
       - name: Upload dispatch examples
         uses: actions/upload-artifact@v4
