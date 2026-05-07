@@ -148,3 +148,21 @@ func TestLookupCurrentToken(t *testing.T) {
 		t.Fatalf("LookupCurrentToken() = %q, want %q", got, "local-token")
 	}
 }
+
+func TestLookupCurrentToken_PrefersEnvToken(t *testing.T) {
+	t.Setenv(api.BaseURLEnvVar, "http://localhost:8787")
+	t.Setenv(authTokenEnvVar, " env-token ")
+
+	store := NewStore()
+	if err := store.SaveToken("http://localhost:8787", "local-token"); err != nil {
+		t.Fatalf("SaveToken() error = %v", err)
+	}
+
+	got, err := LookupCurrentToken()
+	if err != nil {
+		t.Fatalf("LookupCurrentToken() error = %v", err)
+	}
+	if got != "env-token" {
+		t.Fatalf("LookupCurrentToken() = %q, want env token", got)
+	}
+}

@@ -3,6 +3,7 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
@@ -10,6 +11,8 @@ import (
 )
 
 const keyringService = "entire-cli"
+
+const authTokenEnvVar = "ENTIRE_AUTH_TOKEN"
 
 // Store manages CLI authentication tokens in the OS keyring.
 type Store struct {
@@ -69,6 +72,10 @@ func (s *Store) DeleteToken(baseURL string) error {
 
 // LookupCurrentToken retrieves the token for the current base URL.
 func LookupCurrentToken() (string, error) {
+	if token := strings.TrimSpace(os.Getenv(authTokenEnvVar)); token != "" {
+		return token, nil
+	}
+
 	store := NewStore()
 	return store.GetToken(api.BaseURL())
 }
