@@ -11,11 +11,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// tokenStore abstracts keyring access so commands that read or delete the
-// stored bearer token can be unit-tested without hitting the real OS keyring.
-// Used by logout and the auth subcommands.
+// tokenStore abstracts the auth backend (keyring, file, env) so commands that
+// read or delete the stored bearer token can be unit-tested without hitting
+// the real OS keyring or filesystem.
 type tokenStore interface {
 	GetToken(baseURL string) (string, error)
+	GetTokenInfo(baseURL string) (auth.TokenInfo, error)
 	DeleteToken(baseURL string) error
 }
 
@@ -45,14 +46,20 @@ func defaultRevokeCurrentToken(ctx context.Context, token string) error {
 }
 
 func runLogout(ctx context.Context, outW, errW io.Writer, store tokenStore, revoke revokeCurrentFunc, baseURL string) error {
-	token, err := store.GetToken(baseURL)
+	info, err := store.GetTokenInfo(baseURL)
 	if err != nil {
-		// Fall through to the local delete: we still want the keyring entry
+		// Fall through to the local delete: we still want the stored token
 		// gone, even if we couldn't read it well enough to revoke server-side.
 		fmt.Fprintf(errW, "Warning: failed to read token before revocation: %v\n", err)
 	}
-	if token != "" {
-		if err := revoke(ctx, token); err != nil && !api.IsHTTPErrorStatus(err, http.StatusUnauthorized) {
+	if info.Source == auth.TokenSourceEnv {
+		fmt.Fprintf(outW, "Token is supplied by %s. Unset that environment variable to log out locally.\n", auth.AuthTokenEnvVar)
+		fmt.Fprintln(outW, "Run 'entire auth revoke --current' to invalidate this token server-side.")
+		return nil
+	}
+
+	if info.Value != "" {
+		if err := revoke(ctx, info.Value); err != nil && !api.IsHTTPErrorStatus(err, http.StatusUnauthorized) {
 			// Best-effort: a transient network error shouldn't block local
 			// logout. A 401 means the token is already invalid server-side,
 			// so the desired state is achieved — no warning needed.

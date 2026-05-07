@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
+	"github.com/entireio/cli/cmd/entire/cli/auth"
 )
 
 const testLogoutToken = "tok123"
@@ -18,6 +19,8 @@ type mockTokenStore struct {
 	deleted    map[string]bool
 	getErr     error
 	deleteErr  error
+	source     auth.TokenSource
+	path       string
 	getCalls   int
 	deleteCall int
 }
@@ -37,6 +40,22 @@ func (m *mockTokenStore) GetToken(baseURL string) (string, error) {
 	return m.tokens[baseURL], nil
 }
 
+func (m *mockTokenStore) GetTokenInfo(baseURL string) (auth.TokenInfo, error) {
+	m.getCalls++
+	if m.getErr != nil {
+		return auth.TokenInfo{}, m.getErr
+	}
+	token := m.tokens[baseURL]
+	if token == "" {
+		return auth.TokenInfo{}, nil
+	}
+	source := m.source
+	if source == auth.TokenSourceNone {
+		source = auth.TokenSourceKeyring
+	}
+	return auth.TokenInfo{Value: token, Source: source, Path: m.path}, nil
+}
+
 func (m *mockTokenStore) DeleteToken(baseURL string) error {
 	m.deleteCall++
 	if m.deleteErr != nil {
@@ -44,6 +63,38 @@ func (m *mockTokenStore) DeleteToken(baseURL string) error {
 	}
 	m.deleted[baseURL] = true
 	return nil
+}
+
+func TestRunLogout_EnvTokenDoesNotRevokeOrDelete(t *testing.T) {
+	t.Parallel()
+
+	store := newMockTokenStore()
+	store.tokens["https://entire.io"] = testLogoutToken
+	store.source = auth.TokenSourceEnv
+
+	revokeCalled := false
+	revoke := func(context.Context, string) error {
+		revokeCalled = true
+		return nil
+	}
+
+	var out, errOut bytes.Buffer
+	err := runLogout(context.Background(), &out, &errOut, store, revoke, "https://entire.io")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if revokeCalled {
+		t.Fatal("logout should not revoke env token server-side")
+	}
+	if store.deleted["https://entire.io"] {
+		t.Fatal("logout should not delete lower-priority credentials for env token")
+	}
+	if !strings.Contains(out.String(), auth.AuthTokenEnvVar) {
+		t.Fatalf("stdout = %q, want env-token guidance", out.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", errOut.String())
+	}
 }
 
 func TestRunLogout_RevokesServerSideThenDeletesLocally(t *testing.T) {

@@ -96,30 +96,49 @@ func defaultListTokens(ctx context.Context, token string) ([]api.Token, error) {
 }
 
 func runAuthStatus(ctx context.Context, w io.Writer, store tokenStore, list authTokenLister, baseURL string) error {
-	token, err := store.GetToken(baseURL)
+	info, err := store.GetTokenInfo(baseURL)
 	if err != nil {
-		return fmt.Errorf("read keychain: %w", err)
+		return fmt.Errorf("read auth token: %w", err)
 	}
-	if token == "" {
+	if info.Value == "" {
 		fmt.Fprintf(w, "Not logged in to %s\n", baseURL)
 		fmt.Fprintln(w, "Run 'entire login' to authenticate.")
 		return nil
 	}
 
-	tokens, err := list(ctx, token)
+	tokens, err := list(ctx, info.Value)
 	if err != nil {
 		if api.IsHTTPErrorStatus(err, http.StatusUnauthorized) {
-			fmt.Fprintf(w, "Token in keychain for %s is no longer valid.\n", baseURL)
-			fmt.Fprintln(w, "Run 'entire login' to re-authenticate.")
+			fmt.Fprintf(w, "Token for %s is no longer valid.\n", baseURL)
+			if info.Source == auth.TokenSourceEnv {
+				fmt.Fprintf(w, "Update or unset %s to re-authenticate.\n", auth.AuthTokenEnvVar)
+			} else {
+				fmt.Fprintln(w, "Run 'entire login' to re-authenticate.")
+			}
 			return nil
 		}
 		return fmt.Errorf("validate token: %w", err)
 	}
 
 	fmt.Fprintf(w, "Logged in to %s\n", baseURL)
-	fmt.Fprintln(w, "  Token: stored in OS keychain")
+	fmt.Fprintf(w, "  Token: %s\n", describeTokenSource(info))
 	fmt.Fprintf(w, "  Active tokens on this account: %d\n", len(tokens))
 	return nil
+}
+
+func describeTokenSource(info auth.TokenInfo) string {
+	switch info.Source {
+	case auth.TokenSourceNone:
+		return "not configured"
+	case auth.TokenSourceEnv:
+		return "supplied by " + auth.AuthTokenEnvVar
+	case auth.TokenSourceFile:
+		return "stored in file " + info.Path
+	case auth.TokenSourceKeyring:
+		return "stored in OS keychain"
+	default:
+		return "stored"
+	}
 }
 
 // --- list -------------------------------------------------------------------
@@ -146,7 +165,7 @@ func newAuthListCmd() *cobra.Command {
 func runAuthList(ctx context.Context, w io.Writer, store tokenStore, list authTokenLister, baseURL string, jsonOut bool) error {
 	token, err := store.GetToken(baseURL)
 	if err != nil {
-		return fmt.Errorf("read keychain: %w", err)
+		return fmt.Errorf("read auth token: %w", err)
 	}
 	if token == "" {
 		return fmt.Errorf("not logged in to %s; run 'entire login' first", baseURL)
@@ -391,7 +410,7 @@ func newAuthRevokeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "revoke [id]",
 		Short: "Revoke an API token by id",
-		Long:  "Revoke a specific API token. Use --current to revoke the token used by this CLI (equivalent to 'entire logout').",
+		Long:  "Revoke a specific API token. Use --current to revoke the token used by this CLI.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id := ""
@@ -412,7 +431,7 @@ func newAuthRevokeCmd() *cobra.Command {
 				api.BaseURL(), id, revokeCurrent)
 		},
 	}
-	cmd.Flags().BoolVar(&revokeCurrent, "current", false, "Revoke the token used by this CLI and remove the local copy")
+	cmd.Flags().BoolVar(&revokeCurrent, "current", false, "Revoke the token used by this CLI and remove the local copy when stored locally")
 	addInsecureHTTPAuthFlag(cmd, &insecureHTTPAuth)
 	return cmd
 }
@@ -431,35 +450,85 @@ func runAuthRevoke(
 	baseURL, id string,
 	current bool,
 ) error {
-	token, err := store.GetToken(baseURL)
+	info, err := store.GetTokenInfo(baseURL)
 	if err != nil {
-		return fmt.Errorf("read keychain: %w", err)
+		return fmt.Errorf("read auth token: %w", err)
 	}
-	if token == "" {
+	if info.Value == "" {
 		return fmt.Errorf("not logged in to %s; run 'entire login' first", baseURL)
 	}
 
 	if current {
-		// Revoking our own token is just logout — reuse that path so behavior
-		// stays identical (best-effort revoke + local delete).
-		return runLogout(ctx, outW, errW, store, revokeCurrent, baseURL)
+		return revokeCurrentToken(ctx, outW, errW, store, revokeCurrent, baseURL, info)
 	}
 
-	if err := revokeByID(ctx, token, id); err != nil {
+	if err := revokeByID(ctx, info.Value, id); err != nil {
 		return err
 	}
 
 	// The list endpoint requires bearer auth, so a 401 here means the id we
 	// just revoked was the same one this CLI is using — the keychain entry is
 	// now stale and would otherwise produce confusing 401s on every command.
-	if _, listErr := list(ctx, token); listErr != nil && api.IsHTTPErrorStatus(listErr, http.StatusUnauthorized) {
+	if _, listErr := list(ctx, info.Value); listErr != nil && api.IsHTTPErrorStatus(listErr, http.StatusUnauthorized) {
+		if info.Source == auth.TokenSourceEnv {
+			fmt.Fprintf(outW, "Revoked token %s (this was supplied by %s; unset it to stop using it locally).\n", id, auth.AuthTokenEnvVar)
+			return nil
+		}
 		if delErr := store.DeleteToken(baseURL); delErr != nil {
 			return fmt.Errorf("revoked token %s but failed to remove local copy: %w", id, delErr)
 		}
-		fmt.Fprintf(outW, "Revoked token %s (this was your local token; removed from keychain).\n", id)
+		fmt.Fprintf(outW, "Revoked token %s (this was your local token; removed from %s).\n", id, localTokenSourceName(info))
 		return nil
 	}
 
 	fmt.Fprintf(outW, "Revoked token %s.\n", id)
 	return nil
+}
+
+func revokeCurrentToken(
+	ctx context.Context,
+	outW, errW io.Writer,
+	store tokenStore,
+	revoke revokeCurrentFunc,
+	baseURL string,
+	info auth.TokenInfo,
+) error {
+	if info.Source == auth.TokenSourceEnv {
+		// Env tokens have no local copy to fall back on, so a non-401 server
+		// failure means the token is still active — we MUST NOT print
+		// "Revoked" and exit zero in that case. 401 is treated as idempotent
+		// success (the token was already invalid server-side).
+		if err := revoke(ctx, info.Value); err != nil {
+			if !api.IsHTTPErrorStatus(err, http.StatusUnauthorized) {
+				return fmt.Errorf("revoke current token: %w", err)
+			}
+		}
+		fmt.Fprintf(outW, "Revoked current token supplied by %s. Unset it to stop using it locally.\n", auth.AuthTokenEnvVar)
+		return nil
+	}
+
+	if err := revoke(ctx, info.Value); err != nil && !api.IsHTTPErrorStatus(err, http.StatusUnauthorized) {
+		fmt.Fprintf(errW, "Warning: server-side token revocation failed: %v\n", err)
+	}
+	if err := store.DeleteToken(baseURL); err != nil {
+		return fmt.Errorf("remove auth token: %w", err)
+	}
+
+	fmt.Fprintln(outW, "Logged out.")
+	return nil
+}
+
+func localTokenSourceName(info auth.TokenInfo) string {
+	switch info.Source {
+	case auth.TokenSourceFile:
+		return "file"
+	case auth.TokenSourceKeyring:
+		return "keychain"
+	case auth.TokenSourceEnv:
+		return auth.AuthTokenEnvVar
+	case auth.TokenSourceNone:
+		return "local storage"
+	default:
+		return "local storage"
+	}
 }
