@@ -1,0 +1,293 @@
+fix  # claude-code review
+
+  # Combined review:  checkpoint-export-cli  vs  entire-labs-plan
+
+  Scope: 1 commit, 7 files, +894/-7. Adds machine-readable export modes:
+
+  •  entire explain --json  (metadata-only envelope; list or single)
+  •  entire explain --transcript [--session-index N]  (compact transcript
+  stream)
+  •  entire session info|current --transcript  (live raw agent transcript
+  stream)
+  Verdict: needs-attention. Substantial new public surface with three concrete
+  bugs and several real smells. None are blockers if you're shipping behind
+  the existing flag-gated CLI surface, but the JSON contract bugs will burn
+  machine consumers.
+
+  --------
+
+  ## /review — overview
+
+  What it does (well): additive surface, JSON envelope explicitly excludes raw
+  transcript bytes, transcript bytes go to stdout via dedicated  --
+  transcript / --raw-transcript  flags.  MarkFlagsMutuallyExclusive  enforces
+  the trichotomy ( --json  /  --transcript  /  --raw-transcript ). Help text
+  is clear, includes a security-relevant invariant ("Transcript bytes are
+  NEVER embedded in the JSON envelope"). Tests for envelope-leak, mutual-
+  exclusion, out-of-range index, and dispatch routing all present.
+  What's missing:
+
+  • No test for the partial-failure JSON shape (per-session metadata read
+  fails → stub entry).
+  • No test for  runExplainListJSON  non-context error path — currently
+  silently emits  [] .
+  • No test for cancellation mid- io.Copy  on a large transcript.
+
+  --------
+
+  ## /simplify — findings (deduped across the 3 sub-agents)
+
+  ### High severity
+
+   #   Where                   Issue                   Fix
+  --- ----------------------- ----------------------- ------------------------
+   1    sessions.go:858-863    Accepts ctx, checks     Wrap reader in a ctx-
+       ( copySessionTranscri    ctx.Err()  once,       aware adapter or close
+       pt )                    then  io.Copy  is        f  from a goroutine
+                               ctx-blind. Multi-MB     on  <-ctx.Done() .
+                               transcripts can't be
+                               Ctrl-C'd.
+   2    explain_export.go:35   Per-session metadata    Add an  error  field
+       7-367                   read failure produces   to
+       ( runExplainCheckpoin   stub  {Index: idx}       checkpointSessionJSON
+       tJSON )                 indistinguishable        , or return the error
+                               from "session           and let the caller
+                               deliberately empty".    decide.
+                               Silent data loss for
+                               machine consumers.
+   3    explain_export.go:44   Non-context errors      Either return the
+       6-489                   set  points = nil       error or include a
+       ( runExplainListJSON    and return success.     top-level  error
+       )                       CI scripts cannot       field in the envelope.
+                               distinguish "no
+                               checkpoints" from
+                               "git error".
+
+  ### Medium severity
+
+   #   Where                   Issue                   Fix
+  --- ----------------------- ----------------------- ------------------------
+   4    explain_export.go:14   Near-verbatim           Extract
+       9-214  vs               duplication: prefix-     resolveCheckpointIDWi
+        explain.go:543-587     match loop + spinner    thRemoteFallback(ctx,
+                               + dual-tree fetch +     errW, lookup, prefix)
+                               lookup rebuild          and call from both
+                               appears in both. ~25    sites.
+                               lines.
+   5    sessions.go:852-863     openSessionTranscrip   Inline  os.Open  +
+                               t / copySessionTransc    io.Copy  in
+                               ript  package-var        writeSessionTranscrip
+                               indirections are        t . Add stubs back
+                               introduced "for         when the first test
+                               testing" but no test    actually needs them.
+                               swaps them. Dead test
+                               infra.
+   6    explain_export.go:38   When  --raw-            Branch on which flag
+       -39                     transcript  reaches     is set; reference the
+       ( runExplainExport )    this validation         correct one.
+                               without a target, the
+                               error reads  "--
+                               transcript
+                               requires..." .
+                               Reachable from tests
+                               bypassing cobra.
+   7    explain.go:351-353     Dispatch fork: legacy   Acceptable as-is, but
+                                --raw-transcript       fold in a  // Why:
+                               path stays for the      comment linking the
+                               default case, new       two paths. Better:
+                               export path is used     route everything
+                               only when  --session-   through the export
+                               index  is explicit.     path and let it reuse
+                               Two code paths for      the spinner/prefetch
+                               one feature; the        helpers.
+                               legacy path silently
+                               ignores  --session-
+                               index 0  if user
+                               didn't pass it
+                               explicitly (subtle
+                               but documented).
+   8    sessions.go:914         (jsonOutput,           Replace with
+       ( runSessionInfo )      transcriptOutput         outputMode  enum
+                               bool)  — combo (true,   ( outputText / outputJ
+                               true) is reachable in   SON / outputTranscript
+                               code despite cobra       ); makes the
+                               rejecting it.           trichotomy total.
+   9    explain_export.go:30   Redundant — equals      Drop the field;
+       1  ( SessionCount        len(envelope.Session   consumers can  len() .
+       field)                  s) . Risk of drift.
+
+  ### Low severity / nits
+
+  •  sessions_test.go:976 :  transcriptDir + "/session.jsonl"  should be
+   filepath.Join .
+  •  sessions.go:853   //nolint:gosec  justification ("path is resolved from
+  validated session state") overstates what's validated; the path is just
+  deserialized. Update the comment to acknowledge trust model.
+  •  strategy/resolve_transcript.go  exported  ResolveTranscriptPath  has one
+  caller. Acceptable but worth a comment if more callers aren't planned.
+  •  explain.go:367  widens  MarkFlagsMutuallyExclusive  to 5 flags. Verify
+  cobra renders a usable error message when 3+ are passed (it does, but worth
+  a smoke test).
+
+  --------
+
+  ## /adversarial-review — material findings
+
+  ### Finding A: JSON consumers cannot detect partial failure (data integrity)
+
+   runExplainCheckpointJSON  and  runExplainListJSON  both swallow read errors
+  and return success with degraded output. A CI script doing  entire
+  checkpoint explain X --json | jq '.sessions[].agent'  will silently process
+  stub entries with no  agent  field, producing an empty/null result
+  indistinguishable from "agent unset". For a list query,  entire checkpoint
+  explain --json  returning  []  could mean "no checkpoints exist" or "tree
+  fetch failed". This violates the implicit contract of any  --json  flag:
+  structured output should be lossless.
+
+  • File/line:  explain_export.go:359-367 ,  446-458
+  • Likely impact: silent CI / dashboard breakage; bug reports that look like
+  "I lost data".
+  • Fix: distinguish the two cases. Options: top-level  error  field, non-zero
+  exit + JSON error to stderr, or per-session  error  field. Pick one and add
+  a test.
+  • Confidence: 0.85
+
+  ### Finding B: Cancellation contract violation on transcript stream
+
+   copySessionTranscript  accepts  ctx context.Context  but passes nothing
+  through to  io.Copy . The single  ctx.Err()  check at entry is the only ctx-
+  aware moment. For a user doing  entire session current --transcript >
+  big.jsonl  on a multi-hour session with a >100MB transcript, Ctrl-C will not
+  interrupt the copy — it will run to EOF first. Worse, the function signature
+  implies cancellation works, so callers may not add their own watchdog.
+
+  • File/line:  sessions.go:858-863
+  • Likely impact: unkillable streams in interactive use; misleading API for
+  future callers.
+  • Fix: standard pattern — start a goroutine that closes  f  on  <-ctx.
+  Done() .  io.Copy  then returns with an error.
+  • Confidence: 0.9
+
+  ### Finding C: TOCTOU / mid-line read race on live transcripts
+
+   writeSessionTranscript  for  entire session current --transcript  opens the
+  live transcript and  io.Copy s to current EOF. If the agent is mid-write of
+  a JSONL line when the read happens, the consumer gets a truncated line.
+  JSONL parsers will reject it. This is most likely on slow disks or when the
+  agent buffers writes — Claude Code, Cursor, Gemini all stream-write JSONL
+  but with implementation-specific buffering.
+
+  • File/line:  sessions.go:927-948
+  • Likely impact: intermittent JSON parse errors when streaming an active
+  session. Hard to reproduce, easy to blame on the user.
+  • Fix: document the snapshot semantics in the help text ("snapshot of the
+  transcript at command start; partial trailing line possible if agent is mid-
+  write"), or scan back to the last newline before EOF and trim. The latter is
+  more robust.
+  • Confidence: 0.65 (depends on agent write buffering, which varies by
+  integration).
+
+  ### Finding D:  resolveSessionIndex  conflates "checkpoint missing" with
+  "checkpoint empty"
+
+  When  summary != nil && len(summary.Sessions) == 0 , the function returns
+   (0, ErrCheckpointNotFound) . But the checkpoint was found — it just has no
+  sessions. Callers using  errors.Is(err, ErrCheckpointNotFound)  to drive UX
+  (e.g., "did you mistype the ID?") will give wrong guidance.
+
+  • File/line:  explain_export.go:230-232
+  • Likely impact: confusing error UX for legitimate empty-checkpoint edge
+  case; wrong fallback in upstream callers that branch on the sentinel.
+  • Fix: return a distinct error (e.g., a new  ErrCheckpointHasNoSessions  or
+  just  errors.New("checkpoint has no sessions")  — losing the sentinel here
+  is fine because no caller currently branches on it for this code path).
+  • Confidence: 0.7
+
+  ### Finding E: Path-traversal nolint annotation overstates validation
+
+   openSessionTranscript = func(path string) { return os.Open(path) }  is
+  annotated  //nolint:gosec // path is resolved from validated session state .
+  But  state.TranscriptPath  is just deserialized from  .git/entire-
+  sessions/<id>.json  — there is no validation that it's confined to any
+  directory or that it doesn't traverse symlinks. The realistic threat model
+  is low (local user already has filesystem access), but the comment is wrong,
+  and a future reader will trust it.
+
+  • File/line:  sessions.go:852-854
+  • Likely impact: documentation drift hides assumptions; if Entire ever gains
+  a daemon mode or runs under a different uid, this becomes exploitable.
+  • Fix: rewrite the comment to state the actual trust assumption (" state.
+  TranscriptPath  is trusted because session state files are written
+  exclusively by Entire under  .git/ ; this is not validated").
+  • Confidence: 0.6
+
+  --------
+
+  ## Top recommended fixes (in order)
+
+  1. Findings A + 1 — JSON envelope error semantics (per-session error field;
+  non-empty list path returns errors instead of  [] ). Highest user-impact bug.
+  2. Findings B + 1 — make  copySessionTranscript  ctx-aware (close-on-done
+  goroutine pattern).
+  3. Finding 4 — extract the  prefix-match + remote-fetch-on-miss  helper from
+   explain.go  and  explain_export.go . ~25 lines deduped.
+  4. Finding 5 — drop the  openSessionTranscript / copySessionTranscript
+  indirections; they are dead test infra.
+  5. Finding 6 + D — fix the misleading error message and the
+   ErrCheckpointNotFound  conflation.
+  6. Finding C — at minimum, document live-transcript snapshot semantics in  -
+  -help . Trim-to-last-newline is the better fix.
+  The rest are style/nits and can wait.
+
+
+  # codex review
+
+  Findings
+
+  1. cmd/entire/cli/explain_export.go /Users/alisha/.
+  marvin/worktrees/cli/checkpoint-export-cli/cmd/entire/cli/explain_export.
+  go:55 reimplements checkpoint resolution for the new export modes and only
+  treats  --commit  as a commit ref; the positional  target  is always handled
+  as a checkpoint prefix. That breaks the contract added in
+  cmd/entire/cli/explain.go /Users/alisha/.marvin/worktrees/cli/checkpoint-
+  export-cli/cmd/entire/cli/explain.go:314 that  --json  /  --transcript
+  accept a positional commit SHA, and it also skips the fetch-on-miss retry
+  path that normal explain uses in cmd/entire/cli/explain.go /Users/alisha/.
+  marvin/worktrees/cli/checkpoint-export-cli/cmd/entire/cli/explain.go:562.
+  Result: commit-backed exports can fail even though  entire checkpoint
+  explain --commit ...  would succeed after fetching metadata. The new tests
+  only cover checkpoint IDs, not commit targets, in
+  cmd/entire/cli/explain_export_test.go /Users/alisha/.
+  marvin/worktrees/cli/checkpoint-export-
+  cli/cmd/entire/cli/explain_export_test.go:77.
+  2. cmd/entire/cli/sessions.go /Users/alisha/.
+  marvin/worktrees/cli/checkpoint-export-cli/cmd/entire/cli/sessions.go:365
+  returns  NewSilentError(...)  when a session transcript path is missing or
+  unavailable, but it never prints a message first. Because cmd/entire/main.go
+  /Users/alisha/.marvin/worktrees/cli/checkpoint-export-cli/cmd/entire/main.
+  go:33 suppresses output for  SilentError ,  entire session info --
+  transcript  /  session current --transcript  will exit with no user-visible
+  explanation in those cases. The new negative test in
+  cmd/entire/cli/sessions_test.go /Users/alisha/.
+  marvin/worktrees/cli/checkpoint-export-cli/cmd/entire/cli/sessions_test.
+  go:952 only checks the returned error from  ExecuteContext , so it misses
+  the real CLI behavior.
+  3. cmd/entire/cli/explain_export.go /Users/alisha/.
+  marvin/worktrees/cli/checkpoint-export-cli/cmd/entire/cli/explain_export.
+  go:283 says the JSON export is metadata-only, but the v1 fallback still
+  calls  ReadSessionContent , which depends on transcript availability, even
+  though v1 already has a metadata-only reader in
+  cmd/entire/cli/checkpoint/committed.go /Users/alisha/.
+  marvin/worktrees/cli/checkpoint-export-
+  cli/cmd/entire/cli/checkpoint/committed.go:981. On v1 checkpoints with
+  missing/unreadable raw transcripts,  --json  silently degrades to stub
+  session entries via cmd/entire/cli/explain_export.go /Users/alisha/.
+  marvin/worktrees/cli/checkpoint-export-cli/cmd/entire/cli/explain_export.
+  go:265 instead of returning the session metadata the command promises. All
+  export tests set up v2 repositories only in
+  cmd/entire/cli/explain_export_test.go /Users/alisha/.
+  marvin/worktrees/cli/checkpoint-export-
+  cli/cmd/entire/cli/explain_export_test.go:26, so this compatibility path is
+  untested.
+  Targeted package tests passed for the covered cases, but they do not
+  exercise the three scenarios above.
