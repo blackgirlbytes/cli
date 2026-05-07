@@ -184,7 +184,7 @@ func (c *CloudClient) doJSON(ctx context.Context, method, path string, reqBody, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return errors.New("dispatch requires login — run `entire login`")
+		return errors.New("dispatch service rejected the current Entire auth token")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) //nolint:errcheck // best-effort body read for error message

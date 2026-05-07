@@ -111,7 +111,7 @@ func TestCloudClient_CreateDispatch_Unauthorized(t *testing.T) {
 
 	client := NewCloudClient(CloudConfig{BaseURL: srv.URL, Token: ""})
 	_, err := client.CreateDispatch(ctx, CreateDispatchRequest{Repos: []string{"x/y"}})
-	if err == nil || !strings.Contains(err.Error(), "entire login") {
+	if err == nil || !strings.Contains(err.Error(), "dispatch service rejected the current Entire auth token") {
 		t.Fatalf("expected auth error, got %v", err)
 	}
 }
