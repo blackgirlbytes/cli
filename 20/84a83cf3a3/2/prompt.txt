@@ -1,0 +1,31 @@
+can you check if commits into the shadow branch ignore .gitignore?
+
+---
+
+there is this article: https://techstackups.com/guides/entire-io-hands-on-what-it-actually-captures/#what-leaks-into-checkpoints
+
+and it claims:
+
+The full API key, in plaintext, is on a Git branch, even though .env is in .gitignore. The shadow branch bypasses .gitignore when capturing snapshots. If you push the Entire branches to a remote, your secrets go with them.
+
+---
+
+yeah let's write a test or tests (integration or unit, what makes the most sense) first that captures the problem, then build a fix
+
+---
+
+• 1. High: gitignored-file filtering is only applied to WriteTemporary, not to task
+     checkpoints, so subagent/incremental checkpoints can still leak ignored secrets into
+     the shadow branch. The new filter is wired in at cmd/entire/cli/checkpoint/
+     temporary.go:102, but cmd/entire/cli/checkpoint/temporary.go:266 still appends
+     ModifiedFiles and NewFiles directly into the checkpoint tree. That path is live via
+     cmd/entire/cli/strategy/manual_commit_git.go:250, so a subagent that touches .env or
+     another ignored file can still persist it on entire/*. The new tests only cover
+     WriteTemporary (cmd/entire/cli/checkpoint/checkpoint_test.go:1839), so this regression
+     gap would ship unnoticed.
+
+---
+
+- I’m assuming the intended security guarantee is “never persist gitignored files to any
+    shadow-branch checkpoint,” not just main session checkpoints. The commit message and
+    tests read that way.

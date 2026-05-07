@@ -1,0 +1,40 @@
+External agents are unable to get the `cli_version`.
+
+Diagnosis: the CLI doesn't pass ENTIRE_CLI_VERSION to the external agent binary.
+
+  I confirmed this with a probe wrapper around entire-agent-kiro. For every subcommand the CLI invokes on the kiro agent (info, parse-hook,
+   read-transcript, extract-prompts, …), only these env vars are set:
+
+  ENTIRE_LOG_LEVEL=debug
+  ENTIRE_PROTOCOL_VERSION=1
+  ENTIRE_REPO_ROOT=/Users/ninawork/entire/test-repos/test-repo
+
+  ENTIRE_CLI_VERSION is not among them. The agent's currentCLIVersion() reads that env var (transcript.go:568-570), so it returns empty;
+  injectTranscriptCLIVersion early-returns on empty version; and compactCLIVersion falls through to the "unknown" literal constant at
+  compact.go:17.
+
+  When I invoke compact-transcript manually with the env var set, the agent writes the expected value:
+
+  $ ENTIRE_CLI_VERSION=0.5.5 entire-agent-kiro compact-transcript --session-ref .../d05b…json
+  {"v":1,"agent":"kiro","cli_version":"0.5.5","type":"user",…}
+  {"v":1,"agent":"kiro","cli_version":"0.5.5","type":"assistant",…}
+
+  So the kiro agent is doing its part correctly. The bug is in the Entire CLI: it needs to propagate its own version as ENTIRE_CLI_VERSION
+  into the external-agent process env, the way ENTIRE_REPO_ROOT is propagated today. (Claude Code's compact transcripts show cli_version:
+  "dev" because claude-code is a built-in agent — its compaction runs inside the CLI and pulls the version from a compile-time constant
+  directly, bypassing this protocol gap.)
+
+  Two options — which do you want?
+
+  1. File this as a CLI bug (correct fix: CLI should set ENTIRE_CLI_VERSION in the env of spawned external-agent processes). No changes
+  needed in this repo.
+  2. Add a workaround in the kiro agent: when ENTIRE_CLI_VERSION is missing, shell out to entire version and parse the version string.
+  Works immediately but adds a subprocess per compact/write call and couples the agent to the CLI's output format.
+
+---
+
+That's ok
+
+---
+
+I mean the tradeoff is ok. Let's proceed

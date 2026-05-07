@@ -1,0 +1,332 @@
+Implement the following plan:
+
+# Plan: Add CI artifact download to e2e-triage skill
+
+## Context
+
+When the user says "latest CI run", the e2e-triage skill should use `scripts/download-e2e-artifacts.sh` to download artifacts from the most recent failed CI E2E run. Currently, the skill's Step L1 only mentions local artifact paths and test names — it has no guidance for fetching CI artifacts, which led to ad-hoc `gh run list` queries instead of using the existing script.
+
+## Change
+
+**File:** `.claude/skills/e2e-triage/SKILL.md`
+
+Update **Step L1: Parse User Input** to add a new input type and a sub-step for CI artifact retrieval:
+
+1. Add **CI run reference** as an accepted input type:
+   - `latest CI run` / `latest` — most recent failed E2E run on main
+   - A GitHub Actions run ID (numeric)
+   - A GitHub Actions run URL
+
+2. Add instruction to run the download script when a CI reference is provided:
+   ```bash
+   scripts/download-e2e-artifacts.sh <latest | RUN_ID | RUN_URL>
+   ```
+   The script outputs the absolute artifact path as its last line of stdout — capture that and use it as the artifact path for analysis.
+
+3. After downloading, skip Steps L2-L5 (local re-runs) and go straight to **Shared Analysis** (Step 1), since we're analyzing CI artifacts, not running tests locally.
+
+## Verification
+
+- Invoke `/e2e-triage latest CI run` and confirm the skill runs `scripts/download-e2e-artifacts.sh latest` instead of manually querying `gh run list`.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/b9a04c7b-5d8c-404b-829d-1400ff28b27d.jsonl
+
+---
+
+commit
+
+---
+
+## Context
+
+- Current git status: On branch alisha/e2e-triage-local-only
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   .claude/skills/e2e-triage/SKILL.md
+
+no changes added to commit (use "git add" and/or "git commit -a")
+- Current git diff (staged and unstaged changes): diff --git a/.claude/skills/e2e-triage/SKILL.md b/.claude/skills/e2e-triage/SKILL.md
+index 35807c80..afbc9876 100644
+--- a/.claude/skills/e2e-triage/SKILL.md
++++ b/.claude/skills/e2e-triage/SKILL.md
+@@ -15,6 +15,18 @@ The user provides one or more of:
+ - **Test name(s)** — e.g., `TestInteractiveMultiStep`
+ - **`--agent <agent>`** — optional, defaults to all agents that previously failed
+ - **A local artifact path** — skip straight to analysis of existing artifacts
++- **CI run reference** — triggers artifact download instead of local re-runs:
++  - `latest CI run` / `latest` — most recent failed E2E run on main
++  - A GitHub Actions run ID (numeric, e.g., `12345678`)
++  - A GitHub Actions run URL
++
++**CI artifact download:** When a CI run reference is provided, download artifacts using:
++
++```bash
++scripts/download-e2e-artifacts.sh <latest | RUN_ID | RUN_URL>
++```
++
++The script outputs the absolute artifact path as its **last line of stdout** — capture that and use it as the artifact path for analysis. After downloading, **skip Steps L2–L5** (local re-runs) and go straight to **Shared Analysis** (Step 1), since we're analyzing CI artifacts, not running tests locally.
+ 
+ **Cost warning:** Real E2E tests consume API tokens. Before running, confirm with the user unless they provided specific test names (implying intent to run).
+- Current branch: alisha/e2e-triage-local-only
+- Recent commits: 1cd2b0ee Remove CI mode from e2e-triage skill, keep local-only debugging
+86af3437 Switch E2E triage to manual workflow_dispatch, remove auto-trigger and GitHub issues
+270d48dc Fix allowed tools
+4f549470 For testing purposes only
+39d1d8f8 For testing purposes only
+fad002b6 Delegate artifact analysis from e2e-triage to debug-e2e skill
+6bdf24de Add README to E2E triage skill
+76ebb5d2 Clarify real-bug vs flaky/test-bug classification in E2E triage skill
+1ca90ee4 Split E2E triage Take Action and Summary steps by local vs CI mode
+1e50aba5 Add local mode and CI re-run verification to E2E triage skill
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.
+
+---
+
+Base directory for this skill: /Users/alisha/Projects/devenv/cli/.claude/skills/e2e-triage
+
+# E2E Triage
+
+Triage E2E test failures with **re-run verification**. Analyzes artifacts and re-runs failing tests locally to distinguish flaky from real bugs. Presents findings interactively and applies fixes directly in the working tree.
+
+---
+
+## Step L1: Parse User Input
+
+The user provides one or more of:
+- **Test name(s)** — e.g., `TestInteractiveMultiStep`
+- **`--agent <agent>`** — optional, defaults to all agents that previously failed
+- **A local artifact path** — skip straight to analysis of existing artifacts
+- **CI run reference** — triggers artifact download instead of local re-runs:
+  - `latest CI run` / `latest` — most recent failed E2E run on main
+  - A GitHub Actions run ID (numeric, e.g., `12345678`)
+  - A GitHub Actions run URL
+
+**CI artifact download:** When a CI run reference is provided, download artifacts using:
+
+```bash
+scripts/download-e2e-artifacts.sh <latest | RUN_ID | RUN_URL>
+```
+
+The script outputs the absolute artifact path as its **last line of stdout** — capture that and use it as the artifact path for analysis. After downloading, **skip Steps L2–L5** (local re-runs) and go straight to **Shared Analysis** (Step 1), since we're analyzing CI artifacts, not running tests locally.
+
+**Cost warning:** Real E2E tests consume API tokens. Before running, confirm with the user unless they provided specific test names (implying intent to run).
+
+## Step L2: First Run
+
+```bash
+mise run test:e2e --agent <agent> <TestName>
+```
+
+Capture the artifact directory from the `artifacts: <path>` output line.
+
+## Step L3: Re-run on Failure
+
+If the test **passes** on first run: report as passing, done for this test.
+
+If the test **fails**: run a **second time** with the same parameters.
+
+## Step L4: Tiebreaker (if needed)
+
+If results are **split** (1 pass, 1 fail): run a **third time** as tiebreaker.
+
+## Step L5: Collect Results
+
+For each test+agent pair, record: `(test, agent, run_1_result, run_2_result, [run_3_result])`
+
+Proceed to **Shared Analysis** (Step 1 below).
+
+---
+
+## Shared Analysis & Classification
+
+### Step 1: Analyze Each Failure
+
+For each failure, follow the **Debugging Workflow** in `.claude/skills/debug-e2e/SKILL.md` (steps 2-5: console.log → test source → entire.log → deep dive). Collect:
+- What the agent actually did (from console.log)
+- What was expected (from test source)
+- CLI-level errors or anomalies (from entire.log)
+- Repo/checkpoint state (from git-log.txt, git-tree.txt, checkpoint-metadata/)
+
+### Step 2: Classify Each Failure
+
+Use **re-run results as the primary signal**, supplemented by artifact analysis.
+
+#### Re-run signals (strongest):
+
+| Original | Re-run 1 | Re-run 2 | Classification |
+|----------|----------|----------|----------------|
+| FAIL | FAIL (same error) | FAIL (same error) | **real-bug** OR **flaky (test-bug)** — see below |
+| FAIL | PASS | PASS | **flaky** |
+| FAIL | PASS | FAIL | **flaky** (non-deterministic) |
+| FAIL | FAIL | PASS | **flaky** (non-deterministic) |
+| FAIL | FAIL (different error) | FAIL (different error) | **needs deeper analysis** — examine artifacts |
+
+**Important: Consistent failures can still be `flaky` (test-bug).** When all re-runs fail, check *where* the root cause is:
+- Root cause in `cmd/entire/cli/` → **real-bug** (product code is broken)
+- Root cause in `e2e/` (test infra, test helpers, tmux setup, env propagation) → **flaky (test-bug)** — the CLI works fine, the test is broken
+
+#### Strong `real-bug` signals (root cause must be in `cmd/entire/cli/`, not `e2e/`):
+
+- `entire.log` contains `"level":"ERROR"` or panic/stack traces from CLI code
+- Checkpoint metadata structurally corrupt (malformed JSON, missing `checkpoint_id`/`strategy`)
+- Session state file missing or malformed when expected
+- Hooks did not fire at all (no `hook invoked` log entries)
+- Shadow/metadata branch has wrong tree structure
+- Same test fails across 3+ agents with same non-timeout symptom
+- Error references CLI code (panic in `cmd/entire/cli/`)
+
+**Key question:** Is the bug in `cmd/entire/cli/` (product code) or in `e2e/` (test code)? Only the former is a `real-bug`.
+
+#### Strong `flaky` signals (unless overridden by real-bug):
+
+**Agent behavior (non-deterministic):**
+- `signal: killed` (timeout)
+- `context deadline exceeded` or `WaitForCheckpoint.*exceeded deadline`
+- Agent asked for confirmation instead of acting
+- Agent created file at wrong path / wrong name
+- Agent produced no output
+- Agent committed when it shouldn't have (or vice versa)
+- Duration near timeout limit
+
+**Test-bug (consistent failure, but root cause is in `e2e/` not `cmd/entire/cli/`):**
+- Agent "Not logged in" / auth errors → test env setup doesn't propagate auth credentials
+- Env vars not propagated to agent session → tmux/test harness bug
+- Error references test code (`e2e/`) not CLI code (`cmd/entire/cli/`)
+- Test helper logic errors (wrong assertions, bad globs, incorrect expected values)
+- Consistent failure BUT root cause traced to `e2e/` code, not `cmd/entire/cli/`
+- Test setup/teardown issues (missing git config, temp dir cleanup, port conflicts)
+
+#### Ambiguous cases:
+
+Read `entire.log` carefully:
+- If hooks fired correctly and metadata is valid -> lean **flaky**
+- If hooks fired but produced wrong results -> lean **real-bug**
+
+### Step 3: Cross-Agent Correlation
+
+Before acting, check correlations using re-run data:
+- Same test fails for 3+ agents, all re-runs also fail -> strong **real-bug**
+- Same test fails for multiple agents, but re-runs pass -> **flaky** (shared prompt issue)
+- One agent fails consistently, others pass -> agent-specific issue (still **real-bug** if re-runs confirm)
+
+### Step 4: Take Action
+
+Present findings interactively. **Do not** create branches, PRs, or GitHub issues.
+
+#### Present Findings Report
+
+For each test+agent pair, print a findings block:
+
+```
+## <TestName> (<agent>) — <classification>
+
+**Re-run results:** original=FAIL, rerun1=PASS, rerun2=PASS
+**Evidence:**
+- <1-2 sentence summary of what went wrong>
+- <key artifact evidence: entire.log excerpt, console.log excerpt, etc.>
+```
+
+#### For `flaky` failures: describe the proposed fix
+
+For agent-behavior flaky issues, fixes typically modify test prompts. For test-bug flaky issues, fixes target `e2e/` infrastructure code (harness setup, helpers, env propagation).
+
+```
+**Proposed fix:** <description>
+  - File: <path to test file or e2e infrastructure file>
+  - Change: <what will be modified — e.g., append "Do not ask for confirmation" to prompt, or fix env propagation in NewTmuxSession>
+```
+
+Common flaky fixes:
+- Agent asked for confirmation -> append "Do not ask for confirmation" to prompt
+- Agent wrote to wrong path -> be more explicit about paths in prompt
+- Agent committed when shouldn't -> add "Do not commit" to prompt
+- Checkpoint wait timeout -> increase timeout argument
+- Agent timeout (signal: killed) -> increase per-test timeout, simplify prompt
+- Auth/env not propagated -> fix test harness env setup in `e2e/` code
+- Test helper bug (wrong assertion, bad glob) -> fix test helper in `e2e/`
+- tmux session setup issue -> fix `NewTmuxSession` or session config in `e2e/`
+
+#### For `real-bug` failures: describe root cause analysis
+
+```
+**Root cause analysis:**
+  - Component: <hooks | session | checkpoint | strategy | agent>
+  - Suspected location: <file:function>
+  - Description: <what's wrong and why>
+  - Proposed fix: <what code change would address it>
+```
+
+#### Ask the user
+
+Prompt the user:
+
+> **Should I fix these?**
+> - [list of tests with classifications]
+> - You can select all, specific tests, or skip.
+
+Wait for user response before proceeding.
+
+#### Apply fixes (if user approves)
+
+For **flaky** fixes the user approved:
+1. Apply fixes directly in the working tree (no branch creation)
+2. Run verification:
+   ```bash
+   mise run test:e2e:canary   # Must pass
+   mise run fmt && mise run lint
+   ```
+3. If canary fails, investigate and adjust. Report what happened to the user.
+
+For **real-bug** fixes the user approved:
+1. Apply the fix directly in the working tree (no branch creation)
+2. Run relevant tests to verify:
+   ```bash
+   mise run test        # Unit tests
+   mise run test:e2e:canary  # Canary tests
+   ```
+3. Report results to the user.
+
+### Step 5: Summary
+
+Print a summary table:
+```
+| Test | Agent(s) | Re-runs | Classification | Action Taken |
+|------|----------|---------|---------------|-------------|
+| TestFoo | claude-code | FAIL/PASS/PASS | flaky | Fixed in working tree |
+| TestBar | all agents | FAIL/FAIL/FAIL | real-bug | Fix applied, tests passing |
+| TestBaz | opencode | FAIL/PASS/FAIL | flaky | Skipped (user declined) |
+```
+
+
+ARGUMENTS: latest CI run
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+fix the script. lastest run was from this morning and I can see the artifacts still there https://github.com/entireio/cli/actions/runs/22772950740
+
+---
+
+[Request interrupted by user]
+
+---
+
+no don't remove the directory if its already there then just continue to next step in e2e-traige skill. and script should just output that download already exits
+
+---
+
+commit
+
+---
+
+[Request interrupted by user for tool use]

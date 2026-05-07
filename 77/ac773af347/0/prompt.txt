@@ -1,0 +1,960 @@
+Base directory for this skill: /Users/alex/workspace/cli/.claude/skills/debug-e2e
+
+# Debug Entire CLI via E2E Artifacts
+
+Diagnose Entire CLI bugs using captured artifacts from the E2E test suite. Artifacts are written to `e2e/artifacts/` locally or downloaded from CI via GitHub Actions.
+
+## Inputs
+
+The user provides either:
+- **A test run directory:** `e2e/artifacts/{timestamp}/` — triage all failures
+- **A specific test directory:** `e2e/artifacts/{timestamp}/{TestName}-{agent}/` — debug one test
+
+## Artifact Layout
+
+```
+e2e/artifacts/{timestamp}/
+├── report.nocolor.txt          # Pass/fail/skip summary with error lines
+├── test-events.json            # Raw Go test events (NDJSON)
+├── entire-version.txt          # CLI version under test
+└── {TestName}-{agent}/
+    ├── PASS or FAIL            # Status marker
+    ├── console.log             # Full operation transcript
+    ├── git-log.txt             # git log --decorate --graph --all
+    ├── git-tree.txt            # ls-tree HEAD + checkpoint branch
+    ├── entire-logs/entire.log  # CLI structured JSON logs
+    ├── checkpoint-metadata/    # Checkpoint + session metadata
+    └── repo -> /tmp/...        # Symlink to preserved repo (E2E_KEEP_REPOS=1 only)
+```
+
+## Preserved Repo
+
+When the test run was executed with `E2E_KEEP_REPOS=1`, each test's artifact directory contains a `repo` symlink pointing to the preserved temporary git repository. This is the actual repo the test operated on — you can inspect it directly.
+
+**Navigate via the symlink** (e.g., `{artifact-dir}/repo/`) rather than resolving the `/tmp/...` path. The symlink lives inside the artifact directory so permissions and paths stay consistent.
+
+The preserved repo contains:
+- Full git history with all branches (main, `entire/checkpoints/v1`)
+- The `.entire/` directory with CLI state, config, and raw logs
+- The `.claude/` directory (if Claude Code was the agent)
+- All files the agent created or modified, in their final state
+
+This is the most powerful debugging tool — you can run `git log`, `git diff`, `git show`, inspect `.entire/` internals, and see exactly what the CLI left behind.
+
+## Debugging Workflow
+
+### 1. Triage (if given a run directory)
+
+Read `report.nocolor.txt` to identify failures and their error messages. Each entry shows the test name, agent, duration, and failure output with file:line references.
+
+### 2. Read console.log (most important)
+
+Full transcript of every operation:
+- `> claude -p "..." ...` — agent prompts with stdout/stderr
+- `> git add/commit/...` — git commands
+- `> send: ...` — interactive session inputs
+
+This tells you what happened chronologically.
+
+### 3. Read test source code
+
+Use the file:line from the report to find the test in `e2e/tests/`. Understand what the test expected to happen vs what console.log shows actually happened.
+
+### 4. Diagnose the CLI behavior
+
+Cross-reference console.log (what happened) with the test (what should have happened). Focus on CLI-level issues:
+
+| Symptom | CLI Investigation |
+|---------|-------------------|
+| Checkpoint not created / timeout | Check `entire-logs/entire.log` for hook invocations, phase transitions, errors |
+| Wrong checkpoint content | Check `git-tree.txt` for checkpoint branch files, `checkpoint-metadata/` for session info |
+| Hooks didn't fire | Check `entire.log` for missing hook entries (session-start, user-prompt-submit, stop, post-commit) |
+| Stash/unstash problems | Check `entire.log` for stash-related log lines, `git-log.txt` for commit ordering |
+| Attribution issues | Check `checkpoint-metadata/` for `files_touched`, session metadata for attribution data |
+| Strategy mismatch | Check `entire.log` for `strategy` field, verify auto-commit vs manual-commit behavior |
+
+### 5. Deep dive files
+
+- **entire-logs/entire.log**: Structured JSON logs — hook lifecycle, session phases (`active` → `idle` → `ended`), warnings, errors. Key fields: `component`, `hook`, `strategy`, `session_id`.
+- **git-log.txt**: Commit graph showing main branch, `entire/checkpoints/v1`, checkpoint initialization.
+- **git-tree.txt**: Files at HEAD vs checkpoint branch (separated by `--- entire/checkpoints/v1 ---`).
+- **checkpoint-metadata/**: `metadata.json` has `checkpoint_id`, `strategy`, `files_touched`, `token_usage`, and `sessions` array. Session subdirs have per-session details.
+
+### 6. Report findings
+
+Identify whether the issue is in:
+- **CLI hooks** (prepare-commit-msg, commit-msg, post-commit)
+- **Session management** (phase transitions, session tracking)
+- **Checkpoint creation** (branch management, metadata writing)
+- **Attribution** (file tracking, prompt correlation)
+- **Strategy logic** (auto-commit vs manual-commit behavior)
+
+
+ARGUMENTS: /Users/alex/workspace/cli/e2e/artifacts/2026-02-25T16-02-20
+
+---
+
+yes, fix it
+
+---
+
+kick off a e2e in CI please
+
+---
+
+yes
+
+---
+
+are the last round of failures legit? are there some cases where we expect the shadow branch to hang around? /debug-e2e
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+oh, I meant the local run
+
+---
+
+this one TestTrailerRemovalSkipsCondensation let's just fix the test - the shadow branch is legitimately hanging around because of the skipped condensation
+
+---
+
+they others are legit bugs correct?
+
+---
+
+okay, let's commit and push
+
+---
+
+should TestContentOverlapRevertNewFile be cleaning up shadow branches?
+
+---
+
+does mise install cover gotestum?
+
+---
+
+"  TestContentOverlapRevertNewFile
+
+  The AssertNoShadowBranches assertion is incorrect for this test and should be removed.
+
+  This test deliberately tests a scenario where no checkpoint should be created (content mismatch on a new file). When no checkpoint is condensed, the shadow branch correctly remains
+  - it preserves the agent's discarded work for potential later access via entire rewind." - let's discuss?
+
+---
+
+is the session truly Ended in this scenario?
+
+---
+
+or is that an artefact of how the test is structured?
+
+---
+
+so really the 'one-shot' nature of the runprompt is misleading here?
+
+---
+
+I just merged the PR - let's create a new branch to handle:
+- update TestContentOverlapRevertNewFile to be an 'idle' session
+
+---
+
+I think I liked it better when we printed the version under test at the very start of the e2e run - we see this atm:
+> mise run test:e2e:claude
+artifacts: /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T09-09-24
+[e2e/tests]········
+
+---
+
+TestContentOverlapRevertNewFile
+
+  The AssertNoShadowBranches assertion is incorrect for this test and should be removed.
+
+  This test deliberately tests a scenario where no checkpoint should be created (content mismatch on a new file). When no checkpoint is condensed, the shadow branch correctly remains
+  - it preserves the agent's discarded work for potential later access via entire rewind.
+
+  TestModifiedFileAlwaysGetsCheckpoint
+
+  This one should work - a checkpoint should be created because modified files always count as overlap. If the shadow branch isn't being cleaned up, there may be a bug in the
+  condensation logic or FilesTouched population.```
+
+So I think `TestContentOverlapRevertNewFile` is actually fine keeping the shadow branch, only `TestModifiedFileAlwaysGetsCheckpoint` is indicating an issue.
+
+---
+
+[Request interrupted by user]
+
+---
+
+let's do that in a different PR
+
+---
+
+yes please, the e2e only fails on AlwaysGetsCheckpoint as expected
+
+---
+
+now let's look at the carry-forward bug for TestModifiedFileAlwaysGetsCheckpoint, let's branch off main
+
+---
+
+and update our local main
+
+---
+
+okay, sooooo
+1. is the scenario realistic? (i.e. would the agent session be truly 'ended' in this case?) But does that even matter?
+2. the carry forward in this case is incorrect because there are _no_ changes in the working code tree yes?
+
+---
+
+elaborate on the `git add -p` - is this where there are files in 'staged'? do we need a seperate scenario for this?
+
+---
+
+and is there a sub-variant where the agent changes are unstaged?
+
+---
+
+ok cool. let's go.
+
+Q: where should we cover these scenarios? unit, integration, e2e?
+
+---
+
+ok, do you have enough to execute?
+
+---
+
+yes, commit push and draft PR
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me trace through the conversation chronologically:
+
+1. User invoked `/debug-e2e` with artifact path `/Users/alex/workspace/cli/e2e/artifacts/2026-02-25T16-02-20`
+2. I triaged the report - 36 passed, 1 failed: `TestSingleSessionSubagentCommitInTurn`
+3. The failure was: checkpoint commit 2/2 had wrong checkpoint ID - expected `9560cc19a00c` but got `5596886ed387`
+4. Root cause: agent made 2 commits instead of 1 (subagent did create + fix), causing `AssertCheckpointInLastN` to fail because it checked the last N sequential commits
+5. Fixed `AssertCheckpointInLastN` to use `git log --grep` instead of `git log -n N`
+6. Committed and pushed, user asked to trigger E2E in CI
+7. Triggered E2E workflow run 22384898947
+
+8. User asked about "last round of failures" - pointed to local artifacts at `2026-02-25T17-18-36`
+9. 3 failures, all `AssertNoShadowBranches`:
+   - TestContentOverlapRevertNewFile
+   - TestModifiedFileAlwaysGetsCheckpoint
+   - TestTrailerRemovalSkipsCondensation
+
+10. Launched subagent to analyze all 3 failures in detail
+11. For TestTrailerRemovalSkipsCondensation - user said "let's just fix the test" - removed `AssertNoShadowBranches` assertion since hooks were bypassed
+12. Committed and pushed
+
+13. Discussion about TestContentOverlapRevertNewFile:
+    - User shared feedback that the shadow branch correctly persists (preserves discarded work)
+    - I initially proposed it was a CLI bug, but user pushed back
+    - Key realization: the `ended` session state was an artifact of `RunPrompt` (one-shot) - in real usage, session would be `idle`
+    - User agreed this was the issue - restructured test to use interactive session
+    - Renamed to `TestInteractiveContentOverlapRevertNewFile`
+    - Removed `AssertNoShadowBranches` with comment explaining why shadow branch persists
+
+14. User merged the consolidate-e2e-tests PR, created new branch `alex/fix-e2e-shadow-branch-tests`
+15. Committed the interactive test restructure, pushed
+
+16. User asked about printing version at start of E2E run - I proposed changes to mise.toml but user said "let's do this in a different PR"
+
+17. Discussion about TestModifiedFileAlwaysGetsCheckpoint:
+    - User confirmed this IS a real bug (shadow branch should be cleaned up after condensation)
+    - The carry-forward logic in `filesWithRemainingAgentChanges` creates a false positive
+    - When user writes different content than agent, content mismatch is interpreted as "partial commit"
+    - But working tree is clean - nothing left to carry forward
+
+18. Created new branch `alex/fix-carry-forward-shadow-branch` off main
+19. Deep discussion about the scenarios:
+    - User replaced content: committed hash != shadow hash, working tree clean → no carry-forward
+    - git add -p: committed hash != shadow hash, working tree dirty → carry-forward
+    - Unstaged agent files: already handled by `committedFiles` map check
+
+20. Implemented the fix:
+    - Added `workingTreeMatchesCommit` helper function
+    - Modified `filesWithRemainingAgentChanges` to check working tree when content mismatches
+    - Fixed existing `TestFilesWithRemainingAgentChanges_PartialCommit` to simulate real git add -p state
+    - Added new `TestFilesWithRemainingAgentChanges_ReplacedContent` test
+    - Fixed lint issues (gosec G304 and G104)
+
+21. All tests pass, committed, pushed, created draft PR #502
+
+The user's final instruction says "we need to have a look at the E2E failure" - this refers to validating that the E2E test `TestModifiedFileAlwaysGetsCheckpoint` now passes with the fix. The PR is draft and has an unchecked test plan item for E2E validation.
+
+Summary:
+1. Primary Request and Intent:
+   The user invoked `/debug-e2e` to diagnose E2E test failures from local test runs. The work evolved through several phases:
+   - Diagnose and fix `TestSingleSessionSubagentCommitInTurn` failure (checkpoint ID mismatch due to multi-commit agent turn)
+   - Diagnose and fix 3 `AssertNoShadowBranches` failures across different tests
+   - For `TestTrailerRemovalSkipsCondensation`: remove incorrect assertion (hooks bypassed, shadow branch legitimately persists)
+   - For `TestContentOverlapRevertNewFile`: restructure test to use interactive session (idle, not ended) — shadow branch correctly persists
+   - For `TestModifiedFileAlwaysGetsCheckpoint`: fix the actual CLI bug in carry-forward logic where user-replaced content was misinterpreted as partial staging
+   - Each fix was committed, pushed, and PR'd separately
+
+2. Key Technical Concepts:
+   - **Shadow branches**: `entire/<commit-hash>-<worktreeHash>` branches that store checkpoint data during active sessions
+   - **Carry-forward logic**: After a commit, determines if any agent-touched files still have uncommitted changes (for split commits / `git add -p`)
+   - **Content-aware overlap detection**: Compares committed content against shadow branch to distinguish "user replaced content" from "partial staging"
+   - **Session phases**: `active` → `idle` → `ended` lifecycle managed by state machine
+   - **`RunPrompt` vs interactive sessions**: `RunPrompt` is one-shot (session ends before test continues), `StartSession`/`Send`/`WaitFor` keeps session alive
+   - **Condensation**: Process of copying session metadata from shadow branches to `entire/checkpoints/v1` metadata branch
+   - **`git add -p` scenario**: Partial staging where working tree retains full content after commit (differs from committed content AND from shadow)
+   - **Working tree check**: The key fix — after detecting content mismatch between commit and shadow, check if working tree is clean (matches commit) to distinguish replacement from partial staging
+
+3. Files and Code Sections:
+   - **`e2e/testutil/assertions.go`** (PR #1 - merged)
+     - Fixed `AssertCheckpointInLastN` to use `git log --grep` instead of `git log -n N`
+     - Removed `strconv` import (no longer needed)
+     ```go
+     func AssertCheckpointInLastN(t *testing.T, dir string, checkpointID string, n int) {
+         t.Helper()
+         out := GitOutput(t, dir, "log", "--grep="+checkpointID,
+             "--format=%s", "entire/checkpoints/v1")
+         var lines []string
+         for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+             if line != "" {
+                 lines = append(lines, line)
+             }
+         }
+         assert.GreaterOrEqual(t, len(lines), n,
+             "expected at least %d commits mentioning %s on checkpoint branch, got %d: %v",
+             n, checkpointID, len(lines), lines)
+     }
+     ```
+
+   - **`e2e/tests/session_lifecycle_test.go`** (PR #1 - merged)
+     - Removed `AssertNoShadowBranches` from `TestTrailerRemovalSkipsCondensation` — hooks bypassed via `core.hooksPath=/dev/null`, shadow branch legitimately persists
+
+   - **`e2e/tests/existing_files_test.go`** (PR #501)
+     - Restructured `TestContentOverlapRevertNewFile` → `TestInteractiveContentOverlapRevertNewFile`
+     - Changed from `RunPrompt` (session ends) to interactive session (`StartSession`/`Send`/`WaitFor`)
+     - Removed `AssertNoShadowBranches`, added comment explaining shadow branch correctly persists during idle session
+     ```go
+     func TestInteractiveContentOverlapRevertNewFile(t *testing.T) {
+         testutil.ForEachAgent(t, 2*time.Minute, func(t *testing.T, s *testutil.RepoState, ctx context.Context) {
+             prompt := s.Agent.PromptPattern()
+             session := s.StartSession(t, ctx)
+             if session == nil {
+                 t.Skipf("agent %s does not support interactive mode", s.Agent.Name())
+             }
+             s.WaitFor(t, session, prompt, 30*time.Second)
+             s.Send(t, session, "create a markdown file at docs/red.md with a paragraph about the colour red. Do not ask for confirmation, just make the change.")
+             s.WaitFor(t, session, prompt, 60*time.Second)
+             testutil.WaitForFileExists(t, s.Dir, "docs/*.md", 30*time.Second)
+             // Session is now idle. User replaces content entirely.
+             if err := os.WriteFile(filepath.Join(s.Dir, "docs", "red.md"), []byte("# Completely different content\n\nNothing about red here.\n"), 0o644); err != nil {
+                 t.Fatalf("overwrite file: %v", err)
+             }
+             s.Git(t, "add", "docs/red.md")
+             s.Git(t, "commit", "-m", "Replace red.md content")
+             time.Sleep(5 * time.Second)
+             testutil.AssertNoCheckpointTrailer(t, s.Dir, "HEAD")
+             testutil.AssertCheckpointNotAdvanced(t, s)
+             // Shadow branch correctly persists: session is idle and no condensation occurred.
+         })
+     }
+     ```
+
+   - **`cmd/entire/cli/strategy/content_overlap.go`** (PR #502 - draft)
+     - Added `os` and `path/filepath` imports
+     - Modified `filesWithRemainingAgentChanges` to check working tree when committed content differs from shadow
+     - Added `workingTreeMatchesCommit` helper function
+     - Key change: when `commitFile.Hash != shadowFile.Hash`, now checks if working tree matches commit (clean = no carry-forward)
+     ```go
+     // When committed content differs from shadow, check working tree
+     if worktreeRoot != "" && workingTreeMatchesCommit(worktreeRoot, filePath, commitFile.Hash) {
+         logging.Debug(logCtx, "filesWithRemainingAgentChanges: content differs from shadow but working tree is clean, skipping",
+             slog.String("file", filePath),
+             slog.String("commit_hash", commitFile.Hash.String()[:7]),
+             slog.String("shadow_hash", shadowFile.Hash.String()[:7]),
+         )
+         continue
+     }
+     ```
+     ```go
+     func workingTreeMatchesCommit(worktreeRoot, filePath string, commitHash plumbing.Hash) bool {
+         absPath := filepath.Join(worktreeRoot, filePath)
+         diskContent, err := os.ReadFile(absPath) //nolint:gosec // filePath is from git status, not user input
+         if err != nil {
+             return false
+         }
+         h := plumbing.NewHasher(plumbing.BlobObject, int64(len(diskContent)))
+         if _, err := h.Write(diskContent); err != nil {
+             return false
+         }
+         return h.Sum() == commitHash
+     }
+     ```
+
+   - **`cmd/entire/cli/strategy/content_overlap_test.go`** (PR #502 - draft)
+     - Fixed `TestFilesWithRemainingAgentChanges_PartialCommit` — now writes full content back to disk after commit to simulate real `git add -p` state
+     - Added `TestFilesWithRemainingAgentChanges_ReplacedContent` — validates no carry-forward when working tree is clean
+     ```go
+     func TestFilesWithRemainingAgentChanges_ReplacedContent(t *testing.T) {
+         t.Parallel()
+         dir := setupGitRepo(t)
+         repo, err := git.PlainOpen(dir)
+         require.NoError(t, err)
+         agentContent := []byte("func GetPort() int { return 8080 }\n")
+         createShadowBranchWithContent(t, repo, "rep1234", "e3b0c4", map[string][]byte{
+             "config.go": agentContent,
+         })
+         userContent := []byte("func GetHost() string { return \"localhost\" }\n")
+         testFile := filepath.Join(dir, "config.go")
+         require.NoError(t, os.WriteFile(testFile, userContent, 0o644))
+         wt, err := repo.Worktree()
+         require.NoError(t, err)
+         _, err = wt.Add("config.go")
+         require.NoError(t, err)
+         headCommit, err := wt.Commit("Replace config", &git.CommitOptions{
+             Author: &object.Signature{Name: "Test", Email: "test@test.com", When: time.Now()},
+         })
+         require.NoError(t, err)
+         commit, err := repo.CommitObject(headCommit)
+         require.NoError(t, err)
+         shadowBranch := checkpoint.ShadowBranchNameForCommit("rep1234", "e3b0c4")
+         committedFiles := map[string]struct{}{"config.go": {}}
+         remaining := filesWithRemainingAgentChanges(repo, shadowBranch, commit, []string{"config.go"}, committedFiles)
+         assert.Empty(t, remaining, "Replaced content with clean working tree should not be in remaining")
+     }
+     ```
+
+   - **Artifact files analyzed** (read-only):
+     - `e2e/artifacts/2026-02-25T16-02-20/report.nocolor.txt` — initial triage
+     - `e2e/artifacts/2026-02-25T16-02-20/TestSingleSessionSubagentCommitInTurn-claude-code/` — console.log, git-log.txt, git-tree.txt, entire-logs/entire.log
+     - `e2e/artifacts/2026-02-25T17-18-36/report.nocolor.txt` — second round triage (3 shadow branch failures)
+     - Subagent analyzed all 3 failure artifacts in detail
+
+4. Errors and fixes:
+   - **gosec G304 (file inclusion via variable)**: `os.ReadFile(filepath.Join(worktreeRoot, filePath))` flagged. Fixed with `//nolint:gosec` comment explaining filePath comes from git status, not user input.
+   - **gosec G104 (unhandled error)**: `h.Write(diskContent)` return value not checked. Fixed by checking the error return.
+   - **Unused import `strconv`**: After changing `AssertCheckpointInLastN` to remove `strconv.Itoa(n)`, the import was unused. Removed it.
+   - **User pushed back on TestContentOverlapRevertNewFile being a "CLI bug"**: User shared feedback that the shadow branch correctly persists to preserve discarded agent work for potential rewind access. I adjusted understanding — the real issue was the test using `RunPrompt` which forced an unrealistic `ended` state. Restructured to interactive session instead.
+   - **User pushed back on implementing mise.toml version printing changes**: Said "let's do this in a different PR". I stopped and moved on.
+
+5. Problem Solving:
+   - **Multi-commit agent turns**: `AssertCheckpointInLastN` was fragile — fixed to use `--grep` search instead of positional checking
+   - **Shadow branch lifecycle**: Deeply analyzed when shadow branches should and shouldn't persist across 3 different test scenarios, arriving at different fixes for each
+   - **Carry-forward false positive**: The core bug — `filesWithRemainingAgentChanges` couldn't distinguish "user replaced content" from "user did git add -p". Fixed by adding working tree check. Also fixed the existing partial commit test which wasn't properly simulating `git add -p` (it wrote partial content directly instead of leaving full content in working tree).
+
+6. All user messages:
+   - `/debug-e2e /Users/alex/workspace/cli/e2e/artifacts/2026-02-25T16-02-20`
+   - "yes, fix it" (re: AssertCheckpointInLastN assertion)
+   - "kick off a e2e in CI please"
+   - "yes" (re: commit and push first)
+   - "are the last round of failures legit? are there some cases where we expect the shadow branch to hang around? /debug-e2e"
+   - "oh, I meant the local run" (re: checking local artifacts, not CI)
+   - "this one TestTrailerRemovalSkipsCondensation let's just fix the test - the shadow branch is legitimately hanging around because of the skipped condensation"
+   - "they others are legit bugs correct?"
+   - "okay, let's commit and push"
+   - "should TestContentOverlapRevertNewFile be cleaning up shadow branches?"
+   - "is the session truly Ended in this scenario?"
+   - "or is that an artefact of how the test is structured?"
+   - "so really the 'one-shot' nature of the runprompt is misleading here?"
+   - (Shared quote about TestContentOverlapRevertNewFile shadow branch preserving discarded work and TestModifiedFileAlwaysGetsCheckpoint being a real bug)
+   - "So I think TestContentOverlapRevertNewFile is actually fine keeping the shadow branch, only TestModifiedFileAlwaysGetsCheckpoint is indicating an issue."
+   - "I just merged the PR - let's create a new branch to handle: - update TestContentOverlapRevertNewFile to be an 'idle' session"
+   - "can we put 'Interactive' into the test title?"
+   - "I think I liked it better when we printed the version under test at the very start of the e2e run" (then "let's do this in a different PR")
+   - "does mise install cover gotestum?"
+   - (Shared feedback about TestContentOverlapRevertNewFile and TestModifiedFileAlwaysGetsCheckpoint analysis)
+   - "now let's look at the carry-forward bug for TestModifiedFileAlwaysGetsCheckpoint, let's branch off main"
+   - "and update our local main"
+   - "can we discuss further? can we step through the exact sequence of events, noting the code-side and shadow commits?"
+   - "okay, sooooo 1. is the scenario realistic? 2. the carry forward in this case is incorrect because there are _no_ changes in the working code tree yes?"
+   - "elaborate on the git add -p - is this where there are files in 'staged'? do we need a separate scenario for this?"
+   - "and is there a sub-variant where the agent changes are unstaged?"
+   - "ok cool. let's go. Q: where should we cover these scenarios? unit, integration, e2e?"
+   - "ok, do you have enough to execute?"
+   - "yes, commit push and draft PR"
+
+7. Pending Tasks:
+   - **PR #501** (`alex/fix-e2e-shadow-branch-tests`): Interactive content overlap test — awaiting review/merge
+   - **PR #502** (`alex/fix-carry-forward-shadow-branch`): Carry-forward fix — draft PR, needs E2E validation that `TestModifiedFileAlwaysGetsCheckpoint` passes
+   - **Version printing in E2E**: User wants to print the `entire` version at the start of E2E runs (deferred to separate PR)
+
+8. Current Work:
+   Just created draft PR #502 for the carry-forward fix on branch `alex/fix-carry-forward-shadow-branch`. The fix modifies `filesWithRemainingAgentChanges` in `content_overlap.go` to check the working tree when committed content differs from the shadow branch. Unit tests pass. The PR has an unchecked test plan item: "E2E: `TestModifiedFileAlwaysGetsCheckpoint` should pass (shadow branch cleaned up after condensation)".
+
+9. Optional Next Step:
+   The user's additional summarization instruction says "we need to have a look at the E2E failure" — this refers to validating the carry-forward fix against the E2E test `TestModifiedFileAlwaysGetsCheckpoint`. The next step would be to run or trigger the E2E test to confirm the fix resolves the shadow branch cleanup issue. Note: per CLAUDE.md, E2E tests should only be run when the user explicitly asks — and the unchecked PR test plan item plus the user's instruction suggest this validation is needed.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli/dc50dae0-c79b-483e-9c1a-8b4a484a8325.jsonl
+
+---
+
+TestContentOverlapRevertNewFile is still failing - see /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T09-58-16 /debug-e2e
+
+---
+
+Base directory for this skill: /Users/alex/workspace/cli/.claude/skills/debug-e2e
+
+# Debug Entire CLI via E2E Artifacts
+
+Diagnose Entire CLI bugs using captured artifacts from the E2E test suite. Artifacts are written to `e2e/artifacts/` locally or downloaded from CI via GitHub Actions.
+
+## Inputs
+
+The user provides either:
+- **A test run directory:** `e2e/artifacts/{timestamp}/` — triage all failures
+- **A specific test directory:** `e2e/artifacts/{timestamp}/{TestName}-{agent}/` — debug one test
+
+## Artifact Layout
+
+```
+e2e/artifacts/{timestamp}/
+├── report.nocolor.txt          # Pass/fail/skip summary with error lines
+├── test-events.json            # Raw Go test events (NDJSON)
+├── entire-version.txt          # CLI version under test
+└── {TestName}-{agent}/
+    ├── PASS or FAIL            # Status marker
+    ├── console.log             # Full operation transcript
+    ├── git-log.txt             # git log --decorate --graph --all
+    ├── git-tree.txt            # ls-tree HEAD + checkpoint branch
+    ├── entire-logs/entire.log  # CLI structured JSON logs
+    ├── checkpoint-metadata/    # Checkpoint + session metadata
+    └── repo -> /tmp/...        # Symlink to preserved repo (E2E_KEEP_REPOS=1 only)
+```
+
+## Preserved Repo
+
+When the test run was executed with `E2E_KEEP_REPOS=1`, each test's artifact directory contains a `repo` symlink pointing to the preserved temporary git repository. This is the actual repo the test operated on — you can inspect it directly.
+
+**Navigate via the symlink** (e.g., `{artifact-dir}/repo/`) rather than resolving the `/tmp/...` path. The symlink lives inside the artifact directory so permissions and paths stay consistent.
+
+The preserved repo contains:
+- Full git history with all branches (main, `entire/checkpoints/v1`)
+- The `.entire/` directory with CLI state, config, and raw logs
+- The `.claude/` directory (if Claude Code was the agent)
+- All files the agent created or modified, in their final state
+
+This is the most powerful debugging tool — you can run `git log`, `git diff`, `git show`, inspect `.entire/` internals, and see exactly what the CLI left behind.
+
+## Debugging Workflow
+
+### 1. Triage (if given a run directory)
+
+Read `report.nocolor.txt` to identify failures and their error messages. Each entry shows the test name, agent, duration, and failure output with file:line references.
+
+### 2. Read console.log (most important)
+
+Full transcript of every operation:
+- `> claude -p "..." ...` — agent prompts with stdout/stderr
+- `> git add/commit/...` — git commands
+- `> send: ...` — interactive session inputs
+
+This tells you what happened chronologically.
+
+### 3. Read test source code
+
+Use the file:line from the report to find the test in `e2e/tests/`. Understand what the test expected to happen vs what console.log shows actually happened.
+
+### 4. Diagnose the CLI behavior
+
+Cross-reference console.log (what happened) with the test (what should have happened). Focus on CLI-level issues:
+
+| Symptom | CLI Investigation |
+|---------|-------------------|
+| Checkpoint not created / timeout | Check `entire-logs/entire.log` for hook invocations, phase transitions, errors |
+| Wrong checkpoint content | Check `git-tree.txt` for checkpoint branch files, `checkpoint-metadata/` for session info |
+| Hooks didn't fire | Check `entire.log` for missing hook entries (session-start, user-prompt-submit, stop, post-commit) |
+| Stash/unstash problems | Check `entire.log` for stash-related log lines, `git-log.txt` for commit ordering |
+| Attribution issues | Check `checkpoint-metadata/` for `files_touched`, session metadata for attribution data |
+| Strategy mismatch | Check `entire.log` for `strategy` field, verify auto-commit vs manual-commit behavior |
+
+### 5. Deep dive files
+
+- **entire-logs/entire.log**: Structured JSON logs — hook lifecycle, session phases (`active` → `idle` → `ended`), warnings, errors. Key fields: `component`, `hook`, `strategy`, `session_id`.
+- **git-log.txt**: Commit graph showing main branch, `entire/checkpoints/v1`, checkpoint initialization.
+- **git-tree.txt**: Files at HEAD vs checkpoint branch (separated by `--- entire/checkpoints/v1 ---`).
+- **checkpoint-metadata/**: `metadata.json` has `checkpoint_id`, `strategy`, `files_touched`, `token_usage`, and `sessions` array. Session subdirs have per-session details.
+
+### 6. Report findings
+
+Identify whether the issue is in:
+- **CLI hooks** (prepare-commit-msg, commit-msg, post-commit)
+- **Session management** (phase transitions, session tracking)
+- **Checkpoint creation** (branch management, metadata writing)
+- **Attribution** (file tracking, prompt correlation)
+- **Strategy logic** (auto-commit vs manual-commit behavior)
+
+
+ARGUMENTS: /Users/alex/workspace/cli/e2e/artifacts/2026-02-26T09-58-16
+
+---
+
+ahhhh. can we rebase on top of 501?
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+that's fine - let's flip this to ready for review, mention the failing test is handled in #501 in the PR
+
+---
+
+we need to switch back to #501 and /github-pr-review
+
+---
+
+Base directory for this skill: /Users/alex/.claude/skills/github-pr-review
+
+# GitHub PR Review
+
+## Overview
+
+Technical mechanics for GitHub PR review workflows via `gh` CLI. Covers fetching review comments, replying to threads, creating/updating PRs.
+
+**Companion skill:** For *how to evaluate* feedback, see `superpowers:receiving-code-review`. This skill covers *how to interact* with GitHub.
+
+**Security:** Use fine-grained PAT with minimal permissions.
+
+## Setup (One-Time)
+
+### Fine-Grained PAT
+
+Create at github.com -> Settings -> Developer settings -> Personal access tokens -> Fine-grained tokens:
+
+| Permission | Level |
+|------------|-------|
+| Pull requests | Read & Write |
+| Contents | Read |
+
+**Can't:** Delete repos, push code, delete branches, manage settings.
+
+### Configure & Allowlist
+
+```bash
+export GH_TOKEN="github_pat_xxxx"
+```
+
+Add to `.claude/settings.json`:
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh repo view:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr ready:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(gh api repos/*/*/pulls/*/comments:*)",
+      "Bash(gh api repos/*/*/pulls/*/comments/*/replies:*)"
+    ]
+  }
+}
+```
+
+## Quick Reference
+
+| Operation | Command |
+|-----------|---------|
+| Get owner/repo | `gh repo view --json owner,name -q '"\(.owner.login)/\(.name)"'` |
+| Get PR number | `gh pr view --json number -q .number` |
+| Get PR author | `gh pr view --json author -q .author.login` |
+| Fetch all review comments | `gh api repos/{owner}/{repo}/pulls/{pr}/comments --paginate` |
+| Get single comment | `gh api repos/{owner}/{repo}/pulls/comments/{comment_id}` |
+| Reply to comment | `gh api repos/{owner}/{repo}/pulls/{pr}/comments/{comment_id}/replies -f body="msg"` |
+| Create PR | `gh pr create --title "T" --body "B" [--draft]` |
+| Mark ready | `gh pr ready [number]` |
+| Convert to draft | `gh pr ready --undo [number]` |
+| Edit PR | `gh pr edit [number] --title "T" --body "B"` |
+
+## Workflow: Respond to PR Review
+
+### 1. Get repo info and PR details
+
+```bash
+owner_repo=$(gh repo view --json owner,name -q '"\(.owner.login)/\(.name)"')
+pr_number=$(gh pr view --json number -q .number)
+pr_author=$(gh pr view --json author -q .author.login)
+```
+
+### 2. Fetch and analyze threads
+
+```bash
+# Fetch all comments and group into threads, showing last author per thread
+gh api repos/${owner_repo}/pulls/${pr_number}/comments --paginate | jq 'sort_by([.in_reply_to_id // .id, .created_at]) | group_by(.in_reply_to_id // .id) | map({thread_id: (.[0].in_reply_to_id // .[0].id), path: .[0].path, line: (.[0].line // .[0].original_line), last_author: .[-1].user.login, last_body: .[-1].body[0:100], count: length})'
+```
+
+### 3. Filter to threads needing response
+
+```bash
+# Filter to threads where last_author != PR author
+# Note: Use '| not' instead of '!=' to avoid shell escaping issues with !
+... | jq --arg author "$pr_author" '[.[] | select(.last_author == $author | not)]'
+```
+
+For each thread needing response:
+- Read the comment + file/line context
+- Apply `superpowers:receiving-code-review` skill for evaluation
+- Fix code and/or reply to thread
+
+### 4. Commit fixes and push
+- run the build, tests, linting as required
+- commit the changes, noting the commit sha
+- push the changes so they're visible
+- We need to do this FIRST so we have the commit shas to put into the replies to the pr review
+
+### 5. Re-fetch comment IDs (if rebased)
+
+**Important:** If you rebased or force-pushed, comment IDs may have changed. Re-fetch the comment threads before replying:
+
+```bash
+gh api repos/${owner_repo}/pulls/${pr_number}/comments --paginate | jq '...'
+```
+
+### 6. Reply to a thread
+
+```bash
+gh api repos/${owner_repo}/pulls/${pr_number}/comments/{comment_id}/replies \
+  -f body="Fixed in commit abc123. [description of fix]"
+```
+
+### 7. Summarize and finish
+
+After all threads addressed, ask if ready to mark PR ready for review.
+
+**Note:** REST API doesn't expose "resolved" status. We infer "done" when PR author made last comment in thread.
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Broad PAT permissions | Use fine-grained PAT with only Pull requests + Contents |
+| Missing pagination | Always use `--paginate` for comment fetching |
+| Top-level reply | Use `/comments/{id}/replies` endpoint, not `/comments` |
+| Re-responding to threads | Skip threads where PR author made last comment |
+| Forgetting to reply after fix | Always reply to confirm the fix was made |
+| jq `!=` fails with shell error | Use `select(.x == "y" \| not)` instead of `select(.x != "y")` |
+| 404 on reply after rebase | Comment IDs change after force-push/rebase. Re-fetch comments before replying |
+
+ARGUMENTS: 501
+
+---
+
+Base directory for this skill: /Users/alex/.claude/plugins/cache/claude-plugins-official/superpowers/4.3.1/skills/receiving-code-review
+
+# Code Review Reception
+
+## Overview
+
+Code review requires technical evaluation, not emotional performance.
+
+**Core principle:** Verify before implementing. Ask before assuming. Technical correctness over social comfort.
+
+## The Response Pattern
+
+```
+WHEN receiving code review feedback:
+
+1. READ: Complete feedback without reacting
+2. UNDERSTAND: Restate requirement in own words (or ask)
+3. VERIFY: Check against codebase reality
+4. EVALUATE: Technically sound for THIS codebase?
+5. RESPOND: Technical acknowledgment or reasoned pushback
+6. IMPLEMENT: One item at a time, test each
+```
+
+## Forbidden Responses
+
+**NEVER:**
+- "You're absolutely right!" (explicit CLAUDE.md violation)
+- "Great point!" / "Excellent feedback!" (performative)
+- "Let me implement that now" (before verification)
+
+**INSTEAD:**
+- Restate the technical requirement
+- Ask clarifying questions
+- Push back with technical reasoning if wrong
+- Just start working (actions > words)
+
+## Handling Unclear Feedback
+
+```
+IF any item is unclear:
+  STOP - do not implement anything yet
+  ASK for clarification on unclear items
+
+WHY: Items may be related. Partial understanding = wrong implementation.
+```
+
+**Example:**
+```
+your human partner: "Fix 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+
+❌ WRONG: Implement 1,2,3,6 now, ask about 4,5 later
+✅ RIGHT: "I understand items 1,2,3,6. Need clarification on 4 and 5 before proceeding."
+```
+
+## Source-Specific Handling
+
+### From your human partner
+- **Trusted** - implement after understanding
+- **Still ask** if scope unclear
+- **No performative agreement**
+- **Skip to action** or technical acknowledgment
+
+### From External Reviewers
+```
+BEFORE implementing:
+  1. Check: Technically correct for THIS codebase?
+  2. Check: Breaks existing functionality?
+  3. Check: Reason for current implementation?
+  4. Check: Works on all platforms/versions?
+  5. Check: Does reviewer understand full context?
+
+IF suggestion seems wrong:
+  Push back with technical reasoning
+
+IF can't easily verify:
+  Say so: "I can't verify this without [X]. Should I [investigate/ask/proceed]?"
+
+IF conflicts with your human partner's prior decisions:
+  Stop and discuss with your human partner first
+```
+
+**your human partner's rule:** "External feedback - be skeptical, but check carefully"
+
+## YAGNI Check for "Professional" Features
+
+```
+IF reviewer suggests "implementing properly":
+  grep codebase for actual usage
+
+  IF unused: "This endpoint isn't called. Remove it (YAGNI)?"
+  IF used: Then implement properly
+```
+
+**your human partner's rule:** "You and reviewer both report to me. If we don't need this feature, don't add it."
+
+## Implementation Order
+
+```
+FOR multi-item feedback:
+  1. Clarify anything unclear FIRST
+  2. Then implement in this order:
+     - Blocking issues (breaks, security)
+     - Simple fixes (typos, imports)
+     - Complex fixes (refactoring, logic)
+  3. Test each fix individually
+  4. Verify no regressions
+```
+
+## When To Push Back
+
+Push back when:
+- Suggestion breaks existing functionality
+- Reviewer lacks full context
+- Violates YAGNI (unused feature)
+- Technically incorrect for this stack
+- Legacy/compatibility reasons exist
+- Conflicts with your human partner's architectural decisions
+
+**How to push back:**
+- Use technical reasoning, not defensiveness
+- Ask specific questions
+- Reference working tests/code
+- Involve your human partner if architectural
+
+**Signal if uncomfortable pushing back out loud:** "Strange things are afoot at the Circle K"
+
+## Acknowledging Correct Feedback
+
+When feedback IS correct:
+```
+✅ "Fixed. [Brief description of what changed]"
+✅ "Good catch - [specific issue]. Fixed in [location]."
+✅ [Just fix it and show in the code]
+
+❌ "You're absolutely right!"
+❌ "Great point!"
+❌ "Thanks for catching that!"
+❌ "Thanks for [anything]"
+❌ ANY gratitude expression
+```
+
+**Why no thanks:** Actions speak. Just fix it. The code itself shows you heard the feedback.
+
+**If you catch yourself about to write "Thanks":** DELETE IT. State the fix instead.
+
+## Gracefully Correcting Your Pushback
+
+If you pushed back and were wrong:
+```
+✅ "You were right - I checked [X] and it does [Y]. Implementing now."
+✅ "Verified this and you're correct. My initial understanding was wrong because [reason]. Fixing."
+
+❌ Long apology
+❌ Defending why you pushed back
+❌ Over-explaining
+```
+
+State the correction factually and move on.
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Performative agreement | State requirement or just act |
+| Blind implementation | Verify against codebase first |
+| Batch without testing | One at a time, test each |
+| Assuming reviewer is right | Check if breaks things |
+| Avoiding pushback | Technical correctness > comfort |
+| Partial implementation | Clarify all items first |
+| Can't verify, proceed anyway | State limitation, ask for direction |
+
+## Real Examples
+
+**Performative Agreement (Bad):**
+```
+Reviewer: "Remove legacy code"
+❌ "You're absolutely right! Let me remove that..."
+```
+
+**Technical Verification (Good):**
+```
+Reviewer: "Remove legacy code"
+✅ "Checking... build target is 10.15+, this API needs 13+. Need legacy for backward compat. Current impl has wrong bundle ID - fix it or drop pre-13 support?"
+```
+
+**YAGNI (Good):**
+```
+Reviewer: "Implement proper metrics tracking with database, date filters, CSV export"
+✅ "Grepped codebase - nothing calls this endpoint. Remove it (YAGNI)? Or is there usage I'm missing?"
+```
+
+**Unclear Item (Good):**
+```
+your human partner: "Fix items 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+✅ "Understand 1,2,3,6. Need clarification on 4 and 5 before implementing."
+```
+
+## GitHub Thread Replies
+
+When replying to inline review comments on GitHub, reply in the comment thread (`gh api repos/{owner}/{repo}/pulls/{pr}/comments/{id}/replies`), not as a top-level PR comment.
+
+## The Bottom Line
+
+**External feedback = suggestions to evaluate, not orders to follow.**
+
+Verify. Question. Then implement.
+
+No performative agreement. Technical rigor always.

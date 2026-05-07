@@ -1,0 +1,76 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "97423944335b",
+  "session_id": "e57e19d3-9d51-4dfc-a9be-85f900363dec",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T22:37:37.408671Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "cmd/entire/cli/memory_loop_cmd.go",
+    "cmd/entire/cli/memory_loop_cmd_test.go",
+    "cmd/entire/cli/memoryloop/generator.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "84ff7545b9f3",
+  "token_usage": {
+    "input_tokens": 2204,
+    "cache_creation_tokens": 236887,
+    "cache_read_tokens": 8719275,
+    "output_tokens": 27489,
+    "api_call_count": 103
+  },
+  "session_metrics": {
+    "turn_count": 4
+  },
+  "summary": {
+    "intent": "Add --kind flag to memory-loop refresh to focus generation on a specific memory kind (repo_rule, skill_patch, etc.), print the generation threshold under the scope line, and fix TUI threshold changes not persisting to refresh.",
+    "outcome": "All three features were implemented and committed: TUI threshold now propagates to refresh, threshold prints after scope line, and --kind flag focuses both the LLM prompt and post-generation filtering on the specified memory kind.",
+    "learnings": {
+      "repo": [
+        "TUI settings (GenerationThreshold, GenerationOverrides, InjectionScopes) were saved to memory-loop.json but not loaded before refresh's threshold resolution — required moving loadMemoryLoopState earlier in the refresh flow.",
+        "Store rebuild in refresh was dropping InjectionScopes, GenerationThreshold, and GenerationOverrides fields, losing TUI settings across refreshes.",
+        "GenerateInput.KindFocus narrows the LLM prompt's kind enum to a single value AND adds a kind-specific directive string; buildGeneratedRecordsDetailed also filters mismatched kinds post-generation as a safety net.",
+        "KindFocus and FilteredKindCount are tracked in RefreshHistory in memoryloop.go for observability.",
+        "The five valid memory kinds are: repo_rule, workflow_rule, agent_instruction, skill_patch, anti_pattern."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 397,
+          "finding": "LLM prompt uses a JSON schema with 'kind' field — when KindFocus is set, the enum narrows to a single value and a kind-specific directive is appended to the guidelines."
+        },
+        {
+          "path": "cmd/entire/cli/memory_loop_cmd.go",
+          "finding": "runMemoryLoopRefresh signature extended with a 'kind string' parameter; all test call sites required updating to pass empty string."
+        }
+      ],
+      "workflow": [
+        "Moving state/threshold resolution above session loading and backfill is purely cosmetic (allows earlier printing) — backfill behavior is unaffected by threshold.",
+        "Pre-existing lint issues (goconst 'balanced', maintidx) should be verified against baseline before attributing to changes.",
+        "Test call sites for internal functions must be updated when signatures change — grep for all usages before editing."
+      ]
+    },
+    "friction": [
+      "Assistant accidentally ran `git checkout` during a lint baseline check which reverted the working changes, requiring both edits to be re-applied from scratch.",
+      "Duplicate state-loading and threshold-print blocks were left in the file after restructuring and required a separate cleanup edit.",
+      "User interrupted mid-edit to redirect from a simpler filter-only approach to a more comprehensive prompt-tailoring approach."
+    ],
+    "open_items": [
+      "The --kind flag focuses the LLM but doesn't affect summary backfill or facet computation — no filtering there by design, but worth noting for future kind-scoped workflows.",
+      "Pre-existing lint issues (goconst 'balanced', maintidx on large functions) were not fixed as part of this work."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-03T22:37:06.329654Z",
+    "agent_lines": 132,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 132,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "fb99cece2051",
+  "session_id": "505074f6-04f8-47f5-ba59-9d9444474e9c",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T15:49:37.62782Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 6,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "7a45480669b1",
+  "token_usage": {
+    "input_tokens": 2985,
+    "cache_creation_tokens": 482254,
+    "cache_read_tokens": 16006284,
+    "output_tokens": 58744,
+    "api_call_count": 151
+  },
+  "session_metrics": {
+    "turn_count": 14
+  },
+  "summary": {
+    "intent": "Improve memory quality in the memory-loop system by enforcing a hard evidence gate on generated memory records, and fix the summary command's slow first load.",
+    "outcome": "Implemented a two-layer evidence gate (provenance + session ID validation) replacing the weak review-derived gate, added FilteredNoEvidenceCount stat, fixed JSON parsing for LLM trailing text, and removed unconditional backfill from the summary command startup.",
+    "learnings": {
+      "repo": [
+        "AffectedSessions in PatternAnalysis uses CheckpointID, but the prompt was previously exposing SessionID — identifier alignment is a prerequisite for cross-referencing generated memories against analysis signals.",
+        "passesReviewDerivedGate (generator.go:360) was the only hard gate before this change; all other kinds (repo_rule, workflow_rule, agent_instruction) only had soft LLM-instruction-based filtering.",
+        "The summary command ran BackfillSummaries and BackfillFacets unconditionally on every invocation (summary_cmd.go:195-196), causing 20+ sequential LLM calls with output to io.Discard on first load.",
+        "repo_learning and workflow_learning signals have no Count or AffectedSessions fields, making them ineligible as provenance sources for the evidence gate.",
+        "llmcli.ExtractJSONFromMarkdown strips markdown code fences but does not strip trailing natural-language text after a closing brace, causing json.Unmarshal failures.",
+        "Personal-scope memory records auto-activate without TUI promotion (memoryloop.go:623), so Option 4 (TUI evidence display) does not protect the most common injection path."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 319,
+          "end_line": 319,
+          "finding": "Prompt instruction 'Avoid one-off incidents without repeated evidence' was the only enforcement — a suggestion to the LLM, not a code gate."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 155,
+          "end_line": 161,
+          "finding": "Post-filter caught low confidence and low strength but a one-off record with confidence:high and strength:4 passed through."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 173,
+          "end_line": 173,
+          "finding": "SourceSessionIDs was captured but never validated for length; a single-session record was treated identically to a 5-session one."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 360,
+          "end_line": 375,
+          "finding": "passesReviewDerivedGate enforced count>=2 || strong only for review-derived rules; replaced by passesEvidenceGate which covers all signal types."
+        },
+        {
+          "path": "cmd/entire/cli/summary_cmd.go",
+          "line": 195,
+          "end_line": 196,
+          "finding": "Unconditional backfill calls on every summary command invocation caused 50-170s silent startup; removed so backfill only runs on explicit user request."
+        }
+      ],
+      "workflow": [
+        "Using Codex as a second reviewer on architecture docs before implementation caught two critical flaws: missing provenance data model and a fallback-allows escape hatch that nullified the gate.",
+        "Writing an analysis doc and iterating it with a second AI reviewer before implementing is effective for catching architectural gaps early.",
+        "Rebuild the CLI binary after committing fixes — the error recurred because the old binary was still running."
+      ]
+    },
+    "friction": [
+      "LLM returned trailing text after JSON closing brace ('invalid character n after top-level value'), requiring an extractJSONObject fallback parser.",
+      "After committing the JSON fix, the error recurred because the CLI binary wasn't rebuilt — wasted a debug cycle.",
+      "Many existing tests had to be updated to include SourceSignal + analysis signals + valid SourceSessionIDs after the evidence gate was added, requiring careful reading of 12+ test cases.",
+      "identifier alignment (SessionID vs CheckpointID) was a prerequisite blocker that had to be resolved before Layer 2 validation could work correctly.",
+      "logicalRuleSimilarity was defined in memoryloop.go and used there independently, requiring careful scoping when removing the review gate helpers."
+    ],
+    "open_items": [
+      "Option 4 (show evidence count in TUI before promotion) was noted as still useful for transparency alongside the evidence gate, but not implemented.",
+      "Existing low-quality memories already in memory-loop.json are not affected by the evidence gate — a backfill/re-evaluation pass or natural decay would be needed to clean them up.",
+      "improve/generator.go and facets/facets.go may have the same trailing-text JSON parsing issue as memoryloop/generator.go — not investigated.",
+      "A new GenerationStats counter FilteredNoEvidenceCount was added but the doc noted it would be useful for debugging — actual observability of the new gate in production is unverified.",
+      "The matchedSignal.Kind refinement (line 220 in doc) prevents singleton exceptions from leaking across signal types — noted but implementation details not fully verified in transcript."
+    ]
+  }
+}

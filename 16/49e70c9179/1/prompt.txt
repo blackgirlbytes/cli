@@ -1,0 +1,120 @@
+a quick research: the entire cli operates now on hooks of agents to then get the session logs to then create checkpoints containing the session logs, this is all to have some correlation between "what commits resulted out of a session log" and then we bring the data back together later. 
+
+What I wonder now: Can we use the hooks to actually inject "this turn made a commit" or "a commit was made between the last finished prompt and this prompt" somehow into the session logs withour checkpoint ids? this way we could process the logs later and figure out where checkpoints fall into the timeline. You can focus on claude code for now let's figure out if it would work there? We can also do some experiments just let me know which
+
+---
+
+yes, please do. maybe in a test repo and not the cli repo?
+
+---
+
+continue, sorry
+
+---
+
+done, this was the session: claude --resume 3d0d855f-f4a2-4761-b950-fd9c003122f0
+
+---
+
+can you look at checkpoints v2 transcript logic, could we use this somehow? Like are we generating the stripped transcript always fully when needed or do we keep using the old one? I guess not, but I wonder if this could also help?
+
+Basically the sidecar option has the downside that if we do two checkpoints in a session the second checkpoint could happen on a different machine even bei a different user and then the sidecar would be missing... or ok, resume could also restore it...
+
+---
+
+the issue is that we need a backward lookup on every new checkpoint to figure out which prior checkpoint exists and belongs to the session too and inject that again
+
+---
+
+The problem is: 
+
+I have 5 checkpoints that belong to a single session, I want to be able to see for example the session of the 4th and then could expand the timeline easily (without complex data lookups) and have the referneces to the earlier checkpoints. So we could have session views in the UI that are an actual timeline. We could build all that data later, but it's complex, also rebase might remove checkpoints or user might drop it, but the log would still have them and we could also surface that "there was a checkpoint here, it doesn't exist anymore"
+
+---
+
+yeah, this is the question, I would be also surprised if running agents even accept changes on the jsonl while they still have it "open" and add more data to it
+
+---
+
+the issue is: we support multiple agent, I think let's just assume: one of the agent will keep it open, the changes are very high
+
+---
+
+I can do `entire resume <branch>` with a branch I haven't touched since 2 weeks and continue. Then we would go back through 2 weeks of commits and everything would blow up. With a sidecar that we restore on resume this would be safer?
+
+---
+
+yeah I think it should be `.entire/session-commits/<agent>-<session_identifier>.jsonl`
+
+---
+
+yes, please do
+
+---
+
+I wonder if with this approach we should always add a trailer to any commit made
+
+---
+
+a lighter trailer would be Change-Id I think. Can you check what gitbutler is doing there?
+
+---
+
+gitbutler is also doing change-id as header?
+
+---
+
+but a `git rebase` on those repos (not using the right tooling) could break that too, right?
+
+---
+
+ok, maybe separate the things: 
+
+Phase 1: build the sidecar log based on checkpoint trailers, if they are there, we use them, if not we don't track the commit
+Phase 2: improve this by switching to Change-Id (or support both)
+
+---
+
+yes let's try to build an implementation for Phase 1
+
+---
+
+1. High: the new commits.jsonl entry is written too late to ever be included in the checkpoint that was just condensed. In postCommitProcessSession,
+     TransitionAndLog(...) performs the condensation first, and only afterward do we append the sidecar entry (cmd/entire/cli/strategy/
+     manual_commit_hooks.go:1325). The condense path builds WriteCommittedOptions without MetadataDir at all (cmd/entire/cli/strategy/
+     manual_commit_condensation.go:229), and checkpoint persistence only copies sidecar files when opts.MetadataDir != "" (cmd/entire/cli/checkpoint/
+     committed.go:318). So the current checkpoint never contains its own commit-log row; at best a later checkpoint could copy a stale local file, and the last
+     commit in a session is lost entirely. That breaks the “timeline reconstruction” comment in practice.
+
+---
+
+do we have tests now confirming this? integration tests?
+
+---
+
+what's left todo
+
+---
+
+but we are not using the sidecar for anything yet either, right?
+
+---
+
+Findings:
+
+1. Medium: `CommitLog` is wired into shared `WriteCommittedOptions`, but the v2 writer still drops it. `CondenseSession` now passes `CommitLog` into both v1 and v2 writes (`[manual_commit_condensation.go](/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/strategy/manual_commit_condensation.go:244)`), and the field is defined on the shared options struct (`[checkpoint.go](/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/checkpoint.go:312)`). But `V2GitStore.writeMainSessionToSubdirectory` only writes `prompt.txt`, compact transcript, and `metadata.json`; it never persists `commits.jsonl` (`[v2_committed.go](/Users/soph/Work/entire/devenv/cli_experiments_2/cmd/entire/cli/checkpoint/v2_committed.go:334)`). If `checkpoints_v2` is enabled, the new timeline data exists in v1 only, so v2-backed reads/migration will silently lose it.
+
+Open questions / residual risk:
+
+- I don’t see any reader/API for `commits.jsonl` yet, so this is still largely write-side plumbing plus tests.
+- I reran the targeted tests, including the new post-commit coverage and the checkpoint package tests; they passed.
+
+---
+
+<task-notification>
+<task-id>bq0xjm6ti</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments-2/516f7a41-923a-44e0-b589-c1521da2dfcf/tasks/bq0xjm6ti.output</output-file>
+<status>completed</status>
+<summary>Background command "Run full test suite" completed (exit code 0)</summary>
+</task-notification>

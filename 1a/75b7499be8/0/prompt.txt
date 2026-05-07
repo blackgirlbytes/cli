@@ -1,0 +1,405 @@
+Implement the following plan:
+
+# Plan: Add Factory AI Droid Integration Tests
+
+## Context
+
+The integration test folder (`cmd/entire/cli/integration_test/`) has comprehensive tests for Claude Code and Gemini CLI agents — detection, hook installation, session operations, strategy composition, and `enable` command smoke tests. Factory AI Droid has **zero** integration tests despite implementing `HookSupport`, `HookHandler`, `TranscriptAnalyzer`, and `SubagentAwareExtractor`. This is a coverage gap for the real CLI binary execution path.
+
+## Files to Modify/Create
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `integration_test/hooks.go` | Modify | Add `FactoryDroidHookRunner`, `FactoryDroidSession`, `CreateDroidTranscript` |
+| `integration_test/agent_test.go` | Modify | Add detection, hook install, helper, and session stub tests |
+| `integration_test/setup_factoryai_hooks_test.go` | Create | Smoke tests for `entire enable --agent factoryai-droid` |
+| `integration_test/agent_strategy_test.go` | Modify | Add agent+strategy composition tests |
+
+## Step 1: Add Hook Runner to `hooks.go`
+
+Add `FactoryDroidHookRunner` mirroring `GeminiHookRunner` (line 501).
+
+**Key details:**
+- Routes to `exec.Command(getTestBinary(), "hooks", "factoryai-droid", hookName)`
+- No project dir env var needed (unlike Claude/Gemini, `GetSessionDir` is a stub)
+- Just passes `os.Environ()` and `cmd.Dir = r.RepoDir`
+
+**Simulation methods:**
+- `SimulateUserPromptSubmit(sessionID)` — input: `{session_id, transcript_path, prompt}`
+- `SimulateStop(sessionID, transcriptPath)` — input: `{session_id, transcript_path}`
+- `SimulateSessionStart(sessionID)` — input: `{session_id, transcript_path}`
+- `SimulateSessionEnd(sessionID, transcriptPath)` — input: `{session_id, transcript_path}`
+- `SimulatePreTask(sessionID, transcriptPath, toolUseID)` — input with `tool_input`
+- `SimulatePostTask(input PostTaskInput)` — input with `tool_response.agentId`
+- `SimulateUserPromptSubmitWithOutput`, `SimulateSessionStartWithOutput` — return `HookOutput`
+
+**`FactoryDroidSession` struct + `NewFactoryDroidSession()` on TestEnv:**
+- Session ID format: `"droid-session-N"`
+- Transcript path: `.entire/tmp/<id>.jsonl`
+- `CreateDroidTranscript(prompt, changes)` — must generate **Droid envelope JSONL**, not Claude format
+
+**Droid transcript format** (critical — `ParseDroidTranscript` requires `type:"message"` outer wrapper):
+```jsonl
+{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"Fix the bug"}]}}
+{"type":"message","id":"m2","message":{"role":"assistant","content":[{"type":"text","text":"I'll fix it"},{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"main.go","content":"..."}}]}}
+{"type":"message","id":"m3","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"Success"}]}}
+```
+
+**Convenience methods on TestEnv:**
+- `SimulateFactoryDroid{UserPromptSubmit,Stop,SessionStart,SessionEnd,PreTask,PostTask}`
+- `SimulateFactoryDroid{UserPromptSubmit,SessionStart}WithOutput`
+
+## Step 2: Add Tests to `agent_test.go`
+
+Add 4 test functions at the end. Import `factoryaidroid` package.
+
+### `TestFactoryAIDroidAgentDetection` (not parallel — `os.Chdir`)
+- "agent is registered" — `agent.List()` contains `"factoryai-droid"` (parallel)
+- "detects presence when .factory exists" — create `.factory` dir, `os.Chdir`, `DetectPresence()` → true
+
+### `TestFactoryAIDroidHookInstallation` (not parallel — `os.Chdir`)
+- "installs all required hooks" — `InstallHooks(false, false)` returns 7; `AreHooksInstalled()` true; settings.json contains SessionStart, SessionEnd, Stop, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact; permissions.deny has `Read(./.entire/metadata/**)`
+- "idempotent - second install returns 0"
+- "localDev mode uses go run" — settings.json contains `"go run"` and `"${FACTORY_PROJECT_DIR}"`
+- "production mode uses entire binary" — settings.json contains `"entire hooks factoryai-droid"`
+- "force flag reinstalls hooks" — force=true returns 7 after initial install
+
+### `TestFactoryAIDroidHelperMethods` (parallel)
+- "FormatResumeCommand returns droid --session-id" — `FormatResumeCommand("abc123")` == `"droid --session-id abc123"`
+- "GetHookConfigPath returns .factory/settings.json"
+
+### `TestFactoryAIDroidSessionStubs` (parallel)
+- "ReadSession returns not-implemented error"
+- "WriteSession returns not-implemented error"
+- "GetSessionDir returns not-implemented error"
+
+## Step 3: Create `setup_factoryai_hooks_test.go`
+
+Mirror `setup_gemini_hooks_test.go`. Build tag: `//go:build integration`.
+
+### `TestSetupFactoryAIHooks_AddsAllRequiredHooks`
+- `NewTestEnv`, `InitRepo`, `InitEntire("manual-commit")`, initial commit
+- `RunCLIWithError("enable", "--agent", "factoryai-droid")`
+- Read `.factory/settings.json` → verify all 7 hook types present
+- Verify `permissions.deny` contains metadata deny rule
+
+### `TestSetupFactoryAIHooks_PreservesExistingSettings`
+- Pre-populate `.factory/settings.json` with `customSetting` and user Stop hook
+- Run `enable --agent factoryai-droid`
+- Verify `customSetting` preserved, user Stop hook preserved, our hooks added
+
+**Helper:** `readFactorySettingsFile(t, env) FactorySettings`
+
+## Step 4: Add Strategy Tests to `agent_strategy_test.go`
+
+### `TestFactoryAIDroidAgentStrategyComposition`
+- Iterate `AllStrategies()` manually (can't use `RunForAllStrategies` — it defaults agent to claude-code)
+- For each strategy: `NewTestEnv` → `InitRepo` → `InitEntireWithAgent(strat, "factoryai-droid")` → initial commit → feature branch
+- Create `FactoryDroidSession` with Droid-envelope transcript
+- Simulate `UserPromptSubmit` → `Stop`
+- Verify `GetRewindPoints()` has >= 1 point
+
+### `TestFactoryAIDroidSessionIDTransformation`
+- Same setup, verify `Rewind(points[0].ID)` succeeds
+
+**Note:** Since `ReadSession` is a stub, these tests only verify the hook-based flow (lifecycle dispatcher reads transcript via `TranscriptAnalyzer` interface). No transcript restoration test (that requires `ReadSession`/`WriteSession`).
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Integration tests specifically:
+```bash
+mise run test:integration
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.REDACTED.jsonl
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+<task-notification>
+<task-id>b145810</task-id>
+<tool-use-id>toolu_01J9CCWjopaLavSBi3aKUQAu</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha-Projects-devenv-cli/tasks/b145810.output</output-file>
+<status>failed</status>
+<summary>Background command "Run unit tests" failed with exit code 1</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-alisha-Projects-devenv-cli/tasks/b145810.output
+
+---
+
+<task-notification>
+<task-id>be67e05</task-id>
+<tool-use-id>toolu_01SVpDmZvSww3iBJQwjQq35m</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha-Projects-devenv-cli/tasks/be67e05.output</output-file>
+<status>failed</status>
+<summary>Background command "Run all tests (unit + integration)" failed with exit code 1</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-alisha-Projects-devenv-cli/tasks/be67e05.output
+
+---
+
+[Request interrupted by user]
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	new file:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+	modified:   cmd/entire/cli/integration_test/agent_strategy_test.go
+	modified:   cmd/entire/cli/integration_test/agent_test.go
+	modified:   cmd/entire/cli/integration_test/hooks.go
+	new file:   cmd/entire/cli/integration_test/setup_factoryai_hooks_test.go
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	.claude/worktrees/
+	implement-agent-guide.md
+	test-files/
+- Current git diff (staged and unstaged changes): <persisted-output>
+Output too large (41.3KB). Full output saved to: /Users/alisha/.REDACTED.txt
+
+Preview (first 2KB):
+diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+new file mode 100644
+index 00000000..539f605a
+--- /dev/null
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+@@ -0,0 +1,342 @@
++package factoryaidroid
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/entireio/cli/cmd/entire/cli/agent"
++)
++
++func TestNewFactoryAIDroidAgent(t *testing.T) {
++	t.Parallel()
++	ag := NewFactoryAIDroidAgent()
++	if ag == nil {
++		t.Fatal("NewFactoryAIDroidAgent() returned nil")
++	}
++	if _, ok := ag.(*FactoryAIDroidAgent); !ok {
++		t.Fatal("NewFactoryAIDroidAgent() didn't return *FactoryAIDroidAgent")
++	}
++}
++
++func TestName(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	if name := ag.Name(); name != agent.AgentNameFactoryAIDroid {
++		t.Errorf("Name() = %q, want %q", name, agent.AgentNameFactoryAIDroid)
++	}
++}
++
++func TestType(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	if tp := ag.Type(); tp != agent.AgentTypeFactoryAIDroid {
++		t.Errorf("Type() = %q, want %q", tp, agent.AgentTypeFactoryAIDroid)
++	}
++}
++
++func TestDescription(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	desc := ag.Description()
++	if desc == "" {
++		t.Error("Description() returned empty string")
++	}
++}
++
++func TestProtectedDirs(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	dirs := ag.ProtectedDirs()
++	if len(dirs) != 1 || dirs[0] != ".factory" {
++		t.Errorf("ProtectedDirs() = %v, want [.factory]", dirs)
++	}
++}
++
++func TestGetHookConfigPath(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	path := ag.GetHookConfigPath()
++	if path != ".factory/settings.json" {
++		t.Errorf("GetHookConfigPath() = %q, want .factory/settings.json", path)
++	}
++}
++
++func TestSupportsHooks(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	if !ag.SupportsHooks() {
++		t.Error("SupportsHooks() = false, want true")
++	}
++}
+...
+</persisted-output>
+- Current branch: alisha/factoryai-agent
+- Recent commits: da2c18a7 Simplify Droid transcript parsing code
+bdf4c1af Fix Factory AI Droid transcript parsing and session lifecycle issues
+3c37cf55 Add Factory AI Droid agent integration
+6705e0a4 Merge pull request #414 from entireio/alex/investigate-test-hang
+8253d4b7 Fix integration tests hanging on machines with a TTY
+0301248e Add security and privacy documentation (#398)
+a47766b3 Merge pull request #404 from entireio/fixflakytest
+e592af2c fix tests
+d4b77a91 fix flaky test
+cc63eff9 Merge pull request #362 from entireio/update_enable
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. The user provided a detailed plan for adding Factory AI Droid integration tests to the CLI codebase.
+
+2. I read multiple reference files to understand the existing patterns:
+   - `integration_test/hooks.go` - Existing HookRunner and GeminiHookRunner patterns
+   - `integration_test/agent_test.go` - Existing agent detection, hook installation, session operation tests
+   - `integration_test/agent_strategy_test.go` - Strategy composition tests
+   - `integration_test/setup_gemini_hooks_test.go` - Gemini smoke tests pattern
+   - `agent/factoryaidroid/factoryaidroid.go` - The Factory AI Droid agent implementation
+   - `agent/factoryaidroid/hooks.go` - Hook installation, 7 hooks, FactorySettings types
+   - `agent/factoryaidroid/transcript.go` - Droid transcript parsing (envelope format)
+   - `agent/factoryaidroid/lifecycle.go` - ParseHookEvent, TranscriptAnalyzer, etc.
+   - `agent/factoryaidroid/types.go` - FactorySettings, FactoryHooks, etc.
+   - `integration_test/testenv.go` - TestEnv, InitEntireWithAgent, etc.
+   - `integration_test/transcript.go` - TranscriptBuilder for Claude Code format
+
+3. I implemented the plan in 4 steps:
+   - Step 1: Added FactoryDroidHookRunner, FactoryDroidSession, CreateDroidTranscript to hooks.go
+   - Step 2: Added 4 test functions to agent_test.go (detection, hook installation, helpers, stubs)
+   - Step 3: Created setup_factoryai_hooks_test.go (smoke tests)
+   - Step 4: Added strategy composition tests to agent_strategy_test.go
+
+4. Key error encountered: When running `mise run test:ci`, the strategy composition tests failed because:
+   - `InitEntireWithAgent` writes `"agent": "factoryai-droid"` to `.entire/settings.json`
+   - `EntireSettings` struct doesn't have an `agent` field
+   - Settings loader uses `DisallowUnknownFields()`, causing parse error
+   - This caused a log line to be emitted before JSON output from `rewind --list`
+   - `GetRewindPoints()` uses `CombinedOutput()` which captures both stdout and stderr, corrupting JSON parsing
+
+5. Fix: Changed strategy tests to use `InitEntire(strat)` instead of `InitEntireWithAgent(strat, "factoryai-droid")` since the agent is determined by hook command routing (`entire hooks factoryai-droid ...`), not by settings.json.
+
+6. Also removed the unnecessary blank import of factoryaidroid from agent_strategy_test.go.
+
+7. After the fix, integration tests passed (`mise run test:integration` → ok 54.506s).
+
+8. Format and lint also passed cleanly.
+
+9. There was also an unrelated test timeout in `TestRunExplain_SessionFlagFiltersListView` (10 minute timeout in the `cli` package), which is not related to our changes.
+
+10. The user then invoked the `/commit` skill to commit the changes. The staged files are:
+    - new: `cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go`
+    - modified: `cmd/entire/cli/integration_test/agent_strategy_test.go`
+    - modified: `cmd/entire/cli/integration_test/agent_test.go`
+    - modified: `cmd/entire/cli/integration_test/hooks.go`
+    - new: `cmd/entire/cli/integration_test/setup_factoryai_hooks_test.go`
+
+Summary:
+1. Primary Request and Intent:
+   The user asked me to implement a detailed plan for adding Factory AI Droid integration tests to the CLI codebase. The plan specified 4 files to modify/create with specific test functions, hook runners, session helpers, and transcript builders. After implementation, the user invoked `/commit` to commit the staged changes.
+
+2. Key Technical Concepts:
+   - **Integration test binary pattern**: `TestMain` builds the CLI binary once, all tests invoke it as a subprocess via `getTestBinary()`. Hook runners shell out to `entire hooks <agent> <hook-name>` with JSON on stdin.
+   - **Droid transcript envelope format**: Droid wraps messages as `{"type":"message","id":"...","message":{"role":"...","content":[...]}}`, unlike Claude Code's `{"type":"assistant","uuid":"...","message":{"content":[...]}}`.
+   - **Agent routing**: The agent is determined by the hook subcommand path (`entire hooks factoryai-droid ...`), NOT by `.entire/settings.json`. `EntireSettings` struct doesn't have an `agent` field.
+   - **`DisallowUnknownFields()`**: The settings loader in `settings/settings.go:117` rejects unknown JSON fields, so adding `"agent"` to settings.json causes parse errors.
+   - **Factory AI Droid hooks**: 7 hooks total — SessionStart, SessionEnd, Stop, UserPromptSubmit, PreToolUse[Task], PostToolUse[Task], PreCompact.
+   - **os.Chdir limitation**: Tests using `os.Chdir` can't use `t.Parallel()` since it's process-global state.
+   - **FactorySettings types**: Defined in `factoryaidroid/types.go` — `FactorySettings`, `FactoryHooks`, `FactoryHookMatcher`, `FactoryHookEntry`.
+
+3. Files and Code Sections:
+   - **`cmd/entire/cli/integration_test/hooks.go`** (modified)
+     - Added `FactoryDroidHookRunner` struct and methods (SimulateUserPromptSubmit, SimulateStop, SimulateSessionStart, SimulateSessionEnd, SimulatePreTask, SimulatePostTask, plus WithOutput variants)
+     - Added `FactoryDroidSession` struct with `NewFactoryDroidSession()` on TestEnv and `CreateDroidTranscript()` method that produces Droid-envelope JSONL
+     - Added convenience methods on TestEnv (SimulateFactoryDroid*)
+     - No project dir env var needed (unlike Claude/Gemini runners)
+
+   - **`cmd/entire/cli/integration_test/agent_test.go`** (modified)
+     - Added import: `"github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid"`
+     - Added `TestFactoryAIDroidAgentDetection` — tests agent registration and `.factory` directory detection
+     - Added `TestFactoryAIDroidHookInstallation` — 5 subtests: installs 7 hooks, idempotent, localDev mode, production mode, force flag
+     - Added `TestFactoryAIDroidHelperMethods` — FormatResumeCommand, GetHookConfigPath
+     - Added `TestFactoryAIDroidSessionStubs` — ReadSession, WriteSession, GetSessionDir all return "not implemented"
+
+   - **`cmd/entire/cli/integration_test/setup_factoryai_hooks_test.go`** (created)
+     - Type alias: `type FactorySettings = factoryaidroid.FactorySettings`
+     - `TestSetupFactoryAIHooks_AddsAllRequiredHooks` — runs `entire enable --agent factoryai-droid`, verifies all 7 hook types and permissions.deny
+     - `TestSetupFactoryAIHooks_PreservesExistingSettings` — pre-populates settings with custom fields and user hooks, verifies they're preserved after enable
+     - Helper: `readFactorySettingsFile(t, env)`
+
+   - **`cmd/entire/cli/integration_test/agent_strategy_test.go`** (modified)
+     - Added `TestFactoryAIDroidAgentStrategyComposition` — iterates `AllStrategies()` manually, uses `InitEntire(strat)` (NOT `InitEntireWithAgent`), creates Droid session, simulates UserPromptSubmit → Stop, verifies rewind points
+     - Added `TestFactoryAIDroidSessionIDTransformation` — same setup, additionally tests that `Rewind(points[0].ID)` succeeds
+     - Removed blank import of factoryaidroid (not needed)
+
+   - **Reference files read** (not modified):
+     - `factoryaidroid/factoryaidroid.go` — Agent interface implementation, ParseHookInput, stubs for ReadSession/WriteSession/GetSessionDir
+     - `factoryaidroid/hooks.go` — InstallHooks implementation, 7 hook types, entireHookPrefixes, AreHooksInstalled
+     - `factoryaidroid/transcript.go` — ParseDroidTranscript, droidEnvelope, ExtractModifiedFiles
+     - `factoryaidroid/lifecycle.go` — ParseHookEvent, TranscriptAnalyzer, TokenCalculator, SubagentAwareExtractor
+     - `factoryaidroid/types.go` — FactorySettings, FactoryHooks structs, sessionInfoRaw, FileModificationTools
+     - `settings/settings.go` — EntireSettings struct (no agent field), DisallowUnknownFields() on line 117
+     - `config.go` — GetStrategy() falls back to default with INFO log when settings parsing fails
+
+4. Errors and fixes:
+   - **Strategy composition tests failed with JSON parse error**:
+     - Error: `failed to parse rewind points: invalid character '/' after top-level value` — log line `2026/02/19 INFO falling back to default strategy - failed to load settings error="json: unknown field \"agent\""` was mixed into JSON output
+     - Root cause: `InitEntireWithAgent()` wrote `"agent": "factoryai-droid"` to `.entire/settings.json`, but `EntireSettings` struct doesn't have that field. `DisallowUnknownFields()` rejected it, causing `GetStrategy()` to log a warning that corrupted `GetRewindPoints()`'s JSON parsing (uses `CombinedOutput()`)
+     - Fix: Changed to `InitEntire(strat)` instead of `InitEntireWithAgent(strat, "factoryai-droid")`. The agent is determined by hook command routing, not settings.json.
+   - **Unrelated test timeout**: `TestRunExplain_SessionFlagFiltersListView` timed out at 10 minutes in the `cli` package — pre-existing issue, not related to our changes.
+
+5. Problem Solving:
+   - Successfully implemented all 4 steps of the plan
+   - Discovered and fixed the settings.json "agent" field incompatibility
+   - Integration tests pass: `mise run test:integration` → ok 54.506s
+   - Lint passes: `mise run lint` → 0 issues
+   - Format passes: `mise run fmt` → clean
+
+6. All user messages:
+   - "Implement the following plan: [detailed plan for Factory AI Droid integration tests with 4 steps, file modifications, test functions, and transcript format details]"
+   - User invoked `/commit` skill to commit the staged changes
+
+7. Pending Tasks:
+   - The `/commit` skill was invoked — need to create the git commit for the staged changes
+   - Task #5 "Run fmt, lint, and tests" is still marked in_progress (fmt and lint passed, integration tests passed, unit tests had unrelated timeout)
+
+8. Current Work:
+   The user invoked the `/commit` skill. The staged files are:
+   - `cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go` (new)
+   - `cmd/entire/cli/integration_test/agent_strategy_test.go` (modified)
+   - `cmd/entire/cli/integration_test/agent_test.go` (modified)
+   - `cmd/entire/cli/integration_test/hooks.go` (modified)
+   - `cmd/entire/cli/integration_test/setup_factoryai_hooks_test.go` (new)
+
+9. Optional Next Step:
+   Create the git commit for the staged changes as requested by the `/commit` skill invocation. The commit should summarize: adding Factory AI Droid integration tests covering agent detection, hook installation, session stubs, enable command smoke tests, and strategy composition with both manual-commit and auto-commit strategies.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.REDACTED.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.

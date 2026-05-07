@@ -1,0 +1,129 @@
+can you help me understand this again: 
+
+	// OpenCode uses a repo-root config file in addition to its protected
+	// directory. If pre-prompt state is missing, this file would otherwise be
+	// misattributed as agent work and keep shadow branches alive.
+
+---
+
+but I've never seen an opencode.json in root? can you also check the opencode source ../../research/opencode/ why it would do that?
+
+---
+
+BUt wouldn't be the better fix then to let our e2e test add in .opencode/opencode.json? I'm mostly worried that a specific agent detail bleeds into state.go
+
+---
+
+yeah let's build ProtectedFiles() interface now
+
+---
+
+what if an external agent implements this now? will we break them with this interface change?
+
+---
+
+ok, let's do it then
+
+---
+
+https://www.youtube.com/watch?v=lL--M_s5UTA
+
+---
+
+Here's my review of the branch changes (committed + unstaged):
+
+## Overview
+
+This branch fixes several OpenCode integration issues across 6 commits plus additional unstaged work. Two main themes:
+
+### 1. OpenCode Plugin Reliability (committed)
+
+**Turn-start made synchronous** — `callHookSync` replaces `await callHook` for `turn-start`. This is the right call — if a fast mid-turn commit hits git hooks before the async turn-start completes, session state won't be initialized yet.
+
+**Fallback session/turn bootstrapping in `message.updated`** — Handles the case where `opencode run` commits before `message.part.updated` fires. The `resetSessionTracking()` extraction is clean and eliminates the duplicated clear/reset logic.
+
+**Prompt backfill from transcript** — `ExtractPrompts` implements `agent.PromptExtractor` so turn-end can backfill prompts from the OpenCode export file when they weren't captured during turn-start (empty prompt fallback).
+
+### 2. Agent file exclusion from session tracking (committed + unstaged)
+
+**Committed:** `shouldIgnoreSessionTrackingPath` centralizes the filtering of agent-owned files (`opencode.json`, `.opencode/`, `.entire/`, etc.) from `DetectFileChanges`, `FilterAndNormalizePaths`, and `getUntrackedFilesForState`. Previously only `.entire/` was excluded.
+
+**Unstaged:** Generalizes this further by adding `ProtectedFiles() []string` to the `Agent` interface, so `shouldIgnoreSessionTrackingPath` queries the registry dynamically instead of hardcoding `opencode.json`.
+
+## Issues & Suggestions
+
+**1. Interface change blast radius.** The `ProtectedFiles()` addition touches every `Agent` implementation and every mock — 15+ files. Every agent except OpenCode returns `nil`. Consider making this an optional interface (like `PromptExtractor`) instead:
+
+```go
+type FileProtector interface {
+    ProtectedFiles() []string
+}
+```
+
+This eliminates all the `return nil` boilerplate and keeps the core `Agent` interface stable.
+
+**2. `AllProtectedFiles()` instantiates every agent on every call.** Same pattern as `AllProtectedDirs()` so it's consistent, but both allocate fresh agents each time. Not a problem now but worth noting if call frequency increases. Consider caching if this gets called in hot paths.
+
+**3. Hardcoded `opencode.json` in committed code is superseded by unstaged work.** The committed `shouldIgnoreSessionTrackingPath` has:
+```go
+if cleanPath == "opencode.json" {
+    return true
+}
+```
+The unstaged diff replaces this with the dynamic `AllProtectedFiles()` check. The committed code on its own is correct but will look odd in git history — the hardcoded check lives for exactly one commit before being generalized. Not a blocker, just worth squashing or noting.
+
+**4. Test uses `t.Chdir` without the `t.Parallel()` exception comment.** `TestHandleLifecycleTurnEnd_BackfillsPromptFromOpenCodeTranscript` correctly avoids `t.Parallel()` and has the comment, but `TestDetectFileChanges_IgnoresOpenCodeAgentFiles` uses `t.Chdir` without `t.Parallel()` and is missing the explanatory comment. Minor consistency nit.
+
+**5. Plugin `resetSessionTracking` returns bool but the return value semantics are subtle.** It returns `true` when a reset actually happened (session ID changed) and `false` when it's the same session. The callers use it correctly, but a brief doc comment on the function would help future readers.
+
+## Looks Good
+
+- The sync hook approach is well-motivated and the comment update explains the "why"
+- Test coverage is solid — new tests for sync dispatch, fallback session-start, fallback turn-start, file exclusion
+- `ExtractPrompts` reuses existing `SliceFromMessage` + `ExtractAllUserPrompts` cleanly
+- Using `testutil.InitRepo` consistently across new tests
+
+---
+
+yes, do it
+
+---
+
+Good — I can see you've addressed the main concern from my previous review. Here's the updated review:
+
+## What Changed Since Last Review
+
+You switched `ProtectedFiles` from a required `Agent` interface method to an **optional interface** (`ProtectedFilesProvider`), exactly as suggested. This eliminated the `return nil` boilerplate from every agent and mock.
+
+`AllProtectedFiles()` now does a type assertion:
+```go
+pf, ok := factory().(ProtectedFilesProvider)
+if !ok {
+    continue
+}
+```
+
+Only OpenCode and the external agent implement it. Much cleaner.
+
+## Remaining Issues
+
+**1. `wrappedAgent` in `external/capabilities.go` unconditionally delegates `ProtectedFiles()`.** But `wrappedAgent` embeds an `Agent` (the base interface), not a `ProtectedFilesProvider`. If the wrapped agent doesn't implement `ProtectedFiles()`, this will fail to compile — or if it does compile because `external.Agent` always has the method, the wrapper still unconditionally exposes it, which means any external agent gets opted into `ProtectedFilesProvider` whether they declared `protected_files` or not. This is probably fine in practice (returns `nil`), but worth verifying the intent.
+
+**2. Test mock `protectedDirAgent` implements `ProtectedFiles()` directly**, which means it always satisfies `ProtectedFilesProvider`. The "collects files" test will pass, but it doesn't test the skip path where an agent *doesn't* implement the interface. Consider adding an agent without `ProtectedFiles()` to the "collects files" test to verify the type assertion branch.
+
+**3. Hardcoded `opencode.json` in committed code (8c67f69bb) is still superseded by this unstaged work.** When you commit the unstaged changes, consider squashing or at least noting this in the commit message so the history reads cleanly.
+
+## Looks Good
+
+- Optional interface approach is the right design — no interface pollution
+- `AllProtectedFiles()` correctly copies factories before releasing the lock, matching `AllProtectedDirs()` pattern
+- External agent types properly expose `protected_files` in the JSON schema
+- Tests cover empty registry, collection, and deduplication
+
+---
+
+ok, let's ammend the last commit as suggested, right?
+
+---
+
+or let's make a better commit title then, together with 8c67f69bb ?

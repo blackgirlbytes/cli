@@ -1,0 +1,138 @@
+Implement the following plan:
+
+# Plan: Remove Strategy Abstraction & Add `commit_linking` Setting
+
+## Context
+
+The CLI has a `Strategy` interface abstraction (`strategy.go`) designed to support multiple session strategies, but only one implementation (`ManualCommitStrategy`) has ever existed. The current behavior prompts users on every commit to link/unlink the session. Per RFD-003 decisions, we need to:
+
+1. Remove the `Strategy` interface (inline the single implementation)
+2. Add a `commit_linking` setting (`always` / `prompt`)
+3. Default new users to `always` (auto-link), existing users to `prompt` (preserve current behavior)
+4. No user migration action required
+
+## Implementation Steps
+
+### Step 1: Add `commit_linking` setting to `EntireSettings`
+
+**Files:**
+- `cmd/entire/cli/settings/settings.go`
+
+**Changes:**
+- Add `CommitLinking string` field to `EntireSettings` struct with `json:"commit_linking,omitempty"`
+- Add `GetCommitLinking() string` resolver method:
+  - If `CommitLinking` is explicitly set → return it
+  - Otherwise → return `"prompt"` (safe default, preserves existing user behavior)
+- Add validation constant `CommitLinkingAlways = "always"`, `CommitLinkingPrompt = "prompt"`
+- Update `mergeJSON()` to handle the `commit_linking` field override
+
+### Step 2: Set `commit_linking: "always"` for new installations
+
+**Files:**
+- `cmd/entire/cli/setup.go`
+
+**Changes:**
+- In the `entire enable` setup flow, set `settings.CommitLinking = "always"` before writing settings
+- This means new users get auto-linking by default
+- Existing users who don't have the field keep getting `"prompt"` via the `GetCommitLinking()` default
+
+### Step 3: Modify `PrepareCommitMsg` to respect `commit_linking`
+
+**Files:**
+- `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+**Changes:**
+- Load settings via `settings.Load(ctx)` at the start of `PrepareCommitMsg`
+- Call `settings.GetCommitLinking()` to determine mode
+- When `"always"`:
+  - For `source="message"` (-m flag): skip `askConfirmTTY()`, just add the trailer directly
+  - For `source=""` or `"template"` (editor flow): add trailer with comment (user can still remove it) — same as current behavior for this case
+- When `"prompt"`:
+  - Current behavior unchanged (prompt for `source="message"`, add with comment for editor)
+- The no-TTY fast path (agent committing) stays unchanged — always adds trailer regardless of setting
+
+### Step 4: Remove `Strategy` interface
+
+**Files:**
+- `cmd/entire/cli/strategy/strategy.go` — remove `Strategy` interface definition
+- `cmd/entire/cli/strategy/manual_commit.go` — change `NewManualCommitStrategy()` return type from `Strategy` to `*ManualCommitStrategy`, remove compile-time interface check
+- `cmd/entire/cli/config.go` — change `GetStrategy()` return type from `strategy.Strategy` to `*strategy.ManualCommitStrategy`
+
+**Changes:**
+- Delete the `Strategy` interface (~140 lines of interface definition)
+- Keep all method implementations on `ManualCommitStrategy` unchanged
+- Remove `Name()` and `Description()` methods from `ManualCommitStrategy` (no longer needed for polymorphism)
+- Keep `StrategyNameManualCommit` constant in `common.go` (still used in commit trailers/metadata)
+
+### Step 5: Update all call sites
+
+**Files that call `GetStrategy()`** (all in `cmd/entire/cli/`):
+- `hook_registry.go:113` — uses `.Name()` for logging → replace with `StrategyNameManualCommit` constant
+- `hooks_git_cmd.go:38` — stores `strategy.Strategy` in struct → change type to `*strategy.ManualCommitStrategy`
+- `lifecycle.go` (lines 80, 136, 343, 567, 673) — calls methods on strategy → no signature changes needed
+- `hooks_claudecode_posttodo.go:85` — calls `SaveTaskStep` → no change needed
+- `reset.go:48` — calls `Reset`/`ResetSession` → no change needed
+- `rewind.go` (lines 83, 334, 385) — calls rewind methods → no change needed
+- `resume.go:407` — calls `RestoreLogsOnly` → no change needed
+- `doctor.go:102` — calls `CondenseSessionByID` → no change needed
+
+**Specific changes:**
+- `hooks_git_cmd.go`: Change `gitHookContext.strategy` field type from `strategy.Strategy` to `*strategy.ManualCommitStrategy`
+- `hooks_git_cmd.go`: Remove `strategyName` field, use constant directly or inline `strategy.StrategyNameManualCommit`
+- `hook_registry.go:113`: Replace `GetStrategy(ctx).Name()` with `strategy.StrategyNameManualCommit`
+
+### Step 6: Clean up deprecated strategy references
+
+**Files:**
+- `cmd/entire/cli/settings/settings.go` — remove `FilesWithDeprecatedStrategy()` and `WriteDeprecatedStrategyWarnings()`
+- `cmd/entire/cli/strategy/manual_commit.go` — remove `Description()` method
+- `cmd/entire/cli/strategy/session.go` — update `Session.Strategy` field comments (or remove if unused)
+- `cmd/entire/cli/strategy/strategy.go` — update package doc, remove interface-related comments
+- `cmd/entire/cli/setup.go` — remove any `settings.Strategy` assignment if present
+
+### Step 7: Update tests
+
+**Files:**
+- `cmd/entire/cli/strategy/session_test.go` — remove `TestManualCommitStrategyImplementsSessionSource` (interface gone)
+- `cmd/entire/cli/explain_test.go` — remove `TestStrategySessionSourceInterface` (interface gone)
+- `cmd/entire/cli/settings/settings_test.go` — add tests for `GetCommitLinking()` default behavior
+- `cmd/entire/cli/strategy/manual_commit_hooks_test.go` — add tests for `commit_linking: "always"` vs `"prompt"` behavior in `PrepareCommitMsg`
+
+### Step 8: Update CLAUDE.md and docs
+
+**Files:**
+- `CLAUDE.md` — update strategy section to reflect new structure, document `commit_linking` setting
+- `docs/architecture/` — update relevant architecture docs
+
+## Migration Behavior (no user action required)
+
+| User type | Settings file state | `GetCommitLinking()` returns | Behavior |
+|-----------|-------------------|------------------------------|----------|
+| New user (runs `entire enable`) | `commit_linking: "always"` written | `"always"` | Auto-link, no prompt |
+| Existing user (no upgrade action) | No `commit_linking` field | `"prompt"` (default) | Same as before |
+| Existing user who sets preference | `commit_linking: "always"` or `"prompt"` | Explicit value | User's choice |
+
+## What doesn't change
+
+- All `ManualCommitStrategy` method implementations stay the same
+- Shadow branch behavior, condensation, rewind — all unchanged
+- `strategy_options` (push_sessions, summarize) — left as-is
+- `Strategy` field in settings struct — kept for backward compat (`json:"strategy,omitempty"`)
+- Commit trailer format, metadata structure — unchanged
+
+## Verification
+
+1. `mise run fmt && mise run lint` — passes
+2. `mise run test:ci` — all unit + integration tests pass
+3. Manual testing:
+   - Fresh `entire enable` → verify `commit_linking: "always"` in settings
+   - `git commit -m "test"` with active session → trailer auto-added (no prompt)
+   - Edit settings to `"prompt"` → `git commit -m "test"` → interactive prompt appears
+   - Existing settings file without `commit_linking` → prompt behavior preserved
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/429f455c-f7c6-43a4-8c81-444aba0cd42e.jsonl
+
+---
+
+commit and push this to a new PR

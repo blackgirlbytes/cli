@@ -1,0 +1,146 @@
+/brainstorming Help me to figure out a project plan for implementing checkpoints v2
+
+Based on the current state of this repository, I'd like to create a project plan for implementing both transcript log compaction as well as support for the new checkpoints v2 spec based on this document: ~/entire/company-knowledge/rfds/rfd-009-transcript-compaction.md
+
+Base parameters:
+
+- At the time of writing, the plan is for two people to work on this in parallel
+- Both engineers working on this are experienced staff software engineers at a startup
+- While we'll be collaborating actively, we'll need tasks to work on in parallel so making dependencies explicit is very important
+- We'll be working in pull requests against the default branch of this repo: main
+- We'll need a reasonable rollout plan that also includes validation of the changes
+
+Constraints:
+
+- The changes merged with each pull request should always result in a shippable product. New functionality will be hidden/deactivated based on strategy options, but existing functionality must not break for customers using this cli during the development process
+- Newly added functionality must not impact existing users or coworkers using this repository while we're still developing it
+- Before we haven't validated that our changes, especially everything related to writing refs, work, checkpoints in the v2 format should not be pushed to a production git repository. It would, however, be good to use validation repositories for testing and validation purposes.
+
+Open Questions
+
+The open questions down below don't need to be addressed immediately but should be addressed soon to ensure we're not missing anything going forward:
+
+- The cli currently has a plugin system which is documented here: https://docs.entire.io/cli/external-agents
+  - How do we add compaction support for agents implemented as external agent?
+  - I'm assuming that transcripts are simply copied and committed at the moment since they're not compacted or parsed in an agent specific way. Is that correct?
+
+
+Additional information
+
+- I've attached some handwritten notes with some ideas. Please also take them into account.
+
+When there are any open questions or ambiguity, please ask me rather than making decisions on my behalf. Thoroughly think about the timeline and execution of this project and come up with tasks and individual can work on. We'll manually add these tasks to our project management system.
+
+---
+
+I'd prefer option 1 where we're delegating the transcript compaction to the external plugin. Can you come up with a proposal for that so I can add it to the RFD, too?
+
+Something else I'd be interested in: Given the complexities around compaction, would it be possible to structure the project plan such that we can work on the v1 - v2 migration in parallel while someone else is working on compaction. I'd be open to suggestions to what this could look like.
+
+---
+
+I think I need to push back on the idea of accepting JSON via STDIN on the `compact-transcript` command. If I understand correctly, this is not a pattern that we're using for existing commands since the external agent binary should know where the transcripts are located on disk already. I'm assuming that the `--session-ref` parameter would already be enough information for the plugin to locate the transcripts on disk. Correct?
+
+Go take a look at the official docs here: https://docs.entire.io/cli/external-agents#chunk-transcript-max-size-%3Cn%3E
+
+---
+
+For the question about the 10mb limit: I'm not sure if have exising patterns for providing a `--output-dir` and the logistics of providing a folder to a plugin, the plugin writing to that folder and then having to clean up everything again sounds very involved. Could we instead return an `assets` property where an asset can either contain a `data` attribute with base64 encoded data or a file system reference? In the updated doc, I would mention that this would be an optional addition that we could implement down the road.
+
+---
+
+1: What I was thinking was:
+
+- First update the code paths that write the checkpoints metadata used in the hooks to support dual writes when the "checkpoints-v2" setting is enabled
+- In parallel we'd be working on the compaction logic, too
+- During the "dual write implementation" phase, we wouldn't push to production remotes
+- Given that full and proper validation will only be possible when the commands reading the checkpoints data I'd say we can start validating the changes more thoroughly once we have a full end2end scenario where we're writing the new formats to git and have at least one command that will read them.
+- After initial validation against testing repositories, we can start enablign dual writes to be pushed to a production repository. This will also help to unblock work related to updating the API and UI to take advantage of the new format.
+
+---
+
+I think your assumption is mostly correct. What I see as in-scope:
+
+- dual writes
+- compaction
+- validation
+- removing v1 support
+- Generation rotation
+
+Based on the document I think at least the migration and cleanup should be part of the initial work as well since we don't want to leave behind any stale data for our customers. We should add these to the project plan as well. I think the rest of the features mentioned in the doc can ship later.
+
+---
+
+Let's go with approach 1 for now
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+I'd go with option 2 for now but note that this decision is ultimately up to the person implementing this feature and might be subject to change.
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+Yes, let's plan for an additional safeguard for now. This can be something that only exists during development and is removed later.
+
+---
+
+For the current project plan, I'd assume that the migration tool would only run locally. We should add a note that it might become necessary to add a `--remote` option as well down the road.
+
+---
+
+Yes, go ahead
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+Continue with the review loop. The doc doesn't need to be checked into version control.
+
+---
+
+Can you phrase things about `entire clean` and such as a decision that should be made by the person who will implement this. This should be a rough plan used for distributing work, not a prescriptive spec. That's what the RFD is for!
+
+---
+
+The RFD I've references has also been updated. Can you take that into account, too?
+
+---
+
+I think the spec is good for now. I'd like to start working on the project now. I'll be working on the v2 ref structure. Can you start by adding the checkpoints checkpoints_v2 strategy option, related helpers and tests? We'll introduce the other options when they're actually needed.
+
+---
+
+/requesting-code-review Review the changes in this branch against main.
+
+---
+
+Can you commit the .gitignore change and the strategy option in two commits?

@@ -1,0 +1,271 @@
+Please read the plan in ~/entire/cli/docs/superpowers/plans/2026-04-14-best-effort-transcript-capture.md
+
+Validate that the current branch conforms with this plan and check that the changes made in this branch will actually solve the problems outlined in the doc. There has been some back and forth between multiple review agents and me so assume the branch is more up to date than the doc.
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>ab76344b90b7c2fae</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-best-effort-transcript-capture/aae844c1-f577-4647-90bb-2e38e82c96ed/tasks/ab76344b90b7c2fae.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>I now have a thorough understanding of all the changes. Here are my findings:
+
+---
+
+## Review Findings
+
+### 1. `resolveTranscriptFromAgentStorage` partially duplicates `resolveTranscriptPath` and `prepareTranscriptIfNeeded`
+
+**Overlap with `resolveTranscriptPath`** (`resolve_transcript.go:23`): Both functions resolve a transcript path using `ag.GetSessionDir` + `ag.ResolveSessionFile` and update `state.TranscriptPath`. However, they serve different purposes:
+- `resolveTranscriptPath` re-resolves a **known** path that went stale (file moved by agent mid-session). It requires `state.TranscriptPath != ""` as input and extracts `sessionDir` from the existing path via `filepath.Dir`.
+- `resolveTranscriptFromAgentStorage` resolves from scratch when **no path was ever set** (`state.TranscriptPath == ""`). It computes `sessionDir` via `ag.GetSessionDir(repoRoot)` using the session ID.
+
+These are genuinely different use cases (re-resolve vs first-resolve), so this is **not a duplication problem**. The core `GetSessionDir` + `ResolveSessionFile` sequence appears in 3 other places (2 in `manual_commit_rewind.go` at lines 739 and 886, plus `resolve_transcript.go`), but each operates in a different context (rewind restore, rewind status display, path re-resolution). No shared helper exists today for the "resolve from scratch" case.
+
+**Overlap with `prepareTranscriptIfNeeded`** (`common.go:1660`): The new function inlines the `AsTranscriptPreparer` + `PrepareTranscript` pattern (lines 451-461) instead of calling the existing `prepareTranscriptIfNeeded` helper. The difference is that `prepareTranscriptIfNeeded` silently swallows errors, while the new code logs the error at Debug level with context before continuing. That said, this is a **minor reuse opportunity**: the existing helper already handles the nil check and type assertion, and the extra logging could be done at the call site. Consider calling `prepareTranscriptIfNeeded(ctx, ag, resolved)` and adding the debug logging before/after if needed, rather than re-implementing the `AsTranscriptPreparer` check.
+
+### 2. `extractOrCreateSessionData` is a clean refactoring, not duplication
+
+This function consolidates the branching logic that was previously inline in `CondenseSession`. The old code had the same two branches (`hasShadowBranch` vs `state.TranscriptPath != ""`) plus error wrapping. The new function adds a third `default` branch for the empty case. The existing `extractSessionData` and `extractSessionDataFromLiveTranscript` methods are called through (not duplicated). **No issue here.**
+
+### 3. Empty session check in `tryAgentCommitFastPath` is unique but could be a method
+
+The condition `state.TranscriptPath == "" && len(state.FilesTouched) == 0 && state.StepCount == 0` at `manual_commit_hooks.go:1948` is used only once and has a different shape from the skip gate in `CondenseSession` (which checks `len(sessionData.Transcript) == 0 && len(sessionData.FilesTouched) == 0` on extracted data, not state fields). The `CondenseAndMarkFullyCondensed` also has its own slightly different guard (`state.StepCount <= 0` + `len(state.FilesTouched) > 0` checked separately). These are different enough in what they protect against that a shared helper would be forced. **No issue, but worth noting** that if more callers need "is this session empty enough to skip?" the condition should be extracted into a `SessionState` method.
+
+### 4. `paths.WorktreeRoot(ctx)` usage is correct and standard
+
+The new code at `manual_commit_condensation.go:420` uses `paths.WorktreeRoot(ctx)` which is the established pattern throughout the strategy package (20+ usages in production code). **No issue.**
+
+### 5. `Skipped` handling is consistent across all `CondenseSession` callers
+
+The new `Skipped` field on `CondenseResult` is checked in all callers:
+- `condenseAndUpdateState` (hooks.go:1318) - returns false, preserves state
+- `CondenseSessionByID` (condensation.go:1167) - returns nil, preserves state
+- `CondenseAndMarkFullyCondensed` (condensation.go:1289) - marks FullyCondensed
+- Carry-forward path (hooks.go:2735) - returns early
+
+**No issue.** All callers handle the skip case appropriately for their context.
+
+---
+
+## Summary
+
+**One actionable finding:** `resolveTranscriptFromAgentStorage` (lines 451-461 of `manual_commit_condensation.go`) inlines the `AsTranscriptPreparer` + `PrepareTranscript` pattern instead of calling the existing `prepareTranscriptIfNeeded` helper from `common.go:1660`. The only functional difference is extra debug logging on failure. Consider using `prepareTranscriptIfNeeded(ctx, ag, resolved)` to avoid duplicating the type-assertion boilerplate.
+
+**Everything else is clean** -- `extractOrCreateSessionData` is a proper refactor of inline code, the empty-session check is unique enough to not warrant extraction yet, `WorktreeRoot(ctx)` is the standard pattern, and the `writeTranscript` return-signature change is a focused modification with no reuse opportunities missed.</result>
+<usage><total_tokens>51149</total_tokens><tool_uses>30</tool_uses><duration_ms>126478</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ac9cd4f890bc0ce12</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-best-effort-transcript-capture/aae844c1-f577-4647-90bb-2e38e82c96ed/tasks/ac9cd4f890bc0ce12.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Good, that confirms the pre-existing `Skipped` pattern on `WriteTemporaryResult`. Now I have all the information I need for the review.
+
+---
+
+Here is the review of the diff against the six quality categories.
+
+## Findings
+
+### 1. The three `result.Skipped` checks in callers -- copy-paste with variation?
+
+The three callers of `CondenseSession` each handle `result.Skipped` differently:
+
+- **`condenseAndUpdateState`** (line 1318): returns `false` (no state mutation)
+- **`CondenseSessionByID`** (line 1167): logs and returns `nil` (preserves state, skips all post-condensation state updates)
+- **`CondenseAndMarkFullyCondensed`** (line 1289): marks `FullyCondensed = true`, saves state, returns
+
+These are **not copy-paste**. Each caller has genuinely different post-skip behavior dictated by its context (PostCommit needs `condensed=false`; doctor mode preserves state; eager-condense marks FullyCondensed so PostCommit stops retrying). The skip check is a 3-5 line block with different actions each time. Unifying this would require passing callback-style configuration into a shared function, which would be worse than the duplication. **No issue here.**
+
+### 2. Skip gate log: 5 slog attrs -- excessive?
+
+The skip gate at line 173 has 5 attributes: `session_id`, `agent_type`, `checkpoint_id`, `has_shadow_branch`, `transcript_path`. Compare to nearby log statements:
+- `resolveTranscriptFromAgentStorage` success log (line 477): 4 attrs
+- `logging.Warn` in `extractOrCreateSessionData` (line 401): 2 attrs
+- "session condensed" log in `condenseAndUpdateState` (line 1350): 5 attrs
+- "attribution calculated" (line 756): 9 attrs
+
+5 attrs is within the normal range for this codebase. The skip is a diagnostically important event (why did we not condense?) so the extra context (`has_shadow_branch`, `transcript_path`) is valuable for debugging. **No issue.**
+
+### 3. `condensed` field comment -- WHAT or WHY?
+
+The added comment (lines 636-638):
+```go
+// condensed is true only when CondenseSession wrote data to the metadata branch.
+// Both failures and skips (no transcript/files) leave condensed=false, which
+// correctly preserves shadow branches and defers FullyCondensed marking.
+```
+
+The first line ("condensed is true only when CondenseSession wrote data") is somewhat WHAT -- you could derive this from reading the code. But the second line explains WHY the field's semantics matter: that `false` is used downstream to preserve shadow branches and defer cleanup. This is non-obvious control flow across multiple methods (`processSession`, shadow branch cleanup, `FullyCondensed` marking). **The comment is net valuable.** The first line could arguably be tighter, but the second line justifies the comment's existence.
+
+### 4. `extractOrCreateSessionData` -- parameter sprawl (6 params)?
+
+The signature is:
+```go
+func (s *ManualCommitStrategy) extractOrCreateSessionData(
+    ctx context.Context, repo *git.Repository, ag agent.Agent,
+    shadowHash plumbing.Hash, hasShadowBranch bool, state *SessionState,
+)
+```
+
+6 parameters. Of these, `ctx` and `repo` are standard infrastructure, `ag` and `state` are domain objects, and `shadowHash`/`hasShadowBranch` are the pre-resolved shadow branch data.
+
+**Minor concern**: `shadowHash` and `hasShadowBranch` are a "poor man's optional" -- when `hasShadowBranch` is false, `shadowHash` is a zero-value hash. This pair could be collapsed into a single `*plumbing.Hash` (nil = no branch) or a small struct. That said, the existing code at the call site already had `ref` and `hasShadowBranch` as separate variables, and the function extracts `ref.Hash()` only when the branch exists. This pattern is used elsewhere in the codebase (see `resolveShadowRef`). **Debatable, not worth changing** -- the cognitive load of 6 params is manageable given that 2 are standard Go context/repo.
+
+### 5. `resolveTranscriptFromAgentStorage` mutates `state.TranscriptPath` -- leaky side effect
+
+At line 475:
+```go
+state.TranscriptPath = resolved
+```
+
+This function is named `resolveTranscriptFromAgentStorage` and returns `[]byte`. Its primary contract looks like a read-only transcript resolution, but it has a side effect of mutating `state.TranscriptPath`. The doc comment does mention this ("state.TranscriptPath is updated so subsequent condensation attempts can use the fast path"), but **the mutation is easy to miss at the call site** (line 163):
+
+```go
+if resolved := resolveTranscriptFromAgentStorage(ctx, ag, state); len(resolved) > 0 {
+```
+
+Nothing at the call site hints that `state` is being mutated. This is a **minor leaky abstraction / hidden side effect**. Options:
+- Return the resolved path alongside the bytes and have the caller set `state.TranscriptPath` explicitly
+- Rename to `resolveAndCacheTranscriptFromAgentStorage` to signal the mutation
+
+This is a minor readability concern, not a bug.
+
+### 6. `writeTranscript` return type change -- clean
+
+The `(bool, error)` return from `writeTranscript` in `committed.go` is a clean change. The caller now conditionally sets `filePaths.Transcript` and `filePaths.ContentHash` only when content was actually written. Previously, these paths were set unconditionally, which would leave dangling references when the transcript was empty. **Good fix, no issues.**
+
+### 7. No stringly-typed code concerns
+
+The new code uses `state.AgentType` (typed), `agent.Agent` interface, `id.CheckpointID` (typed), and `session.Phase` methods (`.IsActive()`). No raw strings where types exist.
+
+### 8. `tryAgentCommitFastPath` empty-session guard -- mirrors skip gate logic
+
+At line 1948:
+```go
+if state.TranscriptPath == "" && len(state.FilesTouched) == 0 && state.StepCount == 0 {
+```
+
+This predicts what `CondenseSession` would decide (the skip gate). The comment even says "These would produce a Skipped result in CondenseSession." This is a **forward-looking heuristic** to avoid adding a dangling trailer. It's not exactly copy-paste of the skip gate (it checks `StepCount == 0` which is a proxy for "no shadow branch data"), but it does encode knowledge about `CondenseSession`'s behavior in a distant location. If the skip gate conditions ever change, this guard might drift.
+
+**Minor concern**: This is a pragmatic optimization (avoid adding trailers that will never be fulfilled), not a duplication bug. But a brief comment like `// Must stay in sync with CondenseSession's skip gate` would help.
+
+---
+
+## Summary
+
+| # | Category | Finding | Severity |
+|---|----------|---------|----------|
+| 1 | Copy-paste | Three `result.Skipped` checks are **not** copy-paste -- each has distinct post-skip behavior | Not an issue |
+| 2 | Unnecessary comments | Skip gate log attrs (5) are within normal range for the codebase | Not an issue |
+| 3 | Unnecessary comments | `condensed` field comment: first line is borderline WHAT, but second line justifies it with WHY | Not an issue |
+| 4 | Parameter sprawl | `extractOrCreateSessionData` has 6 params; `shadowHash`/`hasShadowBranch` pair could be a single `*plumbing.Hash` | Minor, debatable |
+| 5 | Leaky abstraction | `resolveTranscriptFromAgentStorage` silently mutates `state.TranscriptPath` as a side effect | Minor -- consider returning the path and letting the caller set it |
+| 6 | Redundant state | `tryAgentCommitFastPath` empty-session guard duplicates skip-gate knowledge from `CondenseSession` | Minor -- add a sync comment |
+
+Nothing blocking. The two minor findings worth considering:
+
+- **Finding 5**: The hidden state mutation in `resolveTranscriptFromAgentStorage` is the most actionable. Having the caller do `state.TranscriptPath = resolvedPath` explicitly would make the data flow clearer at the call site.
+- **Finding 6**: A brief sync comment in `tryAgentCommitFastPath` referencing the skip gate would prevent future drift.</result>
+<usage><total_tokens>84624</total_tokens><tool_uses>18</tool_uses><duration_ms>107641</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ab8ac17ef4515039e</task-id>
+<tool-use-id>toolu_01UbL3UyKNNyF6RaZcVbtZ7A</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-best-effort-transcript-capture/aae844c1-f577-4647-90bb-2e38e82c96ed/tasks/ab8ac17ef4515039e.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Now I have a thorough understanding of all the changes. Here is my efficiency review:
+
+---
+
+## Efficiency Review Findings
+
+### 1. Redundant `paths.WorktreeRoot(ctx)` call in `resolveTranscriptFromAgentStorage`
+
+**Severity: Low (mitigated by caching)**
+
+`resolveTranscriptFromAgentStorage` (line 420, `manual_commit_condensation.go`) calls `paths.WorktreeRoot(ctx)` to get the repo root. The PostCommit caller already computes this at line 872 of `manual_commit_hooks.go` and passes it through as `condenseOpts.repoDir`. However, `resolveTranscriptFromAgentStorage` does not receive `condenseOpts` -- it only gets `ctx`, `ag`, and `state`.
+
+**Impact is mitigated** because `paths.WorktreeRoot` uses an in-process read-locked cache (lines 92-98 of `paths.go`), so the second call hits the cache and returns immediately (no git CLI or filesystem walk). Still, passing `o.repoDir` (or `state.WorktreePath`) through would be cleaner and avoid the cache lock acquire entirely.
+
+Note that for the `CondenseSessionByID` and `CondenseAndMarkFullyCondensed` callers, no `condenseOpts` are passed, so `o.repoDir` is empty. The `WorktreeRoot` call is genuinely necessary for those paths. Consider using `state.WorktreePath` (which `SessionState` may already contain based on the `resolveFilesTouched` code at line 1893 that reads `state.WorktreePath`) as a zero-cost alternative.
+
+### 2. `os.ReadFile(resolved)` reads entire transcript into memory
+
+**Severity: Low-to-Medium (acceptable for fallback path)**
+
+At line 463, the entire transcript file is read into memory with `os.ReadFile`. Transcript files can grow large for long sessions (tens of MB). However:
+
+- This is a **fallback path only** -- it only fires when `len(sessionData.Transcript) == 0 && ag != nil`, meaning the normal extraction paths (shadow branch, live transcript) all failed. This is not a hot path.
+- The same transcript is read into memory via `os.ReadFile` in the normal paths too (`extractSessionData` at line 820, `extractSessionDataFromLiveTranscript` at line 877), so this is consistent with existing behavior.
+- The data is subsequently processed entirely (redacted, chunked, hashed), so streaming would not help much.
+
+**No action needed**, but worth noting for future consideration if transcript sizes grow significantly.
+
+### 3. `PrepareTranscript` command execution in fallback path
+
+**Severity: Low (appropriately guarded)**
+
+At line 451, `PrepareTranscript` may execute an external command (e.g., `opencode export`). This is appropriate here because:
+
+- It's in a **fallback path** that only fires for sessions with no transcript via normal channels.
+- The same `PrepareTranscript` call already exists in the normal extraction paths (`extractSessionData` at line 819, `prepareTranscriptIfNeeded` at line 389 in the live transcript path).
+- The error is logged and execution continues, so it doesn't block.
+- Only agents implementing `TranscriptPreparer` (currently OpenCode, Claude Code) are affected, and only when the capability is declared.
+
+**No action needed.** The guard structure is correct.
+
+### 4. `tryAgentCommitFastPath` additional condition check
+
+**Severity: Negligible**
+
+The new check at line 1948 (`state.TranscriptPath == "" && len(state.FilesTouched) == 0 && state.StepCount == 0`) adds three field reads per active session in the prepare-commit-msg hook loop. These are in-memory struct field comparisons with no I/O. The loop typically processes 1-2 sessions.
+
+**No action needed.** This is a net positive -- it prevents dangling checkpoint trailers that would cause wasted I/O in PostCommit.
+
+### 5. Skip gate reduces work (positive finding)
+
+The skip gate at lines 172-185 is a clear efficiency improvement. When both transcript and files are empty, it avoids:
+- Secret redaction
+- Checkpoint store creation
+- Author info resolution
+- Attribution calculation
+- Summary generation
+- Git tree building and commit creation
+
+This is the primary performance improvement in this diff.
+
+### 6. `writeTranscript` return type change
+
+**Severity: None**
+
+The change from `error` to `(bool, error)` in `committed.go` is purely a return-type adjustment. It prevents recording phantom `SessionFilePaths` for empty transcripts (which would leave stale path references). No new I/O.
+
+### Summary
+
+No significant efficiency issues found. The main potential improvement is minor:
+
+- **`resolveTranscriptFromAgentStorage` could use `state.WorktreePath`** (if populated) instead of calling `paths.WorktreeRoot(ctx)`, avoiding even the cache lock acquire. This is a micro-optimization -- the cached path lookup is already very fast.
+
+The overall diff is a net efficiency improvement thanks to the skip gate and the dangling-trailer prevention in `tryAgentCommitFastPath`.</result>
+<usage><total_tokens>99343</total_tokens><tool_uses>31</tool_uses><duration_ms>141837</duration_ms></usage>
+</task-notification>
+
+---
+
+Apply the changes in an iterative way. Allow me to review them before trying to commit. Explain each fix in detail.

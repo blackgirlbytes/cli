@@ -1,0 +1,344 @@
+/review
+
+---
+
+Yes
+
+---
+
+<task-notification>
+<task-id>a8f4faf495b686820</task-id>
+<tool-use-id>toolu_01UuKTJiznuGTcoPZ8WjRPBq</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-close-test-gaps/e72f3c16-a73d-4eb6-a92d-4bfeb62a91b9/tasks/a8f4faf495b686820.output</output-file>
+<status>completed</status>
+<summary>Agent "Security &amp; adversarial review" completed</summary>
+<result>I've now thoroughly analyzed all 19 changed files. Let me compile my findings.
+
+---
+
+Here is my security and adversarial review of the branch `feat/checkpoints-v2-close-test-gaps` (19 files, +940/-39 lines).
+
+## Findings
+
+### No Critical or Important Security Issues Found
+
+After tracing every code path that handles external input, file operations, command execution, and credentials, I found no confirmed exploitable vulnerabilities in this diff. Here is the detailed analysis of each area I examined:
+
+---
+
+### Area 1: Vogon `sessionID` path traversal (e2e/vogon/main.go:547)
+
+**Status: Not a real risk**
+
+The `setupTranscript` function at line 547 uses `filepath.Join(transcriptDir, sessionID+".jsonl")` where `sessionID` comes from a CLI flag (`--session-id`). In theory, a `sessionID` like `../../etc/cron.d/evil` could traverse out of the intended directory.
+
+However, this code is **not reachable in production**. The vogon binary is a deterministic test-only agent that:
+- Is built behind the `e2e` build tag
+- Is only invoked by E2E test code with hardcoded session IDs (e.g., `"attach-vogon-session"`, `"attach-second-vogon-session"`)
+- Runs in isolated temp directories during tests
+
+The `sessionID` values are always controlled by the test harness. There is no user-facing input path. This is a defense-in-depth concern at most.
+
+**Note for consideration**: If the vogon binary is ever reused in broader contexts, adding `filepath.Base(sessionID)` sanitization at line 547 would be prudent. Same applies to the `createFile` function (line 466-475) which joins `dir` with a regex-extracted `path` from prompts -- but again, only test-controlled inputs reach it.
+
+---
+
+### Area 2: GitHub Actions workflow injection (e2e-checkpoints-v2.yml:49-51)
+
+**Status: Not a risk**
+
+The workflow uses `${{ inputs.agent }}` and `${{ inputs.checkpoints_mode }}` in `env:` context (lines 49-51), not in a `run:` context. Both inputs are further constrained to `type: choice` with enumerated options (lines 8-28). The `run:` command is the static string `mise run test:e2e:canary`. There is no script injection vector here.
+
+The `somecredstorepass` string at line 43 is a dummy keyring unlock password used identically in `ci.yml`, `e2e.yml`, and other existing workflows. It is not a real credential -- it is required to initialize GNOME Keyring in headless CI.
+
+---
+
+### Area 3: `ensureHookEntireBinary` symlink/copy (e2e/tests/main_test.go:84-102)
+
+**Status: Not a risk**
+
+This function creates a symlink (or file copy on Windows) from the test binary to `entire` in the same directory. The source path `entireBin` comes from `E2E_ENTIRE_BIN`, which is set by the build system. The target `hookBin` is always `filepath.Join(dir, "entire")` where `dir` is `filepath.Dir(entireBin)`. The `filepath.Clean` equality check at line 87 prevents creating a self-referential link. This runs only during test setup (`TestMain`), not in production code.
+
+---
+
+### Area 4: `runOutputEnv` environment injection (e2e/entire/entire.go:180-195)
+
+**Status: Not a risk**
+
+The `AttachWithEnv` and `runOutputEnv` functions accept `extraEnv []string` and append them to `cmd.Env`. All callers are test code with hardcoded values like `[]string{"HOME=" + homeDir}`. There is no path from user input to these env vars.
+
+---
+
+### Area 5: `vogonHomeDir` temp directory predictability (e2e/agents/vogon.go:145-152)
+
+**Status: Not a risk**
+
+The function creates `os.TempDir()/vogon-e2e-home-&lt;sha256[:12]&gt;` with 0755 permissions. The SHA256 is derived from the repo directory path. While the name is deterministic given the same input, this runs only in test infrastructure. The directory permissions are appropriate for a HOME directory substitute in test contexts.
+
+---
+
+### Area 6: `checkpointsMode()` unvalidated env var passthrough (e2e/testutil/repo.go:190-199)
+
+**Status: Low-impact logic issue, not a security risk**
+
+The `checkpointsMode()` function has a `default: return mode` arm that passes through any unrecognized `E2E_CHECKPOINTS_MODE` value. This causes `primaryCheckpointRef()` to return the v1 ref for unknown modes (hitting the `default` case at line 205). Meanwhile, `ApplySuiteCheckpointsMode()` at line 181 will `t.Fatalf` on unknown modes. The inconsistency means an invalid mode would fail fast in `ApplySuiteCheckpointsMode` but silently degrade in `primaryCheckpointRef`. This is a correctness observation, not a security finding.
+
+---
+
+### Area 7: Race conditions in checkpoint polling
+
+**Status: Acceptable by design**
+
+The `WaitForCheckpoint`, `WaitForCheckpointAdvanceFrom`, and `WaitForSessionIdle` functions use polling loops with `time.Sleep(200ms)` intervals. These are inherently TOCTOU patterns -- the state could change between the check and subsequent assertions. However, this is the standard approach for E2E test infrastructure where you are waiting for async processes (git hooks) to complete. The timeouts and polling intervals are appropriate for the test context.
+
+---
+
+### Area 8: No secrets or credentials in code
+
+Verified: No API keys, tokens, passwords, or sensitive credentials are introduced in this diff. The `somecredstorepass` is an existing pattern for CI keyring initialization, not a real secret.
+
+---
+
+### Summary
+
+**Verdict: No security issues found.**
+
+All changed code is test infrastructure (E2E tests, integration tests, test utilities, CI workflow, documentation). None of the changes touch production code paths. The test code handles only test-controlled inputs within isolated temporary directories. No injection vectors, authentication gaps, or credential exposures were identified.
+
+The one defense-in-depth improvement worth noting for the future is sanitizing `sessionID` in `e2e/vogon/main.go:547` with `filepath.Base()` to prevent path traversal if the vogon binary's usage scope ever expands beyond the current test harness.</result>
+<usage><total_tokens>85888</total_tokens><tool_uses>21</tool_uses><duration_ms>99019</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a33804165f34efa12</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-close-test-gaps/e72f3c16-a73d-4eb6-a92d-4bfeb62a91b9/tasks/a33804165f34efa12.output</output-file>
+<status>completed</status>
+<summary>Agent "Simplification &amp; efficiency review" completed</summary>
+<result>The `os.Remove(hookBin)` on line 91 silently removes the existing symlink/binary before recreating it. This is fine for correctness but the existence-check is implicit. However, the `os.Remove` + `os.Symlink` is the right pattern here -- remove-then-create is safer than checking-then-creating (avoids TOCTOU).
+
+Now I have enough information to compile the review findings. Let me deliver them directly.
+
+---
+
+Here are my findings from reviewing the branch diff (`794edf96705dcb0858bfeff59501f6db06328740...HEAD`, 19 files, +940/-39):
+
+## Critical (Must Fix)
+
+None.
+
+## Important (Should Fix)
+
+### 1. Dead code: `entire.Attach()` is never called
+
+**e2e/entire/entire.go:155** -- The `Attach` function is defined but never called anywhere in the codebase. Only `AttachWithEnv` has call sites (in `e2e/tests/attach_test.go` lines 36 and 86).
+
+**Suggested fix:** Remove `Attach()` entirely, or if you want to keep it for future use, that intent should be documented. In its current form, a new contributor might call `Attach` not realizing they need to pass `HOME` via `AttachWithEnv` for vogon tests to work correctly.
+
+### 2. Duplicated `shadowBranches` function across packages
+
+**e2e/tests/clean_test.go:74** -- This is a line-for-line duplicate of `e2e/testutil/assertions.go:123`. The only reason for the duplication is that the existing function is unexported (`shadowBranches`).
+
+**Suggested fix:** Export the function in `testutil` as `ShadowBranches` and call it from `clean_test.go`. This also prevents the two copies from drifting apart if the filtering logic ever changes (e.g., if new `entire/` ref prefixes are added).
+
+### 3. Copy-paste with variation: `setAttachCheckpointsV2Enabled` / `setAttachCheckpointsVersion2Enabled`
+
+**cmd/entire/cli/attach_test.go:789-811** -- These two functions are identical except for the JSON string value (`checkpoints_v2: true` vs `checkpoints_version: 2`). The structural boilerplate (MkdirAll, WriteFile, error handling) is duplicated.
+
+**Suggested fix:** Unify into a single parameterized helper, for example:
+
+```go
+func setAttachCheckpointsSettings(t *testing.T, repoDir string, strategyOptions string) {
+    t.Helper()
+    entireDir := filepath.Join(repoDir, ".entire")
+    if err := os.MkdirAll(entireDir, 0o750); err != nil {
+        t.Fatal(err)
+    }
+    settingsContent := fmt.Sprintf(`{"enabled": true, "strategy_options": %s}`, strategyOptions)
+    if err := os.WriteFile(filepath.Join(entireDir, "settings.json"), []byte(settingsContent), 0o600); err != nil {
+        t.Fatal(err)
+    }
+}
+```
+
+### 4. Duplicated command execution boilerplate in Vogon agent
+
+**e2e/agents/vogon.go:42-75 vs 97-143** -- `RunPrompt` and `WriteSessionTranscript` share approximately 20 lines of identical command execution scaffolding (create exec.Command, filter env, setup process group, capture stdout/stderr, extract exit code, build Output). The only differences are the args, displayArgs, and env setup.
+
+**Suggested fix:** Extract a private `runVogonCommand` helper that takes args, displayArgs, env, and dir, and returns `(Output, error)`. Both methods would become thin wrappers.
+
+## Suggestions (Consider)
+
+### 5. Dead switch branch in `checkpointsMode()`
+
+**e2e/testutil/repo.go:190-199** -- The `switch` has three cases: `"", legacy` returns `checkpointsModeLegacy`, `v2-dual-write, v2-only` returns `mode`, and `default` also returns `mode`. The second case is unreachable because it does the same thing as the default. The explicit case listing of known modes gives a false impression that unknown modes are handled differently.
+
+**Suggested fix:** Simplify to:
+
+```go
+func checkpointsMode() string {
+    mode := os.Getenv("E2E_CHECKPOINTS_MODE")
+    if mode == "" || mode == checkpointsModeLegacy {
+        return checkpointsModeLegacy
+    }
+    return mode
+}
+```
+
+### 6. Unnecessary private wrapper: `applySuiteCheckpointsMode`
+
+**e2e/testutil/repo.go:185-188** -- The private `applySuiteCheckpointsMode` is called exactly once (line 112) and is a trivial delegation to the exported `ApplySuiteCheckpointsMode`. This adds an indirection that serves no purpose.
+
+**Suggested fix:** Call `ApplySuiteCheckpointsMode(t, dir)` directly on line 112 and remove the private wrapper.
+
+### 7. Unnecessary comment in attach test
+
+**cmd/entire/cli/attach_test.go:108** (in `TestAttach_CheckpointsVersion2`) -- The test body is self-explanatory from its function name and the existing doc comment on `setAttachCheckpointsVersion2Enabled`. No inline comments needed beyond what's already there.
+
+This is borderline cosmetic, so feel free to ignore.
+
+## Praise
+
+- The `mergeSettings` / `cloneSettingsMap` recursive merge in `e2e/testutil/repo.go` is a clean replacement for the previous shallow key-copy in `PatchSettings`. It correctly preserves existing `strategy_options` when adding new ones, which was the root cause of test fragility.
+
+- The `ensureHookEntireBinary` function in `e2e/tests/main_test.go` is well-designed: it handles the Windows copy fallback, uses symlinks on Unix, and correctly short-circuits when the binary is already named `entire`.
+
+- The `vogon --write-session` mode is a good design choice for attach tests -- it gives deterministic transcript setup without firing hooks, keeping the attach test focused on `entire attach` behavior rather than full agent lifecycle.
+
+- The `PushCheckpointRefs` and `CheckpointMetadataRef` helpers in `e2e/testutil/repo.go` properly abstract the v1/v2 ref differences, making the existing `resume_remote_test.go` work correctly across all three checkpoint modes without per-mode test branching.
+
+- The `CommitIfDirty` helper is a pragmatic addition -- it handles the case where `entire enable` in a clone is already idempotent, preventing "nothing to commit" failures.
+
+## Summary
+
+**Overall assessment: APPROVE with minor fixes**
+
+The branch adds solid test coverage for checkpoints v2 across E2E, integration, and unit test layers. The architecture choices (mode-aware ref helpers, vogon write-session mode, recursive settings merge) are sound.
+
+The main areas to clean up are:
+- The dead `entire.Attach()` function (finding 1)
+- The duplicated `shadowBranches` function (finding 2)
+- Two copy-paste-with-variation patterns (findings 3 and 4) that should be unified
+
+Estimated effort to address: 30-45 minutes for findings 1-4. Findings 5-6 are optional and take 5 minutes total.</result>
+<usage><total_tokens>96637</total_tokens><tool_uses>40</tool_uses><duration_ms>178603</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a841e0cec2f313046</task-id>
+<tool-use-id>toolu_01Tsjiv1awvChGuWsCXpjBH8</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-close-test-gaps/e72f3c16-a73d-4eb6-a92d-4bfeb62a91b9/tasks/a841e0cec2f313046.output</output-file>
+<status>completed</status>
+<summary>Agent "Correctness &amp; quality review" completed</summary>
+<result>No prior reviews. Now I have gathered all the evidence needed. Let me compile my findings.
+
+---
+
+Here is the code review for the `feat/checkpoints-v2-close-test-gaps` branch.
+
+## Review Findings
+
+### Critical (Must Fix)
+
+No critical issues found. The branch adds well-structured test coverage for checkpoints v2 modes across unit, integration, and E2E test layers. The code is correct and follows existing patterns consistently.
+
+### Important (Should Fix)
+
+**1. [e2e/tests/attach_test.go:72] `show-ref --verify` with short ref is fragile in legacy mode**
+
+The code uses `testutil.CheckpointMetadataRef()` with `show-ref --verify`, which requires a full ref path. In legacy mode, `CheckpointMetadataRef()` returns `entire/checkpoints/v1` (a short ref, not `refs/heads/entire/checkpoints/v1`), so `show-ref --verify` will always fail. In v2 mode, `refs/entire/checkpoints/v2/main` is a full ref and works correctly.
+
+```go
+if _, refErr := testutil.GitOutputErr(s.Dir, "show-ref", "--verify", "--hash", testutil.CheckpointMetadataRef()); refErr == nil {
+```
+
+In practice this is correct because in legacy mode the ref genuinely does not exist yet at this point in the test (it's before the first commit that creates a checkpoint). But the code is misleading -- it appears to detect "ref exists" but actually always fails in legacy mode for the wrong reason.
+
+Suggested fix: Use `rev-parse --verify` instead of `show-ref --verify`, since `rev-parse` resolves short refs. Or prepend `refs/heads/` in the legacy case.
+
+**2. [e2e/testutil/repo.go:190-198] `checkpointsMode()` default case is redundant and masks invalid input**
+
+```go
+func checkpointsMode() string {
+    switch mode := os.Getenv("E2E_CHECKPOINTS_MODE"); mode {
+    case "", checkpointsModeLegacy:
+        return checkpointsModeLegacy
+    case checkpointsModeV2DualWrite, checkpointsModeV2Only:
+        return mode
+    default:
+        return mode // silently passes through unknown values
+    }
+}
+```
+
+The `default` arm returns unknown modes as-is. `ApplySuiteCheckpointsMode()` catches these downstream with `t.Fatalf()`, but `primaryCheckpointRef()` silently falls back to v1 on unknown modes. This inconsistency means an invalid `E2E_CHECKPOINTS_MODE` value would fail in `ApplySuiteCheckpointsMode` during setup but silently use v1 refs in `primaryCheckpointRef` if that function were ever called before setup. The behavior is currently safe because setup always runs first, but the inconsistency is a maintenance hazard.
+
+Suggested fix: Have `checkpointsMode()` return only known values and add a panic or explicit error for unknown modes, or add validation to `primaryCheckpointRef()` matching the other functions.
+
+### Suggestions (Consider)
+
+**3. [e2e/tests/clean_test.go:74-88] `shadowBranches` duplicates unexported function from testutil/assertions.go**
+
+The `shadowBranches` function in `clean_test.go` is nearly identical to the unexported `shadowBranches` in `testutil/assertions.go` (lines 123-135). Both filter `for-each-ref` output the same way. The duplication exists because the `testutil` version is unexported.
+
+Suggested fix: Export `ShadowBranches` in `testutil/assertions.go` and call it from `clean_test.go` to eliminate the duplication.
+
+**4. [e2e/agents/vogon.go:145-152] `vogonHomeDir` creates temp directories without cleanup**
+
+`vogonHomeDir` creates directories under `/tmp/vogon-e2e-home-&lt;hash&gt;` that are never cleaned up. While the hash is deterministic (same repo dir = same home), these accumulate across test runs. The `attach_test.go` tests correctly use `t.TempDir()` for managed HOME dirs, but `RunPrompt` and `StartSession` use `vogonHomeDir` which leaks.
+
+Suggested fix: Register a cleanup function in the calling test, or at minimum document that these directories persist across runs.
+
+**5. [e2e/testutil/repo.go:712-722] `NewCheckpointCommits` still hardcodes `entire/checkpoints/v1`**
+
+Several utility functions in `repo.go` and `assertions.go` still hardcode `entire/checkpoints/v1` (`NewCheckpointCommits`, `CheckpointIDs`, `ReadCheckpointMetadata`, `ReadSessionMetadata`, `AssertCheckpointExists`, `AssertCheckpointInLastN`, `ValidateCheckpointDeep`, etc.). These are not called from the tests added in this branch but will break when existing tests (e.g., `multi_session_test.go`, `split_commits_test.go`, `stash_workflows_test.go`) are run with `E2E_CHECKPOINTS_MODE=v2-only`. This is likely known tech debt but worth flagging -- running the full E2E suite with `v2-only` mode will fail on many existing tests due to these hardcoded refs.
+
+**6. [e2e/tests/doctor_test.go:44] `os.Getenv` instead of helper function**
+
+The doctor test switches on `os.Getenv("E2E_CHECKPOINTS_MODE")` directly rather than using the `testutil.checkpointsMode()` helper. This means the empty-string normalization to "legacy" is duplicated (the switch treats `""` and `"legacy"` as the same case).
+
+```go
+switch os.Getenv("E2E_CHECKPOINTS_MODE") {
+case "", "legacy":
+```
+
+This works correctly but bypasses the abstraction. If the env var name or default behavior changes, this would need a separate update. Consider exposing a function from `testutil` that returns the mode, or accepting the duplication since the doctor test specifically needs to know the exact string values for mode-specific assertions.
+
+### Praise
+
+- The `mergeSettings` / `cloneSettingsMap` implementation in `repo.go` (lines 635-662) is well-designed -- it correctly handles nested map merging (e.g., `strategy_options` inside settings) without clobbering sibling keys. This fixes a real problem where `PatchSettings` with a flat map assignment would overwrite unrelated strategy options.
+
+- The `ensureHookEntireBinary` function in `main_test.go` (lines 84-102) is a clean solution to the problem of git hooks not finding the test binary. The `filepath.Clean` comparison to handle the already-correct case is a nice defensive touch.
+
+- The `WriteSessionTranscript` method on Vogon (agents/vogon.go lines 97-143) is well-separated from the prompt execution path. The `--write-session` flag with proper validation in `parseArgs` keeps the Vogon binary's concerns clean.
+
+- Good use of `CommitIfDirty` in `resume_remote_test.go` to handle idempotent `entire enable` -- this prevents flaky test failures when enable produces no repo changes in clone scenarios.
+
+- The `ApplySuiteCheckpointsMode` / `PushCheckpointRefs` / `primaryCheckpointRef` abstraction layer is well-structured. It centralizes the mode-specific behavior so new E2E tests don't need to know about ref naming differences between v1 and v2.
+
+- Consistent use of `testutil.WaitForCheckpoint` and `testutil.WaitForCheckpointAdvanceFrom` (which now use `primaryCheckpointRef()`) ensures existing tests automatically adapt to the active checkpoint mode.
+
+### Summary
+
+- Overall assessment: **APPROVE**
+- The branch adds substantial test coverage for checkpoints v2 modes (dual-write and v2-only) across all three test layers: unit tests (`attach_test.go`), integration tests (`v2_dual_write_test.go`, `v2_resume_test.go`), and E2E tests (attach, clean, doctor, explain, resume). The code is well-structured, follows existing patterns, and correctly abstracts the mode-specific behavior behind helper functions.
+- Key concern: The `show-ref --verify` with short ref (finding #1) is the most concrete issue, though its impact is limited since the test outcome is still correct. The other findings are code quality improvements rather than correctness bugs.
+- Estimated effort to address feedback: 30 minutes for findings #1 and #2, optional for the rest.</result>
+<usage><total_tokens>115801</total_tokens><tool_uses>48</tool_uses><duration_ms>243432</duration_ms></usage>
+</task-notification>
+
+---
+
+Address 1-4
+
+---
+
+Commit and continue
+
+---
+
+Go

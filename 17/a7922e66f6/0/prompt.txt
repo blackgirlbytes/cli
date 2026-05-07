@@ -1,0 +1,162 @@
+Implement the following plan:
+
+# Fix PR #555 Review Comments
+
+## Context
+
+PR #555 (agent-integration skill docs) received 10 review comments from Copilot identifying three categories of issues: inconsistent `mise` command syntax, a missing `AGENT_SLUG` parameter definition, and a step numbering mismatch.
+
+## Changes
+
+### 1. Fix `mise` command syntax in `implementer.md`
+
+**File:** `.claude/skills/agent-integration/implementer.md`
+
+- **Line 106** — Change `mise run test:e2e -agent` → `mise run test:e2e --agent` (missing `--`)
+- **Line 166** — Change `mise run test:e2e:$AGENT_SLUG` → `mise run test:e2e --agent $AGENT_SLUG` (wrong task syntax)
+- **Lines 18 + 61** — Clarify Core Principle #6 and Step 3's `mise run test` to note that Step 3's invocation is a compile-only sanity check, not unit-test-driven development. Update principle text to say "any earlier `mise run test` invocations (e.g., in Step 3) are strictly compile-only sanity checks"
+
+### 2. Fix step numbering in `implementer.md`
+
+**File:** `.claude/skills/agent-integration/implementer.md`
+
+- **Line 344** — Change "written in Step 13" → "written in Step 14" to match actual step heading
+
+### 3. Add `AGENT_SLUG` to parameter table in `SKILL.md`
+
+**File:** `.claude/skills/agent-integration/SKILL.md`
+
+- **Line ~24 (parameter table)** — Add `AGENT_SLUG` row: filesystem/URL-safe slug used in script names and E2E runner filenames, usually kebab-case, align with existing entries in `e2e/agents`
+
+### 4. Standardize E2E invocation in `test-writer.md`
+
+**File:** `.claude/skills/agent-integration/test-writer.md`
+
+- **Line 180** — Change "Add mise task `test:e2e:${agent_slug}`" to use canonical `mise run test:e2e --agent ${slug}` pattern
+- **Line 200** — Change `mise run test:e2e:${slug} TestName` → `mise run test:e2e --agent ${slug} TestName`
+
+## Verification
+
+```bash
+# No code to compile — these are markdown doc files
+# Verify no remaining inconsistent patterns:
+grep -r 'test:e2e:' .claude/skills/agent-integration/
+grep -r 'test:e2e -agent' .claude/skills/agent-integration/
+grep -r 'Step 13' .claude/skills/agent-integration/implementer.md
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/5354a6c4-312a-4b96-bdd8-fa60bb1760b1.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/improve-agent-integration-skill
+Your branch is up to date with 'origin/alisha/improve-agent-integration-skill'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   .claude/skills/agent-integration/SKILL.md
+	modified:   .claude/skills/agent-integration/implementer.md
+	modified:   .claude/skills/agent-integration/test-writer.md
+
+no changes added to commit (use "git add" and/or "git commit -a")
+- Current git diff (staged and unstaged changes): diff --git a/.claude/skills/agent-integration/SKILL.md b/.claude/skills/agent-integration/SKILL.md
+index ba2ce156..1c099efd 100644
+--- a/.claude/skills/agent-integration/SKILL.md
++++ b/.claude/skills/agent-integration/SKILL.md
+@@ -22,6 +22,7 @@ Collect these before starting (ask the user if not provided):
+ | `AGENT_NAME` | Human-readable name (e.g., "Gemini CLI") | User provides |
+ | `AGENT_PACKAGE` | Go package dir name — **no hyphens** | Lowercase, remove hyphens/spaces |
+ | `AGENT_KEY` | Registry key for `agent.Register()` and `entire enable` | Check existing patterns in `cmd/entire/cli/agent/registry.go` |
++| `AGENT_SLUG` | Filesystem/URL-safe slug (kebab-case) used in E2E runner filenames and script names | Kebab-case of agent name; align with existing entries in `e2e/agents/` |
+ | `AGENT_BIN` | CLI binary name | `command -v <binary>` |
+ | `LIVE_COMMAND` | Full command to launch agent | User provides |
+ | `EVENTS_OR_UNKNOWN` | Known hook event names, or "unknown" | From agent docs or "unknown" |
+diff --git a/.claude/skills/agent-integration/implementer.md b/.claude/skills/agent-integration/implementer.md
+index 2d2a4321..70bbbb19 100644
+--- a/.claude/skills/agent-integration/implementer.md
++++ b/.claude/skills/agent-integration/implementer.md
+@@ -15,7 +15,7 @@ Build the agent Go package using strict E2E-first TDD. Unit tests are written ON
+ 3. **Minimum viable fix.** At each failure, implement only the code needed to make that specific assertion pass. Don't anticipate future tiers.
+ 4. **`/debug-e2e` is your debugger.** When an E2E test fails, use the artifact directory with `/debug-e2e` before guessing at fixes.
+ 5. **No unit tests during Steps 4-13.** Unit tests are written in Step 14 after all E2E tiers pass, using real data from E2E runs as golden fixtures.
+-6. **Format and lint, don't unit test.** Between E2E tiers, run `mise run fmt && mise run lint` to keep code clean. No `mise run test` until Step 14.
++6. **Format and lint, don't unit test.** Between E2E tiers, run `mise run fmt && mise run lint` to keep code clean. Any earlier `mise run test` invocations (e.g., in Step 3) are strictly compile-only sanity checks — no `mise run test` between E2E tiers (Steps 4-13).
+ 7. **If you didn't watch it fail, you don't know if it tests the right thing.**
+ 
+ **Do NOT write unit tests during Steps 4-13.** All test writing is consolidated in Step 14.
+@@ -57,13 +57,13 @@ cmd/entire/cli/agent/$AGENT_PACKAGE/
+ 
+ - Ensure the blank import `_ "github.com/entireio/cli/cmd/entire/cli/agent/$AGENT_PACKAGE"` exists in `cmd/entire/cli/hooks_cmd.go`
+ 
+-**Verify compilation:**
++**Verify compilation (compile-only sanity check, not unit-test-driven development):**
+ 
+ ```bash
+ mise run fmt && mise run lint && mise run test
+ ```
+ 
+-Everything must pass before proceeding. Fix any issues.
++Everything must compile and pass existing tests before proceeding. Fix any issues.
+ 
+ **Commit:** Use `/commit` to commit all files. Skip if no files changed.
+ 
+@@ -103,7 +103,7 @@ The foundational test. This exercises the full agent lifecycle: start session 
+ 
+ **Cycle:**
+ 
+-1. Run: `mise run test:e2e -agent $AGENT_SLUG TestSingleSessionManualCommit`
++1. Run: `mise run test:e2e --agent $AGENT_SLUG TestSingleSessionManualCommit`
+ 2. **Watch it fail** — read the failure output carefully
+ 3. Use `/debug-e2e {artifact-dir}` to understand what happened
+ 4. Implement the minimum code to fix the first failure
+@@ -163,7 +163,7 @@ Run these tests to validate multi-session behavior:
+ 
+ **Cycle (for each test):**
+ 
+-1. Run: `mise run test:e2e:$AGENT_SLUG TestMultiSessionManualCommit`
++1. Run: `mise run test:e2e --agent $AGENT_SLUG TestMultiSessionManualCommit`
+ 2. **Watch it fail** — use `/debug-e2e {artifact-dir}` on failures
+ 3. Fix and repeat
+ 4. Move to next test
+@@ -341,6 +341,6 @@ Summarize what was implemented:
+ - Interfaces implemented (core + optional)
+ - Hook names registered
+ - E2E tiers passing (list which E2E tests pass)
+-- Unit test coverage (number of test functions, what they cover — written in Step 13)
++- Unit test coverage (number of test functions, what they cover — written in Step 14)
+ - Any gaps or TODOs remaining
+ - Commands to run full validation
+diff --git a/.claude/skills/agent-integration/test-writer.md b/.claude/skills/agent-integration/test-writer.md
+index fba42a80..04256136 100644
+--- a/.claude/skills/agent-integration/test-writer.md
++++ b/.claude/skills/agent-integration/test-writer.md
+@@ -177,7 +177,7 @@ After writing the runner code:
+ 1. **Lint check**: `mise run lint` — ensure no lint errors
+ 2. **Compile check**: `go test -c -tags=e2e ./e2e/tests` — compile-only with the build tag to verify the runner compiles and registers
+ 3. **Verify registration**: The runner's `init()` calls `Register()` and will be picked up by `ForEachAgent` in existing tests
+-4. **Add mise task**: Remind the user to add a `test:e2e:${agent_slug}` task in `mise.toml` and update CI workflows
++4. **Add mise task**: Remind the user that E2E tests are run via `mise run test:e2e --agent ${agent_slug}` and to update CI workflows if needed
+ 5. **Next step**: The implement phase will run E2E tests against this runner — that's where failures are diagnosed and fixed
+ 
+ ### Step 7: Commit
+- Current branch: alisha/improve-agent-integration-skill
+- Recent commits: 75be1c05 Include .claude/plugins/agent-integration updates
+ee048ecb Update agent-integration skill docs
+81ddee25 Merge pull request #544 from entireio/soph/release-0-4-8
+65897b98 credits for cursor community pr
+94e9f456 changelog for 0.4.8
+0c6c9b57 Merge pull request #538 from entireio/gtrrz-victor/replace-fmt-with-log-inside-agent-hooks
+659d8585 add err structued to logging
+abd10d34 Merge branch 'main' into gtrrz-victor/replace-fmt-with-log-inside-agent-hooks
+edc1d626 Merge pull request #542 from entireio/rwr/break-agent-import-loop
+dc9b86d3 Merge pull request #540 from entireio/fix/opencode-xdg-isolation
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

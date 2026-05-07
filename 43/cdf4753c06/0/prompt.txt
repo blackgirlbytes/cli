@@ -1,0 +1,339 @@
+Implement the following plan:
+
+# Fix: Git hooks fail in GUI clients (Issue #489)
+
+## Context
+
+Git hooks installed by `entire enable` use bare `entire` command. GUI git clients (Xcode, Tower, etc.) don't source shell profiles, so `entire` isn't on PATH and hooks fail with `command not found`. The fix adds an opt-in `--absolute-hook-path` flag that embeds the full binary path in git hooks.
+
+## Changes
+
+### 1. Add `AbsoluteHookPath` setting
+
+**`cmd/entire/cli/settings/settings.go`**
+- Add `AbsoluteHookPath bool` field to `EntireSettings` struct (`json:"absolute_hook_path,omitempty"`)
+- Add merge logic in `mergeJSON()` (same pattern as `local_dev`)
+
+### 2. Add `--absolute-hook-path` flag to `entire enable`
+
+**`cmd/entire/cli/setup.go`**
+- Add `absoluteHookPath` bool flag to `newEnableCmd()`
+- Pass it through `runEnableInteractive()` and `setupAgentHooksNonInteractive()`
+- Save to `settings.AbsoluteHookPath`
+- Pass to `strategy.InstallGitHook()` (new parameter)
+
+### 3. Update hook generation to support absolute paths
+
+**`cmd/entire/cli/strategy/hooks.go`**
+- Update `hookCmdPrefix(localDev bool)` → `hookCmdPrefix(localDev, absolutePath bool)`
+- When `absolutePath` is true: resolve via `os.Executable()` + `filepath.EvalSymlinks()`, fall back to `"entire"` on error
+- Update `InstallGitHook(silent, localDev bool)` → `InstallGitHook(silent, localDev, absolutePath bool)`
+- Update `isLocalDev()` → add `isAbsoluteHookPath()` helper that reads from settings
+
+**`cmd/entire/cli/strategy/common.go`** (EnsureSetup)
+- Update `EnsureSetup()` call to pass `isAbsoluteHookPath()` to `InstallGitHook()`
+- The existing `!IsGitHookInstalled()` guard means this only fires when hooks are missing — that's fine, we don't need to self-heal stale paths since users can re-run `entire enable`
+
+**`cmd/entire/cli/strategy/hook_managers.go`**
+- Update `CheckAndWarnHookManagers()` signature to accept `absolutePath` parameter
+- Pass through to `hookCmdPrefix()`
+
+### 4. Update tests
+
+**`cmd/entire/cli/strategy/hooks_test.go`**
+- Update `TestInstallGitHook_LocalDevCommandPrefix` — the `InstallGitHook` calls need the new parameter
+- Add `TestInstallGitHook_AbsoluteHookPath` — verify hooks contain an absolute path when enabled
+- Update all other `InstallGitHook()` call sites in tests to pass `false` for the new parameter
+
+**`cmd/entire/cli/setup_test.go`** — update any `InstallGitHook` calls if present
+
+## Not in scope
+
+- Agent hooks (Claude Code, Gemini CLI) — these are invoked by the agent process which has the user's PATH, so they're unaffected
+- Self-healing of stale absolute paths — users re-run `entire enable` if binary moves
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Manual: `entire enable --absolute-hook-path` then inspect `.git/hooks/prepare-commit-msg` — should contain full path like `/Users/me/.local/bin/entire hooks git prepare-commit-msg ...`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.claude/projects/-Users-soph-Work-entire-devenv-cli/ec239294-a815-4fd0-8069-e318bfb4e837.jsonl
+
+---
+
+1. Shell injection via paths with spaces/metacharacters
+  Flagged by: Security Sentinel
+  hooks.go:353-359 — The resolved path from os.Executable() is interpolated bare into #!/bin/sh scripts via fmt.Sprintf("%s hooks git ..."). macOS home
+  directories can contain spaces or apostrophes (e.g., /Users/John O'Brien/bin/entire), which would break the hook or execute unintended commands.
+  Fix: Shell-quote the path in hookCmdPrefix:
+  return "'" + strings.ReplaceAll(resolved, "'", "'\\''") + "'"
+
+---
+
+2. Silent fallback defeats the feature's purpose
+  Flagged by: Security, Architecture, Pattern, Simplicity, Performance (all five)
+  If os.Executable() or EvalSymlinks() fails, hookCmdPrefix silently returns "entire" — the exact thing the user is trying to escape. Hooks appear installed but
+  will fail in GUI clients with no indication of why.
+  Fix: Log a warning or return an error from InstallGitHook when resolution fails.
+
+---
+
+3. Asymmetric settings handling between interactive and non-interactive paths
+  Flagged by: Security, Architecture, Pattern, Simplicity (four agents)
+  In runEnableInteractive (line 186), absoluteHookPath is set unconditionally — so re-running entire enable without the flag resets it to false, silently
+  breaking GUI integration. In setupAgentHooksNonInteractive (line 600), it's guarded with if absoluteHookPath {, preserving existing values.
+  Note: localDev has the same pre-existing inconsistency, so this is inherited behavior.
+  Fix: Guard the interactive path the same way, or use cmd.Flags().Changed("absolute-hook-path").
+
+---
+
+4. Boolean parameter explosion
+  Flagged by: Architecture, Pattern, Simplicity, Performance (four agents)
+  runEnableInteractive now takes 8 positional bools; setupAgentHooksNonInteractive takes 7. Call sites like setupAgentHooksNonInteractive(w, ag, true, false,
+  false, false, false) are unreadable and error-prone.
+  Fix: Extract an EnableOptions struct. The codebase already uses this pattern elsewhere (e.g., StepContext, TaskStepContext).
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Initial request**: User asked to implement a plan for "Fix: Git hooks fail in GUI clients (Issue #489)". The plan adds an opt-in `--absolute-hook-path` flag that embeds the full binary path in git hooks for GUI git clients.
+
+2. **Implementation phase**: I read all relevant files, created task tracking, and implemented:
+   - Added `AbsoluteHookPath` field to `EntireSettings` struct
+   - Added merge logic in `mergeJSON()`
+   - Updated `hookCmdPrefix()` signature to accept `absolutePath` parameter
+   - Updated `InstallGitHook()` signature
+   - Added `isAbsoluteHookPath()` helper
+   - Updated `CheckAndWarnHookManagers()` signature
+   - Updated `EnsureSetup()` in common.go
+   - Added `--absolute-hook-path` flag to `newEnableCmd()`
+   - Passed through `runEnableInteractive()` and `setupAgentHooksNonInteractive()`
+   - Updated all test call sites
+   - Added `TestInstallGitHook_AbsoluteHookPath` test
+
+3. **Error**: Missed `bench_enable_test.go` which also calls `setupAgentHooksNonInteractive`. Fixed by adding the new parameter.
+
+4. **Review finding 1 - Shell injection**: User flagged that paths with spaces/metacharacters would break hooks. I added `shellQuote()` function using POSIX single-quote escaping, updated `hookCmdPrefix` to use it, updated tests to check for quoted paths, and added `TestShellQuote`.
+
+5. **Review finding 2 - Silent fallback**: User flagged that silent fallback to "entire" defeats the feature's purpose. I changed `hookCmdPrefix` from returning `string` to returning `(string, error)`, propagated the error through `InstallGitHook`, and handled it gracefully in `CheckAndWarnHookManagers`.
+
+6. **Review finding 3 - Asymmetric settings handling**: User flagged that `runEnableInteractive` unconditionally set `absoluteHookPath` while `setupAgentHooksNonInteractive` guarded it. Fixed by guarding both `localDev` and `absoluteHookPath` with `if` in the interactive path.
+
+7. **Review finding 4 - Boolean parameter explosion**: User flagged the unreadable positional bool parameters. I started extracting an `EnableOptions` struct. I defined the struct, updated `newEnableCmd` variable declarations, and started updating call sites but was interrupted mid-work.
+
+Let me trace exactly where I left off:
+- I defined `EnableOptions` struct
+- Changed `newEnableCmd` vars from individual bools to `opts EnableOptions` + leftover `agentName` and `ignoreUntracked`
+- Updated `validateSetupFlags` call to use `opts.UseLocalSettings`, `opts.UseProjectSettings`
+- Updated `setupAgentHooksNonInteractive` call to pass `opts`
+- BUT I have NOT yet:
+  - Updated the `runEnableInteractive` call to pass `opts`
+  - Updated the `runEnableInteractive` function signature
+  - Updated the `setupAgentHooksNonInteractive` function signature
+  - Updated flag registrations to use `&opts.LocalDev` etc.
+  - Updated `bench_enable_test.go` call sites
+  - Updated internal usages within both functions
+  - Run fmt/lint/test
+
+This is a partially-applied refactor that will not compile.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to implement a plan for "Fix: Git hooks fail in GUI clients (Issue #489)". Git hooks installed by `entire enable` use bare `entire` command, but GUI git clients (Xcode, Tower, etc.) don't source shell profiles, so hooks fail. The fix adds an opt-in `--absolute-hook-path` flag that embeds the full binary path in git hooks. After the initial implementation, the user provided four review findings from security/architecture agents, asking me to fix each one sequentially.
+
+2. Key Technical Concepts:
+   - Go CLI built with `spf13/cobra` and `charmbracelet/huh`
+   - Git hook installation system with backup/chain/restore lifecycle
+   - Settings system with base (`settings.json`) + local override (`settings.local.json`) with `mergeJSON()`
+   - `hookCmdPrefix()` resolves the command prefix for hook scripts
+   - Shell quoting for POSIX `/bin/sh` scripts using single-quote escaping
+   - `os.Executable()` + `filepath.EvalSymlinks()` for resolving binary path
+   - Interactive vs non-interactive enable paths with different settings preservation semantics
+   - `EnableOptions` struct pattern to replace positional boolean parameters
+
+3. Files and Code Sections:
+   - **`cmd/entire/cli/settings/settings.go`**
+     - Added `AbsoluteHookPath bool` field to `EntireSettings` struct
+     - Added merge logic in `mergeJSON()` for `absolute_hook_path` key
+     ```go
+     AbsoluteHookPath bool `json:"absolute_hook_path,omitempty"`
+     ```
+     ```go
+     if ahpRaw, ok := raw["absolute_hook_path"]; ok {
+         var ahp bool
+         if err := json.Unmarshal(ahpRaw, &ahp); err != nil {
+             return fmt.Errorf("parsing absolute_hook_path field: %w", err)
+         }
+         settings.AbsoluteHookPath = ahp
+     }
+     ```
+
+   - **`cmd/entire/cli/strategy/hooks.go`**
+     - `hookCmdPrefix` changed to return `(string, error)` with shell quoting
+     - `InstallGitHook` updated to `InstallGitHook(silent, localDev, absolutePath bool)` and handles `hookCmdPrefix` error
+     - Added `shellQuote()` and `isAbsoluteHookPath()` helpers
+     ```go
+     func hookCmdPrefix(localDev, absolutePath bool) (string, error) {
+         if localDev {
+             return "go run ./cmd/entire/main.go", nil
+         }
+         if absolutePath {
+             exe, err := os.Executable()
+             if err != nil {
+                 return "", fmt.Errorf("--absolute-hook-path: failed to resolve binary path: %w", err)
+             }
+             resolved, err := filepath.EvalSymlinks(exe)
+             if err != nil {
+                 return "", fmt.Errorf("--absolute-hook-path: failed to resolve symlinks for %s: %w", exe, err)
+             }
+             return shellQuote(resolved), nil
+         }
+         return "entire", nil
+     }
+     ```
+     ```go
+     func shellQuote(s string) string {
+         return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+     }
+     ```
+     ```go
+     func InstallGitHook(silent, localDev, absolutePath bool) (int, error) {
+         // ...
+         cmdPrefix, err := hookCmdPrefix(localDev, absolutePath)
+         if err != nil {
+             return 0, err
+         }
+         specs := buildHookSpecs(cmdPrefix)
+         // ...
+     }
+     ```
+
+   - **`cmd/entire/cli/strategy/hook_managers.go`**
+     - `CheckAndWarnHookManagers` updated to `(w io.Writer, localDev, absolutePath bool)` with error handling
+     ```go
+     func CheckAndWarnHookManagers(w io.Writer, localDev, absolutePath bool) {
+         // ...
+         cmdPrefix, err := hookCmdPrefix(localDev, absolutePath)
+         if err != nil {
+             return // Best-effort: advisory warnings
+         }
+         warning := hookManagerWarning(managers, cmdPrefix)
+         // ...
+     }
+     ```
+
+   - **`cmd/entire/cli/strategy/common.go`**
+     - `EnsureSetup()` updated to pass `isAbsoluteHookPath()`:
+     ```go
+     if _, err := InstallGitHook(true, isLocalDev(), isAbsoluteHookPath()); err != nil {
+     ```
+
+   - **`cmd/entire/cli/setup.go`** — PARTIALLY REFACTORED (in progress)
+     - Added `EnableOptions` struct definition
+     - Added `--absolute-hook-path` flag
+     - Updated `runEnableInteractive` and `setupAgentHooksNonInteractive` signatures (from bools to include absoluteHookPath)
+     - Fixed asymmetric settings handling (guarded both `localDev` and `absoluteHookPath` with `if`)
+     - **Currently mid-refactor** converting from positional bools to `EnableOptions` struct
+     - Struct definition added:
+     ```go
+     type EnableOptions struct {
+         LocalDev           bool
+         UseLocalSettings   bool
+         UseProjectSettings bool
+         ForceHooks         bool
+         SkipPushSessions   bool
+         Telemetry          bool
+         AbsoluteHookPath   bool
+     }
+     ```
+     - `newEnableCmd` vars changed from individual bools to `var opts EnableOptions`
+     - Three call sites updated so far: `validateSetupFlags`, `setupAgentHooksNonInteractive` call, `runEnableInteractive` call (partial — only the non-interactive call updated)
+     - Function signatures NOT yet updated to accept `EnableOptions`
+
+   - **`cmd/entire/cli/strategy/hooks_test.go`**
+     - All `InstallGitHook` calls updated with third `false` parameter
+     - Added `TestInstallGitHook_AbsoluteHookPath` (checks shell-quoted absolute path in hooks)
+     - Added `TestShellQuote` (tests POSIX quoting including apostrophes in paths)
+
+   - **`cmd/entire/cli/strategy/hook_managers_test.go`**
+     - All `CheckAndWarnHookManagers` calls updated with third `false` parameter
+
+   - **`cmd/entire/cli/setup_test.go`**
+     - `strategy.InstallGitHook(true, false)` → `strategy.InstallGitHook(true, false, false)`
+
+   - **`cmd/entire/cli/bench_enable_test.go`**
+     - All `setupAgentHooksNonInteractive` calls updated with 7th `false` parameter
+     - Will need updating again for `EnableOptions` struct
+
+4. Errors and fixes:
+   - **Missing call site in `bench_enable_test.go`**: Initial implementation missed updating `setupAgentHooksNonInteractive` calls in bench test. Lint caught `not enough arguments` error. Fixed by adding `false` for the new `absoluteHookPath` parameter.
+   - **Review finding 1 - Shell injection**: Paths with spaces/metacharacters in `os.Executable()` result would break hooks. Fixed by adding `shellQuote()` using POSIX `'...'` with `'` escaped as `'\''`.
+   - **Review finding 2 - Silent fallback**: `hookCmdPrefix` silently fell back to `"entire"` on resolution failure, defeating the feature. Fixed by changing return type to `(string, error)` and propagating errors through `InstallGitHook`.
+   - **Review finding 3 - Asymmetric settings handling**: `runEnableInteractive` unconditionally set `settings.AbsoluteHookPath = absoluteHookPath` (resetting to false on re-run without flag). Fixed by guarding with `if absoluteHookPath {`. Also fixed pre-existing `localDev` inconsistency the same way.
+   - **Review finding 4 - Boolean parameter explosion** (IN PROGRESS): Started extracting `EnableOptions` struct but refactor is incomplete.
+
+5. Problem Solving:
+   - Successfully implemented the core feature (absolute hook path support)
+   - Addressed all four security/architecture review findings
+   - Currently in the middle of the `EnableOptions` struct refactor (finding #4)
+
+6. All user messages:
+   - "Implement the following plan: # Fix: Git hooks fail in GUI clients (Issue #489) [detailed plan with 4 sections]"
+   - "1. Shell injection via paths with spaces/metacharacters [...] Fix: Shell-quote the path in hookCmdPrefix: return \"'\" + strings.ReplaceAll(resolved, \"'\", \"'\\\\''\") + \"'\""
+   - "2. Silent fallback defeats the feature's purpose [...] Fix: Log a warning or return an error from InstallGitHook when resolution fails."
+   - "3. Asymmetric settings handling between interactive and non-interactive paths [...] Fix: Guard the interactive path the same way, or use cmd.Flags().Changed(\"absolute-hook-path\")."
+   - "4. Boolean parameter explosion [...] Fix: Extract an EnableOptions struct. The codebase already uses this pattern elsewhere (e.g., StepContext, TaskStepContext)."
+
+7. Pending Tasks:
+   - Complete the `EnableOptions` struct refactor (finding #4) — currently mid-edit, code will not compile
+   - Specifically need to:
+     - Update flag registrations in `newEnableCmd` to bind to `opts.Field` instead of individual vars
+     - Update the `runEnableInteractive` call site in `newEnableCmd` to pass `opts`
+     - Update `runEnableInteractive` function signature to accept `EnableOptions`
+     - Update `setupAgentHooksNonInteractive` function signature to accept `EnableOptions`
+     - Update all field references inside both functions
+     - Update `setupAgentHooks` calls inside both functions (uses `localDev` and `forceHooks`)
+     - Update `bench_enable_test.go` call sites
+     - Run `mise run fmt && mise run lint && mise run test:ci`
+
+8. Current Work:
+   Working on review finding #4: extracting `EnableOptions` struct to replace positional boolean parameters. The refactor is partially applied and the code **will not compile** in its current state. Specifically:
+   - The `EnableOptions` struct is defined
+   - `newEnableCmd` variables changed to `var opts EnableOptions`
+   - Two call sites in `newEnableCmd.RunE` updated: `validateSetupFlags(opts.UseLocalSettings, opts.UseProjectSettings)` and `setupAgentHooksNonInteractive(cmd.OutOrStdout(), ag, opts)`
+   - But the actual function signatures of `runEnableInteractive` and `setupAgentHooksNonInteractive` still expect individual bool parameters
+   - Flag registrations still reference old individual variables (e.g., `&localDev` which no longer exists)
+   - The `runEnableInteractive` call in `newEnableCmd` has NOT been updated yet
+
+9. Optional Next Step:
+   Continue the `EnableOptions` struct refactor. The user's most recent message was: "4. Boolean parameter explosion [...] Fix: Extract an EnableOptions struct." I was mid-edit in `setup.go` — I need to:
+   1. Update flag registrations to use `&opts.LocalDev`, `&opts.ForceHooks`, etc.
+   2. Update the `runEnableInteractive` call to pass `opts`
+   3. Update both function signatures to accept `EnableOptions`
+   4. Update internal field references in both functions
+   5. Update `bench_enable_test.go`
+   6. Run `mise run fmt && mise run lint && mise run test:ci`
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.claude/projects/-Users-soph-Work-entire-devenv-cli/6527fd86-2c3b-465e-8660-b66ee5ce7da9.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+5. Duplicate settings.Load() calls
+  Flagged by: Architecture, Pattern, Performance (three agents)
+
+---
+
+confirmation: it's called "absolute-hook-paths" but it's only using this for git hooks? or all hooks?
+
+---
+
+yeah, let's change it to `--abolsute-git-hook-path`

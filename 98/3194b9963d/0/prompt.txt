@@ -1,0 +1,26 @@
+encoded.Reader() returns a reader that should be closed, but it is never closed here. This can leak resources across repeated checkpoint commits. Close the reader after signer.Sign completes (typically with defer r.Close() after the successful Reader() call).
+
+SignCommitBestEffort calls settings.IsSignCheckpointCommitsEnabled(ctx), which reloads settings from disk each time a commit is created. Since checkpoint creation can be frequent, this adds avoidable overhead. Consider loading this setting once (per command/run/store) and passing the resolved boolean into signing, or caching the loaded settings.
+
+New signing behavior is introduced here, but there are no tests verifying: (1) signatures are added when an ObjectSigner is registered and settings allow it, (2) signing is skipped when sign_checkpoint_commits=false, and (3) errors from the signer are best-effort (commit remains unsigned and a warning is logged). Adding unit tests with a stub plugin.ObjectSigner() would help prevent regressions.
+
+---
+
+Ignore the lint error below: [lint:go] cmd/entire/cli/checkpoint/committed.go:1617:21: SA1019: config.LoadConfig is deprecated: Use the ConfigLoader plugin instead. This will be removed in v7. (staticcheck)
+[lint:go]         globalCfg, err := config.LoadConfig(config.GlobalScope)
+
+---
+
+No, make the linter ignore that issue - e.g. add an exception
+
+---
+
+No, make the linter ignore that issue - e.g. add an exception
+
+---
+
+strategy.createCommit is a line-for-line duplicate of checkpoint.CreateCommit (which the checkpoint.GitStore.createCommit method already delegates to). The PR adds checkpoint.SignCommitBestEffort to both copies independently. The strategy version is only called from test files, and already imports the checkpoint package — it could simply delegate via return checkpoint.CreateCommit(ctx, repo, …), eliminating the duplicated signing call and ensuring future changes to commit creation stay consistent.
+
+---
+
+On the main.go changes to register the objectsigner, let's move that to PersistentPreRun of that commands that actually need it - and eventually trigger a commit.

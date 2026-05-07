@@ -1,0 +1,111 @@
+Implement the following plan:
+
+# Plan: Session Pruning — Skip Fully-Condensed Sessions in PostCommit
+
+## Context
+
+PostCommit iterates over ALL sessions for the worktree, including ENDED sessions that have already been fully condensed. Profiling shows 200 sessions costs ~12.6s, with attribution at 6.49s (51%), shadow cleanup at 2.66s (21%), and hasNewContent at 1.53s (12%). Every session costs ~60ms just to exist in the pipeline (shadow resolve + hasNewContent + state machine + attribution if condensed).
+
+Once a session is ENDED + condensed + no remaining carry-forward files + shadow branch deleted, it's **fully settled**. The only reason it persists is for `LastCheckpointID` (amend trailer restoration). Yet it still goes through the entire PostCommit pipeline every commit.
+
+**Goal:** Add a `FullyCondensed` flag so PostCommit skips settled sessions entirely, reducing steady-state PostCommit from seconds to milliseconds.
+
+## Files to Modify
+
+1. **`cmd/entire/cli/session/state.go`** — Add `FullyCondensed` field to `State` struct
+2. **`cmd/entire/cli/strategy/manual_commit_hooks.go`** — Set the flag after condensation + carry-forward; skip flagged sessions early in PostCommit
+
+## Approach
+
+### Change 1: Add `FullyCondensed` field to `State` (state.go)
+
+Add after `LastCheckpointID` (line ~114):
+
+```go
+// FullyCondensed indicates this session has been condensed and has no remaining
+// carry-forward files. PostCommit skips fully-condensed sessions entirely.
+// Set after successful condensation when no files remain for carry-forward.
+// Reset to false if the session becomes active again (new turn start).
+FullyCondensed bool `json:"fully_condensed,omitempty"`
+```
+
+Backward compatible: missing field in existing JSON files deserializes as `false`.
+
+### Change 2: Set the flag in `postCommitFinalizeAll` (manual_commit_hooks.go)
+
+In `postCommitFinalizeAll` (line ~958), after carry-forward completes and before state is saved:
+
+```go
+// After carry-forward logic (line 955-957):
+if len(remainingFiles) > 0 {
+    s.carryForwardToNewShadowBranch(ctx, repo, state, remainingFiles)
+}
+
+// NEW: Mark session as fully condensed if ENDED with no carry-forward
+if state.Phase == session.PhaseEnded && len(state.FilesTouched) == 0 {
+    state.FullyCondensed = true
+}
+```
+
+Only set for ENDED sessions — ACTIVE/IDLE sessions will have future activity.
+
+### Change 3: Skip fully-condensed sessions in PostCommit (manual_commit_hooks.go)
+
+In the PostCommit session loop (line ~823), add an early skip before `postCommitProcessSession`:
+
+```go
+for _, state := range sessions {
+    // Skip fully-condensed ended sessions — no work remains.
+    // These sessions only exist for LastCheckpointID (amend trailer reuse).
+    if state.FullyCondensed {
+        continue
+    }
+    swh := s.postCommitProcessSession(ctx, repo, state, ...)
+    processed = append(processed, swh)
+}
+```
+
+This skips shadow ref resolve (~54µs), `sessionHasNewContent` (~7.6ms), state machine transition, overlap check, and attribution (~49ms) per session — all the expensive steps.
+
+### Change 4: Reset the flag on session reactivation
+
+In `InitializeSession` / `handleLifecycleTurnStart` (wherever session state is reset for a new turn), clear the flag:
+
+```go
+state.FullyCondensed = false
+```
+
+This handles the edge case where a session somehow gets reactivated after being marked condensed. Looking at the state machine, ENDED is terminal (no transition from ENDED back to ACTIVE), so this is purely defensive. The most natural place is `InitializeSession` in `manual_commit_session.go` since that's where new sessions are created — but ENDED sessions don't get re-initialized, so this is a no-op safety guard.
+
+### What stays the same
+
+- **Session state files persist** — `FullyCondensed` sessions still exist in `.git/entire-sessions/` for `LastCheckpointID` reuse
+- **7-day stale threshold** — still applies for cleanup
+- **`listAllSessionStates`** — no changes needed; it still loads all sessions, PostCommit just skips the condensed ones
+- **State machine** — no changes to transitions or actions
+- **Batch write, condensation, carry-forward** — all unchanged
+
+## Verification
+
+1. Run existing tests:
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+2. Run performance benchmark to measure improvement:
+```bash
+go test -v -run TestCommitHookPerformance -tags hookperf -timeout 15m ./cmd/entire/cli/strategy/
+```
+
+The perf test simulates first-commit-with-200-sessions, so the pruning won't help there (all sessions are fresh). To verify pruning works, we'd need to run PostCommit twice — the second run should be near-instant since all sessions are now `FullyCondensed`.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/36092bc5-f102-4ad4-94c1-68d699bf93db.jsonl
+
+---
+
+lets runt his against our benchmark and see how it does
+
+---
+
+okay let's clean this up, and put this change specifically, skipping fullycondensed sessions on a new branch with a clear outline of the problem and the solution. then commit it and push a new PR

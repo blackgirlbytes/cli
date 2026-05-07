@@ -1,0 +1,686 @@
+agent-integration plugin not quite right. the commands should point to the skill md file instead of duplicating logic
+
+---
+
+## Context
+
+- Current git status: On branch alisha/agent-integration-skill
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   .claude/plugins/agent-integration/commands/implement.md
+	modified:   .claude/plugins/agent-integration/commands/research.md
+	modified:   .claude/plugins/agent-integration/commands/write-tests.md
+	modified:   .claude/skills/agent-integration/SKILL.md
+
+no changes added to commit (use "git add" and/or "git commit -a")
+- Current git diff (staged and unstaged changes): diff --git a/.claude/plugins/agent-integration/commands/implement.md b/.claude/plugins/agent-integration/commands/implement.md
+index 437435fc..191ff6e0 100644
+--- a/.claude/plugins/agent-integration/commands/implement.md
++++ b/.claude/plugins/agent-integration/commands/implement.md
+@@ -4,174 +4,4 @@ description: "Build the agent Go package via TDD using research findings and E2E
+ 
+ # Implement Command
+ 
+-Build the agent Go package using test-driven development. Uses the research report findings and the E2E test suite as the spec.
+-
+-## Parameters
+-
+-Collect these before proceeding (ask the user if not provided):
+-
+-| Parameter | Example | Description |
+-|-----------|---------|-------------|
+-| `AGENT_NAME` | "Windsurf" | Human-readable agent name |
+-| `AGENT_SLUG` | "windsurf" | Lowercase slug for file/directory paths |
+-| `AGENT_BIN` | "windsurf" | CLI binary name |
+-| `LIVE_COMMAND` | "windsurf --project ." | Full command to launch agent |
+-| `EVENTS_OR_UNKNOWN` | "unknown" | Known hook event names, or "unknown" |
+-
+-## Prerequisites
+-
+-- The research command's findings (hook events, transcript format, config mechanism)
+-- The E2E test runner already added (from `write-tests` command)
+-- If neither exists, read the agent's docs and ask the user about hook events, transcript format, and config
+-
+-## Architecture References
+-
+-- **Implementation guide**: `docs/architecture/agent-guide.md`
+-- **Integration checklist**: `docs/architecture/agent-integration-checklist.md`
+-
+-## Procedure
+-
+-### Step 1: Read Implementation Guide
+-
+-Read these files thoroughly before writing any code:
+-
+-1. `docs/architecture/agent-guide.md` — Authoritative implementation guide with code templates. Read thoroughly.
+-2. `docs/architecture/agent-integration-checklist.md` — Validation criteria for completeness.
+-3. `cmd/entire/cli/agent/agent.go` — Read to find the exact `Agent` interface and all optional interfaces.
+-4. `cmd/entire/cli/agent/event.go` — Read to find `EventType` constants and shared parsing helpers.
+-
+-### Step 2: Read Reference Implementation
+-
+-Run `Glob("cmd/entire/cli/agent/*/")` to find all existing agent packages. Pick the closest match based on research findings — read a few agents' `hooks.go` files to find one with a similar hook mechanism to your target. Read all `*.go` files (skip `*_test.go` on first pass) in the chosen reference.
+-
+-### Step 3: Create Package Structure
+-
+-Create the agent package directory:
+-
+-```
+-cmd/entire/cli/agent/$AGENT_SLUG/
+-```
+-
+-### Step 4: TDD Cycle — Types
+-
+-**Red**: Write `types_test.go` with tests for hook input struct parsing:
+-
+-```go
+-//go:build !e2e
+-
+-package $AGENT_SLUG
+-
+-import (
+-    "encoding/json"
+-    "testing"
+-)
+-
+-func TestHookInput_Parsing(t *testing.T) {
+-    t.Parallel()
+-    // Test that hook JSON payloads deserialize correctly
+-}
+-```
+-
+-**Green**: Write `types.go` with hook input structs:
+-
+-```go
+-package $AGENT_SLUG
+-
+-// HookInput represents the JSON payload from the agent's hooks.
+-type HookInput struct {
+-    SessionID      string `json:"session_id"`
+-    TranscriptPath string `json:"transcript_path"`
+-    // ... fields from research report's captured payloads
+-}
+-```
+-
+-**Refactor**: Ensure struct tags match the actual JSON field names from the research captures.
+-
+-Run: `mise run test` to verify.
+-
+-### Step 5: TDD Cycle — Core Agent
+-
+-**Red**: Write `${AGENT_SLUG}_test.go` with tests for Identity methods (Name, Type, Description, IsPreview, DetectPresence, ProtectedDirs) and session management methods.
+-
+-**Green**: Create `${AGENT_SLUG}.go`. Read the `Agent` interface in `cmd/entire/cli/agent/agent.go` for exact method signatures. Read `docs/architecture/agent-guide.md` Step 3 for the full code template. Use `agent.Register(agent.AgentName("$AGENT_SLUG"), New)` in `init()`.
+-
+-Run: `mise run test`
+-
+-### Step 6: TDD Cycle — Lifecycle (ParseHookEvent)
+-
+-This is the **main contribution surface** — mapping native hooks to Entire events.
+-
+-**Red**: Write `lifecycle_test.go` with tests for each hook name from the research report. Use actual JSON payloads from research captures. Test every EventType mapping, nil returns for pass-through hooks, empty input, and malformed JSON.
+-
+-**Green**: Create `lifecycle.go`. Read the `HookSupport` interface in `cmd/entire/cli/agent/agent.go` for exact method signatures. Read `docs/architecture/agent-guide.md` Step 4 for the switch-case pattern. Read a reference agent's `lifecycle.go` (find via `Glob("cmd/entire/cli/agent/*/lifecycle.go")`) for the implementation pattern.
+-
+-Run: `mise run test`
+-
+-### Step 7: TDD Cycle — Hooks (HookSupport)
+-
+-**Red**: Write `hooks_test.go` with tests for InstallHooks (creates config, idempotent), UninstallHooks (removes hooks), and AreHooksInstalled (detects presence).
+-
+-**Green**: Create `hooks.go`. Read the `HookSupport` interface in `cmd/entire/cli/agent/agent.go` for exact signatures. Read `docs/architecture/agent-guide.md` Step 8 for the installation pattern. Read a reference agent's `hooks.go` (find via `Glob("cmd/entire/cli/agent/*/hooks.go")`) for the JSON config file pattern.
+-
+-Use the research report to determine:
+-- Which config file to modify (e.g., `.agent/settings.json`)
+-- How hooks are registered (JSON objects, env vars, etc.)
+-- What command format to use (`entire hooks $AGENT_SLUG <verb>`)
+-
+-Run: `mise run test`
+-
+-### Step 8: TDD Cycle — Transcript
+-
+-**Red**: Write `transcript_test.go` with tests for reading, chunking, and reassembling transcripts. Use sample data in the agent's native format.
+-
+-**Green**: Create `transcript.go`. Read the `TranscriptAnalyzer` interface in `cmd/entire/cli/agent/agent.go` if implementing analysis. Read `docs/architecture/agent-guide.md` Transcript Format Guide for JSONL vs JSON patterns. Read a reference agent's `transcript.go` (find via `Glob("cmd/entire/cli/agent/*/transcript.go")`) for the implementation pattern.
+-
+-Run: `mise run test`
+-
+-### Step 9: Optional Interfaces
+-
+-Read `cmd/entire/cli/agent/agent.go` for all optional interfaces. For each one the research report marked as feasible, follow the same TDD cycle: write tests, implement, refactor. Read the corresponding section in `docs/architecture/agent-guide.md` (Optional Interface Decision Tree) for guidance on when each is needed.
+-
+-### Step 10: Register and Wire Up
+-
+-1. **Register hook commands**: Search `cmd/entire/cli/` for where hook subcommands are registered and add the new agent
+-2. **Verify registration**: The `init()` function in `${AGENT_SLUG}.go` should call `agent.Register(agent.AgentName("$AGENT_SLUG"), New)`
+-3. **Run full test suite**: `mise run test:ci`
+-
+-### Step 11: Final Validation
+-
+-Run the complete validation:
+-
+-```bash
+-mise run fmt      # Format
+-mise run lint     # Lint
+-mise run test:ci  # All tests (unit + integration)
+-```
+-
+-Check against the integration checklist (`docs/architecture/agent-integration-checklist.md`):
+-
+-- [ ] Full transcript stored at every checkpoint
+-- [ ] Native format preserved
+-- [ ] All mappable hook events implemented
+-- [ ] Session storage working
+-- [ ] Hook installation/uninstallation working
+-- [ ] Tests pass with `t.Parallel()`
+-
+-## Key Patterns to Follow
+-
+-- **Use `agent.ReadAndParseHookInput[T]`** for parsing hook stdin JSON
+-- **Use `paths.WorktreeRoot()`** not `os.Getwd()` for git-relative paths
+-- **Preserve unknown config keys** when modifying agent config files (don't clobber user settings)
+-- **Use `logging.Debug/Info/Warn/Error`** for internal logging, not `fmt.Print`
+-- **Keep interface implementations minimal** — only implement what's needed
+-- **Follow Go idioms** from `.golangci.yml` — check before writing code
+-
+-## Output
+-
+-Summarize what was implemented:
+-- Package directory and files created
+-- Interfaces implemented (core + optional)
+-- Hook names registered
+-- Test coverage (number of test functions, what they cover)
+-- Any gaps or TODOs remaining
+-- Commands to run full validation
++Read and follow the full procedure from `.claude/skills/agent-integration/implementer.md`.
+diff --git a/.claude/plugins/agent-integration/commands/research.md b/.claude/plugins/agent-integration/commands/research.md
+index 0ed68db3..ede5def3 100644
+--- a/.claude/plugins/agent-integration/commands/research.md
++++ b/.claude/plugins/agent-integration/commands/research.md
+@@ -4,170 +4,4 @@ description: "Assess a new agent's hook/lifecycle compatibility with the Entire
+ 
+ # Research Command
+ 
+-Assess whether a target AI coding agent's hook/lifecycle model is compatible with the Entire CLI before writing any Go code.
+-
+-## Parameters
+-
+-Collect these before proceeding (ask the user if not provided):
+-
+-| Parameter | Example | Description |
+-|-----------|---------|-------------|
+-| `AGENT_NAME` | "Windsurf" | Human-readable agent name |
+-| `AGENT_SLUG` | "windsurf" | Lowercase slug for file/directory paths |
+-| `AGENT_BIN` | "windsurf" | CLI binary name |
+-| `LIVE_COMMAND` | "windsurf --project ." | Full command to launch agent |
+-| `EVENTS_OR_UNKNOWN` | "unknown" | Known hook event names, or "unknown" |
+-
+-## Architecture References
+-
+-Read these to understand the Entire lifecycle model:
+-
+-- **Implementation guide**: `docs/architecture/agent-guide.md`
+-- **Integration checklist**: `docs/architecture/agent-integration-checklist.md`
+-
+-## Procedure
+-
+-### Phase 1: Architecture Inspection
+-
+-Read these repo files to understand the Entire lifecycle model that the agent must integrate with:
+-
+-**Required reading:**
+-
+-1. `cmd/entire/cli/agent/agent.go` — Read to find the `Agent` interface and all optional capability interfaces
+-2. `cmd/entire/cli/agent/event.go` — Read to find all `EventType` constants (the normalized lifecycle events agents must map to)
+-3. `cmd/entire/cli/hook_registry.go` — How native hook names are registered and routed
+-4. `cmd/entire/cli/lifecycle.go` — `DispatchLifecycleEvent` handler
+-5. `docs/architecture/agent-guide.md` — Full implementation guide
+-6. `docs/architecture/agent-integration-checklist.md` — Validation criteria
+-
+-**Reference implementations:** Run `Glob("cmd/entire/cli/agent/*/")` to discover all existing agent packages. Pick 1-2 as reference. In each, focus on `lifecycle.go` (ParseHookEvent), `hooks.go` (HookSupport), and `types.go` (hook input structs).
+-
+-### Phase 2: Static Capability Checks
+-
+-Non-destructive CLI probing. Record PASS/WARN/FAIL for each:
+-
+-| Check | Command | PASS | FAIL |
+-|-------|---------|------|------|
+-| Binary present | `command -v $AGENT_BIN` | Found | Not found (blocker) |
+-| Help output | `$AGENT_BIN --help` or `$AGENT_BIN help` | Available | No help |
+-| Version info | `$AGENT_BIN --version` or `$AGENT_BIN version` | Available | N/A |
+-| Hook keywords | Scan help for: hook, lifecycle, callback, event, trigger, pre-, post-, plugin, extension | Found | None found |
+-| Session keywords | Scan help for: session, resume, continue, history, transcript, context | Found | None found |
+-| Config directory | Check `~/.$AGENT_SLUG/`, `~/.config/$AGENT_SLUG/`, `./$AGENT_SLUG/`, `./.${AGENT_SLUG}/` | Found | None found |
+-| Documentation | Web search for hook/plugin/extension docs | Found | None found |
+-
+-### Phase 3: Test Script Creation
+-
+-Based on Phase 2 findings, create an **agent-specific** test script:
+-
+-```
+-scripts/test-$AGENT_SLUG-agent-integration.sh
+-```
+-
+-The script is tailored to the specific agent's hook mechanism (not a generic template). Adapt the hook wiring section based on what Phase 2 discovered.
+-
+-**Script structure:**
+-
+-```bash
+-#!/usr/bin/env bash
+-set -euo pipefail
+-
+-AGENT_NAME="..."
+-AGENT_SLUG="..."
+-AGENT_BIN="..."
+-PROBE_DIR=".entire/tmp/probe-${AGENT_SLUG}-$(date +%s)"
+-```
+-
+-**Required sections:**
+-
+-1. **Static checks** — Re-runnable binary/version/help checks
+-2. **Hook wiring** — Create workspace-local config that intercepts hooks and dumps stdin JSON to `$PROBE_DIR/captures/<event-name>-<timestamp>.json`
+-3. **Run modes:**
+-   - `--run-cmd '<cmd>'` — Automated: launch agent, wait, collect
+-   - `--manual-live` — Interactive: user runs agent manually, presses Enter
+-4. **Capture collection** — List and pretty-print all payload files
+-5. **Cleanup** — Restore original config (unless `--keep-config`)
+-6. **Verdict** — PASS/WARN/FAIL per lifecycle event + COMPATIBLE/PARTIAL/INCOMPATIBLE
+-
+-### Phase 4: Execution & Analysis
+-
+-Run the script and analyze:
+-
+-1. **Execute**: `chmod +x scripts/test-$AGENT_SLUG-agent-integration.sh && scripts/test-$AGENT_SLUG-agent-integration.sh --manual-live`
+-2. **For each captured payload**: show command, artifact path, decoded JSON
+-3. **Lifecycle mapping**: native hook name -> Entire EventType
+-4. **Field coverage**: which `Event` struct fields can be populated per event
+-
+-### Phase 5: Compatibility Report
+-
+-Generate structured markdown output directly to the user:
+-
+-```markdown
+-# Agent Compatibility Report: $AGENT_NAME
+-
+-**Date:** YYYY-MM-DD
+-**Agent:** $AGENT_NAME v$VERSION
+-**Binary:** $AGENT_BIN
+-**Verdict:** COMPATIBLE / PARTIAL / INCOMPATIBLE
+-
+-## Static Capability Checks
+-
+-| Check | Result | Notes |
+-|-------|--------|-------|
+-| Binary present | PASS/FAIL | path |
+-| Help available | PASS/FAIL | |
+-| Hook keywords found | PASS/WARN/FAIL | keywords found |
+-| Session concept | PASS/WARN/FAIL | |
+-| Config directory | PASS/WARN/FAIL | path |
+-| Documentation | PASS/WARN/FAIL | URLs |
+-
+-## Lifecycle Event Mapping
+-
+-For each EventType constant found in `cmd/entire/cli/agent/event.go`, create a row:
+-
+-| Entire EventType | Native Hook | Status | Fields Available |
+-|-----------------|-------------|--------|-----------------|
+-| (one row per EventType from event.go) | ? | MAPPED/PARTIAL/MISSING | |
+-
+-## Required Interface Feasibility
+-
+-For each interface defined in `cmd/entire/cli/agent/agent.go`, assess feasibility:
+-
+-| Interface | Feasible | Complexity | Notes |
+-|-----------|----------|------------|-------|
+-| Agent (core) | Yes/No/Partial | Low/Med/High | |
+-| (one row per optional interface from agent.go) | ... | ... | |
+-
+-## Integration Gaps
+-
+-1. **[HIGH/MED/LOW]** Description and impact
+-2. ...
+-
+-## Recommended Adapter Approach
+-
+-- Which interfaces to implement
+-- Complexity estimate (files, LOC)
+-- Similar implementation to use as template
+-- Key challenges
+-
+-## Artifacts
+-
+-- Test script: `scripts/test-$AGENT_SLUG-agent-integration.sh`
+-- Captured payloads: `.entire/tmp/probe-$AGENT_SLUG-*/captures/`
+-```
+-
+-## Blocker Handling
+-
+-If blocked at any point (auth, sandbox, binary not found):
+-
+-1. State the exact blocker
+-2. Provide the exact command for the user to run manually
+-3. Explain what output to paste back
+-4. Continue with provided output
+-
+-## Constraints
+-
+-- **No Go code.** This command produces a feasibility report and test script only.
+-- **Non-destructive.** All artifacts go under `.entire/tmp/` (gitignored).
+-- **Agent-specific scripts.** Adapt based on Phase 2 findings, not a generic template.
+-- **Ask, don't assume.** If the hook mechanism is unclear, ask the user.
++Read and follow the full procedure from `.claude/skills/agent-integration/researcher.md`.
+diff --git a/.claude/plugins/agent-integration/commands/write-tests.md b/.claude/plugins/agent-integration/commands/write-tests.md
+index 51553827..5f3e019e 100644
+--- a/.claude/plugins/agent-integration/commands/write-tests.md
++++ b/.claude/plugins/agent-integration/commands/write-tests.md
+@@ -4,261 +4,4 @@ description: "Generate E2E test suite for a new agent integration"
+ 
+ # Write-Tests Command
+ 
+-Generate the E2E test suite for a new agent integration. Uses the research report's findings and the existing E2E test infrastructure.
+-
+-## Parameters
+-
+-Collect these before proceeding (ask the user if not provided):
+-
+-| Parameter | Example | Description |
+-|-----------|---------|-------------|
+-| `AGENT_NAME` | "Windsurf" | Human-readable agent name |
+-| `AGENT_SLUG` | "windsurf" | Lowercase slug for file/directory paths |
+-| `AGENT_BIN` | "windsurf" | CLI binary name |
+-| `LIVE_COMMAND` | "windsurf --project ." | Full command to launch agent |
+-| `EVENTS_OR_UNKNOWN` | "unknown" | Known hook event names, or "unknown" |
+-
+-## Prerequisites
+-
+-- The research command should have been run first (or equivalent knowledge of the agent's hook model)
+-- If no research report exists, ask the user about the agent's hook events, transcript format, and config mechanism
+-
+-## Architecture References
+-
+-- **Implementation guide**: `docs/architecture/agent-guide.md`
+-- **Integration checklist**: `docs/architecture/agent-integration-checklist.md`
+-
+-## Procedure
+-
+-### Step 1: Read E2E Test Infrastructure
+-
+-Read these files to understand the existing test patterns:
+-
+-1. `e2e/tests/main_test.go` — `TestMain` builds the CLI binary (via `entire.BinPath()`), runs preflight checks for required binaries (git, tmux, agent CLIs), sets up artifact directories, and configures env
+-2. `e2e/testutil/repo.go` — `RepoState` struct (holds agent, dir, artifact dir, head/checkpoint refs), `SetupRepo` (creates temp git repo, runs `entire enable`, patches settings), `ForEachAgent` (runs a test per registered agent with repo setup, concurrency gating, and timeout scaling)
+-3. `e2e/agents/agent.go` — `Agent` interface (`Name`, `Binary`, `EntireAgent`, `PromptPattern`, `TimeoutMultiplier`, `RunPrompt`, `StartSession`, `Bootstrap`, `IsTransientError`), `Register()` for agent self-registration in `init()`, `RegisterGate()` for concurrency limits, `AcquireSlot`/`ReleaseSlot` for gating
+-4. `e2e/agents/tmux.go` — `TmuxSession` for interactive PTY-based tests: `NewTmuxSession`, `Send`, `SendKeys`, `WaitFor` (with settle-time logic), `Capture`, `Close`
+-5. `e2e/testutil/assertions.go` — Rich assertion helpers: `AssertFileExists`, `WaitForFileExists`, `AssertNewCommits`, `WaitForCheckpoint`, `AssertCheckpointAdvanced`, `AssertHasCheckpointTrailer`, `AssertCheckpointExists`, `AssertCommitLinkedToCheckpoint`, `AssertCheckpointMetadataComplete`, `ValidateCheckpointDeep`, and many more
+-6. `e2e/testutil/metadata.go` — `CheckpointMetadata`, `SessionMetadata`, `TokenUsage`, `Attribution`, `SessionRef` types; `CheckpointPath()` helper for sharded directory layout
+-7. `e2e/entire/entire.go` — CLI wrapper: `BinPath()` (builds from source or uses `E2E_ENTIRE_BIN`), `Enable`, `Disable`, `RewindList`, `Rewind`, `RewindLogsOnly`, `Explain`, `ExplainGenerate`, `ExplainCommit`, `Resume`
+-8. `e2e/testutil/artifacts.go` — Automatic artifact capture via `t.Cleanup`: `CaptureArtifacts` saves git-log, git-tree, checkpoint metadata, entire logs, and tmux pane content
+-
+-### Step 2: Read Existing E2E Test Scenarios
+-
+-Run `Glob("e2e/tests/*_test.go")` to find all existing test files. Read a few to understand the patterns:
+-- How tests use `testutil.ForEachAgent` with a timeout and callback `func(t, s, ctx)`
+-- How prompts are written inline (no separate prompt template file)
+-- How `s.RunPrompt`, `s.Git`, `s.StartSession`, `s.WaitFor`, `s.Send` are used
+-- How assertions validate checkpoints, rewind, metadata, etc.
+-
+-### Step 3: Read Checkpoint Scenarios Doc
+-
+-Read `docs/architecture/checkpoint-scenarios.md` for the state machine and scenarios the tests should cover.
+-
+-### Step 4: Create Agent Implementation
+-
+-Add a new `Agent` implementation in `e2e/agents/${agent_slug}.go`:
+-
+-**Pattern to follow** (based on existing implementations like `claude.go`, `gemini.go`, `opencode.go`):
+-
+-```go
+-package agents
+-
+-import (
+-	"context"
+-	"errors"
+-	"fmt"
+-	"os"
+-	"os/exec"
+-	"strings"
+-	"syscall"
+-	"time"
+-)
+-
+-func init() {
+-	if env := os.Getenv("E2E_AGENT"); env != "" && env != "${agent-slug}" {
+-		return
+-	}
+-	Register(&${AgentName}{})
+-	// Optional: limit concurrency for rate-limited agents
+-	// RegisterGate("${agent-slug}", 1)
+-}
+-
+-type ${AgentName} struct{}
+-
+-func (a *${AgentName}) Name() string               { return "${agent-slug}" }
+-func (a *${AgentName}) Binary() string             { return "${binary-name}" }
+-func (a *${AgentName}) EntireAgent() string        { return "${entire-agent-name}" }
+-func (a *${AgentName}) PromptPattern() string      { return `${prompt-regex}` }
+-func (a *${AgentName}) TimeoutMultiplier() float64 { return 1.0 }
+-
+-func (a *${AgentName}) Bootstrap() error {
+-	// CI-specific setup: auth config, API key injection, warmup, etc.
+-	// Must be idempotent. Called once before any tests run.
+-	return nil
+-}
+-
+-func (a *${AgentName}) IsTransientError(out Output, err error) bool {
+-	if err == nil {
+-		return false
+-	}
+-	combined := out.Stdout + out.Stderr
+-	for _, p := range []string{"overloaded", "rate limit", "503", "529"} {
+-		if strings.Contains(combined, p) {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+-func (a *${AgentName}) RunPrompt(ctx context.Context, dir string, prompt string, opts ...Option) (Output, error) {
+-	cfg := &runConfig{}
+-	for _, o := range opts {
+-		o(cfg)
+-	}
+-
+-	args := []string{/* agent CLI flags for non-interactive prompt execution */}
+-	cmd := exec.CommandContext(ctx, a.Binary(), args...)
+-	cmd.Dir = dir
+-	cmd.Env = append(os.Environ(), "ENTIRE_TEST_TTY=0")
+-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+-	cmd.Cancel = func() error {
+-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+-	}
+-
+-	var stdout, stderr strings.Builder
+-	cmd.Stdout = &stdout
+-	cmd.Stderr = &stderr
+-
+-	err := cmd.Run()
+-	exitCode := 0
+-	if err != nil {
+-		exitErr := &exec.ExitError{}
+-		if errors.As(err, &exitErr) {
+-			exitCode = exitErr.ExitCode()
+-		} else {
+-			exitCode = -1
+-		}
+-	}
+-
+-	return Output{
+-		Command:  a.Binary() + " " + strings.Join(args, " "),
+-		Stdout:   stdout.String(),
+-		Stderr:   stderr.String(),
+-		ExitCode: exitCode,
+-	}, err
+-}
+-
+-func (a *${AgentName}) StartSession(ctx context.Context, dir string) (Session, error) {
+-	// Use NewTmuxSession for interactive PTY support.
+-	// Return nil if agent doesn't support interactive mode.
+-	name := fmt.Sprintf("${agent-slug}-test-%d", time.Now().UnixNano())
+-	s, err := NewTmuxSession(name, dir, nil, a.Binary(), /* interactive args */)
+-	if err != nil {
+-		return nil, err
+-	}
+-	return s, nil
+-}
+-```
+-
+-Key implementation details:
+-- Self-register in `init()` with `Register()`, gated by `E2E_AGENT` env var
+-- Use `RegisterGate("name", N)` if the agent's API has strict rate limits (e.g., Gemini uses gate of 1)
+-- `Bootstrap()` handles CI-specific one-time setup (auth config, API key injection)
+-- `IsTransientError()` identifies retryable API failures — `RepoState.RunPrompt` retries once on transient errors
+-- `RunPrompt()` uses `exec.CommandContext` with `Setpgid: true` and process-group kill for clean cancellation
+-- `StartSession()` uses `NewTmuxSession` for interactive PTY tests; return `nil` if interactive mode isn't supported
+-- Use the research report to determine CLI flags, prompt passing mechanism, and env vars
+-
+-### Step 5: Update SetupRepo (if needed)
+-
+-Check if `testutil.SetupRepo` in `e2e/testutil/repo.go` needs agent-specific configuration. Look for the existing `if agent.Name() == "opencode"` block as an example:
+-
+-- Agent-specific config files that must exist before `entire enable`
+-- Permission or auth config files
+-- Environment variables needed for hook testing
+-
+-If no special setup is needed, skip this step.
+-
+-### Step 6: Write E2E Test Scenarios
+-
+-Existing tests are agent-agnostic (they use `ForEachAgent`), so they should already work with the new agent. **Only create new test files if the agent has unique behaviors** that existing scenarios don't cover.
+-
+-Check if all existing scenarios work by reviewing:
+-- Does the agent support non-interactive prompt mode? (required for `RunPrompt`)
+-- Does the agent create files when prompted? (required for basic workflow)
+-- Does the agent support git operations? (required for commit scenarios)
+-- Does the agent support interactive mode? (required for interactive tests — can return nil from `StartSession`)
+-
+-If the agent has unique behaviors, create new test files in `e2e/tests/`:
+-
+-```go
+-//go:build e2e
+-
+-package tests
+-
+-import (
+-	"context"
+-	"testing"
+-	"time"
+-
+-	"github.com/entireio/cli/e2e/testutil"
+-)
+-
+-func TestAgentSpecificBehavior(t *testing.T) {
+-	testutil.ForEachAgent(t, 2*time.Minute, func(t *testing.T, s *testutil.RepoState, ctx context.Context) {
+-		// Skip for agents that don't apply
+-		if s.Agent.Name() != "${agent-slug}" {
+-			t.Skip("only applies to ${agent-slug}")
+-		}
+-
+-		// Use s.RunPrompt for non-interactive, s.StartSession for interactive
+-		_, err := s.RunPrompt(t, ctx,
+-			"create a file at hello.txt with 'hello world'. Do not ask for confirmation.")
+-		if err != nil {
+-			t.Fatalf("agent failed: %v", err)
+-		}
+-
+-		testutil.AssertFileExists(t, s.Dir, "hello.txt")
+-	})
+-}
+-```
+-
+-See `e2e/README.md` for the canonical reference on structure, debugging, and CI workflows.
+-
+-### Step 7: Verify
+-
+-After writing the code:
+-
+-1. **Lint check**: `mise run lint` — ensure no lint errors
+-2. **Compile check**: `go test -c -tags=e2e ./e2e/tests` — compile-only with the build tag to verify the code compiles
+-3. **List what to run**: Print the exact E2E commands but do NOT run them (they cost money):
+-   ```bash
+-   mise run test:e2e:${agent_slug} TestSingleSessionManualCommit
+-   ```
+-4. **Add mise task**: Remind the user to add a `test:e2e:${agent_slug}` task in `mise.toml` and update CI workflows
+-
+-## Key Conventions
+-
+-- **Build tag**: All E2E test files must have `//go:build e2e` as the first line
+-- **Package**: `package tests` for test files in `e2e/tests/`; `package agents` for agent implementations in `e2e/agents/`
+-- **Parallel**: `ForEachAgent` handles parallelism — do not call `t.Parallel()` inside the callback
+-- **Repo setup**: `ForEachAgent` calls `SetupRepo` automatically — do not call it manually
+-- **Prompts**: Write prompts inline in the test. Include "Do not ask for confirmation" to prevent agent stalling
+-- **Assertions**: Use helpers from `e2e/testutil/assertions.go` — see `AssertFileExists`, `WaitForCheckpoint`, `AssertCommitLinkedToCheckpoint`, `ValidateCheckpointDeep`, etc.
+-- **CLI operations**: Use the `e2e/entire` package (`entire.Enable`, `entire.RewindList`, `entire.Rewind`, etc.) — never call the binary via raw `exec.Command`
+-- **No hardcoded paths**: Use `s.Dir` for repo paths, `s.ArtifactDir` for artifacts
+-- **Console logging**: All operations through `s.RunPrompt`, `s.Git`, `s.Send`, `s.WaitFor` are automatically logged to `console.log`
+-- **Transient errors**: `s.RunPrompt` auto-retries once on transient API errors via `IsTransientError`
+-- **Interactive tests**: Use `s.StartSession`, `s.Send`, `s.WaitFor` — tmux pane is auto-captured in artifacts
+-- **Run commands**: `mise run test:e2e:${slug} TestName` — see `e2e/README.md` for all options
+-- **Do NOT run E2E tests**: They make real API calls. Only write the code and print commands.
+-
+-## Output
+-
+-Summarize what was created/modified:
+-- Files added or modified
+-- New agent implementation details (how it invokes the agent, auth setup, concurrency gate)
+-- Any agent-specific test scenarios added
+-- Commands to run the tests (for user to execute manually)
+-- Reminder to update `mise.toml` and CI workflows
++Read and follow the full procedure from `.claude/skills/agent-integration/test-writer.md`.
+diff --git a/.claude/skills/agent-integration/SKILL.md b/.claude/skills/agent-integration/SKILL.md
+index 1d2295e7..88be7ebc 100644
+--- a/.claude/skills/agent-integration/SKILL.md
++++ b/.claude/skills/agent-integration/SKILL.md
+@@ -39,7 +39,7 @@ Run these three phases in order. Each phase builds on the previous phase's outpu
+ 
+ Assess whether the agent's hook/lifecycle model is compatible with the Entire CLI.
+ 
+-Read and follow the research procedure from `.claude/plugins/agent-integration/commands/research.md`.
++Read and follow the research procedure from `.claude/skills/agent-integration/researcher.md`.
+ 
+ **Expected output:** Compatibility report with lifecycle event mapping, interface feasibility assessment, and a test script at `scripts/test-$AGENT_SLUG-agent-integration.sh`.
+ 
+@@ -49,7 +49,7 @@ Read and follow the research procedure from `.claude/plugins/agent-integration/c
+ 
+ Generate the E2E test suite based on the research findings.
+ 
+-Read and follow the write-tests procedure from `.claude/plugins/agent-integration/commands/write-tests.md`.
++Read and follow the write-tests procedure from `.claude/skills/agent-integration/test-writer.md`.
+ 
+ **Expected output:** E2E agent runner at `e2e/agents/$AGENT_SLUG.go` and any agent-specific test scenarios.
+ 
+@@ -57,7 +57,7 @@ Read and follow the write-tests procedure from `.claude/plugins/agent-integratio
+ 
+ Build the Go agent package using test-driven development.
+ 
+-Read and follow the implement procedure from `.claude/plugins/agent-integration/commands/implement.md`.
++Read and follow the implement procedure from `.claude/skills/agent-integration/implementer.md`.
+ 
+ **Expected output:** Complete agent package at `cmd/entire/cli/agent/$AGENT_SLUG/` with all tests passing.
+- Current branch: alisha/agent-integration-skill
+- Recent commits: f004d01f Add agent-integration plugin for colon-namespaced subcommands
+94953894 Merge branch 'main' into alisha/agent-integration-skill
+4b7f84ed update skill with docs
+f43adb29 Merge pull request #500 from entireio/postcommitcache
+ee47d5b3 Remove unreachable shadowRef==nil guard in calculateSessionAttributions
+7db812e7 Add cache equivalence and partial-cache tests for PostCommit optimization
+cf7552f0 add post commit cache
+c0db016c Fix discovery instructions
+83edba93 Merge pull request #474 from entireio/alex/consolidate-e2e-tests
+7fd8dffc Merge pull request #473 from entireio/commit_optimizations
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

@@ -1,0 +1,75 @@
+Findings
+High — still not agent-agnostic beyond Claude/Cursor-style JSONL (cmd/entire/cli/transcript/compact.go)
+The new aliasing fixes role:user/assistant and type:human, but conversion still assumes a Claude/Cursor-shaped line with top-level message and timestamp.
+For agents with different transcript schema (e.g. Gemini JSON messages with type:"gemini" and top-level content, or Factory AI Droid’s type:"message" envelope), entries will still be dropped or serialized with missing fields.
+
+compact.go
+Lines 65-96
+var userAliases = map[string]bool{
+    "user":  true,
+    "human": true,
+}
+var assistantAliases = map[string]bool{
+    "assistant": true,
+}
+func normalizeKind(raw map[string]json.RawMessage) string {
+    kind := unquote(raw["type"])
+    if kind == "" {
+        kind = unquote(raw["role"])
+    }
+    // ...
+}
+
+compact.go
+Lines 116-159
+func convertAssistant(raw map[string]json.RawMessage, opts CompactOptions) [][]byte {
+    var id, content json.RawMessage
+    if msgRaw, ok := raw["message"]; ok {
+        var msg map[string]json.RawMessage
+        if json.Unmarshal(msgRaw, &msg) == nil {
+            id = msg["id"]
+            if contentRaw, ok := msg["content"]; ok {
+                content = stripAssistantContent(contentRaw)
+            }
+        }
+    }
+    // ...
+}
+
+transcript.go
+Lines 14-30
+const (
+    MessageTypeUser   = "user"
+    MessageTypeGemini = "gemini"
+)
+type GeminiTranscript struct {
+    Messages []GeminiMessage `json:"messages"`
+}
+type GeminiMessage struct {
+    ID      string `json:"id,omitempty"`
+    Type    string `json:"type"` // user or gemini
+    Content string `json:"content,omitempty"`
+}
+Medium — user text still bypasses IDE context tag stripping (cmd/entire/cli/transcript/compact.go)
+Compact output includes raw user text; existing transcript parsing paths sanitize with StripIDEContextTags. This can leak noisy IDE context tags into compacted output.
+
+compact.go
+Lines 213-218
+func extractUserContent(contentRaw json.RawMessage) (string, []toolResultEntry) {
+    var str string
+    if json.Unmarshal(contentRaw, &str) == nil {
+        return str, nil
+    }
+
+parse.go
+Lines 155-174
+if str, ok := msg.Content.(string); ok {
+    return textutil.StripIDEContextTags(str)
+}
+...
+return textutil.StripIDEContextTags(strings.Join(texts, "\n\n"))
+What improved
+Prior blocker around Cursor role:* and type:"human" normalization is fixed.
+Cross-format tests were added for those specific cases.
+Remaining test gap
+No coverage yet for Gemini/Factory/OpenCode/Copilot transcript shapes in compact tests, so “any agent” behavior is still unproven.

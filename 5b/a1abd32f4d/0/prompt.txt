@@ -1,0 +1,209 @@
+Implement the following plan:
+
+# Plan: `entire trail` command
+
+## Context
+
+PR #738 in entire.io introduces a "Trails" system on the web — a branch-centric work tracking abstraction stored on an `entire/trails` orphan branch. Trails answer "why/what" (human intent) while Checkpoints answer "how/when" (machine snapshots). They're linked by branch name.
+
+This plan adds the CLI counterpart: an `entire trail` command that creates and manages trail metadata locally in git. When pushed (via pre-push hook), the web UI picks it up via webhooks automatically. Additionally, trails are auto-created when an agent session starts on a non-main branch.
+
+## Command Structure
+
+```
+entire trail              # Show current branch's trail (or list if none)
+entire trail list          # List all trails (with optional --status filter)
+entire trail create        # Create a trail for current or new branch
+entire trail update        # Update trail metadata (status, title, etc.)
+```
+
+## Key Design Decisions
+
+- **Storage**: Dedicated `entire/trails` orphan branch (matches web PR)
+- **ID format**: 12 hex char IDs with `<id[:2]>/<id[2:]>/` sharding (same as checkpoints)
+- **Auto-create**: On session start (UserPromptSubmit hook), if on a non-main branch without a trail, auto-create one with status `in_progress`
+- **Push**: Pre-push hook pushes `entire/trails` alongside `entire/checkpoints/v1`
+- **Linking**: Trail ↔ Checkpoints linked by branch name (no foreign key)
+
+## Data Format
+
+### `entire/trails` branch structure
+```
+<trail_id[:2]>/<trail_id[2:]>/
+  metadata.json
+  discussion.json    # Empty initially, comments come later
+```
+
+### `metadata.json` (matches web PR format)
+```json
+{
+  "trail_id": "abcdef123456",
+  "branch": "feature/auth",
+  "base": "main",
+  "title": "Add user authentication",
+  "description": "",
+  "status": "in_progress",
+  "author": "alice",
+  "assignees": [],
+  "labels": [],
+  "created_at": "2026-02-18T10:30:00Z",
+  "updated_at": "2026-02-20T14:22:00Z"
+}
+```
+
+### Trail Status Lifecycle
+```
+draft → open → in_progress → in_review → done → closed
+```
+
+## Implementation Steps
+
+### 1. Add `TrailsBranchName` constant
+**File**: `cmd/entire/cli/paths/paths.go` (line 38)
+
+Add `TrailsBranchName = "entire/trails"` alongside existing `MetadataBranchName`.
+
+### 2. Create trail package
+**New directory**: `cmd/entire/cli/trail/`
+
+#### `trail.go` — Types and helpers
+- `TrailID` type (12 hex chars, same pattern as `checkpoint/id.CheckpointID` in `cmd/entire/cli/checkpoint/id/id.go`)
+  - `Generate()`, `Validate()`, `Path()`, `String()`, `IsEmpty()`
+- `TrailStatus` type with constants: `StatusDraft`, `StatusOpen`, `StatusInProgress`, `StatusInReview`, `StatusDone`, `StatusClosed`
+  - `ValidStatuses()` and `IsValid()` for validation
+- `TrailMetadata` struct matching web PR format (trail_id, branch, base, title, description, status, author, assignees, labels, created_at, updated_at, merged_at)
+- `TrailDiscussion` struct (initially `Comments []TrailComment` — empty, ready for future use)
+- `TrailComment` and `TrailCommentReply` structs (matching web PR)
+- `HumanizeBranchName(branch string) string` helper
+  - Strip common prefixes (`feature/`, `fix/`, `bugfix/`, `chore/`, `hotfix/`, `release/`)
+  - Replace `-`/`_` with spaces, capitalize first word
+
+#### `store.go` — Git storage operations
+`TrailStore` wrapping `*git.Repository`:
+- `NewTrailStore(repo)` constructor
+- `EnsureBranch()` — create `entire/trails` orphan branch if needed
+  - Follow pattern from `checkpoint.GitStore.ensureSessionsBranch()` (`cmd/entire/cli/checkpoint/committed.go:1264`)
+- `Write(ctx, metadata, discussion)` — write metadata.json + discussion.json to sharded path
+- `Read(ctx, trailID)` — read a single trail by ID
+- `FindByBranch(ctx, branchName)` — find trail for a branch (scan all metadata.json files)
+- `List(ctx)` — list all trails
+- `Update(ctx, metadata)` — update existing trail (read-modify-write)
+- `Delete(ctx, trailID)` — remove trail from tree
+
+Reuse exported functions from checkpoint package:
+- `checkpoint.CreateBlobFromContent()` — `cmd/entire/cli/checkpoint/committed.go:1320`
+- `checkpoint.BuildTreeFromEntries()` — `cmd/entire/cli/checkpoint/temporary.go` (exported)
+- `checkpoint.FlattenTree()` — `cmd/entire/cli/checkpoint/temporary.go` (exported)
+- `checkpoint.GetGitAuthorFromRepo()` — `cmd/entire/cli/checkpoint/committed.go:1457`
+
+### 3. Create trail command
+**New file**: `cmd/entire/cli/trail_cmd.go`
+
+#### `entire trail` (root, no subcommand)
+- If on a branch with a trail → show trail details (title, status, branch, base, timestamps)
+- If no trail for current branch → fall through to `entire trail list` output
+
+#### `entire trail list`
+- Scan `entire/trails` branch, list all trails
+- Flags: `--status <status>` (filter), `--json` (JSON output)
+- Table output: branch, title, status, author, created_at
+
+#### `entire trail create`
+- Interactive mode (default): prompt for title, description, base branch
+  - Title defaults to `HumanizeBranchName(currentBranch)`
+  - Base defaults to detected default branch — reuse `strategy.GetDefaultBranchName()` (`cmd/entire/cli/strategy/common.go:1447`)
+  - Uses `NewAccessibleForm()` for accessibility (`cmd/entire/cli/utils.go`)
+- Non-interactive flags: `--title`, `--description`, `--base`, `--branch`, `--status`
+  - If `--branch` specified and branch doesn't exist, create it via `git checkout -b`
+  - If no `--branch`, use current branch via `GetCurrentBranch()` (`cmd/entire/cli/git_operations.go:156`)
+  - Error if on main/master — use `IsOnDefaultBranch()` (`cmd/entire/cli/git_operations.go:83`)
+- Initial status: `StatusDraft` for explicit create, `StatusInProgress` for auto-create
+
+#### `entire trail update`
+- Requires being on a branch with a trail (or `--branch` flag)
+- Flags: `--status`, `--title`, `--description`, `--label add:X`, `--label remove:X`
+- Updates `updated_at` timestamp automatically
+
+### 4. Auto-create trail on session start
+**File**: `cmd/entire/cli/lifecycle.go` — in `handleLifecycleTurnStart()` (line 112)
+
+Insert after session initialization (line ~145), before return:
+1. Get current branch via `GetCurrentBranch()` (`cmd/entire/cli/git_operations.go:156`)
+2. Check if on default branch via `IsOnDefaultBranch()` — skip if true or error
+3. Open trail store, call `FindByBranch(ctx, branchName)`
+4. If trail already exists, skip
+5. If no trail, auto-create:
+   - Trail ID: `trail.GenerateID()`
+   - Branch: current branch name
+   - Base: `strategy.GetDefaultBranchName(repo)` — need to open repo first
+   - Title: `trail.HumanizeBranchName(branchName)`
+   - Status: `trail.StatusInProgress`
+   - Author: git user.name from `checkpoint.GetGitAuthorFromRepo()`
+6. Write trail via store
+7. Log: `fmt.Fprintf(os.Stderr, "[entire] Created trail for branch: %s\n", branchName)`
+8. Non-blocking: wrap in helper, log errors but don't fail the session
+
+### 5. Push trails in pre-push hook
+**File**: `cmd/entire/cli/strategy/push_common.go`
+
+Add `PushTrailsBranch(remote string) error` function:
+- Reuse `pushSessionsBranchCommon()` pattern (line 26) but with `paths.TrailsBranchName`
+- Same logic: check if branch exists locally, compare with remote, push with conflict resolution
+
+Update pre-push handlers to also call `PushTrailsBranch()`:
+- `cmd/entire/cli/strategy/manual_commit_push.go:12` — add after existing push
+- `cmd/entire/cli/strategy/auto_commit.go:120` — add after existing push
+
+### 6. Register trail command
+**File**: `cmd/entire/cli/root.go` (line 86, before help command)
+
+Add `cmd.AddCommand(newTrailCmd())`.
+
+### 7. Update CLAUDE.md
+Document the new `trail` package, command structure, and `entire/trails` branch.
+
+## Files Summary
+
+| File | Action |
+|------|--------|
+| `cmd/entire/cli/paths/paths.go` | Add `TrailsBranchName` constant |
+| `cmd/entire/cli/trail/trail.go` | **New** — TrailID, TrailStatus, TrailMetadata types, HumanizeBranchName |
+| `cmd/entire/cli/trail/store.go` | **New** — TrailStore git storage (CRUD on `entire/trails` branch) |
+| `cmd/entire/cli/trail/trail_test.go` | **New** — tests for types, ID generation, humanize |
+| `cmd/entire/cli/trail/store_test.go` | **New** — tests for store CRUD, FindByBranch |
+| `cmd/entire/cli/trail_cmd.go` | **New** — `entire trail` command + list/create/update subcommands |
+| `cmd/entire/cli/trail_cmd_test.go` | **New** — command tests |
+| `cmd/entire/cli/root.go` | Register `newTrailCmd()` (line ~86) |
+| `cmd/entire/cli/lifecycle.go` | Auto-create trail in `handleLifecycleTurnStart()` (line ~145) |
+| `cmd/entire/cli/strategy/push_common.go` | Add `PushTrailsBranch()` function |
+| `cmd/entire/cli/strategy/manual_commit_push.go` | Call `PushTrailsBranch()` after checkpoint push |
+| `cmd/entire/cli/strategy/auto_commit.go` | Call `PushTrailsBranch()` after checkpoint push |
+| `cmd/entire/cli/strategy/cleanup.go` | Exclude `entire/trails` from shadow branch listing |
+| `CLAUDE.md` | Document trail package, command, and branch |
+
+## Verification
+
+1. **Unit tests**: `mise run test` — trail package types, store operations, humanize
+2. **Integration tests**: Create trail, list, update, verify on `entire/trails` branch
+3. **Manual test flow**:
+   ```bash
+   git checkout -b feature/test-trail
+   entire trail create --title "Test trail"
+   entire trail list
+   entire trail update --status in_review
+   entire trail
+   ```
+4. **Auto-create**: Start a session on a branch, verify trail is created
+5. **Push**: `git push` and verify `entire/trails` is pushed
+6. **Lint**: `mise run fmt && mise run lint && mise run test:ci`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dip/.claude/projects/-Users-dip-Repositories-cli/cc482fc5-8f9d-46fe-9399-51bd4ec5bb7b.jsonl
+
+---
+
+trail still needs a command to enable/disable it
+
+---
+
+[Request interrupted by user for tool use]

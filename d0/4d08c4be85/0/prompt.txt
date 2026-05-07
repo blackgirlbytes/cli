@@ -1,0 +1,388 @@
+Implement the following plan:
+
+# Code Simplification: factoryaidroid package
+
+## Context
+
+The `factoryaidroid` agent was recently added by closely following the `claudecode` pattern. This introduced several vestigial methods (not on any interface, no production callers), a redundant pass-through function, and duplicated branch logic. These simplifications reduce noise, improve consistency with other agents, and remove dead code.
+
+**Scope: factoryaidroid package only** (+ one subtest removal in integration_test).
+
+## Changes
+
+### 1. Remove dead methods from `factoryaidroid.go`
+
+Remove 4 methods that are not on any interface and have zero production callers:
+
+| Method | Line | Notes |
+|--------|------|-------|
+| `GetHookConfigPath()` | 92-93 | Only called from integration test |
+| `SupportsHooks()` | 95-96 | Never called anywhere |
+| `ParseHookInput()` | 98-108 | Superseded by `ParseHookEvent()` on `HookSupport` interface |
+| `GetSupportedHooks()` | hooks.go:424-434 | Never called anywhere |
+
+Also remove the now-unused `"io"` import (only used by `ParseHookInput`).
+
+**Files:**
+- `cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go` - remove methods + `"io"` import
+- `cmd/entire/cli/agent/factoryaidroid/hooks.go` - remove `GetSupportedHooks()`
+
+### 2. Remove tests for dead methods
+
+- `cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go` lines 136-171: remove `TestParseHookInput_Valid`, `TestParseHookInput_Empty`, `TestParseHookInput_InvalidJSON`
+- `cmd/entire/cli/integration_test/agent_test.go` lines 1107-1120: remove the `"GetHookConfigPath returns .factory/settings.json"` subtest
+
+### 3. Consolidate `HookNames()` / `GetHookNames()`
+
+Other agents (claudecode, geminicli, opencode) implement `HookNames()` directly. Factoryaidroid has an unnecessary indirection: `HookNames()` -> `GetHookNames()`.
+
+- Move the hook name list from `GetHookNames()` (hooks.go:41-53) into `HookNames()` (lifecycle.go:23-25)
+- Delete `GetHookNames()` from hooks.go
+
+**Files:**
+- `cmd/entire/cli/agent/factoryaidroid/lifecycle.go` - inline the hook names list
+- `cmd/entire/cli/agent/factoryaidroid/hooks.go` - delete `GetHookNames()`
+
+### 4. Remove `removeEntireHooksFromMatchers()` pass-through
+
+`removeEntireHooksFromMatchers()` just calls `removeEntireHooks()`. The comment says "Same logic" — confirmed identical.
+
+Replace all 4 call sites with `removeEntireHooks()` and delete the function.
+
+**factoryaidroid/hooks.go:**
+- Lines 129-130: replace in `InstallHooks` force path
+- Lines 323-324: replace in `UninstallHooks`
+- Lines 525-530: delete function
+
+### 5. Simplify `addHookToMatcher()`
+
+The `matcherName == ""` branch is identical to the general case because `matcher.Matcher == ""` equals `matcher.Matcher == matcherName` when matcherName is `""`.
+
+Simplify from 32 lines to ~8 lines:
+
+```go
+func addHookToMatcher(matchers []FactoryHookMatcher, matcherName, command string) []FactoryHookMatcher {
+    entry := FactoryHookEntry{Type: "command", Command: command}
+    for i := range matchers {
+        if matchers[i].Matcher == matcherName {
+            matchers[i].Hooks = append(matchers[i].Hooks, entry)
+            return matchers
+        }
+    }
+    return append(matchers, FactoryHookMatcher{Matcher: matcherName, Hooks: []FactoryHookEntry{entry}})
+}
+```
+
+**File:** `cmd/entire/cli/agent/factoryaidroid/hooks.go` lines 462-494
+
+## Files Modified (summary)
+
+- `cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go`
+- `cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go`
+- `cmd/entire/cli/agent/factoryaidroid/hooks.go`
+- `cmd/entire/cli/agent/factoryaidroid/lifecycle.go`
+- `cmd/entire/cli/integration_test/agent_test.go`
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+All existing tests for `InstallHooks`, `UninstallHooks`, `AreHooksInstalled`, `ParseHookEvent`, and hook behavior should continue to pass unchanged. The only removed tests are those covering the deleted dead methods.
+
+## Out of Scope
+
+- Parallel changes in `claudecode/hooks.go` (same patterns exist but not in scope)
+- Cross-agent type consolidation (shared `HookMatcher`/`HookEntry` types)
+- `opencode` also has a dead `GetSupportedHooks()` - separate cleanup
+- `agent-guide.md` references stale methods - doc update for separate PR
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-factoryai-agent/faace853-64a6-43fc-b901-f220fddac603.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/hooks.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/lifecycle.go
+	modified:   cmd/entire/cli/integration_test/agent_test.go
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+index cfcb26a4..83de3f8f 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+@@ -4,7 +4,6 @@ package factoryaidroid
+ import (
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
+@@ -89,24 +88,6 @@ func (f *FactoryAIDroidAgent) ReassembleTranscript(chunks [][]byte) ([]byte, err
+ 	return agent.ReassembleJSONL(chunks), nil
+ }
+ 
+-// GetHookConfigPath returns the path to Factory AI Droid's hook config file.
+-func (f *FactoryAIDroidAgent) GetHookConfigPath() string { return ".factory/settings.json" }
+-
+-// SupportsHooks returns true as Factory AI Droid supports lifecycle hooks.
+-func (f *FactoryAIDroidAgent) SupportsHooks() bool { return true }
+-
+-// ParseHookInput parses Factory AI Droid hook input from stdin.
+-func (f *FactoryAIDroidAgent) ParseHookInput(_ agent.HookType, r io.Reader) (*agent.HookInput, error) {
+-	raw, err := agent.ReadAndParseHookInput[sessionInfoRaw](r)
+-	if err != nil {
+-		return nil, err
+-	}
+-	return &agent.HookInput{
+-		SessionID:  raw.SessionID,
+-		SessionRef: raw.TranscriptPath,
+-	}, nil
+-}
+-
+ // GetSessionID extracts the session ID from hook input.
+ func (f *FactoryAIDroidAgent) GetSessionID(input *agent.HookInput) string { return input.SessionID }
+ 
+diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+index 426facb1..f26622df 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+@@ -133,43 +133,6 @@ func TestChunkTranscript_RoundTrip(t *testing.T) {
+ 	}
+ }
+ 
+-// --- ParseHookInput tests ---
+-
+-func TestParseHookInput_Valid(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	input := `{"session_id":"sess-abc","transcript_path":"/tmp/transcript.jsonl"}`
+-
+-	result, err := ag.ParseHookInput(agent.HookSessionStart, strings.NewReader(input))
+-	if err != nil {
+-		t.Fatalf("ParseHookInput() error = %v", err)
+-	}
+-	if result.SessionID != "sess-abc" {
+-		t.Errorf("SessionID = %q, want %q", result.SessionID, "sess-abc")
+-	}
+-	if result.SessionRef != "/tmp/transcript.jsonl" {
+-		t.Errorf("SessionRef = %q, want %q", result.SessionRef, "/tmp/transcript.jsonl")
+-	}
+-}
+-
+-func TestParseHookInput_Empty(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	_, err := ag.ParseHookInput(agent.HookSessionStart, strings.NewReader(""))
+-	if err == nil {
+-		t.Error("ParseHookInput() should error on empty input")
+-	}
+-}
+-
+-func TestParseHookInput_InvalidJSON(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	_, err := ag.ParseHookInput(agent.HookSessionStart, strings.NewReader("not json"))
+-	if err == nil {
+-		t.Error("ParseHookInput() should error on invalid JSON")
+-	}
+-}
+-
+ func TestGetSessionDir(t *testing.T) {
+ 	t.Parallel()
+ 	ag := &FactoryAIDroidAgent{}
+diff --git a/cmd/entire/cli/agent/factoryaidroid/hooks.go b/cmd/entire/cli/agent/factoryaidroid/hooks.go
+index acb7f614..f949ed4b 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/hooks.go
++++ b/cmd/entire/cli/agent/factoryaidroid/hooks.go
+@@ -36,22 +36,6 @@ const FactorySettingsFileName = "settings.json"
+ // metadataDenyRule blocks Factory Droid from reading Entire session metadata
+ const metadataDenyRule = "Read(./.entire/metadata/**)"
+ 
+-// GetHookNames returns the hook verbs Factory AI Droid supports.
+-// These become subcommands: entire hooks factoryai-droid <verb>
+-func (f *FactoryAIDroidAgent) GetHookNames() []string {
+-	return []string{
+-		HookNameSessionStart,
+-		HookNameSessionEnd,
+-		HookNameStop,
+-		HookNameUserPromptSubmit,
+-		HookNamePreToolUse,
+-		HookNamePostToolUse,
+-		HookNameSubagentStop,
+-		HookNamePreCompact,
+-		HookNameNotification,
+-	}
+-}
+-
+ // entireHookPrefixes are command prefixes that identify Entire hooks (both old and new formats)
+ var entireHookPrefixes = []string{
+ 	"entire ",
+@@ -126,8 +110,8 @@ func (f *FactoryAIDroidAgent) InstallHooks(localDev bool, force bool) (int, erro
+ 		sessionEnd = removeEntireHooks(sessionEnd)
+ 		stop = removeEntireHooks(stop)
+ 		userPromptSubmit = removeEntireHooks(userPromptSubmit)
+-		preToolUse = removeEntireHooksFromMatchers(preToolUse)
+-		postToolUse = removeEntireHooksFromMatchers(postToolUse)
++		preToolUse = removeEntireHooks(preToolUse)
++		postToolUse = removeEntireHooks(postToolUse)
+ 		preCompact = removeEntireHooks(preCompact)
+ 	}
+ 
+@@ -320,8 +304,8 @@ func (f *FactoryAIDroidAgent) UninstallHooks() error {
+ 	sessionEnd = removeEntireHooks(sessionEnd)
+ 	stop = removeEntireHooks(stop)
+ 	userPromptSubmit = removeEntireHooks(userPromptSubmit)
+-	preToolUse = removeEntireHooksFromMatchers(preToolUse)
+-	postToolUse = removeEntireHooksFromMatchers(postToolUse)
++	preToolUse = removeEntireHooks(preToolUse)
++	postToolUse = removeEntireHooks(postToolUse)
+ 	preCompact = removeEntireHooks(preCompact)
+ 
+ 	// Marshal modified hook types back to rawHooks
+@@ -421,18 +405,6 @@ func (f *FactoryAIDroidAgent) AreHooksInstalled() bool {
+ 		hookCommandExists(settings.Hooks.Stop, "go run ${FACTORY_PROJECT_DIR}/cmd/entire/main.go hooks factoryai-droid stop")
+ }
+ 
+-// GetSupportedHooks returns the hook types Factory AI Droid supports.
+-func (f *FactoryAIDroidAgent) GetSupportedHooks() []agent.HookType {
+-	return []agent.HookType{
+-		agent.HookSessionStart,
+-		agent.HookSessionEnd,
+-		agent.HookUserPromptSubmit,
+-		agent.HookStop,
+-		agent.HookPreToolUse,
+-		agent.HookPostToolUse,
+-	}
+-}
+-
+ // Helper functions for hook management
+ 
+ func hookCommandExists(matchers []FactoryHookMatcher, command string) bool {
+@@ -460,37 +432,14 @@ func hookCommandExistsWithMatcher(matchers []FactoryHookMatcher, matcherName, co
+ }
+ 
+ func addHookToMatcher(matchers []FactoryHookMatcher, matcherName, command string) []FactoryHookMatcher {
+-	entry := FactoryHookEntry{
+-		Type:    "command",
+-		Command: command,
+-	}
+-
+-	// If no matcher name, add to a matcher with empty string
+-	if matcherName == "" {
+-		for i, matcher := range matchers {
+-			if matcher.Matcher == "" {
+-				matchers[i].Hooks = append(matchers[i].Hooks, entry)
+-				return matchers
+-			}
+-		}
+-		return append(matchers, FactoryHookMatcher{
+-			Matcher: "",
+-			Hooks:   []FactoryHookEntry{entry},
+-		})
+-	}
+-
+-	// Find or create matcher with the given name
+-	for i, matcher := range matchers {
+-		if matcher.Matcher == matcherName {
++	entry := FactoryHookEntry{Type: "command", Command: command}
++	for i := range matchers {
++		if matchers[i].Matcher == matcherName {
+ 			matchers[i].Hooks = append(matchers[i].Hooks, entry)
+ 			return matchers
+ 		}
+ 	}
+-
+-	return append(matchers, FactoryHookMatcher{
+-		Matcher: matcherName,
+-		Hooks:   []FactoryHookEntry{entry},
+-	})
++	return append(matchers, FactoryHookMatcher{Matcher: matcherName, Hooks: []FactoryHookEntry{entry}})
+ }
+ 
+ // isEntireHook checks if a command is an Entire hook (old or new format)
+@@ -521,10 +470,3 @@ func removeEntireHooks(matchers []FactoryHookMatcher) []FactoryHookMatcher {
+ 	}
+ 	return result
+ }
+-
+-// removeEntireHooksFromMatchers removes Entire hooks from tool-use matchers (PreToolUse, PostToolUse)
+-// This handles the nested structure where hooks are grouped by tool matcher (e.g., "Task")
+-func removeEntireHooksFromMatchers(matchers []FactoryHookMatcher) []FactoryHookMatcher {
+-	// Same logic as removeEntireHooks - both work on the same structure
+-	return removeEntireHooks(matchers)
+-}
+diff --git a/cmd/entire/cli/agent/factoryaidroid/lifecycle.go b/cmd/entire/cli/agent/factoryaidroid/lifecycle.go
+index 9f8def34..571c371a 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/lifecycle.go
++++ b/cmd/entire/cli/agent/factoryaidroid/lifecycle.go
+@@ -20,8 +20,19 @@ var (
+ )
+ 
+ // HookNames returns the hook verbs Factory AI Droid supports.
++// These become subcommands: entire hooks factoryai-droid <verb>
+ func (f *FactoryAIDroidAgent) HookNames() []string {
+-	return f.GetHookNames()
++	return []string{
++		HookNameSessionStart,
++		HookNameSessionEnd,
++		HookNameStop,
++		HookNameUserPromptSubmit,
++		HookNamePreToolUse,
++		HookNamePostToolUse,
++		HookNameSubagentStop,
++		HookNamePreCompact,
++		HookNameNotification,
++	}
+ }
+ 
+ // ParseHookEvent translates a Factory AI Droid hook into a normalized lifecycle Event.
+diff --git a/cmd/entire/cli/integration_test/agent_test.go b/cmd/entire/cli/integration_test/agent_test.go
+index 6b7a8c05..41334319 100644
+--- a/cmd/entire/cli/integration_test/agent_test.go
++++ b/cmd/entire/cli/integration_test/agent_test.go
+@@ -1104,20 +1104,6 @@ func TestFactoryAIDroidHelperMethods(t *testing.T) {
+ 		}
+ 	})
+ 
+-	t.Run("GetHookConfigPath returns .factory/settings.json", func(t *testing.T) {
+-		t.Parallel()
+-
+-		ag, _ := agent.Get("factoryai-droid")
+-		droid, ok := ag.(*factoryaidroid.FactoryAIDroidAgent)
+-		if !ok {
+-			t.Fatal("agent is not *factoryaidroid.FactoryAIDroidAgent")
+-		}
+-		path := droid.GetHookConfigPath()
+-
+-		if path != ".factory/settings.json" {
+-			t.Errorf("GetHookConfigPath() = %q, want %q", path, ".factory/settings.json")
+-		}
+-	})
+ }
+ 
+ // TestFactoryAIDroidSessionMethods verifies ReadSession, WriteSession, and GetSessionDir.
+- Current branch: alisha/factoryai-agent
+- Recent commits: d2cf521b Remove low-value factoryaidroid tests and consolidate pass-through hooks
+c9f67b82 Fix Droid startOffset applied at raw JSONL level in token calculation
+ffb79f97 Add droid to condense session switch
+632f98d1 Merge branch 'main' into alisha/factoryai-agent
+8c608ebe Merge pull request #468 from entireio/dependabot/github_actions/goreleaser/goreleaser-action-7
+d16345d3 Merge pull request #410 from entireio/soph/agent-integration-instructions
+80695ef9 Merge pull request #484 from entireio/soph/changelog-0-4-7
+2e8f1300 Merge pull request #478 from entireio/docs/opencode-agent-documentation
+2dfbc359 ln -s CLAUDE.md AGENTS.md
+6538cf2d Merge pull request #481 from entireio/soph/opencode-acknowledgment
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

@@ -1,0 +1,160 @@
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   .github/workflows/e2e-isolated.yml
+	modified:   .github/workflows/e2e.yml
+	modified:   cmd/entire/cli/e2e_test/agent_runner.go
+	modified:   cmd/entire/cli/e2e_test/testenv.go
+	modified:   mise.toml
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	cmd/entire/cli/manual-droid-e2e-testing.md
+	scripts/manual-droid-e2e-tmux.sh
+
+no changes added to commit (use "git add" and/or "git commit -a")
+- Current git diff (staged and unstaged changes): diff --git a/.github/workflows/e2e-isolated.yml b/.github/workflows/e2e-isolated.yml
+index aeeff874..eede0d38 100644
+--- a/.github/workflows/e2e-isolated.yml
++++ b/.github/workflows/e2e-isolated.yml
+@@ -8,7 +8,7 @@ on:
+         required: true
+         default: "gemini"
+         type: choice
+-        options: [claude, opencode, gemini]
++        options: [claude, opencode, gemini, factoryai-droid]
+       test:
+         description: "Test name filter (regex)"
+         required: true
+diff --git a/.github/workflows/e2e.yml b/.github/workflows/e2e.yml
+index 188d7ab1..feb120ce 100644
+--- a/.github/workflows/e2e.yml
++++ b/.github/workflows/e2e.yml
+@@ -19,7 +19,7 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
+-        agent: [claude, opencode]
++        agent: [claude, opencode, factoryai-droid]
+ 
+     steps:
+       - name: Checkout repository
+@@ -33,6 +33,7 @@ jobs:
+           case "${{ matrix.agent }}" in
+             claude)   curl -fsSL https://claude.ai/install.sh | bash ;;
+             opencode) curl -fsSL https://opencode.ai/install | bash ;;
++            factoryai-droid) curl -fsSL https://app.factory.ai/cli | sh ;;
+           esac
+           echo "$HOME/.local/bin" >> $GITHUB_PATH
+ 
+diff --git a/cmd/entire/cli/e2e_test/agent_runner.go b/cmd/entire/cli/e2e_test/agent_runner.go
+index 69b92c82..8a9bfc76 100644
+--- a/cmd/entire/cli/e2e_test/agent_runner.go
++++ b/cmd/entire/cli/e2e_test/agent_runner.go
+@@ -346,8 +346,10 @@ type FactoryAIDroidRunner struct {
+ func NewFactoryAIDroidRunner(config AgentRunnerConfig) *FactoryAIDroidRunner {
+ 	model := config.Model
+ 	if model == "" {
+-		model = os.Getenv("E2E_DROID_MODEL")
+-		// No default model — use droid's built-in default if not specified
++		model = os.Getenv("E2E_CLAUDE_MODEL")
++		if model == "" {
++			model = "claude-haiku-4-5-20251001"
++		}
+ 	}
+ 
+ 	timeout := config.Timeout
+@@ -373,15 +375,15 @@ func (r *FactoryAIDroidRunner) Name() string {
+ 	return AgentNameFactoryAIDroid
+ }
+ 
+-// IsAvailable checks if droid CLI is installed and FACTORY_API_KEY is set.
+-// Droid uses API key authentication, not OAuth.
++// IsAvailable checks if droid CLI is installed and ANTHROPIC_API_KEY is set.
++// Droid uses BYOK (Bring Your Own Key) with Anthropic API for E2E tests.
+ func (r *FactoryAIDroidRunner) IsAvailable() (bool, error) {
+ 	if _, err := exec.LookPath("droid"); err != nil {
+ 		return false, fmt.Errorf("droid CLI not found in PATH: %w", err)
+ 	}
+ 
+-	if os.Getenv("FACTORY_API_KEY") == "" {
+-		return false, fmt.Errorf("FACTORY_API_KEY environment variable not set")
++	if os.Getenv("ANTHROPIC_API_KEY") == "" {
++		return false, fmt.Errorf("ANTHROPIC_API_KEY environment variable not set")
+ 	}
+ 
+ 	return true, nil
+@@ -402,6 +404,7 @@ func (r *FactoryAIDroidRunner) runPromptWithExec(ctx context.Context, workDir st
+ 		"--cwd", workDir,
+ 		"--auto", r.AutoLevel,
+ 		"-o", "text",
++		"--model", "E2E Claude Model",
+ 	}
+ 
+ 	// Droid uses its own permission system (.factory/settings.json), not --enabled-tools.
+diff --git a/cmd/entire/cli/e2e_test/testenv.go b/cmd/entire/cli/e2e_test/testenv.go
+index 8bb23134..f01e0da6 100644
+--- a/cmd/entire/cli/e2e_test/testenv.go
++++ b/cmd/entire/cli/e2e_test/testenv.go
+@@ -103,6 +103,29 @@ func NewFeatureBranchEnv(t *testing.T, strategyName string) *TestEnv {
+ 		env.WriteFile("opencode.json", opencodeConfig)
+ 	}
+ 
++	// Inject BYOK customModels config for Droid before `entire enable`.
++	// `entire enable` merges hooks into .factory/settings.json while preserving
++	// unknown keys like customModels, so the BYOK config survives.
++	// Uses ${ANTHROPIC_API_KEY} (Droid env-var reference syntax) so the actual
++	// key never appears in the file or git.
++	if defaultAgent == AgentNameFactoryAIDroid {
++		if droidRunner, ok := env.Agent.(*FactoryAIDroidRunner); ok {
++			byokConfig := `{
++  "customModels": [
++    {
++      "model": "` + droidRunner.Model + `",
++      "displayName": "E2E Claude Model",
++      "baseUrl": "https://api.anthropic.com",
++      "apiKey": "` + os.Getenv("ANTHROPIC_API_KEY") + `",
++      "provider": "anthropic",
++      "maxOutputTokens": 8192
++    }
++  ]
++}`
++			env.WriteFile(".factory/settings.json", byokConfig)
++		}
++	}
++
+ 	// Use `entire enable` to set up everything (hooks, settings, etc.)
+ 	// This sets up .entire/settings.json and .claude/settings.json with hooks
+ 	env.RunEntireEnable(strategyName)
+diff --git a/mise.toml b/mise.toml
+index ea69f7e8..adb466d3 100644
+--- a/mise.toml
++++ b/mise.toml
+@@ -135,3 +135,7 @@ run = "E2E_AGENT=gemini go test -tags=e2e -count=1 -parallel 1 -timeout=30m -v .
+ [tasks."test:e2e:opencode"]
+ description = "Run E2E tests with OpenCode"
+ run = "E2E_AGENT=opencode go test -tags=e2e -count=1 -timeout=30m -v ./cmd/entire/cli/e2e_test/..."
++
++[tasks."test:e2e:factoryai-droid"]
++description = "Run E2E tests with Factory AI Droid"
++run = "E2E_AGENT=factoryai-droid go test -tags=e2e -count=1 -timeout=30m -v ./cmd/entire/cli/e2e_test/..."
+- Current branch: alisha/factoryai-agent
+- Recent commits: 4c6c877e Clean up
+89e927b2 Remove dead methods, redundant indirection, and simplify hook helpers in factoryaidroid
+d2cf521b Remove low-value factoryaidroid tests and consolidate pass-through hooks
+c9f67b82 Fix Droid startOffset applied at raw JSONL level in token calculation
+ffb79f97 Add droid to condense session switch
+632f98d1 Merge branch 'main' into alisha/factoryai-agent
+8c608ebe Merge pull request #468 from entireio/dependabot/github_actions/goreleaser/goreleaser-action-7
+d16345d3 Merge pull request #410 from entireio/soph/agent-integration-instructions
+80695ef9 Merge pull request #484 from entireio/soph/changelog-0-4-7
+2e8f1300 Merge pull request #478 from entireio/docs/opencode-agent-documentation
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

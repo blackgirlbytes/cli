@@ -1,0 +1,503 @@
+/superpowers:brainstorm I want to create aceagent but for entire cli. https://docs.aceagent.io/docs/getting-started/ace-cli . entire collects all this agent data and transcripts. need to figure out a way for users to improve their agent sessions, md files and context to make them more efficient and produce better code specific to the repo / org
+
+---
+
+interested in concept 1,2, and 3
+
+---
+
+1. a 2.c 3. d 4. project context files 5. a 6. do all so I can see which I like
+
+---
+
+how is all this data being stored? or traversed. teammate suggest sqlite "I still think the entire/checkpoints/v1 branch is the right idea but having a sqlite instead of the temporary shadow branches might be a good idea. I wonder if this work would also benefit from that."
+
+---
+
+<task-notification>
+<task-id>aa4bfcbe1ce6a23fc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/aa4bfcbe1ce6a23fc.output</output-file>
+<status>completed</status>
+<summary>Agent "Re-review fixed plan" completed</summary>
+<result>I cannot write the review file because plan mode restricts me to read-only actions. Let me provide the review content directly here instead.
+
+---
+
+# Review 02 - Agent Improvement Engine Implementation Plan
+
+**Status:** pending-dev | **Date:** 2026-03-24 | **Reviewer:** Code Review Agent | **Verdict:** APPROVE
+
+## Previous Review Status
+
+### Critical Issues from Review 01
+
+All five critical issues are **FIXED** and correct:
+
+1. **`ListCommitted()` / `cp.Sessions` mismatch** -- FIXED. Both `insights_cmd.go` (line 1306) and `improve_cmd.go` (line 2358) now call `store.ReadCommitted(ctx, cp.CheckpointID)` to get the `*CheckpointSummary`, then iterate `summary.Sessions` by index. This matches the actual API: `ListCommitted` returns `[]CommittedInfo`, `ReadCommitted` returns `*CheckpointSummary` which has `Sessions []SessionFilePaths`.
+
+2. **`ReadSessionContent` takes `sessionIndex int`** -- FIXED. Both call sites pass the loop variable `i`, e.g., `store.ReadSessionContent(ctx, cp.CheckpointID, i)`. Matches the signature at `committed.go:777`.
+
+3. **`SessionMetrics` field names** -- FIXED. The aggregator (line 477-479) uses `meta.SessionMetrics.TurnCount` and `meta.SessionMetrics.DurationMs`, matching the struct at `checkpoint.go:460-463`. The test (line 366) also uses the correct names.
+
+4. **`CommandRunner` signature** -- FIXED. `improve/generator.go` (line 1922) is now `func(ctx context.Context, name string, args ...string) *exec.Cmd`, matching `summarize.ClaudeGenerator` at `summarize/claude.go:66`. Default is `exec.CommandContext`.
+
+5. **Claude CLI response format** -- FIXED. Response parsing (lines 1956-1961) uses `{"result": "string"}` matching the existing summarize package.
+
+### Important Issues from Review 01
+
+- **Code duplication of styles** -- FIXED. Task 0 introduces the `termstyle` package with `New(w io.Writer)`, exported `ShouldUseColor`, `GetTerminalWidth`, `FormatTokenCount`, `TotalTokens`, `SectionRule`, and `HorizontalRule`. Both `insights/renderer.go` and `improve/differ.go` use `termstyle.New(w)` and `termstyle.Styles` throughout. Step 2 refactors `status_style.go` to delegate.
+
+- **Broken `contains` test helper** -- FIXED. All tests use `strings.Contains()` directly (e.g., `differ_test.go` lines 2155, 2158, 2172).
+
+- **`evolve.Config` duplicates `settings.EvolveSettings`** -- FIXED. The `evolve` package has an explicit comment "NOTE: Config lives in settings.EvolveSettings -- no duplicate type here" (line 2474). All functions use `settings.EvolveSettings` directly: `ShouldTrigger` (line 2554), `CheckAndNotify` (line 3055), and all tests.
+
+- **Missing state persistence** -- FIXED. Task 14b adds `evolve/state.go` with `LoadState`/`SaveState` using `.entire/evolve-state.json`. Tests cover round-trip and fresh state.
+
+- **No tests for command wiring** -- STILL OUTSTANDING. Tasks 6 and 12 still only have "Verify it compiles" as validation.
+
+## New Findings
+
+### Important (Should Fix)
+
+**[Task 16 `hook.go`] `CheckAndNotify` is defined but never wired into the session lifecycle.** The function exists and state persistence exists, but no task shows where `CheckAndNotify` is actually called from the existing hook handlers (e.g., `manual_commit_hooks.go`). The session phase state machine dispatches actions on `TurnEnd`/`SessionStop` events, and this is where the evolve trigger needs to be invoked. Without wiring, the evolve feature is complete but inert. The implementer will need to add a step that loads the evolve state, calls `CheckAndNotify`, and saves back -- likely in the `Stop` hook handler.
+
+**[Task 14b `state.go` line 2880] `SaveState` does not ensure `.entire/` directory exists.** `os.WriteFile` will fail if `.entire/` is missing. The test masks this by calling `os.MkdirAll` explicitly. `LoadState` handles missing files, but `SaveState` should either document the prerequisite or defensively create the directory. In practice `.entire/` usually exists, but the defensive approach is better.
+
+### Suggestions (Consider)
+
+**[Task 6 line 1327-1330] Score ordering assumes chronological results.** `runInsights` truncates with `scores[len(scores)-last:]` assuming newest-last. But `ListCommitted` walks git tree entries sharded by checkpoint ID prefix, which has no guaranteed time order. Scores should be sorted by date before truncating.
+
+**[Task 6 and 12] `ReadCommitted` returns `nil, nil` for missing checkpoints.** The plan handles this with `if err != nil || summary == nil { continue }`, which is correct, but silently skips failures. If many checkpoints are unreadable, users get partial results with no indication. A debug log would help diagnostics.
+
+### Praise
+
+- The fixes to all five critical issues are clean and correctly match the actual codebase APIs. The `ReadCommitted` + `ReadSessionContent` pattern accurately reflects the checkpoint store's contract.
+- The `termstyle` package is well-designed: `Styles` struct with `New(w io.Writer)` constructor, and `Render(style, text)` that degrades to plain text when color is off.
+- The explicit "NOTE: Config lives in settings.EvolveSettings" comment prevents future duplication.
+- `state.go` returns zero-value `*State` for both missing and corrupt files -- a safe default.
+
+## Summary
+
+**Overall assessment: APPROVE**
+
+All five critical issues and four of five important issues from review-01 are correctly addressed. The API call patterns, type signatures, field names, and response parsing all now match the actual codebase.
+
+**Remaining concerns (non-blocking):**
+1. The evolve hook (`CheckAndNotify`) is defined but never wired into session lifecycle handlers -- needs a wiring step during implementation
+2. Command wiring tests still absent (carried from review-01)
+3. `SaveState` should handle missing `.entire/` directory
+
+**Estimated effort:** ~1 hour during implementation to address the wiring gap and directory handling.
+
+---
+
+To write this review to `/Users/alisha/.superset/worktrees/cli/agent-improvements/docs/superpowers/plans/review-02.md`, I need write permission. Plan mode currently restricts me to read-only. Would you like to exit plan mode so I can save the file?</result>
+<usage><total_tokens>72089</total_tokens><tool_uses>32</tool_uses><duration_ms>184996</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/aa4bfcbe1ce6a23fc.output
+
+---
+
+sqllite seems like the right choice will this data be only stored locally or should we push it up so that the frontend can take advantage
+
+---
+
+when you say sync to backend what does that mean? is it stored in checkpoint branch?
+
+---
+
+what do you mean friction, learnings are already push in checkpoint branch?
+
+---
+
+okay so what is the current architecture we have for this?
+
+---
+
+yes both those things
+
+---
+
+is the summarize data really enough for the other new commands? if so what is the point of the sqlitedb. I thought improve would like query the sqllite for friction points and see what went wrong. seems like it needs to query the transcripts for that? or is it is smart and only queries sessions that has a high friction count?
+
+---
+
+okay and insights will work similarly?
+
+---
+
+I don't see how seed is that different than improve. so leave that out. i don't really understand the benchmark stuff and the I'm very interested in pre instruction effectiveness tracking
+
+---
+
+do it
+
+---
+
+<task-notification>
+<task-id>af436acca0369dc8b</task-id>
+<tool-use-id>toolu_0177Bu2nXdVzbdNFAMP7KLd6</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/af436acca0369dc8b.output</output-file>
+<status>completed</status>
+<summary>Agent "Phase 1d: evolve settings" completed</summary>
+<result>Done. Here is a summary of what was implemented:
+
+**Files changed:**
+
+- `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/settings/settings.go` — added:
+  - `EvolveSettings` struct with `Enabled bool` and `SessionThreshold int` fields
+  - `EvolveConfig *EvolveSettings` field on `EntireSettings` (between `ExternalAgents` and the deprecated `Strategy` field)
+  - `GetEvolveConfig()` method returning defaults when nil or when `SessionThreshold` is zero
+  - `evolve` key handling in `mergeJSON` so `settings.local.json` can override it
+
+- `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/settings/settings_evolve_test.go` — four tests covering:
+  - nil `EvolveConfig` → defaults (`Enabled=false`, `SessionThreshold=5`)
+  - zero `SessionThreshold` → defaults to 5
+  - explicit non-zero threshold preserved
+  - explicit disabled+custom threshold preserved
+
+All tests pass (`go test ./cmd/entire/cli/settings/...`) and the full CLI builds cleanly (`go build ./cmd/entire/...`).
+
+Note: `mise run fmt && mise run lint` could not be run because the mise config needs to be trusted first (`mise trust`). Please run that before merging to ensure gofmt and golangci-lint are satisfied.</result>
+<usage><total_tokens>31742</total_tokens><tool_uses>15</tool_uses><duration_ms>74247</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/af436acca0369dc8b.output
+
+---
+
+<task-notification>
+<task-id>aca8efb0dbb17df56</task-id>
+<tool-use-id>toolu_01CKkxqyk6U6U9wKn6FVcuhJ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/aca8efb0dbb17df56.output</output-file>
+<status>completed</status>
+<summary>Agent "Phase 1b: llmcli package" completed</summary>
+<result>Done. Here is a summary of what was done.
+
+## Summary
+
+### What was implemented
+
+**New package: `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/llmcli/llmcli.go`**
+
+- `Runner` struct with `ClaudePath`, `Model`, and `CommandRunner` fields — same shape as the old `ClaudeGenerator` fields, keeping the injection point for tests
+- `Runner.Execute(ctx, prompt) (string, error)` — handles CLI invocation (`--print --output-format json --model --setting-sources ""`), git isolation (TempDir cwd + strip GIT_* env vars), response parsing, and markdown code block extraction
+- `StripGitEnv(env []string) []string` — exported helper
+- `ExtractJSONFromMarkdown(s string) string` — exported helper
+- `DefaultModel = "sonnet"` constant
+
+**Modified: `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude.go`**
+
+- `ClaudeGenerator.Generate()` now builds an `llmcli.Runner` from its own fields and calls `runner.Execute()`, then parses the returned string into `checkpoint.Summary`
+- `DefaultModel` is now a const alias `= llmcli.DefaultModel` so existing callers are unaffected
+- `stripGitEnv` and `extractJSONFromMarkdown` are kept as unexported package-level wrappers delegating to `llmcli` — this keeps the existing `claude_test.go` tests (which call them directly as package-internal functions) compiling without modification
+
+### Tests added
+
+**`/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/llmcli/llmcli_test.go`** — 12 test cases covering:
+
+- `StripGitEnv` (normal, empty input, no GIT vars)
+- `ExtractJSONFromMarkdown` (5 subtests: plain JSON, ` ```json ` block, ` ``` ` block, with whitespace, unclosed block)
+- `Runner.Execute` git isolation (TempDir + no GIT_* vars in subprocess env)
+- `Runner.Execute` valid response parsing
+- `Runner.Execute` markdown-wrapped result extraction
+- `Runner.Execute` command-not-found error
+- `Runner.Execute` non-zero exit error
+- `Runner.Execute` invalid JSON response error
+- Default values (`claude` path, `sonnet` model)
+- Custom ClaudePath and Model
+
+### Design decisions
+
+- The `claudeCLIResponse` struct is kept package-internal to `llmcli` since callers only need the extracted string result, not the raw CLI envelope
+- `summarize.ClaudeGenerator` retains its existing public API unchanged — no callers need updating
+- The `stripGitEnv`/`extractJSONFromMarkdown` unexported wrappers in summarize exist solely to avoid breaking the existing `claude_test.go` tests that reference them as intra-package functions; they add zero logic</result>
+<usage><total_tokens>44825</total_tokens><tool_uses>31</tool_uses><duration_ms>196372</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/aca8efb0dbb17df56.output
+
+---
+
+<task-notification>
+<task-id>a9886e484a3fb106b</task-id>
+<tool-use-id>toolu_01EZcaFwTFYKeVc5qFdCDxuC</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/a9886e484a3fb106b.output</output-file>
+<status>completed</status>
+<summary>Agent "Phase 1a: termstyle package" completed</summary>
+<result>Done. Here is a summary of what was implemented:
+
+## What was implemented
+
+### New package: `/cmd/entire/cli/termstyle/termstyle.go`
+
+Exported types and functions:
+
+- **`Styles`** struct — exported fields `ColorEnabled`, `Width`, `Green`, `Red`, `Yellow`, `Gray`, `Bold`, `Dim`, `Agent`, `Cyan` (Yellow is new, not in the original)
+- **`New(w io.Writer) Styles`** — constructor that detects terminal color support and width
+- **`(Styles) Render(style, text) string`** — applies style only when `ColorEnabled`
+- **`ShouldUseColor(w io.Writer) bool`** — checks `NO_COLOR` env and terminal detection
+- **`GetTerminalWidth(w io.Writer) int`** — capped at 80, fallback 60, checks writer then Stdout/Stderr
+- **`FormatTokenCount(n int) string`** — 0→"0", 1200→"1.2k"
+- **`TotalTokens(tu *agent.TokenUsage) int`** — recursive sum including subagent
+- **`(Styles) SectionRule(label string) string`** — "── Label ────────"
+- **`(Styles) HorizontalRule() string`** — full-width dimmed rule
+
+### Refactored: `/cmd/entire/cli/status_style.go`
+
+- `newStatusStyles` now calls `termstyle.New(w)` and maps exported fields to the unexported struct fields (preserving existing callers in `status.go` unchanged)
+- All implementation functions (`shouldUseColor`, `getTerminalWidth`, `formatTokenCount`, `totalTokens`, `horizontalRule`, `sectionRule`) are now thin one-line delegators to the termstyle package
+- `activeTimeDisplay` and `timeAgo` remain in the cli package as they are not shared utilities
+
+### Tests: `/cmd/entire/cli/termstyle/termstyle_test.go`
+
+13 test cases covering: `New` (no-color, fallback width), `ShouldUseColor` (NO_COLOR env, non-terminal), `GetTerminalWidth` (fallback), `FormatTokenCount` (7 cases), `TotalTokens` (nil, basic, recursive), `Render` (no-color passthrough), `HorizontalRule`, `SectionRule` (normal and short-width edge case).
+
+### Design decisions
+
+- `statusStyles` keeps its unexported fields rather than embedding `termstyle.Styles` — this avoids breaking all callers in `status.go` that use lowercase field names (`sty.green`, `sty.dim`, etc.)
+- `horizontalRule`/`sectionRule` on `statusStyles` construct a temporary `termstyle.Styles` with only the fields they need, keeping the delegation clean without storing a redundant copy</result>
+<usage><total_tokens>53709</total_tokens><tool_uses>40</tool_uses><duration_ms>256923</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/a9886e484a3fb106b.output
+
+---
+
+<task-notification>
+<task-id>a4554e8cc0cb42582</task-id>
+<tool-use-id>toolu_015f6MjPLTmTBGm9Q2LzxRuo</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/a4554e8cc0cb42582.output</output-file>
+<status>completed</status>
+<summary>Agent "Phase 1c: insightsdb SQLite" completed</summary>
+<result>I need to stop here and explain to the user. I cannot proceed without running `go get` to add the `modernc.org/sqlite` dependency, and without running tests or build commands. These are essential Bash operations needed to complete this task.
+
+Here is where I am and what I need from you:
+
+**What's been created so far:**
+
+1. `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/insightsdb/db.go` — `InsightsDB`, `Open()`, `Close()`, `migrate()`, `ListTables()`
+2. `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/insightsdb/cache.go` — `SessionRow`, `LearningRow`, `GetBranchTip()`, `SetBranchTip()`, `HasCheckpoint()`, `InsertSession()`
+3. `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/insightsdb/queries.go` — `QueryLastNSessions()`, `QueryByAgent()`, `QueryRecurringFriction()`, `QuerySessionsWithFriction()`, `SessionCount()`
+4. Test files for all three source files
+
+**What I need Bash access to do:**
+
+The `modernc.org/sqlite` dependency is **not in `go.mod`** (despite the task saying it was pre-added). I need to run:
+```bash
+go get modernc.org/sqlite@v1.37.0
+```
+and then:
+```bash
+go test ./cmd/entire/cli/insightsdb/...
+go build ./cmd/entire/...
+mise run fmt && mise run lint
+```
+
+Could you either:
+1. Grant Bash permission so I can run these commands, or
+2. Run `go get modernc.org/sqlite@v1.37.0` in the working directory `/Users/alisha/.superset/worktrees/cli/agent-improvements` and let me know when it's done?</result>
+<usage><total_tokens>42584</total_tokens><tool_uses>25</tool_uses><duration_ms>180240</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/a4554e8cc0cb42582.output
+
+---
+
+<task-notification>
+<task-id>a4c68739da491e567</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/a4c68739da491e567.output</output-file>
+<status>completed</status>
+<summary>Agent "Phase 2b: commit-time scoring" completed</summary>
+<result>Here is a summary of what was done.
+
+**What was implemented**
+
+Three files were modified:
+
+1. `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/strategy/manual_commit_types.go`
+   - Added `"github.com/entireio/cli/cmd/entire/cli/insights"` import
+   - Added `SessionScore *insights.SessionScore` field to `CondenseResult`
+
+2. `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/strategy/manual_commit_condensation.go`
+   - Added `"time"` and `insights` imports
+   - Added the scoring block after the summary generation section — builds `insights.SessionData`, calls `insights.ScoreSession` and `insights.ComputeOverall`, and constructs a `*insights.SessionScore`
+   - Populated `SessionScore` in the `CondenseResult` return value
+   - Added `totalTokensFromUsage` helper — flattens token counts including subagent usage recursively
+   - Added `turnCountFromState` helper — prefers `SessionTurnCount` (from hooks), falls back to `StepCount` (checkpoint count)
+
+3. `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/strategy/manual_commit_condensation_test.go`
+   - Added `TestTotalTokensFromUsage_Nil`, `_Flat`, and `_WithSubagent` covering the nil, flat, and recursive-subagent cases
+   - Added `TestTurnCountFromState_UsesTurnCount` and `_FallsBackToStepCount`
+
+**Design decisions**
+
+- Scoring is gated on `summary != nil` — if summarization is disabled or fails, `SessionScore` is nil and no error is surfaced. This matches the requirement that scoring is optional and zero-latency.
+- The score is returned in `CondenseResult` only; no writes to `entire/checkpoints/v1` are made yet — that is deferred to the `entire insights` command as specified.</result>
+<usage><total_tokens>43925</total_tokens><tool_uses>38</tool_uses><duration_ms>227094</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/a4c68739da491e567.output
+
+---
+
+<task-notification>
+<task-id>a8fb94e374f9a53a9</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/a8fb94e374f9a53a9.output</output-file>
+<status>completed</status>
+<summary>Agent "Phase 3a: improve package" completed</summary>
+<result>The `improve` package has been created and committed. Here is a summary of what was built:
+
+## Summary
+
+### Files Created
+
+**`/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/improve/improve.go`**
+Types: `ContextFileType`, `ContextFile`, `Suggestion`, `ImprovementReport`, `FrictionPattern`, `PatternAnalysis`.
+
+**`/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/improve/context_files.go`**
+`DetectContextFiles(root string) []ContextFile` — scans for CLAUDE.md, AGENTS.md, .cursorrules, .gemini/settings.json. Returns all 4 entries whether or not they exist, with `Exists=false` for missing files. Handles permissions errors gracefully (marks as existing without content).
+
+**`/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/improve/analyzer.go`**
+`AnalyzePatterns(summaries []SessionSummaryData) PatternAnalysis` — groups friction by normalized themes (lint, import, compile, format, test, type, permission, timeout, retry), surfaces themes with 2+ occurrences as `RepeatedFriction`, deduplicates repo/workflow learnings and open items across sessions.
+
+**`/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/improve/generator.go`**
+`Generator.Generate(ctx, analysis, contextFiles) ([]Suggestion, error)` — builds a prompt with XML-tagged sections wrapping all untrusted content, calls `llmcli.Runner.Execute`, parses the JSON response, assigns `sug-<unix>-<i>` IDs, `created_at`, and `pending` status.
+
+### Tests Added
+- `context_files_test.go` — 5 tests covering all-present, none-present, partial, absolute paths, empty files
+- `analyzer_test.go` — 8 tests covering empty input, threshold (2+), theme classification (7 known themes), deduplication of learnings and open items, multi-theme grouping
+- `generator_test.go` — 8 tests covering happy path, empty response, invalid JSON, friction in prompt, context files in prompt, unique IDs, CreatedAt timing, runner error
+
+All 25 tests pass, lint is clean (0 issues).</result>
+<usage><total_tokens>62517</total_tokens><tool_uses>47</tool_uses><duration_ms>288056</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/a8fb94e374f9a53a9.output
+
+---
+
+<task-notification>
+<task-id>aedcbcc197b08cf98</task-id>
+<tool-use-id>toolu_01WkjaG5v412Gi2oSUhaKXMq</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/aedcbcc197b08cf98.output</output-file>
+<status>completed</status>
+<summary>Agent "Phase 2c: insights command" completed</summary>
+<result>The `entire insights` command has been implemented. Here is a summary of what was done:
+
+**File created:** `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/insights_cmd.go`
+
+**File modified:** `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/root.go` — added `cmd.AddCommand(newInsightsCmd())`
+
+**Key design decisions:**
+
+1. **Cache refresh strategy** — `refreshCacheIfStale` compares the stored branch tip hash against the current `entire/checkpoints/v1` ref. If they differ, it iterates `store.ListCommitted` and uses `HasCheckpoint` to skip already-cached checkpoints before inserting new ones. This is an incremental refresh, not a full rebuild.
+
+2. **Non-fatal cache errors** — if the cache refresh fails (e.g., no git repo reachable, network issue), the command continues with whatever data is already in the cache. The user sees partial data rather than an error.
+
+3. **`agentTypeFromString` is not needed** — `types.AgentType` is a plain `string` typedef, so a direct cast `types.AgentType(r.Agent)` is used.
+
+4. **`idb.Close()` pattern** — uses `defer func() { _ = idb.Close() }()` consistent with the rest of the codebase.
+
+5. **Terminal rendering** — uses `termstyle.New(w)` for color detection and `s.SectionRule(...)` for section headers. Trends show directional arrows (↑/↓/→) with green/red/gray coloring. The session ID is truncated to 12 chars for readability.</result>
+<usage><total_tokens>73463</total_tokens><tool_uses>56</tool_uses><duration_ms>205100</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/aedcbcc197b08cf98.output
+
+---
+
+<task-notification>
+<task-id>af697bf9a49a0aa18</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/af697bf9a49a0aa18.output</output-file>
+<status>completed</status>
+<summary>Agent "Phase 4: evolve package" completed</summary>
+<result>Here is a summary of what was implemented.
+
+## Summary
+
+### What was implemented
+
+The `cmd/entire/cli/evolve/` package with four files:
+
+**`/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/evolve/evolve.go`**
+Types: `State` (tracks run history and session counter) and `SuggestionRecord` (suggestion lifecycle with pre/post impact scores).
+
+**`/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/evolve/trigger.go`**
+Three functions: `ShouldTrigger` checks enabled flag and session threshold, `IncrementSessionCount` adds one to the counter, `RecordRun` resets the counter and records run metadata.
+
+**`/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/evolve/tracker.go`**
+`Tracker` struct (in-memory map) with `AddSuggestion`, `Get`, `Accept`, `Reject`, `MeasureImpact` (averages float64 slices), and `Pending`. Accept/Reject stamp a `ResolvedAt` timestamp.
+
+**`/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/evolve/notify.go`**
+`CheckAndNotify` increments the counter then prints a tip to the provided writer only when the threshold is met and evolve is enabled.
+
+### Tests added
+
+17 tests across three files covering all specified cases plus extras (threshold exceeded, reject-not-found, measure-impact with empty slices). The one notable fix: float64 averaging comparison uses a `1e-9` epsilon via `math.Abs` to avoid precision failures.
+
+### Decisions and trade-offs
+
+- `Tracker` is in-memory only per spec; persistence to SQLite is deferred to the command layer.
+- `MeasureImpact` returns `nil` scores for empty slices rather than `0.0`, which correctly signals "no data" to callers.
+- `CheckAndNotify` always increments the counter regardless of enabled/disabled state, so the counter accurately reflects sessions even before evolve is switched on.
+
+### Validation
+
+- `go test ./cmd/entire/cli/evolve/...`: 17/17 pass
+- `go build ./cmd/entire/...`: clean
+- `golangci-lint run ./cmd/entire/cli/evolve/...`: 0 issues
+- Full `go test ./cmd/entire/...`: all packages pass</result>
+<usage><total_tokens>46233</total_tokens><tool_uses>33</tool_uses><duration_ms>186313</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/af697bf9a49a0aa18.output
+
+---
+
+<task-notification>
+<task-id>ac5f003288eda2450</task-id>
+<tool-use-id>toolu_01437cVxFPR4bZtPt3J2qGFR</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/ac5f003288eda2450.output</output-file>
+<status>completed</status>
+<summary>Agent "Phase 3b: improve command" completed</summary>
+<result>The remaining untracked files (the rest of `insightsdb/`, `insights/`, `go.mod`, `go.sum`) were pre-existing untracked changes on this branch before I started. I've only committed my new work.
+
+The implementation is complete. Here's a summary of what was implemented:
+
+## Summary
+
+**New file:** `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/improve_cmd.go`
+
+**Modified files:**
+- `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/root.go` — added `cmd.AddCommand(newImproveCmd())` after `newInsightsCmd()`
+- `/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/insightsdb/queries.go` — added `json` struct tags to `FrictionTheme` (required by the `musttag` linter)
+
+### How it works
+
+The `entire improve` command runs a four-phase pipeline:
+
+1. **Phase 1 (SQLite index):** Calls `idb.QueryRecurringFriction(2)` to find friction themes with 2+ occurrences. In `--dry-run` mode, renders these and exits without Phase 2-4.
+
+2. **Phase 2 (transcript deep-read):** For the top 3 friction themes, queries affected checkpoint IDs, reads transcripts via `checkpoint.GitStore.ReadSessionContent`, parses with `summarize.BuildCondensedTranscriptFromBytes`, formats with `summarize.FormatCondensedTranscript`, and truncates each to 2000 chars. Limited to 2 sessions per theme to bound prompt size.
+
+3. **Phase 3 (context files):** Calls `improve.DetectContextFiles(worktreeRoot)` to locate CLAUDE.md, AGENTS.md, .cursorrules, and .gemini/settings.json.
+
+4. **Phase 4 (AI generation):** Builds `improve.PatternAnalysis` via `improve.AnalyzePatterns`, overlays transcript excerpts, then calls `improve.Generator{Runner: &llmcli.Runner{}}.Generate(ctx, analysis, contextFiles)`.
+
+### Flags
+- `--last int` (default 10) — sessions to analyze
+- `--dry-run` — friction patterns only, no AI call
+- `--json` — JSON output
+
+### Design decisions
+- Terminal render functions don't return `error` (they never fail) — avoids `unparam` lint noise
+- `worktreeRoot` is passed to `attachTranscriptExcerpts` as `_` since `openRepository(ctx)` resolves the repo from CWD
+- All transcript-read errors are non-fatal (skip and continue) — a missing transcript shouldn't block generation</result>
+<usage><total_tokens>84485</total_tokens><tool_uses>65</tool_uses><duration_ms>286580</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alisha--superset-worktrees-cli-agent-improvements/5da2bf60-2e29-4c46-b13a-b74801006853/tasks/ac5f003288eda2450.output
+
+---
+
+yks
+
+---
+
+commit changes
