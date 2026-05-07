@@ -1,12 +1,14 @@
 package entire
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/entireio/cli/cmd/entire/cli/execx"
 )
 
 // BinPath returns the path to the entire binary from E2E_ENTIRE_BIN.
@@ -21,13 +23,15 @@ func BinPath() string {
 
 // RewindPoint represents a single entry from `entire rewind --list`.
 type RewindPoint struct {
-	ID             string `json:"id"`
-	Message        string `json:"message"`
-	MetadataDir    string `json:"metadata_dir"`
-	Date           string `json:"date"`
-	IsLogsOnly     bool   `json:"is_logs_only"`
-	CondensationID string `json:"condensation_id"`
-	SessionID      string `json:"session_id"`
+	ID               string `json:"id"`
+	Message          string `json:"message"`
+	MetadataDir      string `json:"metadata_dir"`
+	Date             string `json:"date"`
+	IsTaskCheckpoint bool   `json:"is_task_checkpoint"`
+	ToolUseID        string `json:"tool_use_id"`
+	IsLogsOnly       bool   `json:"is_logs_only"`
+	CondensationID   string `json:"condensation_id"`
+	SessionID        string `json:"session_id"`
 }
 
 // Enable runs `entire enable` for the given agent with telemetry disabled.
@@ -42,10 +46,28 @@ func Disable(t *testing.T, dir string) {
 	run(t, dir, "disable")
 }
 
+// Doctor runs `entire doctor --force` and returns the output.
+func Doctor(t *testing.T, dir string) string {
+	t.Helper()
+	return run(t, dir, "doctor", "--force")
+}
+
+// CleanDryRun runs `entire clean --dry-run` and returns the output.
+func CleanDryRun(t *testing.T, dir string) string {
+	t.Helper()
+	return run(t, dir, "clean", "--dry-run")
+}
+
+// CleanForce runs `entire clean --force` and returns the output.
+func CleanForce(t *testing.T, dir string) string {
+	t.Helper()
+	return run(t, dir, "clean", "--force")
+}
+
 // RewindList runs `entire rewind --list` and parses the JSON output.
 func RewindList(t *testing.T, dir string) []RewindPoint {
 	t.Helper()
-	out := run(t, dir, "rewind", "--list")
+	out := run(t, dir, "checkpoint", "rewind", "--list")
 
 	var points []RewindPoint
 	if err := json.Unmarshal([]byte(out), &points); err != nil {
@@ -58,21 +80,21 @@ func RewindList(t *testing.T, dir string) []RewindPoint {
 // failing the test, since callers may test failure cases.
 func Rewind(t *testing.T, dir, id string) error {
 	t.Helper()
-	return runErr(dir, "rewind", "--to", id)
+	return runErr(dir, "checkpoint", "rewind", "--to", id)
 }
 
 // RewindLogsOnly runs `entire rewind --to <id> --logs-only`.
 func RewindLogsOnly(t *testing.T, dir, id string) error {
 	t.Helper()
-	return runErr(dir, "rewind", "--to", id, "--logs-only")
+	return runErr(dir, "checkpoint", "rewind", "--to", id, "--logs-only")
 }
 
 // run executes an `entire` subcommand in dir and fails the test on error.
 func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(BinPath(), args...)
+	cmd := execx.NonInteractive(context.Background(), BinPath(), args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "ENTIRE_TEST_TTY=0")
+	cmd.Env = os.Environ()
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -83,9 +105,9 @@ func run(t *testing.T, dir string, args ...string) string {
 
 // runErr executes an `entire` subcommand in dir and returns any error.
 func runErr(dir string, args ...string) error {
-	cmd := exec.Command(BinPath(), args...)
+	cmd := execx.NonInteractive(context.Background(), BinPath(), args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "ENTIRE_TEST_TTY=0")
+	cmd.Env = os.Environ()
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -116,31 +138,46 @@ func (e *ExecError) Unwrap() error {
 // Explain runs `entire explain --checkpoint <id>` and returns the output.
 func Explain(t *testing.T, dir, checkpointID string) string {
 	t.Helper()
-	return run(t, dir, "explain", "--checkpoint", checkpointID)
+	return run(t, dir, "checkpoint", "explain", "--checkpoint", checkpointID)
 }
 
 // ExplainGenerate runs `entire explain --checkpoint <id> --generate`.
 // Returns (output, error) — doesn't fail test since callers may test failure cases.
 func ExplainGenerate(dir, checkpointID string) (string, error) {
-	return runOutput(dir, "explain", "--checkpoint", checkpointID, "--generate")
+	return runOutput(dir, "checkpoint", "explain", "--checkpoint", checkpointID, "--generate")
 }
 
 // ExplainCommit runs `entire explain --commit <ref>`.
 // Returns (output, error) — for testing failure cases.
 func ExplainCommit(dir, ref string) (string, error) {
-	return runOutput(dir, "explain", "--commit", ref)
+	return runOutput(dir, "checkpoint", "explain", "--commit", ref)
+}
+
+// AttachWithEnv runs `entire attach <session-id> --agent <agent> --force`
+// with extra env vars.
+func AttachWithEnv(dir string, extraEnv []string, sessionID, agent string) (string, error) {
+	return runOutputEnv(dir, extraEnv, "session", "attach", sessionID, "--agent", agent, "--force")
 }
 
 // Resume runs `entire resume <branch> --force` and returns the output.
 func Resume(dir, branch string) (string, error) {
-	return runOutput(dir, "resume", branch, "--force")
+	return runOutput(dir, "session", "resume", branch, "--force")
+}
+
+// ResumeWithEnv runs `entire resume <branch> --force` with extra env vars.
+func ResumeWithEnv(dir, branch string, extraEnv []string) (string, error) {
+	return runOutputEnv(dir, extraEnv, "session", "resume", branch, "--force")
 }
 
 // runOutput executes an `entire` subcommand and returns (output, error).
 func runOutput(dir string, args ...string) (string, error) {
-	cmd := exec.Command(BinPath(), args...)
+	return runOutputEnv(dir, nil, args...)
+}
+
+func runOutputEnv(dir string, extraEnv []string, args ...string) (string, error) {
+	cmd := execx.NonInteractive(context.Background(), BinPath(), args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "ENTIRE_TEST_TTY=0")
+	cmd.Env = append(append([]string{}, os.Environ()...), extraEnv...)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {

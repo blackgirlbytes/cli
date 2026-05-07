@@ -189,6 +189,28 @@ func GetHeadHash(t *testing.T, repoDir string) string {
 	return head.Hash().String()
 }
 
+// CreateBranch creates a local branch at the current HEAD.
+func CreateBranch(t *testing.T, dir string, name string) {
+	t.Helper()
+	cmd := exec.Command("git", "branch", name) //nolint:noctx // test helper, no context needed
+	cmd.Dir = dir
+	cmd.Env = GitIsolatedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git branch %s: %v\n%s", name, err, out)
+	}
+}
+
+// GitReset runs git reset --hard to the given ref.
+func GitReset(t *testing.T, dir string, ref string) {
+	t.Helper()
+	cmd := exec.Command("git", "reset", "--hard", ref) //nolint:noctx // test helper, no context needed
+	cmd.Dir = dir
+	cmd.Env = GitIsolatedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git reset --hard %s: %v\n%s", ref, err, out)
+	}
+}
+
 // BranchExists checks if a branch exists in the repository.
 func BranchExists(t *testing.T, repoDir, branchName string) bool {
 	t.Helper()

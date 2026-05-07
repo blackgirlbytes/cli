@@ -73,11 +73,11 @@ func TestPersistentPostRun_SkipsHiddenParent(t *testing.T) {
 
 	root := NewRootCmd()
 
-	// Find the leaf command: entire hooks git post-commit
+	// Find the leaf command: entire hooks git post-rewrite
 	// This exercises the real command tree where "hooks" is Hidden but its descendants are not.
-	leaf, _, err := root.Find([]string{"hooks", "git", "post-commit"})
+	leaf, _, err := root.Find([]string{"hooks", "git", "post-rewrite"})
 	if err != nil {
-		t.Fatalf("could not find hooks git post-commit command: %v", err)
+		t.Fatalf("could not find hooks git post-rewrite command: %v", err)
 	}
 
 	if leaf.Hidden {
@@ -174,4 +174,71 @@ func TestPersistentPostRun_ParentHiddenWalk(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRoot_NounGroupShorthandsUseCobraAliases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		alias     string
+		canonical string
+	}{
+		{alias: "sessions", canonical: "session"},
+		{alias: "cp", canonical: "checkpoint"},
+		{alias: "checkpoints", canonical: "checkpoint"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.alias, func(t *testing.T) {
+			t.Parallel()
+
+			root := NewRootCmd()
+			cmd, _, err := root.Find([]string{tt.alias})
+			if err != nil {
+				t.Fatalf("root.Find(%q): %v", tt.alias, err)
+			}
+			if cmd.Name() != tt.canonical {
+				t.Fatalf("alias %q resolved to %q, want %q", tt.alias, cmd.Name(), tt.canonical)
+			}
+			if !containsString(cmd.Aliases, tt.alias) {
+				t.Fatalf("%q should be registered in %q Aliases, got %v", tt.alias, tt.canonical, cmd.Aliases)
+			}
+			for _, direct := range root.Commands() {
+				if direct.Name() == tt.alias {
+					t.Fatalf("%q should be a Cobra alias, not a duplicate root command", tt.alias)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckpointSearchIsVisibleButTopLevelSearchIsHidden(t *testing.T) {
+	t.Parallel()
+
+	root := NewRootCmd()
+
+	checkpointSearch, _, err := root.Find([]string{"checkpoint", "search"})
+	if err != nil {
+		t.Fatalf("find checkpoint search: %v", err)
+	}
+	if checkpointSearch.Hidden {
+		t.Fatal("checkpoint search should be visible in checkpoint help")
+	}
+
+	topLevelSearch, _, err := root.Find([]string{"search"})
+	if err != nil {
+		t.Fatalf("find top-level search: %v", err)
+	}
+	if !topLevelSearch.Hidden {
+		t.Fatal("top-level search should remain hidden as a compatibility alias")
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

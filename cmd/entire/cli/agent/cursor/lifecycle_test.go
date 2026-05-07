@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -719,5 +720,21 @@ func TestPrepareTranscript_EmptyFileGrowsDuringPolling(t *testing.T) {
 	err := ag.PrepareTranscript(context.Background(), path)
 	if err != nil {
 		t.Fatalf("expected nil error when empty file grows during polling, got: %v", err)
+	}
+}
+
+func TestPrepareTranscript_ContextCanceled(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "missing.jsonl")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ag := &CursorAgent{}
+	err := ag.PrepareTranscript(ctx, path)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
 }

@@ -10,8 +10,8 @@ This repo contains the CLI for Entire.
 
 ### Commands (`cmd/`)
 
-- `entire/`: Main CLI entry point
-- `entire/cli`: CLI utilities and helpers
+- `entire/`: Main CLI entry point. Also home to kubectl-style external-command resolution (`entire <name>` → `entire-<name>` on PATH) — see [External Commands](docs/architecture/external-commands.md).
+- `entire/cli`: CLI utilities and helpers (Cobra commands, helpers, group roots)
 - `entire/cli/commands`: actual command implementations
 - `entire/cli/agent`: agent implementations (Claude Code, Gemini CLI, OpenCode, Cursor, Factory AI Droid, Copilot CLI) - see [Agent Integration Checklist](docs/architecture/agent-integration-checklist.md) and [Agent Implementation Guide](docs/architecture/agent-guide.md)
 - `entire/cli/strategy`: strategy implementation (manual-commit) - see section below
@@ -19,6 +19,45 @@ This repo contains the CLI for Entire.
 - `entire/cli/session`: session state management
 - `entire/cli/integration_test`: integration tests (simulated hooks)
 - `e2e/`: E2E tests with real agent calls (see [e2e/README.md](e2e/README.md))
+
+### Command Layout
+
+The CLI is organized around five noun groups plus a small set of top-level
+verbs. The groups are the canonical home for each verb; legacy top-level
+shortcuts remain functional but hidden, and emit a deprecation hint pointing
+at the canonical group form.
+
+- `session` (alias: `sessions`): `list`, `info`, `stop`, `attach`, `resume`, `current`
+- `checkpoint` (aliases: `cp`, `checkpoints`): `list`, `explain`, `rewind`, `search`
+- `agent`: bare opens the interactive agent selector, plus `list`, `add`, `remove`
+- `configure`: bare prints help and a hint pointing at `entire agent`; flags
+  manage non-agent settings (telemetry, git-hook installation mode, strategy
+  options, summary provider). Agent CRUD lives under `entire agent`.
+- `auth`: `login`, `logout`, `status`, `list`, `revoke`
+- `doctor`: bare runs the scan-and-fix flow, plus `trace`, `logs`, `bundle`
+
+Top-level lifecycle and standalone commands: `enable`, `disable`, `status`,
+`login`, `logout`, `clean`, `version`, `dispatch`, `activity`, `help`,
+`configure`.
+
+Hidden top-level shortcuts (functional, emit a one-line deprecation hint):
+`rewind` → `checkpoint rewind`, `resume` → `session resume`, `attach` →
+`session attach`, `explain` → `checkpoint explain`, `trace` → `doctor trace`.
+Cobra-native aliases (no hint): `sessions` → `session`, `cp`/`checkpoints` →
+`checkpoint`. The `search` top-level remains hidden without a hint.
+
+Deprecated top-level alias (functional, prints cobra deprecation message):
+`reset` → `clean`.
+
+Hidden infrastructure commands: `hooks`, `migrate`, `trail`,
+`curl-bash-post-install`, `__send_analytics`.
+
+The `hideAsAlias(cmd, canonical)` helper in `cmd/entire/cli/aliascmd.go`
+marks a command Hidden and sets cobra's `Deprecated` field so the hint
+renders to stderr on every invocation while the command stays functional.
+Diagnostic subcommands live alongside `doctor.go` as `doctor_logs.go` and
+`doctor_bundle.go`. Group roots and noun-group children live in files
+named `<noun>_group.go` and `<noun>_<verb>.go` respectively.
 
 ## Tech Stack
 
@@ -132,7 +171,35 @@ t.Chdir(tmpDir)                                 // redirect CWD-based git resolu
 
 `testutil.InitRepo` configures `user.name`, `user.email`, and disables GPG signing — safe for CI environments without global git config.
 
+**Prefer `testutil.InitRepo()` over direct `git.PlainInit()` in tests.** When a test in this repo needs an initialized repository, use `testutil.InitRepo(t, dir)` unless the test specifically needs lower-level initialization behavior that the helper cannot provide. Do not call `git.PlainInit()` directly and then create commits or run CLI git operations without also reproducing the helper's repo-local config.
+
 **Do NOT** shell out to `git init`/`git commit` directly without setting user config and `--no-gpg-sign`, and **do NOT** run lifecycle/strategy handlers from the real repo CWD in tests.
+
+### Spawning subprocesses in tests (TTY detection)
+
+Tests that spawn the real `entire` or `git` binary need the child to be non-interactive so prompts don't hang on a developer terminal.
+
+`interactive.CanPromptInteractively()` resolves in this order:
+
+1. `ENTIRE_TEST_TTY=1` → force interactive ON (any other non-empty value → force OFF).
+2. `testing.Testing()` → false. In-process `go test` runs are non-interactive by default; no per-test `t.Setenv("ENTIRE_TEST_TTY", "0")` is needed.
+3. Agent sentinels (`GEMINI_CLI`, `COPILOT_CLI`, `PI_CODING_AGENT`, `GIT_TERMINAL_PROMPT=0`) → false.
+4. `CI=<non-empty-non-false>` → false.
+5. `/dev/tty` probe.
+
+For subprocesses spawning the real `entire` binary (e2e, integration tests, `entire` calling itself from a hook), prefer `execx.NonInteractive` over env-var plumbing:
+
+```go
+import "github.com/entireio/cli/cmd/entire/cli/execx"
+
+cmd := execx.NonInteractive(ctx, getTestBinary(), "status")
+cmd.Dir = repoDir
+out, err := cmd.CombinedOutput()
+```
+
+`execx.NonInteractive` puts the child in a new session with no controlling terminal (`Setsid` on Unix, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows), so the child's `/dev/tty` probe fails naturally. No env var required.
+
+`interactive.UnderTest()` returns true when `testing.Testing()` or `ENTIRE_TEST_TTY` is set — use it where code needs to skip a real-terminal operation even if `CanPromptInteractively()` returns true (e.g., reading from `/dev/tty` directly inside `askConfirmTTY`).
 
 ### Linting and Formatting
 
@@ -140,9 +207,17 @@ t.Chdir(tmpDir)                                 // redirect CWD-based git resolu
 mise run fmt && mise run lint
 ```
 
+`mise run fmt` can rewrite files. Treat `mise run fmt && mise run lint` as a single verification sequence: if formatting changes anything, run lint again on the formatted tree rather than assuming a previous lint result still applies.
+
 ### Before Every Commit (REQUIRED)
 
 **CI will fail if you skip these steps:**
+
+```bash
+mise run check
+```
+
+Equivalent expanded form:
 
 ```bash
 mise run fmt      # Format code (CI enforces gofmt)
@@ -150,7 +225,13 @@ mise run lint     # Lint check (CI enforces golangci-lint)
 mise run test:ci  # Run all tests (unit + integration)
 ```
 
-Or combined: `mise run fmt && mise run lint && mise run test:ci`
+`mise run check` runs the three commands above.
+
+Safety note: do not treat a clean `mise run lint` result as final unless it was run after the most recent `mise run fmt` pass.
+
+### Before Any Push Or Remote Code Update (REQUIRED)
+
+Before pushing commits or otherwise sending code changes to any remote, run `mise run lint` on the current tree and ensure it passes. If `mise run fmt` changed files, rerun `mise run lint` on the formatted tree before pushing.
 
 **Common CI failures from skipping this:**
 
@@ -261,6 +342,7 @@ if settings.IsSummarizeEnabled() {
 ### Logging vs User Output
 
 - **Internal/debug logging**: Use `logging.Debug/Info/Warn/Error(ctx, msg, attrs...)` from `cmd/entire/cli/logging/`. Writes to `.entire/logs/`.
+- **Enabling debug/perf logs locally**: Prefer adding `"log_level": "DEBUG"` to `.entire/settings.local.json` when you need detailed hook/perf logs. This file is gitignored, so it is a low-risk local-only change. `ENTIRE_LOG_LEVEL=debug` also works and takes precedence.
 - **User-facing output**: Use `fmt.Fprint*(cmd.OutOrStdout(), ...)` or `cmd.ErrOrStderr()`.
 
 Don't use `fmt.Print*` for operational messages (checkpoint saves, hook invocations, strategy decisions) - those should use the `logging` package.
@@ -350,6 +432,7 @@ The manual-commit strategy (`manual_commit*.go`) does not modify the active bran
 - **Worktree-specific branches** - each git worktree gets its own shadow branch namespace, preventing conflicts
 - **Supports multiple concurrent sessions** - checkpoints from different sessions in the same directory interleave on the same shadow branch
 - Condenses session logs to permanent `entire/checkpoints/v1` branch on user commits
+- Uses the `post-rewrite` Git hook to keep local session linkage aligned after amend/rebase rewrites
 - Builds git trees in-memory using go-git plumbing APIs
 - Rewind restores files from shadow branch commit tree (does not use `git reset`)
 - **Location-independent transcript resolution** - transcript paths are always computed dynamically from the current repo location (via `agent.GetSessionDir` + `agent.ResolveSessionFile`), never stored in checkpoint metadata. This ensures restore/rewind works after repo relocation or across machines.
@@ -373,8 +456,10 @@ The manual-commit strategy (`manual_commit*.go`) does not modify the active bran
 - `manual_commit_rewind.go` - Rewind implementation: file restoration from checkpoint trees
 - `manual_commit_git.go` - Git operations: checkpoint commits, tree building
 - `manual_commit_logs.go` - Session log retrieval and session listing
-- `manual_commit_hooks.go` - Git hook handlers (prepare-commit-msg, post-commit, pre-push)
+- `manual_commit_hooks.go` - Git hook handlers (prepare-commit-msg, post-commit, post-rewrite, pre-push)
 - `manual_commit_reset.go` - Shadow branch reset/cleanup functionality
+- `cleanup.go` - Cleanup discovery/deletion, including archived v2 generation retention
+- `generation_repair.go` - Archived v2 generation metadata repair from raw transcript timestamps
 - `session_state.go` - Package-level session state functions (`LoadSessionState`, `SaveSessionState`, `ListSessionStates`, `FindMostRecentSession`)
 - `hooks.go` - Git hook installation
 
@@ -586,6 +671,112 @@ Trailers:
 - The strategy must implement the full `Strategy` interface
 - Test with `mise run test` - strategy tests are in `*_test.go` files
 - **Update both CLAUDE.md and AGENTS.md** when modifying the strategy to keep documentation current
+
+### `entire review` Command
+
+`entire review` runs a set of configured review skills inside an agent session. The review session is an immutable fact attached to a checkpoint — no verdict, no status tracking, no empty commits. On the next `git commit`, the review session is condensed into the checkpoint metadata alongside normal sessions, permanently recording that the code was reviewed and which skills were run.
+
+#### Command Surface
+
+```
+entire review                          # Normal run: load config, run configured agent(s)
+entire review --edit                   # Re-open the skills picker before running
+entire review --agent <name>           # Force a specific configured agent (skips multi-picker)
+entire review attach <session-id>      # Tag an existing agent session as a review (post-hoc)
+entire review attach --force           # Skip confirmation
+entire review attach --agent <name>    # Agent that created the session
+entire review attach --skills <s,...>  # Declare which skills were run
+```
+
+When two or more launchable agents are configured and `--agent` is not set, a multi-select picker appears with an optional per-run prompt field (e.g. "focus on security"). Selecting one agent or passing `--agent` runs the single-agent path; selecting two or more runs the N-agent path.
+
+#### Settings Schema
+
+Review skills are configured per-agent in `.entire/settings.json`:
+
+```json
+{
+  "review": {
+    "claude-code": {"skills": ["/pr-review-toolkit:review-pr"], "prompt": "Be thorough."},
+    "codex": {"skills": ["/codex:adversarial-review"]}
+  }
+}
+```
+
+The key is the agent name. The value is a `ReviewConfig` with `skills` (skill invocations passed verbatim to the agent) and optional `prompt` (an always-prompt appended to the composed prompt). Settings field: `EntireSettings.Review` in `cmd/entire/cli/settings/settings.go`.
+
+#### How It Works (env-var handshake)
+
+1. `entire review` selects the configured agent (override → alphabetically first → prompt if multiple), composes the review prompt via `review.ComposeReviewPrompt`, and computes scope (closest-ancestor branch via `review.ComputeScopeStats`).
+2. **For launchable agents** (claude-code, codex, gemini-cli): the spawned agent process is given env vars `ENTIRE_REVIEW_{SESSION,AGENT,SKILLS,PROMPT,STARTING_SHA}` that the agent's `UserPromptSubmit` lifecycle hook reads to tag the session as `Kind = "agent_review"` with the configured skills/prompt. Each spawned process has its own env, so multiple worktrees and multi-agent runs are correct by construction (no shared marker file, no race).
+3. **For non-launchable agents** (cursor, opencode, factoryai-droid): `RunMarkerFallback` writes a `PendingReviewMarker` file and prints guidance — the user opens the agent themselves and runs the skills. Single shared file (`review/marker_fallback.go`); adding new non-launchable agents is a registry entry, not a new file.
+4. The agent runs the review skills; the session ends naturally.
+5. On the next `git commit`, the PostCommit hook condenses the review session into the checkpoint on `entire/checkpoints/v1`, with `Kind` and `ReviewSkills` recorded in `CommittedMetadata`.
+6. The `CheckpointSummary` sets `HasReview = true` for O(1) lookup. `HasReview` is an umbrella "any review happened" flag — future review kinds (e.g. manual review) should also set it.
+7. `entire status` and the re-run guard read `HasReview` from the checkpoint metadata (no commit history walking).
+
+#### Checkpoint Metadata
+
+Review metadata is stored at two levels on `entire/checkpoints/v1`:
+
+- **`CommittedMetadata` (per-session)**: `kind: "agent_review"`, `review_skills: ["/skill1", "/skill2"]`, `review_prompt: "..."`
+- **`CheckpointSummary` (per-checkpoint)**: `has_review: true` (umbrella; set when any session in the checkpoint has a review-kind `Kind`)
+
+#### Architecture
+
+- **`AgentReviewer` interface** (`cmd/entire/cli/review/types/reviewer.go`): per-agent contract with `Name() string` and `Start(ctx, RunConfig) (Process, error)`. Each launchable agent implements this in its own package.
+- **`ReviewerTemplate`** (`cmd/entire/cli/review/types/template.go`): shared scaffolding (Spawn → pipe stdout → run parser → forward events → close). Each agent supplies only its `BuildCmd` (argv/env) and `Parser` (stdout-to-Event stream).
+- **`Sink` interface**: consumers of the event stream. Production sinks: `DumpSink` (post-run per-agent narrative), `TUISink` (Bubble Tea live dashboard with Ctrl+O drill-in), `SynthesisSink` (opt-in y/N cross-agent verdict). Sinks are composed by `composeMultiAgentSinks` based on TTY detection.
+- **`Run(ctx, reviewer, cfg, sinks)`** (`cmd/entire/cli/review/run.go`): single-agent orchestrator. Forwards events to all sinks via `AgentEvent`, calls `RunFinished` once at end with a populated `RunSummary`. Sink dispatch is serialized; sinks need not internally synchronize.
+- **`RunMulti(ctx, reviewers, cfg, sinks)`** (`cmd/entire/cli/review/run_multi.go`): N-agent orchestrator. Each agent runs concurrently in its own goroutine; events fan into a single dispatch loop so the serial-dispatch contract is preserved. Per-agent skills/prompts are injected via `perAgentConfiguredReviewer` adapter (each reviewer sees its own `RunConfig` despite the shared API surface).
+- **Env-var contract** (`cmd/entire/cli/review/env.go`): single source of truth for `ENTIRE_REVIEW_*` constants used by spawn-side and lifecycle adoption.
+- **Scope detection** (`cmd/entire/cli/review/scope.go`): `detectScopeBaseRef` finds the closest non-self ancestor branch by tip timestamp, with fallback chain `origin/HEAD → origin/main → origin/master → main → master`. Banner output: "Reviewing feat/X vs main: 3 commits, 7 files changed, 2 uncommitted".
+
+#### Multi-Agent UI
+
+When `RunMulti` is dispatched in a TTY, the sink slice is `[TUISink, DumpSink, SynthesisSink?]`:
+
+- **`TUISink` / `reviewTUIModel`** (`cmd/entire/cli/review/tui_sink.go`, `tui_model.go`, `tui_detail.go`): live dashboard with one row per agent (name, status, tokens, last assistant preview, duration). `Ctrl+O` enters drill-in mode on the alt screen showing the full event buffer for the selected agent; `Esc` returns to the dashboard. `Ctrl+C` cancels the run via the shared `CancelFunc`. The model uses `tea.WithoutSignalHandler` so the cobra root retains SIGINT routing. After all agents finish, the user dismisses with any key — `RunFinished` blocks on dismissal so `DumpSink` renders below the TUI rather than overlapping it.
+- **`SynthesisSink`** (`cmd/entire/cli/review/synthesis_sink.go`): opt-in y/N prompt offered after the dump. On "y", composes a synthesis prompt covering all agent narratives + per-run user prompt, calls the configured summary provider, and prints the unified verdict. Skipped silently when stdin can't prompt, the run was cancelled, or fewer than 2 agents produced usable output. Provider failures degrade gracefully ("synthesis unavailable: <err>") so the user can still commit.
+- **Sink composition** (`composeMultiAgentSinks` in `cmd/entire/cli/review/cmd.go`): pure helper taking explicit `isTTY`/`canPrompt` so tests don't depend on real TTY detection. `findTUISink` picks the TUI out of the slice for `Start`/`Wait` lifecycle hooks.
+
+#### Skill Discovery (Claude Code)
+
+`DiscoverReviewSkills` (`cmd/entire/cli/agent/claudecode/discovery.go`) walks three roots: plugin cache (`~/.claude/plugins/cache/<market>/<plugin>/<version>/{skills,commands,agents}`), user skills (`~/.claude/skills`), user commands/agents (`~/.claude/commands`, `~/.claude/agents`).
+
+For the plugin cache, `pickLatestVersion` picks ONE version directory per plugin: highest valid semver wins; if no entries parse as semver, the lexicographic max is picked (handles the `unknown` sentinel some plugins ship). Without this, multiple installed versions of a plugin produced duplicate skill entries in the picker and prompt.
+
+#### Anti-Features (do NOT recreate)
+
+The redesign eliminated several constructs from the prior implementation. None should be reintroduced without explicit design:
+
+- `PendingReviewMarker` for launchable agents (env-var handshake makes it unnecessary)
+- `WorktreePath` field + worktree-scoping logic (env per process eliminates the multi-tenant problem)
+- `AgentEntries` map on the marker (each agent has its own env)
+- Marker overwrite tripwire / refuse-attach guard (the bug classes they defended against don't exist)
+- `--track-only` flag (intentionally removed by #1009)
+- `--postreview` / `--finalize` / empty review commits / `/entire-review:finish` skill installer
+- `Launcher` + `HeadlessLauncher` as separate interfaces (single `AgentReviewer`)
+- `filterCodexOutput` in shared multi-agent code (lives in codex's adapter)
+- `sync.Once`-guarded onCancel + parallel `signal.Notify` goroutine (single cancel from start)
+
+#### Key Files
+
+- `cmd/entire/cli/review/cmd.go` — `NewCommand()`, `runReview` dispatch fork, `composeMultiAgentSinks`
+- `cmd/entire/cli/review/picker.go` / `multipicker.go` — config-edit picker, first-run setup, single- and multi-agent selection
+- `cmd/entire/cli/review/attach.go` + `cli/review_helpers.go:newReviewAttachCmd` — `entire review attach` subcommand
+- `cmd/entire/cli/review/marker_fallback.go` — non-launchable agent flow (single shared file)
+- `cmd/entire/cli/review/prompt.go` / `scope.go` / `run.go` / `dump.go` / `run_multi.go` — core machinery (single-agent + N-agent fan-in)
+- `cmd/entire/cli/review/tui_sink.go` / `tui_model.go` / `tui_detail.go` — Bubble Tea TUI sink
+- `cmd/entire/cli/review/synthesis_sink.go` / `synthesis_prompt.go` — opt-in cross-agent verdict
+- `cmd/entire/cli/review/types/{reviewer,sink,template}.go` — interface contracts (CU2 + CU4 + CU5b)
+- `cmd/entire/cli/review/env.go` — `ENTIRE_REVIEW_*` constants + `EncodeSkills`/`DecodeSkills` + `AppendReviewEnv`
+- `cmd/entire/cli/agent/{claudecode,codex,geminicli}/reviewer.go` — per-agent `AgentReviewer` implementations (claude-code, codex with chrome filter, gemini-cli)
+- `cmd/entire/cli/agent/claudecode/discovery.go` — skill discovery + `pickLatestVersion` plugin-cache dedupe
+- `cmd/entire/cli/lifecycle.go` — `adoptReviewEnv` reads `ENTIRE_REVIEW_*` from process env; replaces marker-file adoption
+- `cmd/entire/cli/review_bridge.go` / `review_helpers.go` — bridge code in `cli` package for cycle-bound functions (`headHasReviewCheckpoint`, `launchableReviewerFor`, `newReviewAttachCmd`, `lazySynthesisProvider`)
+- `cmd/entire/cli/checkpoint/checkpoint.go` — `Kind`, `ReviewSkills`, `ReviewPrompt` on `CommittedMetadata`; `HasReview` on `CheckpointSummary`
+- `cmd/entire/cli/settings/settings.go` — `EntireSettings.Review` field
 
 # Important Notes
 

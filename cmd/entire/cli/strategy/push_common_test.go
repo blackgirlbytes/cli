@@ -3,18 +3,23 @@ package strategy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
+	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
+	"github.com/entireio/cli/redact"
 
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
 
 	"github.com/stretchr/testify/assert"
@@ -826,6 +831,109 @@ func TestFetchAndRebase_URLTarget_ReconcilesFetchedTempRef(t *testing.T) {
 	assert.ErrorIs(t, err, plumbing.ErrReferenceNotFound, "temporary fetched ref should be cleaned up")
 }
 
+// TestFetchAndRebase_FlaggedOriginTarget_UsesTempRef verifies that enabling
+// filtered_fetches for a normal remote-name target follows the temp-ref
+// path and still cleans up after rebasing.
+//
+// Not parallel: uses t.Chdir() (required for OpenRepository).
+func TestFetchAndRebase_FlaggedOriginTarget_UsesTempRef(t *testing.T) {
+	ctx := context.Background()
+	branchName := paths.MetadataBranchName
+
+	bareDir := t.TempDir()
+	setupDir := t.TempDir()
+	gitRun := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = dir
+		cmd.Env = testutil.GitIsolatedEnv()
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "git %v in %s failed: %s", args, dir, out)
+	}
+
+	gitRun(bareDir, "init", "--bare", "-b", "main")
+	gitRun(setupDir, "clone", bareDir, ".")
+	gitRun(setupDir, "config", "user.email", "test@test.com")
+	gitRun(setupDir, "config", "user.name", "Test User")
+	gitRun(setupDir, "config", "commit.gpgsign", "false")
+	require.NoError(t, os.WriteFile(filepath.Join(setupDir, "README.md"), []byte("# Test"), 0o644))
+	gitRun(setupDir, "add", ".")
+	gitRun(setupDir, "commit", "-m", "init")
+	gitRun(setupDir, "push", "origin", "main")
+
+	gitRun(setupDir, "checkout", "--orphan", branchName)
+	gitRun(setupDir, "rm", "-rf", ".")
+	baseDir := filepath.Join(setupDir, "aa", "aaaaaaaaaa")
+	require.NoError(t, os.MkdirAll(baseDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(baseDir, "metadata.json"),
+		[]byte(`{"checkpoint_id":"aaaaaaaaaaaa"}`), 0o644))
+	gitRun(setupDir, "add", ".")
+	gitRun(setupDir, "commit", "-m", "Checkpoint: aaaaaaaaaaaa")
+	gitRun(setupDir, "push", "origin", branchName)
+	gitRun(setupDir, "checkout", "main")
+
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	require.NoError(t, os.MkdirAll(cloneDir, 0o755))
+	gitRun(cloneDir, "clone", bareDir, ".")
+	gitRun(cloneDir, "config", "user.email", "test@test.com")
+	gitRun(cloneDir, "config", "user.name", "Test User")
+	gitRun(cloneDir, "config", "commit.gpgsign", "false")
+	gitRun(cloneDir, "branch", branchName, "origin/"+branchName)
+	require.NoError(t, os.MkdirAll(filepath.Join(cloneDir, ".entire"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(cloneDir, ".entire", "settings.json"),
+		[]byte(`{"enabled": true, "strategy_options": {"filtered_fetches": true}}`),
+		0o644,
+	))
+
+	gitRun(cloneDir, "checkout", "--orphan", "temp-orphan")
+	gitRun(cloneDir, "rm", "-rf", ".")
+	localDir := filepath.Join(cloneDir, "cc", "cccccccccc")
+	require.NoError(t, os.MkdirAll(localDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(localDir, "metadata.json"),
+		[]byte(`{"checkpoint_id":"cccccccccccc"}`), 0o644))
+	gitRun(cloneDir, "add", ".")
+	gitRun(cloneDir, "commit", "-m", "Checkpoint: cccccccccccc")
+	gitRun(cloneDir, "branch", "-f", branchName, "temp-orphan")
+	gitRun(cloneDir, "checkout", "main")
+
+	repo, err := git.PlainOpen(cloneDir)
+	require.NoError(t, err)
+	localRefBeforeFetch, err := repo.Reference(plumbing.NewBranchReferenceName(branchName), true)
+	require.NoError(t, err)
+	staleOriginRef := plumbing.NewHashReference(
+		plumbing.NewRemoteReferenceName("origin", branchName),
+		localRefBeforeFetch.Hash(),
+	)
+	require.NoError(t, repo.Storer.SetReference(staleOriginRef))
+
+	t.Chdir(cloneDir)
+
+	err = fetchAndRebaseSessionsCommon(ctx, "origin", branchName)
+	require.NoError(t, err)
+
+	repo, err = git.PlainOpen(cloneDir)
+	require.NoError(t, err)
+
+	localRef, err := repo.Reference(plumbing.NewBranchReferenceName(branchName), true)
+	require.NoError(t, err)
+
+	tipCommit, err := repo.CommitObject(localRef.Hash())
+	require.NoError(t, err)
+	require.Len(t, tipCommit.ParentHashes, 1)
+
+	tree, err := tipCommit.Tree()
+	require.NoError(t, err)
+
+	entries := make(map[string]object.TreeEntry)
+	require.NoError(t, checkpoint.FlattenTree(repo, tree, "", entries))
+	assert.Contains(t, entries, "aa/aaaaaaaaaa/metadata.json", "remote checkpoint should be preserved")
+	assert.Contains(t, entries, "cc/cccccccccc/metadata.json", "local checkpoint should be preserved")
+
+	_, err = repo.Reference(plumbing.ReferenceName("refs/entire-fetch-tmp/"+branchName), true)
+	assert.ErrorIs(t, err, plumbing.ErrReferenceNotFound, "temporary fetched ref should be cleaned up")
+}
+
 // TestIsCheckpointRemoteCommitted verifies that the discoverability check reads
 // the committed content of .entire/settings.json at HEAD, not just tracking status.
 // Not parallel: uses t.Chdir().
@@ -1097,5 +1205,400 @@ func TestPrintSettingsCommitHint(t *testing.T) {
 
 		count := bytes.Count(buf.Bytes(), []byte("does not contain checkpoint_remote"))
 		assert.Equal(t, 1, count, "hint should print exactly once, got %d", count)
+	})
+}
+
+func TestIsCheckpointsVersion2Committed(t *testing.T) {
+	t.Run("false when settings.json not committed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		testutil.WriteFile(t, tmpDir, "f.txt", "init")
+		testutil.GitAdd(t, tmpDir, "f.txt")
+		testutil.GitCommit(t, tmpDir, "init")
+
+		entireDir := filepath.Join(tmpDir, ".entire")
+		require.NoError(t, os.MkdirAll(entireDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(entireDir, "settings.json"),
+			[]byte(`{"strategy_options":{"checkpoints_version":2}}`), 0o644))
+
+		t.Chdir(tmpDir)
+		assert.False(t, isCheckpointsVersion2Committed(context.Background()))
+	})
+
+	t.Run("true when checkpoints_version 2 is committed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		testutil.InitRepo(t, tmpDir)
+		testutil.WriteFile(t, tmpDir, "f.txt", "init")
+		testutil.GitAdd(t, tmpDir, "f.txt")
+		testutil.GitCommit(t, tmpDir, "init")
+
+		entireDir := filepath.Join(tmpDir, ".entire")
+		require.NoError(t, os.MkdirAll(entireDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(entireDir, "settings.json"),
+			[]byte(`{"strategy_options":{"checkpoints_version":2}}`), 0o644))
+		testutil.GitAdd(t, tmpDir, ".entire/settings.json")
+		testutil.GitCommit(t, tmpDir, "enable checkpoints_version 2")
+
+		t.Chdir(tmpDir)
+		assert.True(t, isCheckpointsVersion2Committed(context.Background()))
+	})
+}
+
+// setupCheckpointsV2CommittedRepo creates a temp repo with checkpoints_version: 2
+// set in the committed .entire/settings.json and chdirs into it. Returns an opened
+// *git.Repository for populating checkpoints.
+func setupCheckpointsV2CommittedRepo(t *testing.T) *git.Repository {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	testutil.InitRepo(t, tmpDir)
+	testutil.WriteFile(t, tmpDir, "f.txt", "init")
+	testutil.GitAdd(t, tmpDir, "f.txt")
+	testutil.GitCommit(t, tmpDir, "init")
+
+	entireDir := filepath.Join(tmpDir, ".entire")
+	require.NoError(t, os.MkdirAll(entireDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(entireDir, "settings.json"),
+		[]byte(`{"strategy_options":{"checkpoints_version":2}}`), 0o644))
+	testutil.GitAdd(t, tmpDir, ".entire/settings.json")
+	testutil.GitCommit(t, tmpDir, "enable checkpoints_version 2")
+	t.Chdir(tmpDir)
+
+	repo, err := git.PlainOpen(tmpDir)
+	require.NoError(t, err)
+	return repo
+}
+
+// writeV1Checkpoint writes a minimal checkpoint to the v1 metadata branch.
+func writeV1Checkpoint(t *testing.T, repo *git.Repository, cpID id.CheckpointID, sessionID string) {
+	t.Helper()
+	err := checkpoint.NewGitStore(repo).WriteCommitted(context.Background(), checkpoint.WriteCommittedOptions{
+		CheckpointID: cpID,
+		SessionID:    sessionID,
+		Strategy:     "manual-commit",
+		Transcript:   redact.AlreadyRedacted([]byte(`{"from":"` + sessionID + `"}`)),
+		AuthorName:   "Test",
+		AuthorEmail:  "test@test.com",
+	})
+	require.NoError(t, err)
+}
+
+func writeMalformedV1CheckpointWithoutSummary(t *testing.T, repo *git.Repository, cpID id.CheckpointID) {
+	t.Helper()
+	ctx := context.Background()
+
+	blobHash, err := checkpoint.CreateBlobFromContent(repo, []byte("transcript without root metadata"))
+	require.NoError(t, err)
+
+	treeHash, err := checkpoint.BuildTreeFromEntries(ctx, repo, map[string]object.TreeEntry{
+		cpID.Path() + "/0/" + paths.TranscriptFileName: {
+			Mode: filemode.Regular,
+			Hash: blobHash,
+		},
+	})
+	require.NoError(t, err)
+
+	commitHash, err := checkpoint.CreateCommit(ctx, repo, treeHash, plumbing.ZeroHash, "malformed v1 checkpoint", "Test", "test@test.com")
+	require.NoError(t, err)
+
+	refName := plumbing.NewBranchReferenceName(paths.MetadataBranchName)
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(refName, commitHash)))
+}
+
+func TestPrintCheckpointsV2MigrationHint(t *testing.T) {
+	t.Run("suppressed when no v1 checkpoints exist", func(t *testing.T) {
+		checkpointsV2MigrationHintOnce = sync.Once{}
+		setupCheckpointsV2CommittedRepo(t)
+
+		restore := captureStderr(t)
+		printCheckpointsV2MigrationHint(context.Background())
+		output := restore()
+
+		assert.Empty(t, output, "hint should not print when there are no v1 checkpoints to migrate")
+	})
+
+	t.Run("suppressed when every v1 checkpoint is already in v2", func(t *testing.T) {
+		checkpointsV2MigrationHintOnce = sync.Once{}
+		repo := setupCheckpointsV2CommittedRepo(t)
+
+		cpID := id.MustCheckpointID("aabbccddeeff")
+		writeV1Checkpoint(t, repo, cpID, "session-1")
+		writeV2Checkpoint(t, repo, cpID, "session-1")
+
+		restore := captureStderr(t)
+		printCheckpointsV2MigrationHint(context.Background())
+		output := restore()
+
+		assert.Empty(t, output, "hint should not print once v2 already mirrors every v1 checkpoint")
+	})
+
+	t.Run("prints when v1 has checkpoints not in v2", func(t *testing.T) {
+		checkpointsV2MigrationHintOnce = sync.Once{}
+		repo := setupCheckpointsV2CommittedRepo(t)
+
+		writeV1Checkpoint(t, repo, id.MustCheckpointID("111111111111"), "session-1")
+
+		restore := captureStderr(t)
+		printCheckpointsV2MigrationHint(context.Background())
+		output := restore()
+
+		assert.Contains(t, output, "entire migrate --checkpoints v2")
+		assert.Contains(t, output, "entire migrate --checkpoints v2 --force")
+	})
+
+	t.Run("prints only once per process", func(t *testing.T) {
+		checkpointsV2MigrationHintOnce = sync.Once{}
+		repo := setupCheckpointsV2CommittedRepo(t)
+
+		writeV1Checkpoint(t, repo, id.MustCheckpointID("222222222222"), "session-2")
+
+		restore := captureStderr(t)
+		printCheckpointsV2MigrationHint(context.Background())
+		printCheckpointsV2MigrationHint(context.Background())
+		output := restore()
+
+		// --force appears in exactly one line, so its count equals the number of
+		// invocations that actually emitted output.
+		forceCount := strings.Count(output, "--force")
+		assert.Equal(t, 1, forceCount, "hint should print exactly once per process")
+	})
+}
+
+func TestHasUnmigratedV1Checkpoints(t *testing.T) {
+	t.Run("false when no v1 checkpoints exist", func(t *testing.T) {
+		setupCheckpointsV2CommittedRepo(t)
+		assert.False(t, hasUnmigratedV1Checkpoints(context.Background()))
+	})
+
+	t.Run("false when every v1 checkpoint is in v2", func(t *testing.T) {
+		repo := setupCheckpointsV2CommittedRepo(t)
+		cpID := id.MustCheckpointID("333333333333")
+		writeV1Checkpoint(t, repo, cpID, "session-a")
+		writeV2Checkpoint(t, repo, cpID, "session-a")
+
+		assert.False(t, hasUnmigratedV1Checkpoints(context.Background()))
+	})
+
+	t.Run("true when at least one v1 checkpoint is missing from v2", func(t *testing.T) {
+		repo := setupCheckpointsV2CommittedRepo(t)
+		mirrored := id.MustCheckpointID("444444444444")
+		missing := id.MustCheckpointID("555555555555")
+		writeV1Checkpoint(t, repo, mirrored, "session-b")
+		writeV2Checkpoint(t, repo, mirrored, "session-b")
+		writeV1Checkpoint(t, repo, missing, "session-c")
+
+		assert.True(t, hasUnmigratedV1Checkpoints(context.Background()))
+	})
+
+	t.Run("false when only malformed v1 checkpoint entries are missing from v2", func(t *testing.T) {
+		repo := setupCheckpointsV2CommittedRepo(t)
+		writeMalformedV1CheckpointWithoutSummary(t, repo, id.MustCheckpointID("666666666666"))
+
+		assert.False(t, hasUnmigratedV1Checkpoints(context.Background()))
+	})
+}
+
+// captureStderr redirects os.Stderr to a pipe and returns a function that restores
+// stderr and returns the captured output. Must be called on the main goroutine
+// (not parallel-safe). Uses t.Cleanup as a safety net to restore stderr and close
+// pipe file descriptors if the test fails or panics before the returned function
+// is called.
+func captureStderr(t *testing.T) func() string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+
+	// Safety net: restore stderr and close pipe ends on test failure/panic.
+	// In the normal path the returned function handles cleanup first;
+	// duplicate Close calls return an error that we intentionally ignore.
+	t.Cleanup(func() {
+		os.Stderr = old
+		_ = w.Close()
+		_ = r.Close()
+	})
+
+	return func() string {
+		_ = w.Close()
+		var buf bytes.Buffer
+		_, readErr := buf.ReadFrom(r)
+		require.NoError(t, readErr)
+		_ = r.Close()
+		os.Stderr = old
+		return buf.String()
+	}
+}
+
+// setupBareRemoteWithCheckpointBranch creates a work repo with a checkpoint branch
+// and a bare remote that already has the branch pushed. Returns (workDir, bareDir).
+// Caller must t.Chdir(workDir) before calling push functions.
+func setupBareRemoteWithCheckpointBranch(t *testing.T) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+
+	workDir := setupRepoWithCheckpointBranch(t)
+
+	bareDir := t.TempDir()
+	initCmd := exec.CommandContext(ctx, "git", "init", "--bare")
+	initCmd.Dir = bareDir
+	initCmd.Env = testutil.GitIsolatedEnv()
+	out, err := initCmd.CombinedOutput()
+	require.NoError(t, err, "git init --bare failed: %s", out)
+
+	// Push the checkpoint branch to the bare remote
+	pushCmd := exec.CommandContext(ctx, "git", "push", bareDir, paths.MetadataBranchName)
+	pushCmd.Dir = workDir
+	pushCmd.Env = testutil.GitIsolatedEnv()
+	out, err = pushCmd.CombinedOutput()
+	require.NoError(t, err, "initial push failed: %s", out)
+
+	return workDir, bareDir
+}
+
+// TestDoPushBranch_AlreadyUpToDate verifies that when the remote already has all
+// commits, the output says "already up-to-date" instead of "done".
+//
+// Not parallel: uses t.Chdir() and os.Stderr redirection.
+func TestDoPushBranch_AlreadyUpToDate(t *testing.T) {
+	workDir, bareDir := setupBareRemoteWithCheckpointBranch(t)
+	t.Chdir(workDir)
+
+	restore := captureStderr(t)
+	err := doPushBranch(context.Background(), bareDir, paths.MetadataBranchName)
+	output := restore()
+
+	require.NoError(t, err)
+	assert.Contains(t, output, "already up-to-date", "should indicate nothing was pushed")
+	assert.NotContains(t, output, " done", "should not say 'done' when nothing was pushed")
+}
+
+// TestDoPushBranch_NewContent_SaysDone verifies that when there are new commits
+// to push, the output says "done".
+//
+// Not parallel: uses t.Chdir() and os.Stderr redirection.
+func TestDoPushBranch_NewContent_SaysDone(t *testing.T) {
+	workDir := setupRepoWithCheckpointBranch(t)
+
+	// Create a bare remote with no checkpoint branch yet
+	bareDir := t.TempDir()
+	initCmd := exec.CommandContext(context.Background(), "git", "init", "--bare")
+	initCmd.Dir = bareDir
+	initCmd.Env = testutil.GitIsolatedEnv()
+	out, err := initCmd.CombinedOutput()
+	require.NoError(t, err, "git init --bare failed: %s", out)
+
+	t.Chdir(workDir)
+
+	restore := captureStderr(t)
+	err = doPushBranch(context.Background(), bareDir, paths.MetadataBranchName)
+	output := restore()
+
+	require.NoError(t, err)
+	assert.Contains(t, output, " done", "should say 'done' when new content was pushed")
+	assert.NotContains(t, output, "already up-to-date", "should not say 'already up-to-date' when content was pushed")
+}
+
+func TestIsProtectedRefRejection(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		output string
+		want   bool
+	}{
+		"GH013 marker":           {"remote: error: GH013: Repository rule violations found", true},
+		"cannot update phrase":   {"remote: error: Cannot update this protected ref.", true},
+		"legacy hook declined":   {"! [remote rejected] main -> main (protected branch hook declined)", true},
+		"plain non-fast-forward": {"! [rejected] v1 -> v1 (non-fast-forward)", false},
+		"empty":                  {"", false},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, isProtectedRefRejection(tc.output))
+		})
+	}
+}
+
+func TestClassifyPushOutput(t *testing.T) {
+	t.Parallel()
+
+	t.Run("protected-ref wins over 'rejected' keyword", func(t *testing.T) {
+		t.Parallel()
+		output := "remote: error: GH013\n! [remote rejected] v1 -> v1"
+
+		var perr *protectedRefError
+		require.ErrorAs(t, classifyPushOutput(output), &perr)
+		assert.Equal(t, output, perr.output)
+	})
+
+	t.Run("non-fast-forward maps to NFF error", func(t *testing.T) {
+		t.Parallel()
+		err := classifyPushOutput("! [rejected] v1 -> v1 (non-fast-forward)")
+
+		var perr *protectedRefError
+		assert.NotErrorAs(t, err, &perr)
+		require.ErrorIs(t, err, errNonFastForward)
+		assert.EqualError(t, err, "non-fast-forward")
+	})
+
+	t.Run("fetch-first maps to NFF error", func(t *testing.T) {
+		t.Parallel()
+		err := classifyPushOutput("!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)")
+
+		assert.ErrorIs(t, err, errNonFastForward)
+	})
+
+	t.Run("generic rejected output stays generic", func(t *testing.T) {
+		t.Parallel()
+		err := classifyPushOutput("remote: rejected credentials")
+
+		require.Error(t, err)
+		require.NotErrorIs(t, err, errNonFastForward)
+		assert.ErrorContains(t, err, "push failed: remote: rejected credentials")
+	})
+
+	t.Run("other output is wrapped as push failed", func(t *testing.T) {
+		t.Parallel()
+		err := classifyPushOutput("fatal: Could not resolve host")
+		assert.ErrorContains(t, err, "push failed: fatal: Could not resolve host")
+	})
+
+	t.Run("empty output preserves push error", func(t *testing.T) {
+		t.Parallel()
+		pushErr := errors.New("exit status 128")
+		err := classifyPushFailure(context.Background(), "", pushErr)
+
+		require.Error(t, err)
+		require.ErrorIs(t, err, pushErr)
+		assert.ErrorContains(t, err, "push failed")
+	})
+}
+
+func TestPrintProtectedRefBlock(t *testing.T) {
+	t.Parallel()
+
+	t.Run("remote-name target", func(t *testing.T) {
+		t.Parallel()
+		var buf bytes.Buffer
+		printProtectedRefBlock(&buf, "entire/checkpoints/v1", "origin")
+
+		out := buf.String()
+		for _, want := range []string{"BLOCKED", "entire/checkpoints/v1", "e.g. GH013", "entire/*", "checkpoints are saved locally", "checkpoint_remote"} {
+			assert.Contains(t, out, want)
+		}
+		banner := strings.Repeat("=", 20)
+		assert.GreaterOrEqual(t, strings.Count(out, banner), 2, "block must be bracketed by banner lines")
+	})
+
+	t.Run("URL target is masked", func(t *testing.T) {
+		t.Parallel()
+		var buf bytes.Buffer
+		printProtectedRefBlock(&buf, "entire/checkpoints/v1", "git@github.com:org/repo.git")
+
+		out := buf.String()
+		assert.Contains(t, out, displayPushTarget("git@github.com:org/repo.git"))
+		assert.NotContains(t, out, "git@github.com:org/repo.git")
 	})
 }

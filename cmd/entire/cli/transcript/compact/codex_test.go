@@ -3,6 +3,8 @@ package compact
 import (
 	"strings"
 	"testing"
+
+	"github.com/entireio/cli/redact"
 )
 
 func TestCompact_CodexFixture(t *testing.T) {
@@ -105,7 +107,7 @@ func TestCompact_CodexInlineCases(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			result, err := Compact(tc.input, codexOpts)
+			result, err := Compact(redact.AlreadyRedacted(tc.input), codexOpts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -182,7 +184,7 @@ func TestCompact_CodexStartLine(t *testing.T) {
 		`{"v":1,"agent":"codex","cli_version":"0.5.1","type":"assistant","ts":"t7","content":[{"type":"text","text":"response to second"}]}`,
 	}
 
-	result, err := Compact(input, opts)
+	result, err := Compact(redact.AlreadyRedacted(input), opts)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -206,7 +208,7 @@ func TestCompact_CodexStartLine_IgnoresTokenCountEvents(t *testing.T) {
 		`{"v":1,"agent":"codex","cli_version":"0.5.1","type":"assistant","ts":"t4","input_tokens":10,"content":[{"type":"text","text":"second entry"}]}`,
 	}
 
-	result, err := Compact(input, opts)
+	result, err := Compact(redact.AlreadyRedacted(input), opts)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

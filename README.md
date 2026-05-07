@@ -43,15 +43,25 @@ With Entire, you can:
 ## Quick Start
 
 ```bash
-# Install via Homebrew
+# Install stable via Homebrew
 brew tap entireio/tap
-brew install entireio/tap/entire
+brew install --cask entire
 
-# Or install via Scoop (Windows)
+# Or install nightly via Homebrew
+brew tap entireio/tap
+brew install --cask entire@nightly
+
+# Or install stable via install.sh
+curl -fsSL https://entire.io/install.sh | bash
+
+# Or install nightly via install.sh
+curl -fsSL https://entire.io/install.sh | bash -s -- --channel nightly
+
+# Or install stable via Scoop (Windows)
 scoop bucket add entire https://github.com/entireio/scoop-bucket.git
 scoop install entire/cli
 
-# Or install via Go
+# Or install via Go (development/manual setup)
 go install github.com/entireio/cli/cmd/entire@latest
 
 # Linux: Add Go binaries to PATH (add to ~/.zshrc or ~/.bashrc if not already configured)
@@ -64,6 +74,23 @@ cd your-project && entire enable
 entire status
 ```
 
+After the initial setup, use `entire agent` to add or remove agents, `entire configure` to update non-agent settings, and `entire enable` / `entire disable` to toggle Entire on or off.
+
+## Release Channels
+
+Entire currently ships two release channels:
+
+- `stable`: recommended for most users. Stable releases change less often and are the default for Homebrew, Scoop, and `install.sh`.
+- `nightly`: prerelease builds for users who want the latest changes earlier. Nightlies are published more frequently and may include newer, less-proven changes than stable.
+
+How to use each channel:
+
+- Homebrew stable: `brew install --cask entire`
+- Homebrew nightly: `brew install --cask entire@nightly`
+- `install.sh` stable: `curl -fsSL https://entire.io/install.sh | bash`
+- `install.sh` nightly: `curl -fsSL https://entire.io/install.sh | bash -s -- --channel nightly`
+- Scoop: currently supports `stable` only via `scoop install entire/cli`
+
 ## Typical Workflow
 
 ### 1. Enable Entire in Your Repository
@@ -72,7 +99,13 @@ entire status
 entire enable
 ```
 
-This installs agent and Git hooks to work with your AI agent. You'll be prompted to select which agents to enable. To enable a specific agent non-interactively, use `entire enable --agent <name>` (e.g., `entire enable --agent cursor`).
+On a repo that has not been enabled yet, `entire enable` runs the initial enable flow: it creates Entire settings, installs git hooks, and prompts you to choose which agent hooks to install. To enable a specific agent non-interactively, use `entire enable --agent <name>` (for example, `entire enable --agent cursor`).
+
+After setup:
+
+- Use `entire enable` to turn Entire back on if the repo is currently disabled.
+- Use `entire agent` to add or remove agents.
+- Use `entire configure` to update non-agent settings (telemetry, hooks, checkpoint remote, summary provider).
 
 The hooks capture session data as you work. Checkpoints are created when you or the agent make a git commit. Your code commits stay clean, Entire never creates commits on your active branch. All session metadata is stored on a separate `entire/checkpoints/v1` branch.
 
@@ -89,7 +122,7 @@ entire status  # Check current session status anytime
 If you want to undo some changes and go back to an earlier checkpoint:
 
 ```
-entire rewind
+entire checkpoint rewind
 ```
 
 This shows all available checkpoints in the current session. Select one to restore your code to that exact state.
@@ -99,7 +132,7 @@ This shows all available checkpoints in the current session. Select one to resto
 To restore the latest checkpointed session metadata for a branch:
 
 ```
-entire resume <branch>
+entire session resume <branch>
 ```
 
 Entire checks out the branch, restores the latest checkpointed session metadata (one or more sessions), and prints command(s) to continue.
@@ -200,15 +233,20 @@ go test -tags=integration ./cmd/entire/cli/integration_test -run TestLogin
 | Command          | Description                                                                                       |
 | ---------------- | ------------------------------------------------------------------------------------------------- |
 | `entire clean`   | Clean up session data and orphaned Entire data (use `--all` for repo-wide cleanup)                |
+| `entire agent`   | Add, remove, or list agent integrations for the current repository                                |
+| `entire configure` | Update non-agent settings (telemetry, git hook, strategy options, summary provider)            |
 | `entire disable` | Remove Entire hooks from repository                                                               |
 | `entire doctor`  | Fix or clean up stuck sessions                                                                    |
 | `entire enable`  | Enable Entire in your repository                                                                  |
-| `entire explain` | Explain a session or commit                                                                       |
+| `entire checkpoint`        | List, explain, rewind, and search checkpoints                                           |
+| `entire checkpoint explain` | Explain a session, commit, or checkpoint                                               |
+| `entire checkpoint rewind` | Rewind to a previous checkpoint                                                         |
 | `entire login`   | Authenticate the CLI with Entire device auth                                                      |
-| `entire resume`  | Switch to a branch, restore latest checkpointed session metadata, and show command(s) to continue |
-| `entire rewind`  | Rewind to a previous checkpoint                                                                   |
+| `entire session` | View and manage agent sessions tracked by Entire                                                  |
+| `entire session resume`    | Switch to a branch, restore latest checkpointed session metadata, and show command(s) |
+| `entire session attach`    | Attach to a previously detached session                                                |
 | `entire status`  | Show current session info                                                                         |
-| `entire sessions stop` | Mark one or more active sessions as ended                                                   |
+| `entire doctor trace` | Show hook performance traces                                                                 |
 | `entire version` | Show Entire CLI version                                                                           |
 
 ### `entire enable` Flags
@@ -226,11 +264,50 @@ go test -tags=integration ./cmd/entire/cli/integration_test -run TestLogin
 **Examples:**
 
 ```
-# Force reinstall hooks
+# First-time setup with a specific agent
+entire enable --agent claude-code
+
+# Re-enable a disabled repo
+entire enable
+
+# Re-enable and refresh hooks
 entire enable --force
 
 # Save settings locally (not committed to git)
 entire enable --local
+```
+
+`entire enable` is primarily for turning Entire on. On an unconfigured repo it will also bootstrap setup. Use `entire agent` for adding or removing agents, and `entire configure` for non-agent settings.
+
+### `entire configure`
+
+Use `entire configure` to update non-agent settings on a repo that's already set up. Agent installation lives under `entire agent`.
+
+Typical uses:
+
+- Toggle telemetry
+- Reinstall the Entire git hook (`--force`, `--absolute-git-hook-path`)
+- Update strategy options such as `--checkpoint-remote` or `--skip-push-sessions`
+- Pick a summary provider for `entire explain --generate`
+
+**Examples:**
+
+```bash
+# Show help and the hint pointing to 'entire agent'
+entire configure
+
+# Opt out of telemetry
+entire configure --telemetry=false
+
+# Reinstall the Entire git hook with an absolute binary path
+entire configure --absolute-git-hook-path
+
+# Update strategy options on an existing repo
+entire configure --checkpoint-remote github:myorg/checkpoints-private
+
+# Add or remove an agent
+entire agent add claude-code
+entire agent remove claude-code
 ```
 
 ## Configuration
@@ -312,6 +389,21 @@ Entire derives the git URL automatically using the same protocol (SSH or HTTPS) 
 - Push `entire/checkpoints/v1` to the checkpoint repo instead of your default push remote
 - Skip pushing if a fork is detected (push remote owner differs from checkpoint repo owner)
 - If the remote is unreachable, warn and continue without blocking your main push
+
+#### `ENTIRE_CHECKPOINT_TOKEN`
+
+`ENTIRE_CHECKPOINT_TOKEN` allows you to provide a dedicated token for checkpoint repository operations, without modifying the credentials used for your primary repository.
+
+When this environment variable is set, Entire behaves as follows:
+
+- Injects the token into HTTPS Git operations used for checkpoint fetch and push
+- If `checkpoint_remote` is configured:
+  - Prefers an HTTPS URL for the checkpoint remote when a token is present, even if the repository’s `origin` uses SSH
+- If `checkpoint_remote` is not configured:
+  - Falls back to using the default `origin` remote
+- If `checkpoint_remote` configuration cannot be loaded:
+  - Falls back to `origin`
+  - If `origin` is a valid SSH or HTTPS Git remote, Entire converts it to an HTTPS URL to enable token-based authentication
 
 ### Auto-Summarization
 
@@ -436,6 +528,21 @@ mise trust
 # Build the CLI
 mise run build
 ```
+
+### Dev Container
+
+The repo includes a `.devcontainer/` configuration that installs the system packages used by local development and CI (`git`, `tmux`, `gnome-keyring`, etc) and then bootstraps the repo's `mise` toolchain.
+
+Open the folder in a Dev Container, or start it from the `devcontainer` CLI as follows:
+
+```bash
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . bash -lc '.devcontainer/run-with-keyring.sh'
+```
+
+The container's `postCreateCommand` runs `mise trust --yes && mise install`, so Go, `golangci-lint`, `gotestsum`, `shellcheck`, and the canary E2E helper binaries are ready after creation. Use `.devcontainer/run-with-keyring.sh <command>` for commands that touch the Linux keyring, including `mise run test:ci`.
+
+If `ENTIRE_DEVCONTAINER_KEYRING_PASSWORD` is set in the environment, `.devcontainer/run-with-keyring.sh` uses that value to unlock the keyring non-interactively. If it is unset, the script generates a random password for the session automatically.
 
 ### Common Tasks
 

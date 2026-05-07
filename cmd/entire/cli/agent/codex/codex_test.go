@@ -1,7 +1,10 @@
 package codex
 
 import (
+	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -93,6 +96,33 @@ func TestCodexAgent_ResolveSessionFile_SessionTreeLayout(t *testing.T) {
 	require.Equal(t, expected, result)
 }
 
+func TestCodexAgent_ResolveRestoredSessionFile(t *testing.T) {
+	t.Parallel()
+
+	ag := &CodexAgent{}
+	dir := t.TempDir()
+
+	path, err := ag.ResolveRestoredSessionFile(dir, "019d24c3-1111-2222-3333-444444444444", []byte(sampleRollout))
+	require.NoError(t, err)
+	require.Equal(t,
+		filepath.Join(dir, "2026", "03", "25", "rollout-2026-03-25T11-31-10-019d24c3-1111-2222-3333-444444444444.jsonl"),
+		path,
+	)
+}
+
+func TestCodexAgent_ResolveSessionFile_FindsNestedRollout(t *testing.T) {
+	t.Parallel()
+
+	ag := &CodexAgent{}
+	dir := t.TempDir()
+	want := filepath.Join(dir, "2026", "03", "25", "rollout-2026-03-25T11-31-10-019d24c3.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(want), 0o755))
+	require.NoError(t, os.WriteFile(want, []byte(sampleRollout), 0o600))
+
+	got := ag.ResolveSessionFile(dir, "019d24c3")
+	require.Equal(t, want, got)
+}
+
 func TestCodexAgent_ReadSession(t *testing.T) {
 	t.Parallel()
 	ag := &CodexAgent{}
@@ -134,5 +164,32 @@ func requireJSONL(t *testing.T, expected string, actual string) {
 	require.Len(t, actualLines, len(expectedLines))
 	for i := range expectedLines {
 		require.JSONEq(t, expectedLines[i], actualLines[i])
+	}
+}
+
+func TestCodexAgent_LaunchCmd(t *testing.T) {
+	t.Parallel()
+	a := NewCodexAgent()
+	launcher, ok := a.(agent.Launcher)
+	if !ok {
+		t.Fatal("CodexAgent does not implement agent.Launcher")
+	}
+	// Binary may not be on PATH in CI; ErrNotFound is acceptable for this test.
+	cmd, err := launcher.LaunchCmd(context.Background(), "hello world")
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			t.Skip("codex binary not on PATH; skipping cmd shape check")
+		}
+		t.Fatalf("LaunchCmd: %v", err)
+	}
+	if cmd == nil {
+		t.Fatal("nil cmd")
+	}
+	if cmd.Path == "" {
+		t.Error("cmd.Path empty")
+	}
+	joined := strings.Join(cmd.Args, " ")
+	if !strings.Contains(joined, "hello world") {
+		t.Errorf("args missing prompt: %v", cmd.Args)
 	}
 }

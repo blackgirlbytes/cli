@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
+	"github.com/entireio/cli/cmd/entire/cli/validation"
 )
 
 //nolint:gochecknoinits // Agent self-registration is the intended pattern
@@ -21,7 +24,9 @@ func init() {
 // CodexAgent implements the Agent interface for OpenAI's Codex CLI.
 //
 //nolint:revive // CodexAgent is clearer than Agent in this context
-type CodexAgent struct{}
+type CodexAgent struct {
+	CommandRunner agent.TextCommandRunner
+}
 
 // NewCodexAgent creates a new Codex agent instance.
 func NewCodexAgent() agent.Agent {
@@ -89,22 +94,26 @@ func (c *CodexAgent) ResolveSessionFile(sessionDir, agentSessionID string) strin
 	if filepath.IsAbs(agentSessionID) {
 		return agentSessionID
 	}
+	if path := findRolloutBySessionID(sessionDir, agentSessionID); path != "" {
+		return path
+	}
 	if sessionDir != "" {
-		patterns := []string{
-			filepath.Join(sessionDir, "rollout-*-"+agentSessionID+".jsonl"),
-			filepath.Join(sessionDir, "*", "*", "*", "rollout-*-"+agentSessionID+".jsonl"),
-		}
-		for _, pattern := range patterns {
-			matches, err := filepath.Glob(pattern)
-			if err == nil && len(matches) > 0 {
-				sort.Strings(matches)
-				return matches[len(matches)-1]
-			}
-		}
-
 		return filepath.Join(sessionDir, agentSessionID+".jsonl")
 	}
 	return agentSessionID
+}
+
+// ResolveRestoredSessionFile returns the canonical Codex rollout path for a
+// restored session so `codex resume <id>` can rediscover it.
+func (c *CodexAgent) ResolveRestoredSessionFile(sessionDir, agentSessionID string, transcript []byte) (string, error) {
+	if err := validation.ValidateAgentSessionID(agentSessionID); err != nil {
+		return "", fmt.Errorf("validate agent session ID: %w", err)
+	}
+	startTime, err := parseSessionStartTime(transcript)
+	if err != nil {
+		return "", fmt.Errorf("parse session start time: %w", err)
+	}
+	return restoredRolloutPath(sessionDir, agentSessionID, startTime), nil
 }
 
 // ProtectedDirs returns directories that Codex uses for config/state.
@@ -166,7 +175,8 @@ func (c *CodexAgent) WriteSession(_ context.Context, session *agent.AgentSession
 		return errors.New("session has no native data to write")
 	}
 
-	if err := os.WriteFile(session.SessionRef, session.NativeData, 0o600); err != nil {
+	dataToWrite := sanitizeRestoredTranscript(session.NativeData)
+	if err := os.WriteFile(session.SessionRef, dataToWrite, 0o600); err != nil {
 		return fmt.Errorf("failed to write transcript: %w", err)
 	}
 
@@ -199,4 +209,57 @@ func (c *CodexAgent) ChunkTranscript(_ context.Context, content []byte, maxSize 
 // ReassembleTranscript concatenates JSONL chunks with newlines.
 func (c *CodexAgent) ReassembleTranscript(chunks [][]byte) ([]byte, error) {
 	return agent.ReassembleJSONL(chunks), nil
+}
+
+func restoredRolloutPath(codexHome, agentSessionID string, startTime time.Time) string {
+	timestamp := startTime.UTC()
+	datePath := filepath.Join(
+		codexHome,
+		timestamp.Format("2006"),
+		timestamp.Format("01"),
+		timestamp.Format("02"),
+	)
+	filename := fmt.Sprintf("rollout-%s-%s.jsonl", timestamp.Format("2006-01-02T15-04-05"), agentSessionID)
+	return filepath.Join(datePath, filename)
+}
+
+// LaunchCmd builds an exec.Cmd for `codex "<initialPrompt>"`. Stdio is wired
+// to the caller's TTY so the agent runs foreground and the user interacts
+// normally. The call site is expected to Run() and wait. Hooks inherit the
+// parent environment.
+func (c *CodexAgent) LaunchCmd(ctx context.Context, initialPrompt string) (*exec.Cmd, error) {
+	bin, err := exec.LookPath("codex")
+	if err != nil {
+		return nil, fmt.Errorf("codex binary not on PATH: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, bin, initialPrompt)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	return cmd, nil
+}
+
+func findRolloutBySessionID(codexHome, agentSessionID string) string {
+	if codexHome == "" || validation.ValidateAgentSessionID(agentSessionID) != nil {
+		return ""
+	}
+
+	patterns := []string{
+		filepath.Join(codexHome, "rollout-*-"+agentSessionID+".jsonl"),
+		filepath.Join(codexHome, "*", "*", "*", "rollout-*-"+agentSessionID+".jsonl"),
+		filepath.Join(filepath.Dir(codexHome), "archived_sessions", "*", "*", "*", "rollout-*-"+agentSessionID+".jsonl"),
+	}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil || len(matches) == 0 {
+			continue
+		}
+		// Multiple restored rollouts for the same session ID can exist. Return the
+		// lexicographically latest path so newer dated restores win deterministically.
+		sort.Strings(matches)
+		return matches[len(matches)-1]
+	}
+
+	return ""
 }

@@ -7,8 +7,10 @@ import (
 	"os"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
+	"github.com/entireio/cli/cmd/entire/cli/api"
 	"github.com/entireio/cli/cmd/entire/cli/auth"
+	"github.com/entireio/cli/cmd/entire/cli/interactive"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/search"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
@@ -39,7 +41,8 @@ displayed in an interactive table. Use --json for machine-readable output.
 
 CLI queries also support inline filters like author:<name>, date:<week|month>,
 branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
-		Args: cobra.ArbitraryArgs,
+		Args:   cobra.ArbitraryArgs,
+		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			query := strings.Join(args, " ")
@@ -65,7 +68,7 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 			}
 
 			w := cmd.OutOrStdout()
-			isTerminal := isTerminalWriter(w)
+			isTerminal := interactive.IsTerminalWriter(w)
 			hasFilters := authorFlag != "" || dateFlag != "" || branchFlag != "" || len(repos) > 0
 
 			// Fast-fail: no query + non-interactive mode = error (before auth/git checks)
@@ -134,7 +137,7 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 				model := newSearchModel(nil, "", 0, searchCfg, styles)
 				model.mode = modeSearch
 				model.input.Focus()
-				p := tea.NewProgram(model, tea.WithAltScreen())
+				p := tea.NewProgram(model)
 				if _, err := p.Run(); err != nil {
 					return fmt.Errorf("TUI error: %w", err)
 				}
@@ -173,7 +176,7 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 
 			// Interactive TUI
 			model := newSearchModel(resp.Results, query, resp.Total, searchCfg, styles)
-			p := tea.NewProgram(model, tea.WithAltScreen())
+			p := tea.NewProgram(model)
 			if _, err := p.Run(); err != nil {
 				return fmt.Errorf("TUI error: %w", err)
 			}
@@ -189,7 +192,36 @@ branch:<name>, repo:<owner/name>, and repo:* to search all accessible repos.`,
 	cmd.Flags().StringVar(&branchFlag, "branch", "", "Filter by branch name")
 	cmd.Flags().StringVar(&repoFlag, "repo", "", "Filter by repository (owner/name or *)")
 
+	cmd.RegisterFlagCompletionFunc("date", func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) { //nolint:errcheck,gosec // only fails if the flag isn't defined; defined directly above
+		return []string{"week", "month"}, cobra.ShellCompDirectiveNoFileComp
+	})
+	cmd.RegisterFlagCompletionFunc("repo", completeRepoFlag) //nolint:errcheck,gosec // only fails if the flag isn't defined; defined directly above
+
 	return cmd
+}
+
+// completeRepoFlag returns shell-completion suggestions for the search
+// command's --repo flag. "*" is always offered so the wildcard works
+// regardless of auth state. Errors are swallowed (rather than surfaced via
+// ShellCompDirectiveError) because completion runs on every TAB press and
+// must never pollute the user's prompt with error output.
+func completeRepoFlag(cmd *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+	suggestions := []string{"*"}
+	client, err := NewAuthenticatedAPIClient(false)
+	if err != nil {
+		return suggestions, cobra.ShellCompDirectiveNoFileComp
+	}
+	repos, err := client.ListRepositories(cmd.Context(), api.RepositorySortRecent)
+	if err != nil {
+		return suggestions, cobra.ShellCompDirectiveNoFileComp
+	}
+	for _, r := range repos {
+		if r.CheckpointCount == 0 {
+			continue // searching a repo with no checkpoints would always be empty
+		}
+		suggestions = append(suggestions, r.FullName)
+	}
+	return suggestions, cobra.ShellCompDirectiveNoFileComp
 }
 
 // writeSearchJSON writes client-side paginated search results as JSON.

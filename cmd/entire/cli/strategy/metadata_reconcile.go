@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
+	remote "github.com/entireio/cli/cmd/entire/cli/checkpoint/remote"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 
@@ -180,7 +182,7 @@ func ReconcileDisconnectedMetadataBranch(
 
 	fmt.Fprintf(w, "[entire] Cherry-picking %d local checkpoint(s) onto remote...\n", len(dataCommits))
 
-	newTip, err := cherryPickOnto(repo, remoteHash, dataCommits)
+	newTip, err := cherryPickOnto(ctx, repo, remoteHash, dataCommits)
 	if err != nil {
 		return fmt.Errorf("failed to cherry-pick local commits onto remote: %w", err)
 	}
@@ -193,6 +195,238 @@ func ReconcileDisconnectedMetadataBranch(
 
 	fmt.Fprintln(w, "[entire] Done — all local and remote checkpoints preserved")
 	return nil
+}
+
+// v2DoctorTmpRef is the temporary ref used by doctor to fetch and compare the remote v2 /main.
+// Uses the refs/entire-fetch-tmp/ namespace consistent with checkpoint_remote.go.
+const v2DoctorTmpRef = "refs/entire-fetch-tmp/doctor-v2-main"
+
+// IsV2MainDisconnected checks whether the local v2 /main ref and the remote
+// v2 /main ref exist but share no common ancestor. Uses git ls-remote to
+// discover the remote ref (custom refs don't have remote-tracking refs).
+//
+// remote is the git remote name, URL, or local path to check against.
+// Returns (false, nil) if either ref doesn't exist or they share ancestry.
+func IsV2MainDisconnected(ctx context.Context, repo *git.Repository, remote string) (bool, error) {
+	refName := plumbing.ReferenceName(paths.V2MainRefName)
+
+	localRef, err := repo.Reference(refName, true)
+	if errors.Is(err, plumbing.ErrReferenceNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to check local v2 /main ref: %w", err)
+	}
+
+	repoPath, err := getRepoPath(repo)
+	if err != nil {
+		return false, err
+	}
+
+	remoteHash, err := lsRemoteRef(ctx, repoPath, remote, paths.V2MainRefName)
+	if err != nil {
+		return false, fmt.Errorf("failed to ls-remote v2 /main: %w", err)
+	}
+	if remoteHash == plumbing.ZeroHash {
+		return false, nil // Remote doesn't have the ref
+	}
+
+	if localRef.Hash() == remoteHash {
+		return false, nil
+	}
+
+	// Fetch remote ref to temporary local ref for merge-base check.
+	// Use the fetched hash (not ls-remote hash) since the remote may have advanced.
+	if fetchErr := fetchRefToTemp(ctx, repoPath, remote, paths.V2MainRefName, v2DoctorTmpRef); fetchErr != nil {
+		return false, fmt.Errorf("failed to fetch remote v2 /main: %w", fetchErr)
+	}
+	defer cleanupTmpRef(repo)
+
+	fetchedHash, err := resolveRefHash(repo, v2DoctorTmpRef)
+	if err != nil {
+		return false, fmt.Errorf("failed to read fetched v2 /main ref: %w", err)
+	}
+
+	if localRef.Hash() == fetchedHash {
+		return false, nil
+	}
+
+	return isDisconnected(ctx, repoPath, localRef.Hash().String(), fetchedHash.String())
+}
+
+// ReconcileDisconnectedV2Ref detects and repairs disconnected local/remote
+// v2 /main refs. Same strategy as v1: cherry-pick local commits onto remote tip.
+// The remote is discovered via git ls-remote and fetched to a temp ref.
+//
+// remote is the git remote name, URL, or local path.
+func ReconcileDisconnectedV2Ref(
+	ctx context.Context,
+	repo *git.Repository,
+	remote string,
+	w io.Writer,
+) error {
+	refName := plumbing.ReferenceName(paths.V2MainRefName)
+
+	localRef, err := repo.Reference(refName, true)
+	if errors.Is(err, plumbing.ErrReferenceNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to check local v2 /main ref: %w", err)
+	}
+
+	repoPath, err := getRepoPath(repo)
+	if err != nil {
+		return err
+	}
+
+	remoteHash, err := lsRemoteRef(ctx, repoPath, remote, paths.V2MainRefName)
+	if err != nil {
+		return fmt.Errorf("failed to ls-remote v2 /main: %w", err)
+	}
+	if remoteHash == plumbing.ZeroHash {
+		return nil
+	}
+
+	if localRef.Hash() == remoteHash {
+		return nil
+	}
+
+	if fetchErr := fetchRefToTemp(ctx, repoPath, remote, paths.V2MainRefName, v2DoctorTmpRef); fetchErr != nil {
+		return fmt.Errorf("failed to fetch remote v2 /main: %w", fetchErr)
+	}
+	defer cleanupTmpRef(repo)
+
+	// Use the fetched hash (not ls-remote hash) since the remote may have advanced.
+	fetchedHash, err := resolveRefHash(repo, v2DoctorTmpRef)
+	if err != nil {
+		return fmt.Errorf("failed to read fetched v2 /main ref: %w", err)
+	}
+
+	if localRef.Hash() == fetchedHash {
+		return nil
+	}
+
+	disconnected, err := isDisconnected(ctx, repoPath, localRef.Hash().String(), fetchedHash.String())
+	if err != nil {
+		return fmt.Errorf("failed to check v2 /main ancestry: %w", err)
+	}
+	if !disconnected {
+		return nil
+	}
+
+	fmt.Fprintln(w, "[entire] Detected disconnected v2 /main refs (local and remote share no common ancestor)")
+
+	localCommits, err := collectCommitChain(repo, localRef.Hash())
+	if err != nil {
+		return fmt.Errorf("failed to collect local commits: %w", err)
+	}
+
+	var dataCommits []*object.Commit
+	for _, c := range localCommits {
+		tree, treeErr := c.Tree()
+		if treeErr != nil {
+			return fmt.Errorf("failed to read tree for commit %s: %w", c.Hash.String()[:7], treeErr)
+		}
+		if len(tree.Entries) > 0 {
+			dataCommits = append(dataCommits, c)
+		}
+	}
+
+	if len(dataCommits) == 0 {
+		ref := plumbing.NewHashReference(refName, fetchedHash)
+		if setErr := repo.Storer.SetReference(ref); setErr != nil {
+			return fmt.Errorf("failed to reset v2 /main to remote: %w", setErr)
+		}
+		fmt.Fprintln(w, "[entire] Done — local had no checkpoint data, reset to remote")
+		return nil
+	}
+
+	fmt.Fprintf(w, "[entire] Cherry-picking %d local checkpoint(s) onto remote...\n", len(dataCommits))
+
+	newTip, err := cherryPickOnto(ctx, repo, fetchedHash, dataCommits)
+	if err != nil {
+		return fmt.Errorf("failed to cherry-pick local commits onto remote: %w", err)
+	}
+
+	ref := plumbing.NewHashReference(refName, newTip)
+	if setErr := repo.Storer.SetReference(ref); setErr != nil {
+		return fmt.Errorf("failed to update v2 /main ref: %w", setErr)
+	}
+
+	fmt.Fprintln(w, "[entire] Done — all local and remote checkpoints preserved")
+	return nil
+}
+
+// lsRemoteRef runs git ls-remote and returns the hash for a specific ref.
+// Returns plumbing.ZeroHash if the ref doesn't exist on the remote.
+func lsRemoteRef(ctx context.Context, repoPath, remoteName, refName string) (plumbing.Hash, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	fetchTarget, err := remote.ResolveFetchTarget(ctx, remoteName)
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("resolve fetch target for ls-remote: %w", err)
+	}
+
+	output, err := remote.LsRemoteInDir(ctx, repoPath, fetchTarget, refName)
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("git ls-remote %s failed: %w", remote.RedactURL(fetchTarget), err)
+	}
+
+	line := strings.TrimSpace(string(output))
+	if line == "" {
+		return plumbing.ZeroHash, nil
+	}
+
+	parts := strings.Fields(line)
+	if len(parts) < 2 {
+		return plumbing.ZeroHash, nil
+	}
+
+	return plumbing.NewHash(parts[0]), nil
+}
+
+// fetchRefToTemp fetches a remote ref to a temporary local ref for comparison.
+func fetchRefToTemp(ctx context.Context, repoPath, remoteName, srcRef, dstRef string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	fetchTarget, err := remote.ResolveFetchTarget(ctx, remoteName)
+	if err != nil {
+		return fmt.Errorf("resolve fetch target for doctor v2 fetch: %w", err)
+	}
+
+	refspec := fmt.Sprintf("+%s:%s", srcRef, dstRef)
+	output, err := remote.Fetch(ctx, remote.FetchOptions{
+		Remote:   fetchTarget,
+		RefSpecs: []string{refspec},
+		NoTags:   true,
+		Dir:      repoPath,
+	})
+	if err != nil {
+		redactedURL := remote.RedactURL(fetchTarget)
+		msg := strings.TrimSpace(strings.ReplaceAll(string(output), fetchTarget, redactedURL))
+		if msg != "" {
+			return fmt.Errorf("git fetch %s failed: %s: %w", redactedURL, msg, err)
+		}
+		return fmt.Errorf("git fetch %s failed: %w", redactedURL, err)
+	}
+	return nil
+}
+
+// resolveRefHash reads the commit hash that a ref points to.
+func resolveRefHash(repo *git.Repository, refName string) (plumbing.Hash, error) {
+	ref, err := repo.Reference(plumbing.ReferenceName(refName), true)
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("ref %s not found: %w", refName, err)
+	}
+	return ref.Hash(), nil
+}
+
+// cleanupTmpRef deletes the temporary ref used by doctor checks.
+func cleanupTmpRef(repo *git.Repository) {
+	_ = repo.Storer.RemoveReference(plumbing.ReferenceName(v2DoctorTmpRef)) //nolint:errcheck // best-effort cleanup
 }
 
 // isDisconnected checks if two commits have no common ancestor using git merge-base.
@@ -253,7 +487,7 @@ func collectCommitChain(repo *git.Repository, tip plumbing.Hash) ([]*object.Comm
 // cherryPickOnto applies each commit's delta onto base, building a linear chain.
 // For each commit, it computes the full diff from its parent (additions, modifications,
 // and deletions), then applies that delta onto the current tip's tree.
-func cherryPickOnto(repo *git.Repository, base plumbing.Hash, commits []*object.Commit) (plumbing.Hash, error) {
+func cherryPickOnto(ctx context.Context, repo *git.Repository, base plumbing.Hash, commits []*object.Commit) (plumbing.Hash, error) {
 	currentTip := base
 
 	for _, commit := range commits {
@@ -324,13 +558,13 @@ func cherryPickOnto(repo *git.Repository, base plumbing.Hash, commits []*object.
 			delete(mergedEntries, path)
 		}
 
-		mergedTreeHash, err := checkpoint.BuildTreeFromEntries(repo, mergedEntries)
+		mergedTreeHash, err := checkpoint.BuildTreeFromEntries(ctx, repo, mergedEntries)
 		if err != nil {
 			return plumbing.ZeroHash, fmt.Errorf("failed to build merged tree: %w", err)
 		}
 
 		// Create new commit on top of current tip, preserving original message/author
-		newHash, err := createCherryPickCommit(repo, mergedTreeHash, currentTip, commit)
+		newHash, err := createCherryPickCommit(ctx, repo, mergedTreeHash, currentTip, commit)
 		if err != nil {
 			return plumbing.ZeroHash, fmt.Errorf("failed to create cherry-pick commit: %w", err)
 		}
@@ -343,7 +577,7 @@ func cherryPickOnto(repo *git.Repository, base plumbing.Hash, commits []*object.
 
 // createCherryPickCommit creates a new commit on top of parent, preserving the
 // original commit's message and author.
-func createCherryPickCommit(repo *git.Repository, treeHash, parent plumbing.Hash, original *object.Commit) (plumbing.Hash, error) {
+func createCherryPickCommit(ctx context.Context, repo *git.Repository, treeHash, parent plumbing.Hash, original *object.Commit) (plumbing.Hash, error) {
 	committerName, committerEmail := GetGitAuthorFromRepo(repo)
 	now := time.Now()
 
@@ -358,6 +592,8 @@ func createCherryPickCommit(repo *git.Repository, treeHash, parent plumbing.Hash
 		},
 		Message: original.Message,
 	}
+
+	checkpoint.SignCommitBestEffort(ctx, commit)
 
 	obj := repo.Storer.NewEncodedObject()
 	if err := commit.Encode(obj); err != nil {

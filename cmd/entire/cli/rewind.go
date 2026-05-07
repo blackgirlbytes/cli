@@ -24,7 +24,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/spf13/cobra"
@@ -1208,10 +1208,10 @@ func printMultiSessionResumeCommands(w, errW io.Writer, sessions []strategy.Rest
 	}
 
 	if len(sessions) > 1 {
-		fmt.Fprintf(w, "\n✓ Restored %d sessions. To continue, run:\n", len(sessions))
+		fmt.Fprintf(w, "\n✓ Restored %d sessions. To continue:\n", len(sessions))
 	} else {
 		fmt.Fprintf(w, "✓ Restored session %s.\n", sessions[0].SessionID)
-		fmt.Fprintf(w, "\nTo continue this session, run:\n")
+		fmt.Fprintf(w, "\nTo continue this session:\n")
 	}
 
 	isMulti := len(sessions) > 1

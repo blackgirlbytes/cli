@@ -235,6 +235,13 @@ func (r *HookRunner) runHookWithInput(flag string, input interface{}) error {
 }
 
 func (r *HookRunner) runHookInRepoDir(hookName string, inputJSON []byte) error {
+	return r.runHookInRepoDirWithExtraEnv(hookName, inputJSON, nil)
+}
+
+// runHookInRepoDirWithExtraEnv is like runHookInRepoDir but appends additional
+// env vars to the subprocess environment. Used by review-env adoption tests that
+// need ENTIRE_REVIEW_* vars present in the hook child process.
+func (r *HookRunner) runHookInRepoDirWithExtraEnv(hookName string, inputJSON []byte, extraEnv []string) error {
 	// Run using the shared test binary
 	// Command structure: entire hooks claude-code <hook-name>
 	cmd := exec.Command(getTestBinary(), "hooks", "claude-code", hookName)
@@ -243,6 +250,7 @@ func (r *HookRunner) runHookInRepoDir(hookName string, inputJSON []byte) error {
 	cmd.Env = append(testutil.GitIsolatedEnv(),
 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+r.ClaudeProjectDir,
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -252,6 +260,27 @@ func (r *HookRunner) runHookInRepoDir(hookName string, inputJSON []byte) error {
 
 	r.T.Logf("Hook %s output: %s", hookName, output)
 	return nil
+}
+
+// SimulateUserPromptSubmitWithReviewEnvVars simulates the UserPromptSubmit
+// hook with ENTIRE_REVIEW_* env vars set on the subprocess, as `entire review`
+// would set them on the spawned agent process. The hook child process inherits
+// these vars, triggering env-based review adoption in the lifecycle handler.
+func (r *HookRunner) SimulateUserPromptSubmitWithReviewEnvVars(sessionID, prompt string, extraEnv []string) error {
+	r.T.Helper()
+
+	input := map[string]string{
+		"session_id":      sessionID,
+		"transcript_path": "",
+		"prompt":          prompt,
+	}
+
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return fmt.Errorf("failed to marshal hook input: %w", err)
+	}
+
+	return r.runHookInRepoDirWithExtraEnv("user-prompt-submit", inputJSON, extraEnv)
 }
 
 // Session represents a simulated Claude Code session.
@@ -316,6 +345,15 @@ func (env *TestEnv) SimulateUserPromptSubmitWithPrompt(sessionID, prompt string)
 	env.T.Helper()
 	runner := NewHookRunner(env.RepoDir, env.ClaudeProjectDir, env.T)
 	return runner.SimulateUserPromptSubmitWithPrompt(sessionID, prompt)
+}
+
+// SimulateUserPromptSubmitWithReviewEnvVars is a convenience method on TestEnv.
+// It simulates the UserPromptSubmit hook with ENTIRE_REVIEW_* env vars set on
+// the subprocess, reproducing what `entire review` does before spawning the agent.
+func (env *TestEnv) SimulateUserPromptSubmitWithReviewEnvVars(sessionID, prompt string, extraEnv []string) error {
+	env.T.Helper()
+	runner := NewHookRunner(env.RepoDir, env.ClaudeProjectDir, env.T)
+	return runner.SimulateUserPromptSubmitWithReviewEnvVars(sessionID, prompt, extraEnv)
 }
 
 // SimulateUserPromptSubmitWithTranscriptPath is a convenience method on TestEnv.
@@ -430,14 +468,16 @@ type HookOutput struct {
 	Err    error
 }
 
-// runHookWithOutput runs a hook and returns both stdout and stderr separately.
-func (r *HookRunner) runHookWithOutput(hookName string, inputJSON []byte) HookOutput {
-	cmd := exec.Command(getTestBinary(), "hooks", "claude-code", hookName)
+// runAgentHookWithOutput runs a hook for the given agent and returns stdout/stderr separately.
+func (r *HookRunner) runAgentHookWithOutput(agentName, hookName string, inputJSON []byte, extraEnv ...string) HookOutput {
+	cmd := exec.Command(getTestBinary(), "hooks", agentName, hookName)
 	cmd.Dir = r.RepoDir
 	cmd.Stdin = bytes.NewReader(inputJSON)
 	cmd.Env = append(testutil.GitIsolatedEnv(),
 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+r.ClaudeProjectDir,
+		"GOCACHE=/tmp/go-build",
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -449,6 +489,35 @@ func (r *HookRunner) runHookWithOutput(hookName string, inputJSON []byte) HookOu
 		Stderr: stderr.Bytes(),
 		Err:    err,
 	}
+}
+
+// runShellHookCommandWithOutput runs an installed hook shell command exactly as written
+// in the hook file and returns stdout/stderr separately.
+func (r *HookRunner) runShellHookCommandWithOutput(command string, inputJSON []byte, extraEnv ...string) HookOutput {
+	cmd := exec.Command("/bin/sh", "-c", command)
+	cmd.Dir = r.RepoDir
+	cmd.Stdin = bytes.NewReader(inputJSON)
+	cmd.Env = append(testutil.GitIsolatedEnv(),
+		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+r.ClaudeProjectDir,
+		"GOCACHE=/tmp/go-build",
+	)
+	cmd.Env = append(cmd.Env, extraEnv...)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	return HookOutput{
+		Stdout: stdout.Bytes(),
+		Stderr: stderr.Bytes(),
+		Err:    err,
+	}
+}
+
+// runHookWithOutput runs a hook and returns both stdout and stderr separately.
+func (r *HookRunner) runHookWithOutput(hookName string, inputJSON []byte) HookOutput {
+	return r.runAgentHookWithOutput("claude-code", hookName, inputJSON)
 }
 
 // SimulateUserPromptSubmitWithOutput simulates the UserPromptSubmit hook and returns the output.

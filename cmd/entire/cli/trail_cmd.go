@@ -13,11 +13,12 @@ import (
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/api"
+	"github.com/entireio/cli/cmd/entire/cli/gitremote"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/stringutil"
 	"github.com/entireio/cli/cmd/entire/cli/trail"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/spf13/cobra"
@@ -71,7 +72,7 @@ func runTrailShow(ctx context.Context, w io.Writer, insecureHTTP bool) error {
 		return fmt.Errorf("authentication required: %w", err)
 	}
 
-	host, owner, repo, err := strategy.ResolveRemoteRepo(ctx, "origin")
+	host, owner, repo, err := gitremote.ResolveRemoteRepo(ctx, "origin")
 	if err != nil {
 		return fmt.Errorf("failed to resolve repository: %w", err)
 	}
@@ -94,7 +95,7 @@ func printTrailDetails(w io.Writer, m *trail.Metadata) {
 	fmt.Fprintf(w, "  Branch:  %s\n", m.Branch)
 	fmt.Fprintf(w, "  Base:    %s\n", m.Base)
 	fmt.Fprintf(w, "  Status:  %s\n", m.Status)
-	fmt.Fprintf(w, "  Author:  %s\n", m.Author)
+	fmt.Fprintf(w, "  Author:  %s\n", m.AuthorLogin())
 	if m.Body != "" {
 		fmt.Fprintf(w, "  Body:    %s\n", m.Body)
 	}
@@ -134,7 +135,7 @@ func runTrailListAll(ctx context.Context, w io.Writer, statusFilter string, json
 		return fmt.Errorf("authentication required: %w", err)
 	}
 
-	host, owner, repo, err := strategy.ResolveRemoteRepo(ctx, "origin")
+	host, owner, repo, err := gitremote.ResolveRemoteRepo(ctx, "origin")
 	if err != nil {
 		return fmt.Errorf("failed to resolve repository: %w", err)
 	}
@@ -220,7 +221,7 @@ func runTrailListAll(ctx context.Context, w io.Writer, statusFilter string, json
 		branch := stringutil.TruncateRunes(t.Branch, 30, "...")
 		title := stringutil.TruncateRunes(t.Title, 40, "...")
 		fmt.Fprintf(w, "%-30s %-40s %-13s %-15s %s\n",
-			branch, title, t.Status, stringutil.TruncateRunes(t.Author, 15, "..."), timeAgo(t.UpdatedAt))
+			branch, title, t.Status, stringutil.TruncateRunes(t.AuthorLogin(), 15, "..."), timeAgo(t.UpdatedAt))
 	}
 
 	return nil
@@ -321,7 +322,7 @@ func runTrailCreate(cmd *cobra.Command, title, body, base, branch, statusStr str
 		return fmt.Errorf("authentication required: %w", err)
 	}
 
-	host, owner, repoName, err := strategy.ResolveRemoteRepo(ctx, "origin")
+	host, owner, repoName, err := gitremote.ResolveRemoteRepo(ctx, "origin")
 	if err != nil {
 		return fmt.Errorf("failed to resolve repository: %w", err)
 	}
@@ -408,7 +409,7 @@ func runTrailUpdate(ctx context.Context, w, errW io.Writer, insecureHTTP bool, s
 		return fmt.Errorf("authentication required: %w", err)
 	}
 
-	host, owner, repoName, err := strategy.ResolveRemoteRepo(ctx, "origin")
+	host, owner, repoName, err := gitremote.ResolveRemoteRepo(ctx, "origin")
 	if err != nil {
 		return fmt.Errorf("failed to resolve repository: %w", err)
 	}
@@ -544,6 +545,12 @@ func buildTrailUpdateRequest(current *api.TrailResource, statusStr, title, body 
 
 // defaultBaseBranch is the fallback base branch name when it cannot be determined.
 const defaultBaseBranch = "main"
+
+// masterBaseBranch is the secondary fallback for repos still using "master"
+// (pre-git-2.28 defaults, forks of older projects, etc.). Extracted as a
+// constant so goconst stays quiet across the several call sites in the cli
+// package.
+const masterBaseBranch = "master"
 
 func formatValidStatuses() string {
 	statuses := trail.ValidStatuses()

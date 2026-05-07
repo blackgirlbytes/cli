@@ -34,6 +34,35 @@ const (
 	StuckActiveThreshold = 1 * time.Hour
 )
 
+// Kind identifies the purpose of a session. Empty means "normal" (legacy
+// sessions + every session that isn't a review). Callers must not rely on
+// Kind being set unless they specifically want to branch on it.
+//
+// Kind is a discriminator — it distinguishes review variants at a per-session
+// granularity. The checkpoint-level HasReview flag remains an umbrella that
+// any review-kind session should set (so future review kinds like manual
+// review can be added without changing summary-shape).
+type Kind string
+
+const (
+	// KindAgentReview tags a session created by `entire review` (agent-driven
+	// review). Future review kinds (e.g., manual review) should be defined as
+	// distinct Kind values AND added to Kind.IsReview so the checkpoint's
+	// HasReview umbrella flag keeps covering them.
+	KindAgentReview Kind = "agent_review"
+)
+
+// IsReview reports whether this Kind counts as "a review happened" for the
+// purpose of CheckpointSummary.HasReview. Extend this when adding new
+// review-kind Kind values (e.g. KindManualReview) so the umbrella flag stays
+// accurate without string-literal coupling across packages.
+func (k Kind) IsReview() bool {
+	// Note: a switch is the natural shape here, but golangci's
+	// singleCaseSwitch flags a one-case switch — so we keep it as a list of
+	// equality checks. Add new review-kind values to the disjunction below.
+	return k == KindAgentReview
+}
+
 // State represents the state of an active session.
 // This is stored in .git/entire-sessions/<session-id>.json
 type State struct {
@@ -72,6 +101,21 @@ type State struct {
 	// Empty means idle (backward compat with pre-state-machine files).
 	Phase Phase `json:"phase,omitempty"`
 
+	// Kind tags the session's purpose. Empty for normal agent sessions;
+	// set to KindAgentReview when the session was started by `entire review`.
+	Kind Kind `json:"kind,omitempty"`
+
+	// ReviewSkills is the snapshot of configured review skills at session start.
+	// Preserved so checkpoint metadata records which skills were run. May be
+	// empty when a review was attached post-hoc and skills were not declared;
+	// ReviewPrompt is the ground truth in that case.
+	ReviewSkills []string `json:"review_skills,omitempty"`
+
+	// ReviewPrompt is the actual text of the review request — the composed
+	// prompt sent to the agent (spawn path) or the session's first user
+	// prompt (attach path). Always populated when Kind is a review kind.
+	ReviewPrompt string `json:"review_prompt,omitempty"`
+
 	// TurnID is a unique identifier for the current agent turn.
 	// Lifecycle:
 	//   - Generated fresh in InitializeSession at each turn start
@@ -109,6 +153,11 @@ type State struct {
 	// against this value without reading the full transcript content.
 	CheckpointTranscriptSize int64 `json:"checkpoint_transcript_size,omitempty"`
 
+	// CompactTranscriptStart is the transcript.jsonl line offset where the current
+	// checkpoint cycle began. It parallels CheckpointTranscriptStart (full.jsonl)
+	// and is updated after each condensation.
+	CompactTranscriptStart int `json:"compact_transcript_start,omitempty"`
+
 	// Deprecated: CondensedTranscriptLines is replaced by CheckpointTranscriptStart.
 	// Kept for backward compatibility with existing state files.
 	// Use NormalizeAfterLoad() to migrate.
@@ -125,12 +174,29 @@ type State struct {
 	// sessions that have been condensed at least once. Cleared on new prompt.
 	LastCheckpointID id.CheckpointID `json:"last_checkpoint_id,omitempty"`
 
+	// LastCheckpointCommitHash is the exact commit SHA that carried
+	// LastCheckpointID at condensation time. Used by the reconcile path to
+	// distinguish "reset back to the condensed commit" (same SHA) from
+	// "cherry-picked / rebased a commit that happens to preserve the trailer"
+	// (different SHA). Without this guard, a cherry-picked checkpoint would
+	// falsely fire reconcile and drop the pinned AttributionBaseCommit,
+	// corrupting attribution math for uncondensed shadow-branch work.
+	// Empty for legacy state files — reconcile falls back to trailer-only
+	// matching for backward compatibility.
+	LastCheckpointCommitHash string `json:"last_checkpoint_commit_hash,omitempty"`
+
 	// FullyCondensed indicates this session has been condensed and has no remaining
 	// carry-forward files. PostCommit skips fully-condensed sessions entirely.
 	// Set after successful condensation when no files remain for carry-forward
 	// and the session phase is ENDED. Cleared on session reactivation (ENDED →
 	// ACTIVE via TurnStart, or ENDED → IDLE via SessionStart) by ActionClearEndedAt.
 	FullyCondensed bool `json:"fully_condensed,omitempty"`
+
+	// DivergenceNoticeShown indicates the prepare-commit-msg warning about
+	// attribution divergence has been shown. Set when the warning fires,
+	// cleared when AttributionBaseCommit realigns with BaseCommit (next
+	// successful condensation). Prevents repeated warnings on every commit.
+	DivergenceNoticeShown bool `json:"divergence_notice_shown,omitempty"`
 
 	// AttachedManually indicates this session was imported via `entire attach` rather
 	// than being captured by hooks during normal agent execution.
@@ -248,6 +314,24 @@ func (s *State) NormalizeAfterLoad(ctx context.Context) {
 	if s.AttributionBaseCommit == "" && s.BaseCommit != "" {
 		s.AttributionBaseCommit = s.BaseCommit
 	}
+
+	// DivergenceNoticeShown is only meaningful while attribution is actually
+	// diverged. Self-heal any state file where the flag outlived the divergence
+	// — otherwise a future legitimate divergence would be silently suppressed.
+	if s.DivergenceNoticeShown && s.AttributionBaseCommit == s.BaseCommit {
+		s.DivergenceNoticeShown = false
+	}
+}
+
+// RealignAttributionBase sets AttributionBaseCommit to newBase and clears any
+// bookkeeping whose meaning depends on attribution being diverged from the
+// shadow-branch base. Call this every time a code path intentionally brings
+// AttributionBaseCommit back in line with BaseCommit (condensation, reconcile,
+// post-commit base advance) so a stale DivergenceNoticeShown cannot suppress
+// the next legitimate divergence warning.
+func (s *State) RealignAttributionBase(newBase string) {
+	s.AttributionBaseCommit = newBase
+	s.DivergenceNoticeShown = false
 }
 
 // IsStale returns true when a session hasn't seen interaction for longer than
@@ -371,26 +455,36 @@ func (s *StateStore) Save(ctx context.Context, state *State) error {
 		return fmt.Errorf("failed to marshal session state: %w", err)
 	}
 
-	// Use os.Root for traversal-resistant write of temp file.
-	// Rename is not available on os.Root, so we keep using os.Rename.
-	root, err := os.OpenRoot(s.stateDir)
-	if err != nil {
-		return fmt.Errorf("failed to open session state directory: %w", err)
-	}
-	defer root.Close()
-
+	stateFile := s.stateFilePath(state.SessionID)
 	fileName := state.SessionID + ".json"
-	tmpFileName := fileName + ".tmp"
-	if err := osroot.WriteFile(root, tmpFileName, data, 0o600); err != nil {
+
+	// Use a unique temp file per save. Concurrent hook processes can write the
+	// same session ID, so a fixed "<session>.json.tmp" path can corrupt JSON.
+	tmpFile, err := os.CreateTemp(s.stateDir, fileName+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary session state file: %w", err)
+	}
+	tmpFileName := tmpFile.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpFileName)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("failed to write session state: %w", err)
 	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close session state file: %w", err)
+	}
 
-	// Atomic rename: not available on os.Root, use os.Rename with validated paths.
-	stateFile := s.stateFilePath(state.SessionID)
-	tmpFile := stateFile + ".tmp"
-	if err := os.Rename(tmpFile, stateFile); err != nil {
+	// Atomic rename into the validated final path.
+	if err := os.Rename(tmpFileName, stateFile); err != nil {
 		return fmt.Errorf("failed to rename session state file: %w", err)
 	}
+	removeTmp = false
 	return nil
 }
 
@@ -482,6 +576,15 @@ func ClearGitCommonDirCache() {
 	gitCommonDirCache = ""
 	gitCommonDirCacheDir = ""
 	gitCommonDirMu.Unlock()
+}
+
+// GetGitCommonDir returns the .git common directory for the current working
+// directory. In a regular checkout this is .git/; in a worktree, it's the
+// main repo's .git/ (not .git/worktrees/<name>/). Result is cached per
+// working directory. This is a public wrapper around the package-internal
+// helper for callers outside this package.
+func GetGitCommonDir(ctx context.Context) (string, error) {
+	return getGitCommonDir(ctx)
 }
 
 // getGitCommonDir returns the path to the shared git directory.

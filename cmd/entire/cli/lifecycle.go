@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,12 +22,24 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/logging"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/cmd/entire/cli/review"
 	"github.com/entireio/cli/cmd/entire/cli/session"
 	"github.com/entireio/cli/cmd/entire/cli/strategy"
 	"github.com/entireio/cli/cmd/entire/cli/transcript"
 	"github.com/entireio/cli/cmd/entire/cli/validation"
 	"github.com/entireio/cli/perf"
 )
+
+// eventBypassesAgentOwnershipCheck reports whether an event must run
+// regardless of the recorded session-owning agent:
+//   - SessionStart fires before SessionState exists; the hint file dedup
+//     in handleLifecycleSessionStart already prevents a duplicate banner.
+//   - TurnStart needs to reach InitializeSession so transcript-path
+//     resolution can repair a wrongly-set AgentType. Skipping here would
+//     lock in a bad state.
+func eventBypassesAgentOwnershipCheck(t agent.EventType) bool {
+	return t == agent.SessionStart || t == agent.TurnStart
+}
 
 // DispatchLifecycleEvent routes a normalized lifecycle event to the appropriate handler.
 // Returns nil if the event was handled successfully.
@@ -36,6 +49,23 @@ func DispatchLifecycleEvent(ctx context.Context, ag agent.Agent, event *agent.Ev
 	}
 	if event == nil {
 		return errors.New("event cannot be nil")
+	}
+
+	// Filter forwarded hooks: when Cursor IDE forwards events to both
+	// .cursor/hooks.json and .claude/settings.json, only the agent that owns
+	// the session should process them — otherwise checkpoints, metadata
+	// writes, and step counts double.
+	if event.SessionID != "" && !eventBypassesAgentOwnershipCheck(event.Type) {
+		if state, _ := strategy.LoadSessionState(ctx, event.SessionID); state != nil && state.AgentType != "" && state.AgentType != ag.Type() { //nolint:errcheck // a load failure means we can't filter; let the event reach its handler, which surfaces its own load error
+			logging.Info(logging.WithAgent(logging.WithComponent(ctx, "lifecycle"), ag.Name()),
+				"skipping forwarded hook for non-owning agent",
+				slog.String("event", event.Type.String()),
+				slog.String("session_id", event.SessionID),
+				slog.String("owning_agent", string(state.AgentType)),
+				slog.String("firing_agent", string(ag.Type())),
+			)
+			return nil
+		}
 	}
 
 	switch event.Type {
@@ -78,6 +108,16 @@ func handleLifecycleSessionStart(ctx context.Context, ag agent.Agent, event *age
 		return fmt.Errorf("invalid %s event: %w", event.Type, err)
 	}
 
+	// Claim the session for this agent. First-writer-wins: subsequent agents
+	// firing SessionStart for the same session ID are no-ops. Used by
+	// InitializeSession (TurnStart) and the dispatcher skip in
+	// DispatchLifecycleEvent for cross-agent disambiguation when Cursor IDE
+	// forwards hooks to both .cursor/hooks.json and .claude/settings.json.
+	if _, hintErr := strategy.StoreAgentTypeHint(ctx, event.SessionID, ag.Type()); hintErr != nil {
+		logging.Warn(logCtx, "failed to store agent hint on session start",
+			slog.String("error", hintErr.Error()))
+	}
+
 	// Build informational message — warn early if repo has no commits yet,
 	// since checkpoints require at least one commit to work.
 	message := sessionStartMessage(ag.Name(), false)
@@ -100,15 +140,30 @@ func handleLifecycleSessionStart(ctx context.Context, ag agent.Agent, event *age
 	// Output informational message if the agent supports hook responses.
 	// Claude Code reads JSON from stdout; agents that don't implement
 	// HookResponseWriter silently skip (avoids raw JSON in their terminal).
+	//
+	// Banner display is gated by ClaimSessionStartBanner — separate from the
+	// agent-ownership claim above. If the ownership winner can't write banners
+	// (Cursor), we'd suppress the banner entirely on a Cursor+Claude race;
+	// the banner marker is only claimed inside this branch so a non-writer
+	// winner can't consume the user's only banner.
 	_, hookResponseSpan := perf.Start(ctx, "write_hook_response")
 	if event.ResponseMessage != "" {
 		message = event.ResponseMessage
 	}
 	if writer, ok := agent.AsHookResponseWriter(ag); ok {
-		if err := writer.WriteHookResponse(message); err != nil {
-			hookResponseSpan.RecordError(err)
-			hookResponseSpan.End()
-			return fmt.Errorf("failed to write hook response: %w", err)
+		bannerFirst, bErr := strategy.ClaimSessionStartBanner(ctx, event.SessionID)
+		if bErr != nil {
+			// Better to duplicate the banner than to suppress the only one.
+			logging.Warn(logCtx, "failed to claim session start banner marker",
+				slog.String("error", bErr.Error()))
+			bannerFirst = true
+		}
+		if bannerFirst {
+			if err := writer.WriteHookResponse(message); err != nil {
+				hookResponseSpan.RecordError(err)
+				hookResponseSpan.End()
+				return fmt.Errorf("failed to write hook response: %w", err)
+			}
 		}
 	}
 	hookResponseSpan.End()
@@ -143,15 +198,15 @@ func handleLifecycleSessionStart(ctx context.Context, ag agent.Agent, event *age
 func sessionStartMessage(agentName types.AgentName, emptyRepo bool) string {
 	if agentName == agent.AgentNameCodex {
 		if emptyRepo {
-			return "Powered by Entire: No commits yet — checkpoints will activate after your first commit."
+			return "Entire CLI found no commits yet — checkpoints will activate after your first commit."
 		}
-		return "Powered by Entire: This conversation will be linked to your next commit."
+		return "Entire CLI will link this conversation to your next commit."
 	}
 
 	if emptyRepo {
-		return "\n\nPowered by Entire:\n  No commits yet — checkpoints will activate after your first commit."
+		return "\n\nEntire CLI found no commits yet — checkpoints will activate after your first commit."
 	}
-	return "\n\nPowered by Entire:\n  This conversation will be linked to your next commit."
+	return "\n\nEntire CLI will link this conversation to your next commit."
 }
 
 // handleLifecycleModelUpdate persists the model name for the current session.
@@ -266,6 +321,23 @@ func handleLifecycleTurnStart(ctx context.Context, ag agent.Agent, event *agent.
 	if err := strat.InitializeSession(ctx, sessionID, ag.Type(), event.SessionRef, event.Prompt, event.Model); err != nil {
 		logging.Warn(logCtx, "failed to initialize session state",
 			slog.String("error", err.Error()))
+	}
+
+	// Best-effort: adopt ENTIRE_REVIEW_* env vars set by `entire review` on
+	// the spawned agent process. Each agent process has its own env, so there
+	// is no file race across worktrees. Errors in load/save must not fail the turn.
+	if state, loadErr := strategy.LoadSessionState(ctx, sessionID); loadErr != nil {
+		logging.Warn(logCtx, "failed to load session state for review env adoption",
+			slog.String("error", loadErr.Error()))
+	} else if state != nil {
+		updated := *state
+		adoptReviewEnv(logCtx, &updated, string(ag.Name()))
+		if updated.Kind != state.Kind || updated.ReviewPrompt != state.ReviewPrompt || !slices.Equal(updated.ReviewSkills, state.ReviewSkills) {
+			if saveErr := strategy.SaveSessionState(ctx, &updated); saveErr != nil {
+				logging.Warn(logCtx, "failed to save session state after review env adoption",
+					slog.String("error", saveErr.Error()))
+			}
+		}
 	}
 	initSpan.End()
 
@@ -945,4 +1017,55 @@ func persistEventMetadataToState(event *agent.Event, state *strategy.SessionStat
 	if event.ContextWindowSize > 0 {
 		state.ContextWindowSize = event.ContextWindowSize
 	}
+}
+
+// adoptReviewEnv tags the session as a review session when ENTIRE_REVIEW_*
+// env vars are present on the current process. `entire review` sets these
+// vars on the spawned agent process; the lifecycle hook (a child of the agent)
+// inherits them naturally. Agent and starting-SHA checks protect against stale
+// ENTIRE_REVIEW_* values inherited from a parent shell or a nested invocation.
+//
+// Adoption is idempotent: if state.Kind is already set (subsequent turns of
+// a review session) the function returns without modifying state.
+//
+// Failure modes are silent at the user level but logged for diagnostics:
+//   - EnvSession unset or not "1": not a review session; return, no tagging.
+//   - EnvAgent does not match the hook agent: leave session untagged.
+//   - EnvStartingSHA does not match the session base commit: leave untagged.
+//   - EnvSkills malformed JSON: log warning, leave session untagged to avoid
+//     corrupting metadata with junk data.
+func adoptReviewEnv(ctx context.Context, state *session.State, expectedAgent string) {
+	// Already tagged — don't re-apply on subsequent turns.
+	if state.Kind != "" {
+		return
+	}
+	if os.Getenv(review.EnvSession) != "1" {
+		return
+	}
+	envAgent := os.Getenv(review.EnvAgent)
+	if envAgent != expectedAgent {
+		logging.Warn(ctx, "review env adoption skipped: agent mismatch",
+			slog.String("env_agent", envAgent),
+			slog.String("hook_agent", expectedAgent))
+		return
+	}
+	startingSHA := os.Getenv(review.EnvStartingSHA)
+	if startingSHA == "" || state.BaseCommit == "" || startingSHA != state.BaseCommit {
+		logging.Warn(ctx, "review env adoption skipped: starting SHA mismatch",
+			slog.String("env_starting_sha", startingSHA),
+			slog.String("state_base_commit", state.BaseCommit))
+		return
+	}
+	skills, err := review.DecodeSkills(os.Getenv(review.EnvSkills))
+	if err != nil {
+		logging.Warn(ctx, "review env adoption failed: invalid skills JSON",
+			slog.String("err", err.Error()))
+		return
+	}
+	state.Kind = session.KindAgentReview
+	state.ReviewSkills = skills
+	state.ReviewPrompt = os.Getenv(review.EnvPrompt)
+	logging.Debug(ctx, "adopted review env",
+		slog.String("agent", envAgent),
+		slog.Int("skill_count", len(skills)))
 }

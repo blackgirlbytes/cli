@@ -2,13 +2,17 @@ package checkpoint
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/redact"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
 	"github.com/go-git/go-git/v6/plumbing/object"
@@ -25,7 +29,7 @@ func TestV2ReadCommitted_ReturnsCheckpointSummary(t *testing.T) {
 		CheckpointID: cpID,
 		SessionID:    "session-1",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"test": true}`),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"test": true}`)),
 		Prompts:      []string{"hello"},
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
@@ -62,7 +66,7 @@ func TestV2ReadSessionContent_ReturnsMetadataAndTranscript(t *testing.T) {
 		CheckpointID: cpID,
 		SessionID:    "session-1",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"message": "hello world"}`),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"message": "hello world"}`)),
 		Prompts:      []string{"test prompt"},
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
@@ -89,7 +93,7 @@ func TestV2ReadSessionContent_TranscriptFromArchivedGeneration(t *testing.T) {
 		CheckpointID: cpID1,
 		SessionID:    "session-1",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"first": true}`),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"first": true}`)),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	})
@@ -100,7 +104,7 @@ func TestV2ReadSessionContent_TranscriptFromArchivedGeneration(t *testing.T) {
 		CheckpointID: cpID2,
 		SessionID:    "session-2",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"second": true}`),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"second": true}`)),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	})
@@ -165,6 +169,115 @@ func TestV2ReadSessionMetadataAndPrompts_ReturnsWithoutTranscript(t *testing.T) 
 	assert.Empty(t, content.Transcript)
 }
 
+func TestV2ReadSessionMetadata_DoesNotRequireRawTranscript(t *testing.T) {
+	t.Parallel()
+	repo := initTestRepo(t)
+	store := NewV2GitStore(repo, "origin")
+	cpID := id.MustCheckpointID("f2f3f4f5f6f7")
+	ctx := context.Background()
+
+	err := store.WriteCommitted(ctx, WriteCommittedOptions{
+		CheckpointID: cpID,
+		SessionID:    "session-1",
+		Strategy:     "manual-commit",
+		Prompts:      []string{"prompt"},
+		Agent:        "Claude Code",
+		AuthorName:   "Test",
+		AuthorEmail:  "test@test.com",
+	})
+	require.NoError(t, err)
+
+	metadata, err := store.ReadSessionMetadata(ctx, cpID, 0)
+	require.NoError(t, err)
+	require.NotNil(t, metadata)
+	assert.Equal(t, "session-1", metadata.SessionID)
+	assert.Equal(t, "Claude Code", string(metadata.Agent))
+}
+
+func TestV2ReadSessionMetadata_ContextCancellation(t *testing.T) {
+	t.Parallel()
+	repo := initTestRepo(t)
+	store := NewV2GitStore(repo, "origin")
+	cpID := id.MustCheckpointID("f2f3f4f5f6f8")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := store.ReadSessionMetadata(ctx, cpID, 0)
+	require.ErrorIs(t, err, context.Canceled, "ReadSessionMetadata error = %v, want context.Canceled", err)
+
+	_, err = store.ReadSessionMetadataAndPrompts(ctx, cpID, 0)
+	require.ErrorIs(t, err, context.Canceled, "ReadSessionMetadataAndPrompts error = %v, want context.Canceled", err)
+}
+
+func TestV2ReadSessionMetadata_ReturnsMetadata(t *testing.T) {
+	t.Parallel()
+	repo := initTestRepo(t)
+	store := NewV2GitStore(repo, "origin")
+	cpID := id.MustCheckpointID("f1f2f3f4f5fa")
+	ctx := context.Background()
+
+	err := store.WriteCommitted(ctx, WriteCommittedOptions{
+		CheckpointID: cpID,
+		SessionID:    "session-metadata-only",
+		Strategy:     "manual-commit",
+		Prompts:      []string{"test prompt"},
+		AuthorName:   "Test",
+		AuthorEmail:  "test@test.com",
+	})
+	require.NoError(t, err)
+
+	meta, err := store.ReadSessionMetadata(ctx, cpID, 0)
+	require.NoError(t, err)
+	assert.Equal(t, "session-metadata-only", meta.SessionID)
+}
+
+func TestV2ReadSessionMetadata_FetchesMissingMetadataBlob(t *testing.T) {
+	t.Parallel()
+	repo := initTestRepo(t)
+	store := NewV2GitStore(repo, "origin")
+	cpID := id.MustCheckpointID("f1f2f3f4f5fb")
+	ctx := context.Background()
+
+	err := store.WriteCommitted(ctx, WriteCommittedOptions{
+		CheckpointID: cpID,
+		SessionID:    "session-fetch-metadata",
+		Strategy:     "manual-commit",
+		Prompts:      []string{"test prompt"},
+		AuthorName:   "Test",
+		AuthorEmail:  "test@test.com",
+	})
+	require.NoError(t, err)
+
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+	repoRoot := wt.Filesystem.Root()
+	mainTree := v2MainTree(t, repo)
+	sessionTree, err := mainTree.Tree(cpID.Path() + "/0")
+	require.NoError(t, err)
+	metadataEntry, err := sessionTree.FindEntry(paths.MetadataFileName)
+	require.NoError(t, err)
+	metadataContent := v2ReadFile(t, mainTree, cpID.Path()+"/0/"+paths.MetadataFileName)
+
+	metadataObjectPath := filepath.Join(repoRoot, ".git", "objects", metadataEntry.Hash.String()[:2], metadataEntry.Hash.String()[2:])
+	require.NoError(t, os.Remove(metadataObjectPath))
+
+	reopenedRepo, err := git.PlainOpen(repoRoot)
+	require.NoError(t, err)
+	reopenedStore := NewV2GitStore(reopenedRepo, "origin")
+	fetchCalled := false
+	reopenedStore.SetBlobFetcher(func(_ context.Context, hashes []plumbing.Hash) error {
+		fetchCalled = true
+		require.Equal(t, []plumbing.Hash{metadataEntry.Hash}, hashes)
+		_, createErr := CreateBlobFromContent(reopenedRepo, []byte(metadataContent))
+		return createErr
+	})
+
+	meta, err := reopenedStore.ReadSessionMetadata(ctx, cpID, 0)
+	require.NoError(t, err)
+	assert.True(t, fetchCalled)
+	assert.Equal(t, "session-fetch-metadata", meta.SessionID)
+}
+
 func TestV2ReadSessionMetadataAndPrompts_MissingCheckpoint(t *testing.T) {
 	t.Parallel()
 	repo := initTestRepo(t)
@@ -194,12 +307,12 @@ func TestV2ReadSessionContent_ChunkedTranscript(t *testing.T) {
 	require.NoError(t, err)
 
 	// Manually write chunked transcript to /full/current:
-	// chunk 0 = full.jsonl (base file), chunk 1 = full.jsonl.001
+	// chunk 0 = raw_transcript (base file), chunk 1 = raw_transcript.001
 	chunk0 := []byte(`{"line":"one"}` + "\n" + `{"line":"two"}`)
 	chunk1 := []byte(`{"line":"three"}` + "\n" + `{"line":"four"}`)
 
 	refName := plumbing.ReferenceName(paths.V2FullCurrentRefName)
-	err = v2Store.ensureRef(refName)
+	err = v2Store.ensureRef(context.Background(), refName)
 	require.NoError(t, err)
 
 	_, rootTreeHash, err := v2Store.GetRefState(refName)
@@ -214,24 +327,24 @@ func TestV2ReadSessionContent_ChunkedTranscript(t *testing.T) {
 	require.NoError(t, err)
 
 	entries := map[string]object.TreeEntry{
-		sessionPath + paths.TranscriptFileName: {
-			Name: sessionPath + paths.TranscriptFileName,
+		sessionPath + paths.V2RawTranscriptFileName: {
+			Name: sessionPath + paths.V2RawTranscriptFileName,
 			Mode: filemode.Regular,
 			Hash: blob0,
 		},
-		sessionPath + paths.TranscriptFileName + ".001": {
-			Name: sessionPath + paths.TranscriptFileName + ".001",
+		sessionPath + paths.V2RawTranscriptFileName + ".001": {
+			Name: sessionPath + paths.V2RawTranscriptFileName + ".001",
 			Mode: filemode.Regular,
 			Hash: blob1,
 		},
 	}
 
-	newTreeHash, err := v2Store.gs.spliceCheckpointSubtree(rootTreeHash, cpID, cpID.Path()+"/", entries)
+	newTreeHash, err := v2Store.gs.spliceCheckpointSubtree(context.Background(), rootTreeHash, cpID, cpID.Path()+"/", entries)
 	require.NoError(t, err)
 
 	parentHash, _, err := v2Store.GetRefState(refName)
 	require.NoError(t, err)
-	err = v2Store.updateRef(refName, newTreeHash, parentHash, "chunked test", "Test", "test@test.com")
+	err = v2Store.updateRef(ctx, refName, newTreeHash, parentHash, "chunked test", "Test", "test@test.com")
 	require.NoError(t, err)
 
 	// Read it back — should reassemble both chunks
@@ -258,7 +371,7 @@ func TestV2ReadSessionCompactTranscript_ReturnsCompactData(t *testing.T) {
 		CheckpointID:      cpID,
 		SessionID:         "session-compact",
 		Strategy:          "manual-commit",
-		Transcript:        []byte(`{"raw":true}` + "\n"),
+		Transcript:        redact.AlreadyRedacted([]byte(`{"raw":true}` + "\n")),
 		CompactTranscript: compact,
 		AuthorName:        "Test",
 		AuthorEmail:       "test@test.com",
@@ -281,7 +394,7 @@ func TestV2ReadSessionCompactTranscript_MissingCompactTranscript(t *testing.T) {
 		CheckpointID: cpID,
 		SessionID:    "session-no-compact",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"raw":true}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"raw":true}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	})
@@ -305,7 +418,7 @@ func TestV2ReadSessionCompactTranscript_MissingCheckpointOrSession(t *testing.T)
 		CheckpointID: cpID,
 		SessionID:    "session-0",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"raw":true}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"raw":true}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -325,7 +438,7 @@ func TestV2UpdateSummary_PersistsSummaryToLatestSession(t *testing.T) {
 		CheckpointID: cpID,
 		SessionID:    "session-summary-test",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	})

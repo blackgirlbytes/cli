@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func strPtr(s string) *string { return &s }
+
 // initTestRepo creates a test git repository with an initial commit.
 func initTestRepo(t *testing.T) *git.Repository {
 	t.Helper()
@@ -60,12 +62,12 @@ func TestStore_EnsureBranch(t *testing.T) {
 	store := NewStore(repo)
 
 	// First call should create the branch
-	if err := store.EnsureBranch(); err != nil {
+	if err := store.EnsureBranch(context.Background()); err != nil {
 		t.Fatalf("EnsureBranch() error = %v", err)
 	}
 
 	// Second call should be idempotent
-	if err := store.EnsureBranch(); err != nil {
+	if err := store.EnsureBranch(context.Background()); err != nil {
 		t.Fatalf("EnsureBranch() second call error = %v", err)
 	}
 }
@@ -88,7 +90,7 @@ func TestStore_WriteAndRead(t *testing.T) {
 		Title:     "Test trail",
 		Body:      "A test trail",
 		Status:    StatusDraft,
-		Author:    "tester",
+		Author:    &Author{ID: "1", Login: strPtr("tester")},
 		Assignees: []string{},
 		Labels:    []string{"test"},
 		CreatedAt: now,
@@ -97,7 +99,7 @@ func TestStore_WriteAndRead(t *testing.T) {
 
 	discussion := &Discussion{Comments: []Comment{}}
 
-	if err := store.Write(metadata, discussion, nil); err != nil {
+	if err := store.Write(context.Background(), metadata, discussion, nil); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
 
@@ -146,13 +148,13 @@ func TestStore_FindByBranch(t *testing.T) {
 			Base:      "main",
 			Title:     HumanizeBranchName(branch),
 			Status:    StatusDraft,
-			Author:    "test",
+			Author:    &Author{ID: "1", Login: strPtr("test")},
 			Assignees: []string{},
 			Labels:    []string{},
 			CreatedAt: now,
 			UpdatedAt: now,
 		}
-		if err := store.Write(meta, nil, nil); err != nil {
+		if err := store.Write(context.Background(), meta, nil, nil); err != nil {
 			t.Fatalf("Write() error = %v", err)
 		}
 	}
@@ -203,13 +205,13 @@ func TestStore_List(t *testing.T) {
 		Base:      "main",
 		Title:     "Test",
 		Status:    StatusDraft,
-		Author:    "test",
+		Author:    &Author{ID: "1", Login: strPtr("test")},
 		Assignees: []string{},
 		Labels:    []string{},
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if err := store.Write(meta, nil, nil); err != nil {
+	if err := store.Write(context.Background(), meta, nil, nil); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
 
@@ -241,18 +243,18 @@ func TestStore_Update(t *testing.T) {
 		Base:      "main",
 		Title:     "Original",
 		Status:    StatusDraft,
-		Author:    "test",
+		Author:    &Author{ID: "1", Login: strPtr("test")},
 		Assignees: []string{},
 		Labels:    []string{},
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if err := store.Write(meta, nil, nil); err != nil {
+	if err := store.Write(context.Background(), meta, nil, nil); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
 
 	// Update
-	if err := store.Update(id, func(m *Metadata) {
+	if err := store.Update(context.Background(), id, func(m *Metadata) {
 		m.Title = "Updated"
 		m.Status = StatusInProgress
 		m.Labels = []string{"urgent"}
@@ -295,18 +297,18 @@ func TestStore_Delete(t *testing.T) {
 		Base:      "main",
 		Title:     "To delete",
 		Status:    StatusDraft,
-		Author:    "test",
+		Author:    &Author{ID: "1", Login: strPtr("test")},
 		Assignees: []string{},
 		Labels:    []string{},
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if err := store.Write(meta, nil, nil); err != nil {
+	if err := store.Write(context.Background(), meta, nil, nil); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
 
 	// Delete
-	if err := store.Delete(id); err != nil {
+	if err := store.Delete(context.Background(), id); err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 
@@ -322,7 +324,7 @@ func TestStore_ReadNonExistent(t *testing.T) {
 	repo := initTestRepo(t)
 	store := NewStore(repo)
 
-	if err := store.EnsureBranch(); err != nil {
+	if err := store.EnsureBranch(context.Background()); err != nil {
 		t.Fatalf("EnsureBranch() error = %v", err)
 	}
 
@@ -356,13 +358,13 @@ func TestStore_DeleteInvalidID(t *testing.T) {
 	store := NewStore(repo)
 
 	// Invalid format: uppercase hex
-	err := store.Delete(ID("ABCDEF123456"))
+	err := store.Delete(context.Background(), ID("ABCDEF123456"))
 	if err == nil {
 		t.Error("Delete() should fail for invalid trail ID")
 	}
 
 	// Path traversal attempt
-	err = store.Delete(ID("../../../etc"))
+	err = store.Delete(context.Background(), ID("../../../etc"))
 	if err == nil {
 		t.Error("Delete() should fail for path traversal ID")
 	}
@@ -386,7 +388,7 @@ func TestStore_AddCheckpointPreservesOtherFields(t *testing.T) {
 		Title:     "Preservation test",
 		Body:      "Verify AddCheckpoint doesn't corrupt other fields",
 		Status:    StatusInProgress,
-		Author:    "tester",
+		Author:    &Author{ID: "1", Login: strPtr("tester")},
 		Assignees: []string{"alice"},
 		Labels:    []string{"important"},
 		CreatedAt: now,
@@ -396,7 +398,7 @@ func TestStore_AddCheckpointPreservesOtherFields(t *testing.T) {
 		{ID: "c1", Author: "bob", Body: "looks good", CreatedAt: now},
 	}}
 
-	if err := store.Write(metadata, discussion, nil); err != nil {
+	if err := store.Write(context.Background(), metadata, discussion, nil); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
 
@@ -408,7 +410,7 @@ func TestStore_AddCheckpointPreservesOtherFields(t *testing.T) {
 		CreatedAt:    now,
 		Summary:      &firstSummary,
 	}
-	if err := store.AddCheckpoint(trailID, cpRef); err != nil {
+	if err := store.AddCheckpoint(context.Background(), trailID, cpRef); err != nil {
 		t.Fatalf("AddCheckpoint() error = %v", err)
 	}
 
@@ -459,7 +461,7 @@ func TestStore_AddCheckpointPreservesOtherFields(t *testing.T) {
 		CreatedAt:    now,
 		Summary:      &secondSummary,
 	}
-	if err := store.AddCheckpoint(trailID, cpRef2); err != nil {
+	if err := store.AddCheckpoint(context.Background(), trailID, cpRef2); err != nil {
 		t.Fatalf("AddCheckpoint() second call error = %v", err)
 	}
 

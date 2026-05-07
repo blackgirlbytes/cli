@@ -15,6 +15,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent"
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/redact"
 
 	"github.com/go-git/go-git/v6/plumbing"
 )
@@ -206,14 +207,20 @@ type WriteCommittedOptions struct {
 	// SessionID is the session identifier
 	SessionID string
 
+	// CreatedAt is when the checkpoint was originally created.
+	// When zero, writers use the current time. Migration sets this to preserve
+	// the original v1 checkpoint time in v2 metadata and retention decisions.
+	CreatedAt time.Time
+
 	// Strategy is the name of the strategy that created this checkpoint
 	Strategy string
 
 	// Branch is the branch name where the checkpoint was created (empty if detached HEAD)
 	Branch string
 
-	// Transcript is the session transcript content (full.jsonl)
-	Transcript []byte
+	// Transcript is the session transcript content (full.jsonl).
+	// Must be pre-redacted (via redact.JSONLBytes or redact.AlreadyRedacted for trusted sources).
+	Transcript redact.RedactedBytes
 
 	// Prompts contains user prompts from the session
 	Prompts []string
@@ -273,6 +280,11 @@ type WriteCommittedOptions struct {
 	// CheckpointTranscriptStart is written to both CommittedMetadata.CheckpointTranscriptStart
 	// and the deprecated CommittedMetadata.TranscriptLinesAtStart for backward compatibility.
 
+	// CompactTranscriptStart is the transcript.jsonl line offset at checkpoint start.
+	// V2 /main writes this to checkpoint_transcript_start; v1 continues to use
+	// CheckpointTranscriptStart (full.jsonl).
+	CompactTranscriptStart int
+
 	// TokenUsage contains the token usage for this checkpoint
 	TokenUsage *agent.TokenUsage
 
@@ -289,6 +301,11 @@ type WriteCommittedOptions struct {
 	// Uses json.RawMessage to avoid importing session package.
 	PromptAttributionsJSON json.RawMessage
 
+	// CombinedAttribution is holistic attribution across all sessions.
+	// Used during migration to preserve v1 root summary attribution.
+	// During normal condensation this is nil (computed post-commit via UpdateCheckpointSummary).
+	CombinedAttribution *InitialAttribution
+
 	// Summary is an optional AI-generated summary for this checkpoint.
 	// This field may be nil when:
 	//   - summarization is disabled in settings
@@ -301,6 +318,24 @@ type WriteCommittedOptions struct {
 	// Written to v2 /main ref alongside metadata. May be nil if compaction
 	// was not performed (unknown agent, compaction error, empty transcript).
 	CompactTranscript []byte
+
+	// Kind identifies the session purpose (e.g., "agent_review"). Empty for normal sessions.
+	Kind string
+
+	// ReviewSkills is the snapshot of skills used (only meaningful when Kind is a review kind).
+	// May be empty when a review is attached post-hoc without declared skills.
+	ReviewSkills []string
+
+	// ReviewPrompt is the actual text of the review request (composed prompt
+	// for spawn, first user prompt for attach). Only meaningful when Kind is
+	// a review kind.
+	ReviewPrompt string
+
+	// HasReview is set by the caller when this session should mark its
+	// checkpoint as reviewed. The caller computes this (e.g. via
+	// session.Kind.IsReview) because checkpoint can't import session
+	// — the session package imports checkpoint, creating a cycle.
+	HasReview bool
 }
 
 // UpdateCommittedOptions contains options for updating an existing committed checkpoint.
@@ -314,8 +349,9 @@ type UpdateCommittedOptions struct {
 	// SessionID identifies which session slot to update within the checkpoint
 	SessionID string
 
-	// Transcript is the full session transcript (replaces existing)
-	Transcript []byte
+	// Transcript is the full session transcript (replaces existing).
+	// Must be pre-redacted (via redact.JSONLBytes or redact.AlreadyRedacted for trusted sources).
+	Transcript redact.RedactedBytes
 
 	// Prompts contains all user prompts (replaces existing)
 	Prompts []string
@@ -326,6 +362,47 @@ type UpdateCommittedOptions struct {
 	// CompactTranscript is the updated Entire Transcript Format bytes.
 	// If non-nil, replaces the existing transcript.jsonl on v2 /main.
 	CompactTranscript []byte
+
+	// PrecomputedBlobs, if non-nil, provides chunk blob hashes and the
+	// content-hash blob hash computed once for this transcript. When set,
+	// UpdateCommitted skips the per-call ChunkTranscript + zlib work and
+	// reuses these hashes. Used by finalizeAllTurnCheckpoints to avoid
+	// re-compressing identical content N times.
+	PrecomputedBlobs *PrecomputedTranscriptBlobs
+}
+
+// PrecomputedTranscriptBlobs holds blob hashes for a transcript that was
+// chunked and written to the object store once, for reuse across multiple
+// UpdateCommitted calls sharing the same transcript content.
+//
+// Blob hashes are content-addressed (SHA-1 of chunk bytes), so the same
+// PrecomputedTranscriptBlobs works for both v1 (full.jsonl) and v2
+// (raw_transcript) paths — only the tree-entry filename differs.
+//
+// Callers should avoid constructing this for empty transcripts; agent.ChunkTranscript
+// would otherwise produce a single zero-length chunk and a hash for an empty
+// blob, which downstream stores would never reference.
+type PrecomputedTranscriptBlobs struct {
+	// ChunkHashes are the blob hashes for each transcript chunk, in order.
+	// Always non-empty when built via PrecomputeTranscriptBlobs (a non-empty
+	// transcript chunks to at least one entry; callers should skip precompute
+	// for empty transcripts).
+	ChunkHashes []plumbing.Hash
+
+	// ContentHashBlob is the blob hash of the "sha256:<hex>" content-hash
+	// string for the transcript.
+	ContentHashBlob plumbing.Hash
+
+	// ContentHash is the "sha256:<hex>" string itself, so the short-circuit
+	// path can compare without re-reading the blob.
+	ContentHash string
+}
+
+// isUsable reports whether the precomputed blobs satisfy the invariants that
+// consumers depend on: a non-zero content-hash blob and at least one chunk
+// hash. Callers should fall back to the fresh-write path when this is false.
+func (p *PrecomputedTranscriptBlobs) isUsable() bool {
+	return p != nil && !p.ContentHashBlob.IsZero() && len(p.ChunkHashes) > 0
 }
 
 // CommittedInfo contains summary information about a committed checkpoint.
@@ -423,6 +500,18 @@ type CommittedMetadata struct {
 	// PromptAttributions is the raw per-prompt attribution data used to compute InitialAttribution.
 	// Diagnostic field — shows which prompt recorded which "user" lines.
 	PromptAttributions json.RawMessage `json:"prompt_attributions,omitempty"`
+
+	// Kind identifies the session purpose (e.g., "agent_review"). Empty for normal sessions.
+	Kind string `json:"kind,omitempty"`
+
+	// ReviewSkills lists the review skills that were run (only set when Kind is a review kind).
+	// May be empty when a review was attached post-hoc without declared skills.
+	ReviewSkills []string `json:"review_skills,omitempty"`
+
+	// ReviewPrompt is the actual text of the review request (composed prompt
+	// for spawn, first user prompt for attach). Only set when Kind is a
+	// review kind.
+	ReviewPrompt string `json:"review_prompt,omitempty"`
 }
 
 // GetTranscriptStart returns the transcript line offset at which this checkpoint's data begins.
@@ -473,6 +562,13 @@ type CheckpointSummary struct {
 	Sessions            []SessionFilePaths  `json:"sessions"`
 	TokenUsage          *agent.TokenUsage   `json:"token_usage,omitempty"`
 	CombinedAttribution *InitialAttribution `json:"combined_attribution,omitempty"`
+
+	// HasReview is the umbrella "any review happened" flag: true when at least
+	// one session in this checkpoint has a review-kind Kind (currently
+	// "agent_review"). When new review kinds are introduced they should also
+	// cause this flag to be set so callers can keep asking "was this reviewed
+	// in any way?" without caring about the variant.
+	HasReview bool `json:"has_review,omitempty"`
 }
 
 // SessionMetrics contains hook-provided session metrics from agents that report

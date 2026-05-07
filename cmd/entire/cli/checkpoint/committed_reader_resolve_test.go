@@ -7,6 +7,7 @@ import (
 
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
+	"github.com/entireio/cli/redact"
 	"github.com/stretchr/testify/require"
 
 	"github.com/go-git/go-git/v6"
@@ -28,7 +29,7 @@ func TestResolveCommittedReaderForCheckpoint_UsesV2WhenFound(t *testing.T) {
 		CheckpointID: cpID,
 		SessionID:    "session-v2",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -52,7 +53,7 @@ func TestResolveCommittedReaderForCheckpoint_FallsBackToV1WhenMissingInV2(t *tes
 		CheckpointID: cpID,
 		SessionID:    "session-v1",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -76,7 +77,7 @@ func TestResolveCommittedReaderForCheckpoint_PrefersV1WhenV2Disabled(t *testing.
 		CheckpointID: cpID,
 		SessionID:    "session-v2",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -85,7 +86,7 @@ func TestResolveCommittedReaderForCheckpoint_PrefersV1WhenV2Disabled(t *testing.
 		CheckpointID: cpID,
 		SessionID:    "session-v1",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"hello"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -109,7 +110,7 @@ func TestResolveRawSessionLogForCheckpoint_UsesV2WhenFound(t *testing.T) {
 		CheckpointID: cpID,
 		SessionID:    "session-v2",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v2"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v2"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -133,7 +134,7 @@ func TestResolveRawSessionLogForCheckpoint_FallsBackToV1WhenMissingInV2(t *testi
 		CheckpointID: cpID,
 		SessionID:    "session-v1",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v1"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v1"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -157,7 +158,7 @@ func TestResolveRawSessionLogForCheckpoint_PrefersV1WhenV2Disabled(t *testing.T)
 		CheckpointID: cpID,
 		SessionID:    "session-v2",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v2"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v2"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -166,7 +167,7 @@ func TestResolveRawSessionLogForCheckpoint_PrefersV1WhenV2Disabled(t *testing.T)
 		CheckpointID: cpID,
 		SessionID:    "session-v1",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v1"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v1"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -191,7 +192,7 @@ func TestResolveCommittedReaderForCheckpoint_FallsBackToV1WhenV2Malformed(t *tes
 		CheckpointID: cpID,
 		SessionID:    "session-v1",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v1"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v1"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -201,7 +202,7 @@ func TestResolveCommittedReaderForCheckpoint_FallsBackToV1WhenV2Malformed(t *tes
 		CheckpointID: cpID,
 		SessionID:    "session-v2",
 		Strategy:     "manual-commit",
-		Transcript:   []byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v2"}]}}` + "\n"),
+		Transcript:   redact.AlreadyRedacted([]byte(`{"type":"user","message":{"content":[{"type":"text","text":"from-v2"}]}}` + "\n")),
 		AuthorName:   "Test",
 		AuthorEmail:  "test@test.com",
 	}))
@@ -247,7 +248,7 @@ func corruptV2MainMetadata(t *testing.T, repo *git.Repository, cpID id.Checkpoin
 	})
 	require.NoError(t, err)
 
-	commitHash, err := CreateCommit(repo, rootTreeHash, parentHash,
+	commitHash, err := CreateCommit(context.Background(), repo, rootTreeHash, parentHash,
 		"corrupt metadata for test", "Test", "test@test.com")
 	require.NoError(t, err)
 

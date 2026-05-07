@@ -12,8 +12,8 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/entireio/cli/cmd/entire/cli/api"
 	"github.com/entireio/cli/cmd/entire/cli/auth"
+	"github.com/entireio/cli/cmd/entire/cli/interactive"
 	"github.com/spf13/cobra"
 )
 
@@ -35,28 +35,17 @@ type deviceAuthClient interface {
 
 func newLoginCmd() *cobra.Command {
 	var insecureHTTPAuth bool
-
 	cmd := &cobra.Command{
 		Use:   "login",
 		Short: "Log in to Entire",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client := auth.NewClient(nil)
-
-			if !insecureHTTPAuth {
-				if err := api.RequireSecureURL(client.BaseURL()); err != nil {
-					return fmt.Errorf("base URL check: %w", err)
-				}
+			if err := requireSecureBaseURL(insecureHTTPAuth); err != nil {
+				return err
 			}
-
-			return runLogin(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), client, openBrowser)
+			return runLogin(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), auth.NewClient(nil), openBrowser)
 		},
 	}
-
-	cmd.Flags().BoolVar(&insecureHTTPAuth, "insecure-http-auth", false, "Allow authentication over plain HTTP (insecure, for local development only)")
-	if err := cmd.Flags().MarkHidden("insecure-http-auth"); err != nil {
-		panic(fmt.Sprintf("hide insecure-http-auth flag: %v", err))
-	}
-
+	addInsecureHTTPAuthFlag(cmd, &insecureHTTPAuth)
 	return cmd
 }
 
@@ -70,7 +59,7 @@ func runLogin(ctx context.Context, outW, errW io.Writer, client deviceAuthClient
 
 	approvalURL := start.VerificationURI
 
-	if canPromptInteractively() {
+	if interactive.CanPromptInteractively() {
 		fmt.Fprintf(outW, "Press Enter to open %s in your browser and enter the generated device code...", approvalURL)
 
 		// Read from /dev/tty so we get a real keypress and don't consume piped stdin.

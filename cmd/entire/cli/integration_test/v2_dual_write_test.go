@@ -96,8 +96,8 @@ func TestV2DualWrite_FullWorkflow(t *testing.T) {
 	assert.Contains(t, mainPrompts, "Add greeting function")
 
 	// Transcript should NOT be on /main
-	_, found = env.ReadFileFromRef(paths.V2MainRefName, cpPath+"/0/"+paths.TranscriptFileName)
-	assert.False(t, found, "full.jsonl should NOT be on v2 /main")
+	_, found = env.ReadFileFromRef(paths.V2MainRefName, cpPath+"/0/"+paths.V2RawTranscriptFileName)
+	assert.False(t, found, "raw_transcript should NOT be on v2 /main")
 
 	// transcript.jsonl (compact format) SHOULD be on /main
 	compactTranscript, found := env.ReadFileFromRef(paths.V2MainRefName, cpPath+"/0/"+paths.CompactTranscriptFileName)
@@ -117,13 +117,13 @@ func TestV2DualWrite_FullWorkflow(t *testing.T) {
 		"v2 /full/current ref should exist")
 
 	// Transcript should be on /full/current
-	fullTranscript, found := env.ReadFileFromRef(paths.V2FullCurrentRefName, cpPath+"/0/"+paths.TranscriptFileName)
-	require.True(t, found, "full.jsonl should exist on v2 /full/current")
+	fullTranscript, found := env.ReadFileFromRef(paths.V2FullCurrentRefName, cpPath+"/0/"+paths.V2RawTranscriptFileName)
+	require.True(t, found, "raw_transcript should exist on v2 /full/current")
 	assert.Contains(t, fullTranscript, "Greet")
 
 	// Content hash should be co-located with transcript
-	fullHash, found := env.ReadFileFromRef(paths.V2FullCurrentRefName, cpPath+"/0/"+paths.ContentHashFileName)
-	require.True(t, found, "content_hash.txt should exist on v2 /full/current")
+	fullHash, found := env.ReadFileFromRef(paths.V2FullCurrentRefName, cpPath+"/0/"+paths.V2RawTranscriptHashFileName)
+	require.True(t, found, "raw_transcript_hash.txt should exist on v2 /full/current")
 	assert.True(t, strings.HasPrefix(fullHash, "sha256:"))
 
 	// Metadata should NOT be on /full/current
@@ -235,12 +235,123 @@ func TestV2DualWrite_StopTimeFinalization(t *testing.T) {
 	require.NoError(t, err)
 
 	// After stop-time finalization, /full/current should have the finalized transcript
-	fullTranscript, found := env.ReadFileFromRef(paths.V2FullCurrentRefName, cpPath+"/0/"+paths.TranscriptFileName)
-	require.True(t, found, "full.jsonl should exist on /full/current after finalization")
+	fullTranscript, found := env.ReadFileFromRef(paths.V2FullCurrentRefName, cpPath+"/0/"+paths.V2RawTranscriptFileName)
+	require.True(t, found, "raw_transcript should exist on /full/current after finalization")
 	assert.Contains(t, fullTranscript, "main")
 
 	// transcript.jsonl should exist on /main after stop-time finalization
 	compactTranscript, found := env.ReadFileFromRef(paths.V2MainRefName, cpPath+"/0/"+paths.CompactTranscriptFileName)
 	require.True(t, found, "transcript.jsonl should exist on v2 /main after finalization")
 	assert.Contains(t, compactTranscript, `"v":1`)
+}
+
+// TestCheckpointsVersion2_SkipsV1Write verifies the specific deltas of running
+// with checkpoints_version: 2 — v1 metadata is not written and v2 refs still
+// exist. The full v2 payload shape is already covered by
+// TestV2DualWrite_FullWorkflow.
+func TestCheckpointsVersion2_SkipsV1Write(t *testing.T) {
+	t.Parallel()
+	env := NewTestEnv(t)
+	defer env.Cleanup()
+
+	env.InitRepo()
+	env.WriteFile("README.md", "# Test")
+	env.WriteFile(".gitignore", ".entire/\n")
+	env.GitAdd("README.md")
+	env.GitAdd(".gitignore")
+	env.GitCommit("Initial commit")
+	env.GitCheckoutNewBranch("feature/checkpoints-v2-test")
+
+	env.InitEntireWithOptions(map[string]any{
+		"checkpoints_version": 2,
+	})
+
+	session := env.NewSession()
+	require.NoError(t, env.SimulateUserPromptSubmitWithPrompt(session.ID, "Add greeting function"))
+
+	env.WriteFile("greet.go", "package main\n\nfunc Greet() string { return \"hello\" }")
+	session.CreateTranscript(
+		"Add greeting function",
+		[]FileChange{{Path: "greet.go", Content: "package main\n\nfunc Greet() string { return \"hello\" }"}},
+	)
+	require.NoError(t, env.SimulateStop(session.ID, session.TranscriptPath))
+
+	env.GitCommitWithShadowHooks("Add greeting function", "greet.go")
+
+	cpIDStr := env.GetLatestCheckpointIDFromHistory()
+	require.NotEmpty(t, cpIDStr, "checkpoint ID should be in commit trailer")
+
+	cpID, err := id.NewCheckpointID(cpIDStr)
+	require.NoError(t, err)
+	cpPath := cpID.Path()
+
+	// v1: should NOT be written.
+	_, found := env.ReadFileFromBranch(paths.MetadataBranchName, cpPath+"/"+paths.MetadataFileName)
+	assert.False(t, found,
+		"v1 committed checkpoint metadata should NOT exist when checkpoints_version is 2")
+
+	// v2: smoke check that the checkpoint still landed.
+	assert.True(t, env.RefExists(paths.V2MainRefName), "v2 /main ref should exist")
+	assert.True(t, env.RefExists(paths.V2FullCurrentRefName), "v2 /full/current ref should exist")
+}
+
+// TestCheckpointsVersion2_HookDrivenCommitOnMain verifies the same hook-driven
+// prompt -> stop -> commit flow used by the attach E2E precondition setup. In
+// checkpoints_version: 2 mode, the normal git hook path should still write only
+// v2 refs even when committing on the default branch.
+func TestCheckpointsVersion2_HookDrivenCommitOnMain(t *testing.T) {
+	t.Parallel()
+	env := NewTestEnv(t)
+	defer env.Cleanup()
+
+	env.InitRepo()
+	env.WriteFile("README.md", "# Test")
+	env.WriteFile(".gitignore", ".entire/\n")
+	env.GitAdd("README.md")
+	env.GitAdd(".gitignore")
+	env.GitCommit("Initial commit")
+
+	env.InitEntireWithOptions(map[string]any{
+		"checkpoints_version": 2,
+	})
+
+	// Mirror the E2E flow: enable is committed first, then a normal prompt/stop
+	// cycle produces content that the subsequent user commit condenses.
+	env.GitAdd(".entire/settings.json")
+	env.GitCommit("Enable entire")
+
+	session := env.NewSession()
+	require.NoError(t, env.SimulateUserPromptSubmitWithPrompt(session.ID, "Add existing checkpoint doc"))
+
+	env.WriteFile("docs/existing.md", "# Existing\n\nA short paragraph about existing checkpoints.\n")
+	session.CreateTranscript(
+		"Add existing checkpoint doc",
+		[]FileChange{{Path: "docs/existing.md", Content: "# Existing\n\nA short paragraph about existing checkpoints.\n"}},
+	)
+	require.NoError(t, env.SimulateStop(session.ID, session.TranscriptPath))
+
+	env.GitCommitWithShadowHooks("Add existing checkpoint doc", "docs/existing.md")
+
+	cpIDStr := env.GetLatestCheckpointIDFromHistory()
+	require.NotEmpty(t, cpIDStr, "checkpoint ID should be in commit trailer")
+
+	cpID, err := id.NewCheckpointID(cpIDStr)
+	require.NoError(t, err)
+	cpPath := cpID.Path()
+
+	// v1 should remain absent in strict v2-only mode.
+	_, found := env.ReadFileFromBranch(paths.MetadataBranchName, cpPath+"/"+paths.MetadataFileName)
+	assert.False(t, found, "v1 metadata branch should not be used when checkpoints_version is 2")
+
+	// v2 refs should contain the checkpoint created by the normal hook path.
+	assert.True(t, env.RefExists(paths.V2MainRefName), "v2 /main ref should exist after hook-driven commit")
+	assert.True(t, env.RefExists(paths.V2FullCurrentRefName), "v2 /full/current ref should exist after hook-driven commit")
+
+	mainSummary, found := env.ReadFileFromRef(paths.V2MainRefName, cpPath+"/"+paths.MetadataFileName)
+	require.True(t, found, "v2 /main metadata.json should exist")
+	assert.Contains(t, mainSummary, cpIDStr)
+
+	fullTranscript, found := env.ReadFileFromRef(paths.V2FullCurrentRefName, cpPath+"/0/"+paths.V2RawTranscriptFileName)
+	require.True(t, found, "v2 /full/current raw transcript should exist")
+	assert.Contains(t, fullTranscript, "existing checkpoints")
 }

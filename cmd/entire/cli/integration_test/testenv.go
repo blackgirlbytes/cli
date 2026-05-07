@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -19,6 +21,7 @@ import (
 	"github.com/entireio/cli/cmd/entire/cli/agent/types"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+	"github.com/entireio/cli/cmd/entire/cli/execx"
 	"github.com/entireio/cli/cmd/entire/cli/jsonutil"
 	"github.com/entireio/cli/cmd/entire/cli/paths"
 	"github.com/entireio/cli/cmd/entire/cli/testutil"
@@ -51,6 +54,13 @@ type TestEnv struct {
 	GeminiProjectDir   string
 	OpenCodeProjectDir string
 	SessionCounter     int
+	gitConfigSnapshot  string
+	gitConfigGuardSet  bool
+
+	// ExtraEnv holds additional environment variables appended to all CLI
+	// invocations (RunPrePush, GitCommitWithShadowHooks, etc.). Use this to
+	// pass ENTIRE_CHECKPOINT_TOKEN, GIT_SSL_CAINFO, and similar per-test env.
+	ExtraEnv []string
 }
 
 // NewTestEnv creates a new isolated test environment.
@@ -109,33 +119,16 @@ func (env *TestEnv) Cleanup() {
 	// No-op - temp dirs are cleaned up by t.TempDir()
 }
 
-// gitEmptyConfigPath returns the path to an empty file suitable for use as
-// GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM. We use an empty file instead of
-// os.DevNull because git on Windows cannot open NUL as a config file.
-var gitEmptyConfig string
-
-func gitEmptyConfigPath() string {
-	if gitEmptyConfig == "" {
-		f, err := os.CreateTemp("", "git-empty-config-*")
-		if err != nil {
-			panic("create empty git config: " + err.Error())
-		}
-		f.Close()
-		gitEmptyConfig = f.Name()
-	}
-	return gitEmptyConfig
-}
-
 // cliEnv returns the environment variables for CLI execution.
 // Includes Claude, Gemini, and OpenCode project dirs so tests work for any agent.
 // Delegates to testutil.GitIsolatedEnv() for git config isolation.
 func (env *TestEnv) cliEnv() []string {
-	return append(testutil.GitIsolatedEnv(),
+	base := append(testutil.GitIsolatedEnv(),
 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+env.ClaudeProjectDir,
 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+env.GeminiProjectDir,
 		"ENTIRE_TEST_OPENCODE_PROJECT_DIR="+env.OpenCodeProjectDir,
-		"ENTIRE_TEST_TTY=0", // Prevent interactive prompts from blocking in tests
 	)
+	return append(base, env.ExtraEnv...)
 }
 
 // RunCLI runs the entire CLI with the given arguments and returns stdout.
@@ -152,8 +145,9 @@ func (env *TestEnv) RunCLI(args ...string) string {
 func (env *TestEnv) RunCLIWithError(args ...string) (string, error) {
 	env.T.Helper()
 
-	// Run CLI using the shared binary
-	cmd := exec.Command(getTestBinary(), args...)
+	// Run CLI using the shared binary, detached from any controlling TTY
+	// so interactive.CanPromptInteractively() returns false in the child.
+	cmd := execx.NonInteractive(context.Background(), getTestBinary(), args...)
 	cmd.Dir = env.RepoDir
 	cmd.Env = env.cliEnv()
 
@@ -165,8 +159,8 @@ func (env *TestEnv) RunCLIWithError(args ...string) (string, error) {
 func (env *TestEnv) RunCLIWithStdin(stdin string, args ...string) string {
 	env.T.Helper()
 
-	// Run CLI with stdin using the shared binary
-	cmd := exec.Command(getTestBinary(), args...)
+	// Run CLI with stdin using the shared binary, detached from controlling TTY.
+	cmd := execx.NonInteractive(context.Background(), getTestBinary(), args...)
 	cmd.Dir = env.RepoDir
 	cmd.Env = env.cliEnv()
 	cmd.Stdin = strings.NewReader(stdin)
@@ -241,6 +235,87 @@ func (env *TestEnv) InitRepo() {
 	if err := repo.SetConfig(cfg); err != nil {
 		env.T.Fatalf("failed to set repo config: %v", err)
 	}
+
+	env.setGitConfigBaseline()
+}
+
+func (env *TestEnv) setGitConfigBaseline() {
+	env.T.Helper()
+
+	configPath := env.gitConfigPath()
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		env.T.Fatalf("failed to read %s: %v", configPath, err)
+	}
+
+	env.gitConfigSnapshot = string(data)
+	if env.gitConfigGuardSet {
+		return
+	}
+
+	env.gitConfigGuardSet = true
+	env.T.Cleanup(func() {
+		configPath := env.gitConfigPath()
+		currentData, err := os.ReadFile(configPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				if _, statErr := os.Stat(env.RepoDir); errors.Is(statErr, os.ErrNotExist) {
+					return
+				}
+			}
+			env.T.Fatalf(".git/config guard failed: could not read %s during cleanup: %v", configPath, err)
+		}
+
+		current := string(currentData)
+		if normalizeGitConfigForGuard(current) == normalizeGitConfigForGuard(env.gitConfigSnapshot) {
+			return
+		}
+
+		env.T.Fatalf(
+			".git/config changed unexpectedly during integration test\nBaseline:\n%s\nCurrent:\n%s",
+			env.gitConfigSnapshot,
+			current,
+		)
+	})
+}
+
+// AcceptGitConfigChanges updates the .git/config guard baseline after verifying
+// the config matches the exact content the test intended to write.
+func (env *TestEnv) AcceptGitConfigChanges(expected string) {
+	env.T.Helper()
+
+	actual, err := os.ReadFile(env.gitConfigPath())
+	if err != nil {
+		env.T.Fatalf("failed to read %s: %v", env.gitConfigPath(), err)
+	}
+	if string(actual) != expected {
+		env.T.Fatalf(
+			".git/config did not match expected test mutation\nExpected:\n%s\nActual:\n%s",
+			expected,
+			string(actual),
+		)
+	}
+
+	env.gitConfigSnapshot = expected
+}
+
+func (env *TestEnv) gitConfigPath() string {
+	return filepath.Join(env.RepoDir, ".git", "config")
+}
+
+var gitConfigGuardRepositoryFormatVersionRE = regexp.MustCompile(`(?m)^([ \t]*)repositoryformatversion = [01]$`)
+
+var gitConfigGuardTransportPromisorRemoteRE = regexp.MustCompile(
+	`(?m)^\[remote "(?:(?:https?|ssh|file)://|/|[A-Za-z]:[\\/]|[^"\n]+@[^"\n]+:[^"\n]+).+"\]\n(?:[ \t]+promisor = true\n[ \t]+partialclonefilter = blob:none\n?|[ \t]+partialclonefilter = blob:none\n[ \t]+promisor = true\n?)`,
+)
+
+func normalizeGitConfigForGuard(content string) string {
+	content = gitConfigGuardRepositoryFormatVersionRE.ReplaceAllString(content, `${1}repositoryformatversion = <normalized>`)
+	// Deliberately ignore only the full promisor+partialclonefilter pair that
+	// git writes for transport-keyed remotes during filtered fetches. If git ever
+	// writes a partial section, the guard should still fail loudly.
+	content = gitConfigGuardTransportPromisorRemoteRE.ReplaceAllString(content, "")
+	return content
 }
 
 // InitEntire initializes the .entire directory with the specified strategy.
@@ -292,7 +367,13 @@ func (env *TestEnv) initEntireInternal(strategyOptions map[string]any) {
 		"enabled":   true,
 		"local_dev": true, // Note: git-triggered hooks won't work (path is relative); tests call hooks via getTestBinary() instead
 	}
-	if strategyOptions != nil {
+	if strategyOptions == nil {
+		strategyOptions = make(map[string]any)
+	}
+	if _, exists := strategyOptions["filtered_fetches"]; !exists {
+		strategyOptions["filtered_fetches"] = true
+	}
+	if len(strategyOptions) > 0 {
 		settings["strategy_options"] = strategyOptions
 	}
 	data, err := jsonutil.MarshalIndentWithNewline(settings, "", "  ")
@@ -533,6 +614,39 @@ func (env *TestEnv) GitCommitWithMultipleCheckpoints(message string, checkpointI
 	}
 }
 
+// WriteSettings writes arbitrary JSON to .entire/settings.json. Used in
+// tests that need to seed specific config shapes before running a CLI
+// command. Overwrites any existing file.
+func (env *TestEnv) WriteSettings(m map[string]any) {
+	env.T.Helper()
+	dir := filepath.Join(env.RepoDir, ".entire")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		env.T.Fatalf("mkdir .entire: %v", err)
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		env.T.Fatalf("marshal settings: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), data, 0o600); err != nil {
+		env.T.Fatalf("write settings.json: %v", err)
+	}
+}
+
+// composeReviewPromptForTest mirrors the prompt shape runReview composes
+// so integration tests can assert against the same ReviewPrompt format
+// that spawn would produce.
+func composeReviewPromptForTest(skills []string) string {
+	if len(skills) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("Please run these review skills in order:\n")
+	for i, skill := range skills {
+		fmt.Fprintf(&sb, "  %d. %s\n", i+1, skill)
+	}
+	return sb.String()
+}
+
 // GetHeadHash returns the current HEAD commit hash.
 func (env *TestEnv) GetHeadHash() string {
 	env.T.Helper()
@@ -658,7 +772,7 @@ func (env *TestEnv) GetRewindPoints() []RewindPoint {
 	env.T.Helper()
 
 	// Run rewind --list using the shared binary
-	cmd := exec.Command(getTestBinary(), "rewind", "--list")
+	cmd := exec.Command(getTestBinary(), "checkpoint", "rewind", "--list")
 	cmd.Dir = env.RepoDir
 	cmd.Env = env.cliEnv()
 
@@ -706,7 +820,7 @@ func (env *TestEnv) Rewind(commitID string) error {
 	env.T.Helper()
 
 	// Run rewind --to <commitID> using the shared binary
-	cmd := exec.Command(getTestBinary(), "rewind", "--to", commitID)
+	cmd := exec.Command(getTestBinary(), "checkpoint", "rewind", "--to", commitID)
 	cmd.Dir = env.RepoDir
 	cmd.Env = env.cliEnv()
 
@@ -725,7 +839,7 @@ func (env *TestEnv) RewindLogsOnly(commitID string) error {
 	env.T.Helper()
 
 	// Run rewind --to <commitID> --logs-only using the shared binary
-	cmd := exec.Command(getTestBinary(), "rewind", "--to", commitID, "--logs-only")
+	cmd := exec.Command(getTestBinary(), "checkpoint", "rewind", "--to", commitID, "--logs-only")
 	cmd.Dir = env.RepoDir
 	cmd.Env = env.cliEnv()
 
@@ -744,7 +858,7 @@ func (env *TestEnv) RewindReset(commitID string) error {
 	env.T.Helper()
 
 	// Run rewind --to <commitID> --reset using the shared binary
-	cmd := exec.Command(getTestBinary(), "rewind", "--to", commitID, "--reset")
+	cmd := exec.Command(getTestBinary(), "checkpoint", "rewind", "--to", commitID, "--reset")
 	cmd.Dir = env.RepoDir
 	cmd.Env = env.cliEnv()
 
@@ -1004,9 +1118,26 @@ func (env *TestEnv) GitCommitWithShadowHooksAsAgent(message string, files ...str
 	env.gitCommitWithShadowHooks(message, false, files...)
 }
 
+// prepareCommitMsgCmd builds the prepare-commit-msg hook command. When
+// simulateTTY is true, ENTIRE_TEST_TTY=1 forces interactive=true (an in-test
+// stand-in for a real terminal — Setsid can't synthesize a TTY). When false,
+// the child runs in a new session without a controlling terminal so its
+// /dev/tty probe fails and CanPromptInteractively() returns false.
+func (env *TestEnv) prepareCommitMsgCmd(simulateTTY bool, hookArgs ...string) *exec.Cmd {
+	args := append([]string{"hooks", "git", "prepare-commit-msg"}, hookArgs...)
+	var cmd *exec.Cmd
+	if simulateTTY {
+		cmd = exec.Command(getTestBinary(), args...)
+		cmd.Env = env.gitHookEnv("ENTIRE_TEST_TTY=1")
+	} else {
+		cmd = execx.NonInteractive(context.Background(), getTestBinary(), args...)
+		cmd.Env = env.gitHookEnv()
+	}
+	cmd.Dir = env.RepoDir
+	return cmd
+}
+
 // gitCommitWithShadowHooks is the shared implementation for committing with shadow hooks.
-// When simulateTTY is true, sets ENTIRE_TEST_TTY=1 to simulate a human at the terminal.
-// When false, filters it out to simulate an agent subprocess (no controlling terminal).
 func (env *TestEnv) gitCommitWithShadowHooks(message string, simulateTTY bool, files ...string) {
 	env.T.Helper()
 
@@ -1023,17 +1154,7 @@ func (env *TestEnv) gitCommitWithShadowHooks(message string, simulateTTY bool, f
 
 	// Run prepare-commit-msg hook using the shared binary.
 	// Pass source="message" to match real `git commit -m` behavior.
-	prepCmd := exec.Command(getTestBinary(), "hooks", "git", "prepare-commit-msg", msgFile, "message")
-	prepCmd.Dir = env.RepoDir
-	if simulateTTY {
-		// Simulate human at terminal: ENTIRE_TEST_TTY=1 makes hasTTY() return true
-		// and askConfirmTTY() return defaultYes without reading from /dev/tty.
-		prepCmd.Env = env.gitHookEnv("ENTIRE_TEST_TTY=1")
-	} else {
-		// Simulate agent: ENTIRE_TEST_TTY=0 makes hasTTY() return false,
-		// triggering the fast path that adds trailers for ACTIVE sessions.
-		prepCmd.Env = env.gitHookEnv("ENTIRE_TEST_TTY=0")
-	}
+	prepCmd := env.prepareCommitMsgCmd(simulateTTY, msgFile, "message")
 	if output, err := prepCmd.CombinedOutput(); err != nil {
 		env.T.Logf("prepare-commit-msg output: %s", output)
 		// Don't fail - hook may silently succeed
@@ -1147,6 +1268,28 @@ func (env *TestEnv) GitCommitAmendWithShadowHooks(message string, files ...strin
 	postCmd.Env = env.gitHookEnv()
 	if output, err := postCmd.CombinedOutput(); err != nil {
 		env.T.Logf("post-commit (amend) output: %s", output)
+	}
+}
+
+// GitPostRewriteWithShadowHooks runs the git post-rewrite hook with the provided
+// old->new commit mappings. Each mapping is a pair of commit SHAs.
+func (env *TestEnv) GitPostRewriteWithShadowHooks(rewriteType string, mappings ...[2]string) {
+	env.T.Helper()
+
+	var input strings.Builder
+	for _, mapping := range mappings {
+		input.WriteString(mapping[0])
+		input.WriteByte(' ')
+		input.WriteString(mapping[1])
+		input.WriteByte('\n')
+	}
+
+	cmd := exec.Command(getTestBinary(), "hooks", "git", "post-rewrite", rewriteType)
+	cmd.Dir = env.RepoDir
+	cmd.Env = env.gitHookEnv()
+	cmd.Stdin = strings.NewReader(input.String())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		env.T.Fatalf("post-rewrite hook failed: %v\nOutput: %s", err, output)
 	}
 }
 
@@ -1264,13 +1407,7 @@ func (env *TestEnv) gitCommitStagedWithShadowHooks(message string, simulateTTY b
 	}
 
 	// Run prepare-commit-msg hook using the shared binary.
-	prepCmd := exec.Command(getTestBinary(), "hooks", "git", "prepare-commit-msg", msgFile, "message")
-	prepCmd.Dir = env.RepoDir
-	if simulateTTY {
-		prepCmd.Env = env.gitHookEnv("ENTIRE_TEST_TTY=1")
-	} else {
-		prepCmd.Env = env.gitHookEnv("ENTIRE_TEST_TTY=0")
-	}
+	prepCmd := env.prepareCommitMsgCmd(simulateTTY, msgFile, "message")
 	if output, err := prepCmd.CombinedOutput(); err != nil {
 		env.T.Logf("prepare-commit-msg output: %s", output)
 	}
@@ -1783,6 +1920,8 @@ func (env *TestEnv) SetupNamedBareRemote(remoteName string) string {
 		env.T.Fatalf("failed to push to %s: %v\n%s", remoteName, err, output)
 	}
 
+	env.setGitConfigBaseline()
+
 	return bareDir
 }
 
@@ -1853,6 +1992,7 @@ func (env *TestEnv) CloneFrom(bareDir string) *TestEnv {
 
 	// Initialize Entire in the clone
 	cloneEnv.InitEntire()
+	cloneEnv.setGitConfigBaseline()
 
 	return cloneEnv
 }
@@ -1942,7 +2082,7 @@ func (env *TestEnv) FetchMetadataBranch(remoteURL string) {
 
 	branchName := paths.MetadataBranchName
 	refSpec := "+refs/heads/" + branchName + ":refs/heads/" + branchName
-	cmd := exec.CommandContext(env.T.Context(), "git", "fetch", "--no-tags", "--filter=blob:none", remoteURL, refSpec)
+	cmd := exec.CommandContext(env.T.Context(), "git", "fetch", "--no-tags", remoteURL, refSpec)
 	cmd.Dir = env.RepoDir
 	cmd.Env = testutil.GitIsolatedEnv()
 

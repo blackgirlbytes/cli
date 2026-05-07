@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"time"
@@ -27,11 +28,13 @@ func init() {
 // ClaudeCodeAgent implements the Agent interface for Claude Code.
 //
 //nolint:revive // ClaudeCodeAgent is clearer than Agent in this context
-type ClaudeCodeAgent struct{}
+type ClaudeCodeAgent struct {
+	CommandRunner func(ctx context.Context, name string, args ...string) *exec.Cmd
+}
 
 // NewClaudeCodeAgent creates a new Claude Code agent instance.
 func NewClaudeCodeAgent() agent.Agent {
-	return &ClaudeCodeAgent{}
+	return &ClaudeCodeAgent{CommandRunner: exec.CommandContext}
 }
 
 // Name returns the agent registry key.
@@ -367,4 +370,21 @@ func (c *ClaudeCodeAgent) ChunkTranscript(_ context.Context, content []byte, max
 
 func (c *ClaudeCodeAgent) ReassembleTranscript(chunks [][]byte) ([]byte, error) {
 	return agent.ReassembleJSONL(chunks), nil
+}
+
+// LaunchCmd builds an exec.Cmd for `claude "<initialPrompt>"`. Stdio is wired
+// to the caller's TTY so the agent runs foreground and the user interacts
+// normally. The call site is expected to Run() and wait. Hooks inherit the
+// parent environment.
+func (c *ClaudeCodeAgent) LaunchCmd(ctx context.Context, initialPrompt string) (*exec.Cmd, error) {
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		return nil, fmt.Errorf("claude binary not on PATH: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, bin, initialPrompt)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	return cmd, nil
 }
