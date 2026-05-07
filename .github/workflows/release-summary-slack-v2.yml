@@ -3,11 +3,17 @@ name: Release Summary to Slack V2
 on:
   workflow_dispatch:
     inputs:
-      since:
-        description: "Dispatch window start, for example 7d or 2026-04-01"
-        required: false
-        default: "7d"
-        type: string
+      repos:
+        description: "Repositories to include"
+        required: true
+        type: choice
+        options:
+          - all
+          - entirehq/entire.io
+          - entireio/cli
+          - go-git/go-git
+          - entirehq/entiredb
+          - entireio/git-sync
   schedule:
     # Weekdays at 10am PT during daylight time (17:00 UTC).
     - cron: "0 17 * * 1-5"
@@ -27,46 +33,79 @@ jobs:
     steps:
       - name: Resolve dispatch window
         id: window
-        run: |
-          SINCE="${{ inputs.since }}"
-          echo "since=${SINCE}" >> "$GITHUB_OUTPUT"
-
-          if [[ "$SINCE" =~ ^[0-9]+d$ ]]; then
-            DAYS="${SINCE%d}"
-            GITHUB_SINCE=$(date -u -d "${DAYS} days ago" +"%Y-%m-%d")
-          elif [[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            GITHUB_SINCE="$SINCE"
-          else
-            GITHUB_SINCE=$(date -u -d "7 days ago" +"%Y-%m-%d")
-            echo "::warning::Could not convert '${SINCE}' to a GitHub search date; using ${GITHUB_SINCE} for PR metadata."
-          fi
-          echo "github_since=${GITHUB_SINCE}" >> "$GITHUB_OUTPUT"
-
-      - name: Build repo matrix
-        id: repos
-        run: |
-          jq -nc '{
-            include: [
-              {"repo":"entirehq/entire.io","name":"Entire Web","feature_flags":true},
-              {"repo":"entireio/cli","name":"Entire CLI","feature_flags":false},
-              {"repo":"go-git/go-git","name":"Go-Git","feature_flags":false},
-              {"repo":"entirehq/entiredb","name":"EntireDB","feature_flags":false},
-              {"repo":"entireio/git-sync","name":"Git-Sync","feature_flags":false}
-            ]
-          }' | tee /tmp/matrix.json
-          echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
-
-      - name: Clone entire.io for dispatch examples
         env:
           GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
         run: |
           git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/entirehq/entire.io.git" /tmp/entire-io
 
-          mkdir -p /tmp/dispatch-examples
           DISPATCH_DIR="/tmp/entire-io/website/src/routes/_content/blog/-content"
+          LATEST_DISPATCH=$(ls -1 "$DISPATCH_DIR"/*dispatch*.md 2>/dev/null | sort | tail -1)
+
+          if [ -z "$LATEST_DISPATCH" ]; then
+            echo "::error::No dispatch posts found in ${DISPATCH_DIR}"
+            exit 1
+          fi
+
+          FILENAME=$(basename "$LATEST_DISPATCH")
+          SINCE=$(echo "$FILENAME" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+
+          if [ -z "$SINCE" ]; then
+            echo "::error::Could not extract dispatch date from ${FILENAME}"
+            exit 1
+          fi
+
+          echo "since=${SINCE}" >> "$GITHUB_OUTPUT"
+          echo "github_since=${SINCE}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Using latest dispatch ${FILENAME}; collecting changes since ${SINCE}."
+
+          mkdir -p /tmp/dispatch-examples
           ls -1 "$DISPATCH_DIR"/*dispatch*.md | sort | tail -3 | while read -r f; do
             cp "$f" /tmp/dispatch-examples/
           done
+
+      - name: Build repo matrix
+        id: repos
+        env:
+          INPUT_REPOS: ${{ inputs.repos }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          build_repo_json() {
+            case "$1" in
+              "entirehq/entire.io")
+                printf '{"repo":"%s","name":"Entire Web","feature_flags":true}\n' "$1"
+                ;;
+              "entireio/cli")
+                printf '{"repo":"%s","name":"Entire CLI","feature_flags":false}\n' "$1"
+                ;;
+              "go-git/go-git")
+                printf '{"repo":"%s","name":"Go-Git","feature_flags":false}\n' "$1"
+                ;;
+              "entirehq/entiredb")
+                printf '{"repo":"%s","name":"EntireDB","feature_flags":false}\n' "$1"
+                ;;
+              "entireio/git-sync")
+                printf '{"repo":"%s","name":"Git-Sync","feature_flags":false}\n' "$1"
+                ;;
+              *)
+                echo "::error::Unsupported repo: $1"
+                exit 1
+                ;;
+            esac
+          }
+
+          ALL_REPOS="entirehq/entire.io entireio/cli go-git/go-git entirehq/entiredb entireio/git-sync"
+          REPOS=()
+
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$INPUT_REPOS" = "all" ]; then
+            for repo in $ALL_REPOS; do
+              REPOS+=("$(build_repo_json "$repo")")
+            done
+          else
+            REPOS+=("$(build_repo_json "$INPUT_REPOS")")
+          fi
+
+          printf '%s\n' "${REPOS[@]}" | jq -sc '{include: .}' | tee /tmp/matrix.json
+          echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload dispatch examples
         uses: actions/upload-artifact@v4
@@ -136,11 +175,11 @@ jobs:
 
       - name: Run entire dispatch
         env:
-          ENTIRE_AUTH_TOKEN: ${{ secrets.ENTIRE_API_TOKEN }}
+          ENTIRE_API_TOKEN: ${{ secrets.ENTIRE_API_TOKEN }}
           REPO: ${{ matrix.repo }}
           SINCE: ${{ needs.prepare.outputs.since }}
         run: |
-          if [ -z "${ENTIRE_AUTH_TOKEN}" ]; then
+          if [ -z "${ENTIRE_API_TOKEN}" ]; then
             echo "::error::Missing ENTIRE_API_TOKEN secret for entire dispatch."
             exit 1
           fi
