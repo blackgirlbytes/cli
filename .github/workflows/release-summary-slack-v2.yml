@@ -160,7 +160,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq
+          sudo apt-get install -y dbus-x11 gnome-keyring jq libsecret-tools
           bash scripts/install.sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -184,9 +184,19 @@ jobs:
             exit 1
           fi
 
+          dbus-run-session -- bash <<'EOF'
+          set -euo pipefail
+
+          eval "$(printf '\n' | gnome-keyring-daemon --unlock --components=secrets)"
+          printf '%s' "${ENTIRE_API_TOKEN}" | secret-tool store \
+            --label="Entire CLI token" \
+            service entire-cli \
+            username https://entire.io
+
           cd /tmp/repo
           entire dispatch --repos "$REPO" --since "$SINCE" --voice neutral > /tmp/entire-dispatch.md
           cat /tmp/entire-dispatch.md
+          EOF
 
       - name: Collect GitHub release and PR data
         env:
