@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/entireio/cli/cmd/entire/cli/auth"
@@ -33,8 +34,13 @@ type deviceAuthClient interface {
 	BaseURL() string
 }
 
+type loginTokenStore interface {
+	SaveToken(baseURL, token string) error
+}
+
 func newLoginCmd() *cobra.Command {
 	var insecureHTTPAuth bool
+	var noKeyring bool
 	cmd := &cobra.Command{
 		Use:   "login",
 		Short: "Log in to Entire",
@@ -42,14 +48,36 @@ func newLoginCmd() *cobra.Command {
 			if err := requireSecureBaseURL(insecureHTTPAuth); err != nil {
 				return err
 			}
+			if err := requireNonKeyringStorageConfigured(noKeyring); err != nil {
+				return err
+			}
 			return runLogin(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), auth.NewClient(nil), openBrowser)
 		},
 	}
+	cmd.Flags().BoolVar(&noKeyring, "no-keyring", false, "Refuse to save the token to the OS keyring; requires ENTIRE_SECRETS_PATH to be set")
 	addInsecureHTTPAuthFlag(cmd, &insecureHTTPAuth)
 	return cmd
 }
 
+// requireNonKeyringStorageConfigured fails closed before device auth when
+// --no-keyring is set without a non-keyring backend configured. The flag
+// exists for headless/CI environments where falling back to the OS keyring
+// silently is unsafe — the user has explicitly opted out of it.
+func requireNonKeyringStorageConfigured(noKeyring bool) error {
+	if !noKeyring {
+		return nil
+	}
+	if strings.TrimSpace(os.Getenv(auth.SecretsPathEnvVar)) == "" {
+		return fmt.Errorf("--no-keyring requires %s to be set to an absolute file path", auth.SecretsPathEnvVar)
+	}
+	return nil
+}
+
 func runLogin(ctx context.Context, outW, errW io.Writer, client deviceAuthClient, openURL browserOpenFunc) error {
+	return runLoginWithStore(ctx, outW, errW, client, openURL, auth.NewStore())
+}
+
+func runLoginWithStore(ctx context.Context, outW, errW io.Writer, client deviceAuthClient, openURL browserOpenFunc, store loginTokenStore) error {
 	start, err := client.StartDeviceAuth(ctx)
 	if err != nil {
 		return fmt.Errorf("start login: %w", err)
@@ -84,10 +112,15 @@ func runLogin(ctx context.Context, outW, errW io.Writer, client deviceAuthClient
 		return fmt.Errorf("complete login: %w", err)
 	}
 
-	store := auth.NewStore()
-
 	if err := store.SaveToken(client.BaseURL(), token); err != nil {
+		if strings.TrimSpace(os.Getenv(auth.SecretsPathEnvVar)) == "" {
+			fmt.Fprintf(errW, "For headless environments, set %s=/path/to/credentials.json and retry `entire login`.\n", auth.SecretsPathEnvVar)
+		}
 		return fmt.Errorf("save auth token: %w", err)
+	}
+
+	if strings.TrimSpace(os.Getenv(auth.AuthTokenEnvVar)) != "" {
+		fmt.Fprintf(errW, "Warning: %s is set and will take precedence over the newly saved login token until it is unset.\n", auth.AuthTokenEnvVar)
 	}
 
 	fmt.Fprintln(outW, "Login complete.")

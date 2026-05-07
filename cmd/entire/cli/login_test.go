@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -13,6 +14,8 @@ import (
 // mockClient implements deviceAuthClient for unit tests.
 type mockClient struct {
 	responses []pollResponse
+	start     *auth.DeviceAuthStart
+	startErr  error
 	calls     int
 }
 
@@ -22,7 +25,13 @@ type pollResponse struct {
 }
 
 func (m *mockClient) StartDeviceAuth(_ context.Context) (*auth.DeviceAuthStart, error) {
-	return nil, errors.New("not implemented in mock")
+	if m.startErr != nil {
+		return nil, m.startErr
+	}
+	if m.start == nil {
+		return nil, errors.New("not implemented in mock")
+	}
+	return m.start, nil
 }
 
 func (m *mockClient) BaseURL() string {
@@ -36,6 +45,112 @@ func (m *mockClient) PollDeviceAuth(_ context.Context, _ string) (*auth.DeviceAu
 	r := m.responses[m.calls]
 	m.calls++
 	return r.result, r.err
+}
+
+type mockLoginTokenStore struct {
+	saveErr    error
+	baseURL    string
+	savedToken string
+}
+
+func (m *mockLoginTokenStore) SaveToken(baseURL, token string) error {
+	m.baseURL = baseURL
+	m.savedToken = token
+	return m.saveErr
+}
+
+func newSuccessfulLoginClient(token string) *mockClient {
+	return &mockClient{
+		start: &auth.DeviceAuthStart{
+			DeviceCode:      "device-1",
+			UserCode:        "ABCD-EFGH",
+			VerificationURI: "https://entire.io/cli/auth",
+			ExpiresIn:       60,
+			Interval:        1,
+		},
+		responses: []pollResponse{
+			{result: &auth.DeviceAuthPoll{AccessToken: token}},
+		},
+	}
+}
+
+func TestRequireNonKeyringStorageConfigured(t *testing.T) {
+	t.Run("flag unset is a no-op", func(t *testing.T) {
+		t.Setenv(auth.SecretsPathEnvVar, "")
+		if err := requireNonKeyringStorageConfigured(false); err != nil {
+			t.Fatalf("err = %v, want nil when --no-keyring is unset", err)
+		}
+	})
+
+	t.Run("flag set without ENTIRE_SECRETS_PATH errors before device auth", func(t *testing.T) {
+		t.Setenv(auth.SecretsPathEnvVar, "")
+		err := requireNonKeyringStorageConfigured(true)
+		if err == nil {
+			t.Fatal("expected error when --no-keyring is set with no SECRETS_PATH")
+		}
+		if !strings.Contains(err.Error(), auth.SecretsPathEnvVar) {
+			t.Fatalf("err = %v, want mention of %s", err, auth.SecretsPathEnvVar)
+		}
+	})
+
+	t.Run("flag set with ENTIRE_SECRETS_PATH passes preflight", func(t *testing.T) {
+		t.Setenv(auth.SecretsPathEnvVar, "/tmp/credentials.json")
+		if err := requireNonKeyringStorageConfigured(true); err != nil {
+			t.Fatalf("err = %v, want nil when SECRETS_PATH is set", err)
+		}
+	})
+
+	t.Run("flag set with whitespace-only ENTIRE_SECRETS_PATH errors", func(t *testing.T) {
+		t.Setenv(auth.SecretsPathEnvVar, "   ")
+		if err := requireNonKeyringStorageConfigured(true); err == nil {
+			t.Fatal("whitespace SECRETS_PATH must not satisfy --no-keyring")
+		}
+	})
+}
+
+func TestRunLogin_SaveFailureIncludesHeadlessHint(t *testing.T) {
+	client := newSuccessfulLoginClient("login-token")
+	store := &mockLoginTokenStore{
+		saveErr: errors.New("save token to keyring: failed to unlock correct collection"),
+	}
+
+	var out, errOut bytes.Buffer
+	err := runLoginWithStore(context.Background(), &out, &errOut, client,
+		func(context.Context, string) error { return nil },
+		store)
+	if err == nil {
+		t.Fatal("expected save failure")
+	}
+	if !strings.Contains(err.Error(), "save auth token") {
+		t.Fatalf("error = %v, want save auth token context", err)
+	}
+	if !strings.Contains(errOut.String(), auth.SecretsPathEnvVar) {
+		t.Fatalf("stderr = %q, want %s hint", errOut.String(), auth.SecretsPathEnvVar)
+	}
+}
+
+func TestRunLogin_WarnsWhenEnvTokenShadowsSavedToken(t *testing.T) {
+	t.Setenv(auth.AuthTokenEnvVar, "env-token")
+
+	client := newSuccessfulLoginClient("login-token")
+	store := &mockLoginTokenStore{}
+
+	var out, errOut bytes.Buffer
+	err := runLoginWithStore(context.Background(), &out, &errOut, client,
+		func(context.Context, string) error { return nil },
+		store)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.savedToken != "login-token" {
+		t.Fatalf("saved token = %q, want login-token", store.savedToken)
+	}
+	if !strings.Contains(errOut.String(), auth.AuthTokenEnvVar) {
+		t.Fatalf("stderr = %q, want %s warning", errOut.String(), auth.AuthTokenEnvVar)
+	}
+	if !strings.Contains(out.String(), "Login complete.") {
+		t.Fatalf("stdout = %q, want login complete", out.String())
+	}
 }
 
 func TestWaitForApproval_ImmediateSuccess(t *testing.T) {
