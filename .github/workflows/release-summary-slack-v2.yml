@@ -2,6 +2,18 @@ name: Release Summary to Slack V2
 
 on:
   workflow_dispatch:
+    inputs:
+      repos:
+        description: "Repositories to include"
+        required: true
+        type: choice
+        options:
+          - all
+          - entirehq/entire.io
+          - entireio/cli
+          - go-git/go-git
+          - entirehq/entiredb
+          - entireio/git-sync
   schedule:
     # Weekdays at 10am PT during daylight time (17:00 UTC).
     - cron: "0 17 * * 1-5"
@@ -53,16 +65,46 @@ jobs:
 
       - name: Build repo matrix
         id: repos
+        env:
+          INPUT_REPOS: ${{ inputs.repos }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          jq -nc '{
-            include: [
-              {"repo":"entirehq/entire.io","name":"Entire Web","feature_flags":true},
-              {"repo":"entireio/cli","name":"Entire CLI","feature_flags":false},
-              {"repo":"go-git/go-git","name":"Go-Git","feature_flags":false},
-              {"repo":"entirehq/entiredb","name":"EntireDB","feature_flags":false},
-              {"repo":"entireio/git-sync","name":"Git-Sync","feature_flags":false}
-            ]
-          }' | tee /tmp/matrix.json
+          build_repo_json() {
+            case "$1" in
+              "entirehq/entire.io")
+                printf '{"repo":"%s","name":"Entire Web","feature_flags":true}\n' "$1"
+                ;;
+              "entireio/cli")
+                printf '{"repo":"%s","name":"Entire CLI","feature_flags":false}\n' "$1"
+                ;;
+              "go-git/go-git")
+                printf '{"repo":"%s","name":"Go-Git","feature_flags":false}\n' "$1"
+                ;;
+              "entirehq/entiredb")
+                printf '{"repo":"%s","name":"EntireDB","feature_flags":false}\n' "$1"
+                ;;
+              "entireio/git-sync")
+                printf '{"repo":"%s","name":"Git-Sync","feature_flags":false}\n' "$1"
+                ;;
+              *)
+                echo "::error::Unsupported repo: $1"
+                exit 1
+                ;;
+            esac
+          }
+
+          ALL_REPOS="entirehq/entire.io entireio/cli go-git/go-git entirehq/entiredb entireio/git-sync"
+          REPOS=()
+
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$INPUT_REPOS" = "all" ]; then
+            for repo in $ALL_REPOS; do
+              REPOS+=("$(build_repo_json "$repo")")
+            done
+          else
+            REPOS+=("$(build_repo_json "$INPUT_REPOS")")
+          fi
+
+          printf '%s\n' "${REPOS[@]}" | jq -sc '{include: .}' | tee /tmp/matrix.json
           echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload dispatch examples
