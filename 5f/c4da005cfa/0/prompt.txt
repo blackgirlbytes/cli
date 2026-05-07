@@ -1,0 +1,1115 @@
+merge latest main
+
+---
+
+push it
+
+---
+
+Could we make this step "⎿  UserPromptSubmit says: [Wingman] A code review is pending and will be addressed before your request." only get injected IF there is actually something to address?
+
+---
+
+We could also say that there weren't any issues found?
+
+---
+
+commit and push
+
+---
+
+The new Agent API merged to main, would that make it easier for us to support different agents for Wingman respectively that I could define the agent and maybe even model?
+
+---
+
+Or would it be worth the expand the API to include what we need so it's on a generic layer?
+
+---
+
+yes, plan it out
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **First user message: "merge latest main"**
+   - Pre-step: Read `.entire/REVIEW.md` about the wingman model change (sonnet→opus). Two suggestions were informational, no code changes needed.
+   - Main task: Merge origin/main into `dipree/entire-wingman` branch
+   - Two merge conflicts found:
+     - `cmd/entire/cli/hooks.go` - content conflict (imports + handleSessionStartCommon + hookResponse types)
+     - `cmd/entire/cli/hooks_claudecode_handlers.go` - modify/delete conflict (deleted on main, modified on HEAD)
+   - Main had done a major refactor: handlers moved from `hooks_claudecode_handlers.go` to `lifecycle.go` and agent-specific lifecycle files
+   - Resolution approach:
+     - `hooks.go`: Take main's simplified version but keep wingman response types (hookSpecificOutput, outputHookMessage, outputHookResponseWithContextAndMessage)
+     - `hooks_claudecode_handlers.go`: Accept deletion, port wingman code to new lifecycle architecture
+     - Created new `wingman_lifecycle.go` with wingman integration functions
+     - Added wingman hooks into `lifecycle.go` at SessionStart, TurnStart, and TurnEnd
+   - Bug fix: `wingman_review.go` had `session.Phase(phaseInfo.Phase).IsActive()` which didn't normalize `active_committed`. Fixed to use `session.PhaseFromString(phaseInfo.Phase).IsActive()`
+   - Tests passed after fix, merge committed and pushed
+
+2. **Second user message: "push it"**
+   - Simple git push
+
+3. **Third user message: "Could we make this step... only get injected IF there is actually something to address?"**
+   - User wanted wingman review injection to only happen when REVIEW.md has actionable issues
+   - Added `reviewHasActionableIssues(reviewPath)` function that checks for `[CRITICAL]`, `[WARNING]`, `[SUGGESTION]` markers
+   - Updated `handleWingmanTurnStart` to check before injecting, clean up REVIEW.md if no issues
+   - Updated `appendWingmanSessionStartStatus` to only show "review pending" if actionable
+
+4. **Fourth user message: "We could also say that there weren't any issues found?"**
+   - Added `outputHookMessage("[Wingman] Reviewed your changes — no issues found.")` when review has no actionable issues
+
+5. **Fifth user message: "commit and push"**
+   - Committed and pushed the wingman changes
+
+6. **Sixth user message (with review): "The new Agent API merged to main, would that make it easier for us to support different agents for Wingman..."**
+   - Pre-step: Addressed review with two WARNINGs (triggerWingmanAutoApplyIfPending spawning for clean reviews, outputWingmanStopNotification showing pending for clean reviews) - both fixed
+   - User asked about leveraging the Agent API for configurable wingman agents/models
+   - Explored the codebase and found:
+     - Model hardcoded as `wingmanReviewModel = "opus"`
+     - Agent hardcoded to `claude` CLI
+     - Same pattern duplicated in summarize package
+   - Presented analysis: model is easy, agent needs more work (Prompter interface)
+
+7. **Seventh user message: "Or would it be worth the expand the API to include what we need so it's on a generic layer?"**
+   - User suggested expanding the Agent API itself
+   - Found duplication: `wingmanStripGitEnv` and `stripGitEnv` are identical
+   - Found three places shelling out to claude: wingman review, wingman auto-apply, summarization
+   - Proposed `Prompter` interface on Agent API
+   - User agreed
+
+8. **Eighth user message: "yes, plan it out"**
+   - Entered plan mode
+   - Launched two Explore agents in parallel to understand:
+     1. Agent API, interfaces, registry, implementations, current prompt patterns, settings
+     2. Wingman spawn mechanism, test patterns, summarize test patterns
+   - Both agents completed with thorough analysis
+   - Was in Phase 2 (Design) of the plan workflow when summary was requested
+
+Now let me capture the current state of all files and code.
+
+Key files modified/created during this conversation:
+- `cmd/entire/cli/hooks.go` - Resolved merge conflict
+- `cmd/entire/cli/hooks_claudecode_handlers.go` - Deleted (accepted main's deletion)
+- `cmd/entire/cli/wingman_lifecycle.go` - Created new, then updated
+- `cmd/entire/cli/lifecycle.go` - Added wingman integration hooks
+- `cmd/entire/cli/wingman_review.go` - Fixed PhaseFromString bug
+
+Current state: In plan mode, Phase 1 exploration complete, need to do Phase 2 (Design) and write the plan.
+
+Summary:
+1. Primary Request and Intent:
+   - **Merge latest main**: Merge `origin/main` into `dipree/entire-wingman` branch, resolving conflicts from a major lifecycle refactor on main
+   - **Conditional wingman injection**: Only inject REVIEW.md into agent context when it contains actionable issues (`[CRITICAL]`, `[WARNING]`, `[SUGGESTION]`)
+   - **Clean review notification**: Show "[Wingman] Reviewed your changes — no issues found." when review has no actionable issues
+   - **Expand Agent API for wingman configurability**: Plan adding a `Prompter` interface to the generic Agent API so wingman (and summarize) can invoke any agent with a prompt, with configurable agent and model via settings. This is the **current active task** — in plan mode, Phase 1 exploration complete.
+
+2. Key Technical Concepts:
+   - **Lifecycle dispatcher pattern**: Main refactored from agent-specific handler files (`hooks_claudecode_handlers.go`) to a generic `lifecycle.go` dispatcher that routes normalized `agent.Event` objects
+   - **Agent API**: Interface in `agent/agent.go` with optional interfaces (`TranscriptAnalyzer`, `TranscriptPreparer`, `TokenCalculator`, `SubagentAwareExtractor`). Registry pattern with `agent.Get()`, `agent.Register()`, `agent.Detect()`
+   - **Strategy interface renames on main**: `SaveContext→StepContext`, `TaskCheckpointContext→TaskStepContext`, `SaveChanges()→SaveStep()`, `SaveTaskCheckpoint()→SaveTaskStep()`
+   - **Hook response types**: `hookResponse` with `hookSpecificOutput` for injecting `additionalContext` into agent conversation vs `systemMessage` for user-visible notifications
+   - **`Prompter` interface proposal**: New optional agent interface for "invoke with a prompt and get text back", consolidating duplicated CLI invocation patterns
+   - **Duplicated patterns found**: `wingmanStripGitEnv` (wingman_review.go) and `stripGitEnv` (summarize/claude.go) are identical; JSON response parsing (`claudeCLIResponse`/`wingmanCLIResponse`) also duplicated; three places shell out to `claude` CLI
+   - **CommandRunner injection pattern**: Used in `summarize/claude.go` for testability — `func(ctx, name, args) *exec.Cmd`
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/hooks.go`** — Resolved merge conflict. Took main's simplified imports (no agent/logging/paths/session/settings), removed `handleSessionStartCommon()`, but kept wingman response types needed for review injection.
+     ```go
+     // hookSpecificOutput for additionalContext injection
+     type hookSpecificOutput struct {
+         HookEventName     string `json:"hookEventName"`
+         AdditionalContext string `json:"additionalContext,omitempty"`
+     }
+     
+     type hookResponse struct {
+         SystemMessage      string              `json:"systemMessage,omitempty"`
+         HookSpecificOutput *hookSpecificOutput `json:"hookSpecificOutput,omitempty"`
+     }
+     
+     // Three output helpers kept:
+     func outputHookResponse(additionalContext string) error { ... }      // SessionStart: both systemMessage + additionalContext
+     func outputHookMessage(message string) error { ... }                 // Notifications: systemMessage only
+     func outputHookResponseWithContextAndMessage(ctx, msg string) error { ... } // TurnStart wingman: separate context and message
+     ```
+
+   - **`cmd/entire/cli/hooks_claudecode_handlers.go`** — Deleted via `git rm` (accepted main's deletion). All handler code moved to `lifecycle.go`. Wingman-specific code ported to `wingman_lifecycle.go`.
+
+   - **`cmd/entire/cli/wingman_lifecycle.go`** — Created new file. Contains all wingman integration hooks for the lifecycle dispatcher. Current state after all edits:
+     ```go
+     package cli
+     
+     import (
+         "context"
+         "fmt"
+         "log/slog"
+         "os"
+         "path/filepath"
+         "strings"
+         "time"
+     
+         "github.com/entireio/cli/cmd/entire/cli/logging"
+         "github.com/entireio/cli/cmd/entire/cli/paths"
+         "github.com/entireio/cli/cmd/entire/cli/settings"
+         "github.com/entireio/cli/cmd/entire/cli/strategy"
+     )
+     
+     const wingmanNotificationLockThreshold = 10 * time.Minute
+     
+     func appendWingmanSessionStartStatus(message string) string { ... }  // Adds wingman status to banner; only shows "review pending" if reviewHasActionableIssues
+     func handleWingmanTurnStart(sessionID string) bool { ... }           // Checks for pending review, only injects if actionable; cleans up + notifies "no issues found" otherwise
+     func handleWingmanTurnEnd(sessionID string, totalChanges int, ...) { ... } // Triggers review (auto-commit), auto-apply, stop notification
+     func triggerWingmanAutoApplyIfPending(repoRoot string) { ... }       // Skips auto-apply if review has no actionable issues (cleans up)
+     func reviewHasActionableIssues(reviewPath string) bool { ... }       // Checks for [CRITICAL], [WARNING], [SUGGESTION] markers
+     func outputWingmanStopNotification(repoRoot string) { ... }          // Only shows "pending" if reviewHasActionableIssues
+     ```
+
+   - **`cmd/entire/cli/lifecycle.go`** — Added wingman integration at three points:
+     - `handleLifecycleSessionStart`: Added `message = appendWingmanSessionStartStatus(message)` before outputHookResponse
+     - `handleLifecycleTurnStart`: Added `handleWingmanTurnStart(sessionID)` after CapturePrePromptState, returns early if review injected
+     - `handleLifecycleTurnEnd`: Added `handleWingmanTurnEnd(...)` calls at both the no-changes path and the normal path
+
+   - **`cmd/entire/cli/wingman_review.go`** — Fixed two PhaseFromString bugs:
+     ```go
+     // Line 499: Was session.Phase(phaseInfo.Phase).IsActive()
+     // Fixed to:
+     if phaseInfo.Phase != "" && session.PhaseFromString(phaseInfo.Phase).IsActive() {
+     
+     // Line 390 (hasAnyLiveSession): Same fix
+     if session.PhaseFromString(info.Phase).IsActive() {
+     ```
+
+   - **`cmd/entire/cli/agent/agent.go`** — Read during exploration. Core `Agent` interface with 4 method groups (Identity, Event Mapping, Transcript Storage, Legacy). Optional interfaces: `HookSupport`, `TranscriptAnalyzer`, `TranscriptPreparer`, `TokenCalculator`, `SubagentAwareExtractor`. No `Prompter` interface yet.
+
+   - **`cmd/entire/cli/agent/registry.go`** — Agent registry with `Register()`, `Get()`, `List()`, `Detect()`, `DetectAll()`. Two agents registered: `claude-code` and `gemini`.
+
+   - **`cmd/entire/cli/agent/claudecode/claude.go`** — Claude Code agent implementation (~460 lines). Implements full Agent interface. Session storage in `~/.claude/projects/`.
+
+   - **`cmd/entire/cli/agent/geminicli/gemini.go`** — Gemini CLI agent implementation (~464 lines). Different transcript format (JSON with messages array vs JSONL).
+
+   - **`cmd/entire/cli/summarize/claude.go`** — `ClaudeGenerator` struct with `ClaudePath`, `Model`, `CommandRunner` fields. Uses same `stripGitEnv()` pattern (duplicated). `CommandRunner` injection pattern enables testing.
+
+   - **`cmd/entire/cli/wingman_prompt.go`** — Review prompt template with structured Markdown output format (`### [SEVERITY] description`). `buildReviewPrompt()` function.
+
+   - **`cmd/entire/cli/settings/settings.go`** — `EntireSettings` struct with `StrategyOptions map[string]any`. Wingman config currently only has `enabled` boolean at `StrategyOptions["wingman"]["enabled"]`.
+
+4. Errors and Fixes:
+   - **Merge conflicts in hooks.go and hooks_claudecode_handlers.go**: Resolved by taking main's simplified hooks.go, keeping wingman response types, deleting handlers file, porting wingman code to new lifecycle architecture
+   - **`go mod tidy` needed after merge**: New dependencies from main required `go mod tidy`
+   - **`TestRunWingmanApply_ActiveCommittedPhaseAborts` test failure**: `session.Phase("active_committed").IsActive()` returned false because it doesn't normalize. Fixed by using `session.PhaseFromString(phaseInfo.Phase).IsActive()` which normalizes `active_committed` → `active`. Same bug in `hasAnyLiveSession` also fixed.
+   - **Review WARNING: auto-apply spawning for clean reviews**: `triggerWingmanAutoApplyIfPending` would spawn background `claude --continue` even for reviews with no actionable issues. Fixed by adding `reviewHasActionableIssues` check.
+   - **Review WARNING: stop notification for clean reviews**: `outputWingmanStopNotification` showed "Review pending" for clean reviews. Fixed by gating on `reviewHasActionableIssues`.
+
+5. Problem Solving:
+   - Successfully merged a major lifecycle refactor from main while preserving wingman features that only exist on this branch
+   - Ported wingman hooks from deleted `hooks_claudecode_handlers.go` into new `wingman_lifecycle.go` file that integrates with the generic lifecycle dispatcher
+   - Added conditional wingman injection to avoid wasting agent context on empty reviews
+   - Identified architectural opportunity: three places duplicate CLI invocation patterns, and the Agent API can be extended with a `Prompter` interface to consolidate
+
+6. All User Messages:
+   - "merge latest main"
+   - "push it"
+   - "Could we make this step '⎿  UserPromptSubmit says: [Wingman] A code review is pending and will be addressed before your request.' only get injected IF there is actually something to address?"
+   - "We could also say that there weren't any issues found?"
+   - "commit and push"
+   - "The new Agent API merged to main, would that make it easier for us to support different agents for Wingman respectively that I could define the agent and maybe even model?"
+   - "Or would it be worth the expand the API to include what we need so it's on a generic layer?"
+   - "yes, plan it out"
+
+7. Pending Tasks:
+   - **Active: Plan the `Prompter` interface expansion of the Agent API** — Currently in plan mode, Phase 1 (exploration) complete with two Explore agents finished. Need to proceed to Phase 2 (Design with Plan agent), Phase 3 (Review), Phase 4 (Write final plan), Phase 5 (ExitPlanMode).
+
+8. Current Work:
+   In **plan mode** for expanding the Agent API with a `Prompter` interface. Two Explore agents have completed Phase 1 with comprehensive findings:
+   
+   **Exploration findings summary:**
+   - Agent interface has Identity, Event Mapping, Transcript Storage, and Legacy method groups with optional interfaces pattern
+   - Three places shell out to `claude` CLI: wingman review (`callClaudeForReview`), wingman auto-apply (`triggerAutoApply`), and summarization (`ClaudeGenerator.Generate`)
+   - `stripGitEnv`/`wingmanStripGitEnv` are identical implementations in two files
+   - `CommandRunner` injection pattern in summarize package enables testing
+   - Settings already support `StrategyOptions["wingman"]` map but only `enabled` field exists
+   - Claude Code and Gemini CLI have different CLIs, flags, and transcript formats
+   
+   The plan file has not yet been created at `/Users/dip/.claude/plans/tidy-booping-fountain.md`.
+
+9. Optional Next Step:
+   Continue plan mode workflow: Launch a Plan agent (Phase 2) to design the implementation based on exploration results, then write the final plan to the plan file and call ExitPlanMode.
+   
+   The user's most recent explicit request: **"yes, plan it out"** — referring to expanding the Agent API with a `Prompter` interface to make wingman agent/model configurable, consolidating the duplicated CLI invocation patterns across wingman and summarize.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dip/.claude/projects/-Users-dip-Repositories-cli/c551cf96-b121-495b-b191-6ca6784fe2e1.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Context from previous conversation (summarized at start)**:
+   - Previous work involved merging main into `dipree/entire-wingman` branch, resolving conflicts
+   - Created `wingman_lifecycle.go` with wingman integration hooks
+   - Added conditional wingman injection (only when REVIEW.md has actionable issues)
+   - Fixed PhaseFromString bugs
+   - User asked about expanding Agent API with a `Prompter` interface for configurable wingman agents/models
+   - Plan mode was entered, Phase 1 exploration was complete
+
+2. **Current conversation starts in plan mode**:
+   - The system picked up from where it left off - in plan mode, needing to design and write the plan
+   - Read key files: `agent/agent.go`, `agent/registry.go`, `wingman_review.go`, `summarize/claude.go`
+   - Read settings, wingman files, spawn files, test files
+   - Launched a Plan agent to design the implementation
+   - Plan agent returned comprehensive design
+
+3. **Plan was written and approved**:
+   - Wrote plan to `/Users/dip/.claude/plans/tidy-booping-fountain.md`
+   - Called ExitPlanMode, user approved
+
+4. **Implementation began - 7 tasks created**:
+   - Task 1: Create shared CLI helpers (agent/cli_helpers.go)
+   - Task 2: Create Prompter interface (agent/prompter.go)
+   - Task 3: Implement Prompter for Claude Code
+   - Task 4: Add settings helpers
+   - Task 5: Refactor wingman review to use Prompter
+   - Task 6: Refactor summarize to use Prompter
+   - Task 7: Run fmt, lint, and tests
+
+5. **Task 1: Created `agent/cli_helpers.go` and `agent/cli_helpers_test.go`**:
+   - `CLIResponse` struct, `StripGitEnv()`, `FormatExecError()`
+   - Tests for all three
+
+6. **Task 2: Created `agent/prompter.go`**:
+   - `PromptOptions`, `PromptResult`, `Prompter` interface
+
+7. **Task 3: Implemented Prompter for Claude Code**:
+   - Added `CommandRunner` field to `ClaudeCodeAgent` struct (was empty struct)
+   - Added `context` and `os/exec` imports to `claude.go`
+   - Created `agent/claudecode/prompter.go` with `Prompt()` and `CLICommand()`
+   - Created `agent/claudecode/prompter_test.go` with comprehensive tests
+
+8. **Task 4: Added settings helpers**:
+   - Added `WingmanAgent()`, `WingmanModel()`, `SummarizeAgent()`, `SummarizeModel()` to `EntireSettings`
+   - Added private helper `strategyOptionString(section, key string)`
+   - Added tests in `settings_test.go`
+
+9. **Task 5: Refactored wingman review**:
+   - Added `agent` and `settings` imports
+   - Renamed `wingmanReviewModel` to `wingmanDefaultReviewModel`
+   - Removed `wingmanCLIResponse` struct
+   - Added `resolveWingmanModel()`, `resolveWingmanAgent()`, `callAgentForReview()`
+   - Updated `triggerAutoApply()` to use `agent.StripGitEnv()` and skip for non-claude agents
+   - Removed `wingmanStripGitEnv()`
+   - Removed `TestWingmanStripGitEnv` from test file
+
+10. **Task 6: Refactored summarize**:
+    - Rewrote `claude.go`: added `PrompterGenerator`, removed `stripGitEnv` and `claudeCLIResponse`, kept `ClaudeGenerator` for backward compat
+    - Updated `summarize.go`: added `settings` import, added `defaultGenerator()` function, updated nil-generator fallback
+    - Removed `TestStripGitEnv` from `claude_test.go`
+
+11. **Task 7: Run fmt, lint, tests**:
+    - fmt passed
+    - lint found 7 issues:
+      1. `errcheck` in settings - `val, _ := sectionOpts[key].(string)` → fixed with proper ok check
+      2. `ireturn` on `defaultGenerator()` → added `//nolint:ireturn` comment
+      3. `noctx` in test - `exec.Command` → changed to `exec.CommandContext`
+      4-7. `wrapcheck` issues (4 total) - errors from external packages/interfaces unwrapped → wrapped all
+    - lint passed after fixes
+    - Tests: first run had `TestPrompt_WorkDir/custom_workdir` failing because `/tmp/test-repo` doesn't exist → fixed by using `t.TempDir()` and splitting into two separate tests to avoid race condition
+    - Tests: full `test:ci` had a timeout in `TestRunExplain_SessionFlagFiltersListView` (10 min) which is pre-existing and unrelated
+    - All modified package tests pass individually
+    - Wingman tests pass
+    - Integration tests not yet verified (they were part of the timed-out run)
+
+Let me enumerate all user messages and check for pending work.
+
+User messages:
+1. The initial context restoration message (continuing from previous conversation)
+
+No explicit user messages during implementation - the user approved the plan and the assistant has been implementing autonomously.
+
+Current state: All 7 tasks are functionally complete. Tests pass for all modified packages. The only remaining issue is the pre-existing timeout in `TestRunExplain_SessionFlagFiltersListView` which is unrelated to these changes.
+
+Summary:
+1. Primary Request and Intent:
+   - The user's overarching request (from previous conversation) was to expand the Agent API with a `Prompter` interface to make wingman's agent and model configurable via settings, and to consolidate duplicated CLI invocation patterns across wingman and summarize packages.
+   - Specific goals: (1) New `Prompter` optional interface on the Agent API, (2) configurable agent/model for wingman and summarize via `strategy_options` in settings, (3) consolidate `stripGitEnv` duplication, (4) consolidate CLI response types.
+   - The user previously said "yes, plan it out" to enter plan mode. In this session, the plan was completed, approved, and implementation was carried out.
+
+2. Key Technical Concepts:
+   - **Agent API optional interface pattern**: `Prompter` follows the same pattern as existing optional interfaces (`TranscriptAnalyzer`, `TokenCalculator`, `SubagentAwareExtractor`) — use type assertion to check if agent supports it
+   - **Prompter interface**: `Prompt(ctx, prompt, PromptOptions) (*PromptResult, error)` + `CLICommand() string`
+   - **PromptOptions struct**: Captures variant behavior (model, workdir, allowed tools, permission mode, output format, git isolation, extra env)
+   - **Settings-driven configuration**: Agent and model configurable under `strategy_options.wingman` and `strategy_options.summarize`
+   - **CommandRunner injection pattern**: Used in both `ClaudeCodeAgent` and `ClaudeGenerator` for test injection — `func(ctx, name, args) *exec.Cmd`
+   - **Backward compatibility**: `ClaudeGenerator` kept for existing tests, `PrompterGenerator` added alongside it
+   - **triggerAutoApply stays direct CLI**: `--continue` is Claude-specific, not a prompt-and-response pattern, so it stays as direct `exec.Command` invocation
+   - **Factory pattern with `defaultGenerator()`**: Loads settings, resolves agent, checks for Prompter support, falls back to ClaudeGenerator
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/agent/cli_helpers.go`** — **NEW FILE**
+     - Consolidates duplicated code from wingman and summarize packages
+     ```go
+     package agent
+     
+     type CLIResponse struct {
+         Result string `json:"result"`
+     }
+     
+     func StripGitEnv(env []string) []string {
+         filtered := make([]string, 0, len(env))
+         for _, e := range env {
+             if strings.HasPrefix(e, "GIT_") || strings.HasPrefix(e, "CLAUDECODE=") {
+                 continue
+             }
+             filtered = append(filtered, e)
+         }
+         return filtered
+     }
+     
+     func FormatExecError(err error, cliName, stderr string) error {
+         var execErr *exec.Error
+         if errors.As(err, &execErr) {
+             return fmt.Errorf("%s CLI not found: %w", cliName, err)
+         }
+         var exitErr *exec.ExitError
+         if errors.As(err, &exitErr) {
+             return fmt.Errorf("%s CLI failed (exit %d): %s", cliName, exitErr.ExitCode(), stderr)
+         }
+         return fmt.Errorf("failed to run %s CLI: %w", cliName, err)
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/cli_helpers_test.go`** — **NEW FILE**
+     - Tests for `StripGitEnv`, `FormatExecError` (not found, exit error, generic error)
+
+   - **`cmd/entire/cli/agent/prompter.go`** — **NEW FILE**
+     - Defines the Prompter optional interface, PromptOptions, and PromptResult
+     ```go
+     type PromptOptions struct {
+         Model          string
+         WorkDir        string
+         AllowedTools   string
+         PermissionMode string
+         OutputFormat   string
+         IsolateFromGit *bool
+         ExtraEnv       []string
+     }
+     
+     type PromptResult struct {
+         Text string
+     }
+     
+     type Prompter interface {
+         Agent
+         Prompt(ctx context.Context, prompt string, opts PromptOptions) (*PromptResult, error)
+         CLICommand() string
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/claudecode/claude.go`** — **MODIFIED**
+     - Added `CommandRunner` field to `ClaudeCodeAgent` struct (was empty struct)
+     - Added `context` and `os/exec` imports
+     ```go
+     type ClaudeCodeAgent struct {
+         CommandRunner func(ctx context.Context, name string, args ...string) *exec.Cmd
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/claudecode/prompter.go`** — **NEW FILE**
+     - Implements `Prompter` interface for Claude Code
+     - Compile-time assertion: `var _ agent.Prompter = (*ClaudeCodeAgent)(nil)`
+     - `CLICommand()` returns `"claude"`
+     - `Prompt()` builds claude CLI args from PromptOptions, handles env isolation, JSON parsing
+     ```go
+     func (c *ClaudeCodeAgent) Prompt(ctx context.Context, prompt string, opts agent.PromptOptions) (*agent.PromptResult, error) {
+         args := []string{"--print", "--setting-sources", ""}
+         // ... builds args from opts.Model, opts.AllowedTools, opts.PermissionMode
+         runner := c.CommandRunner
+         if runner == nil {
+             runner = exec.CommandContext
+         }
+         cmd := runner(ctx, c.CLICommand(), args...)
+         // ... sets Dir, Env, Stdin, runs, parses JSON response
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/claudecode/prompter_test.go`** — **NEW FILE**
+     - Tests: valid JSON, text output, command args, custom/default workdir, git isolation, extra env, command not found, non-zero exit, invalid JSON
+
+   - **`cmd/entire/cli/settings/settings.go`** — **MODIFIED**
+     - Added `WingmanAgent()`, `WingmanModel()`, `SummarizeAgent()`, `SummarizeModel()` methods
+     - Added private `strategyOptionString(section, key string) string` helper
+     ```go
+     func (s *EntireSettings) strategyOptionString(section, key string) string {
+         if s.StrategyOptions == nil {
+             return ""
+         }
+         sectionOpts, ok := s.StrategyOptions[section].(map[string]any)
+         if !ok {
+             return ""
+         }
+         val, ok := sectionOpts[key].(string)
+         if !ok {
+             return ""
+         }
+         return val
+     }
+     ```
+
+   - **`cmd/entire/cli/settings/settings_test.go`** — **MODIFIED**
+     - Added `TestStrategyOptionString` with table-driven tests covering nil options, missing section, wrong types, wingman/summarize agent/model
+
+   - **`cmd/entire/cli/wingman_review.go`** — **MODIFIED**
+     - Added `agent` and `settings` imports
+     - Renamed `wingmanReviewModel` → `wingmanDefaultReviewModel`
+     - Removed `wingmanCLIResponse` struct
+     - Removed `wingmanStripGitEnv()` function
+     - Removed `callClaudeForReview()` function
+     - Added `resolveWingmanModel()`, `resolveWingmanAgent()`, `callAgentForReview()`
+     - Updated `triggerAutoApply()` to use `agent.StripGitEnv()` and skip for non-claude agents
+     ```go
+     func callAgentForReview(repoRoot, prompt, model string) (string, error) {
+         agentName := resolveWingmanAgent()
+         ag, err := agent.Get(agentName)
+         // ... check Prompter interface assertion
+         prompter, ok := ag.(agent.Prompter)
+         // ... call prompter.Prompt with PromptOptions
+     }
+     
+     func triggerAutoApply(repoRoot string) error {
+         agentName := resolveWingmanAgent()
+         if agentName != agent.AgentNameClaudeCode {
+             wingmanLog("auto-apply skipped: --continue is only supported for claude-code")
+             return nil
+         }
+         // ... rest uses agent.StripGitEnv() instead of wingmanStripGitEnv()
+     }
+     ```
+
+   - **`cmd/entire/cli/wingman_test.go`** — **MODIFIED**
+     - Removed `TestWingmanStripGitEnv` test (now covered by `agent/cli_helpers_test.go`)
+
+   - **`cmd/entire/cli/summarize/claude.go`** — **REWRITTEN**
+     - Added `agent` import, removed `errors` import
+     - Added `PrompterGenerator` struct implementing `Generator`
+     - Kept `ClaudeGenerator` for backward compatibility
+     - Removed `stripGitEnv()` and `claudeCLIResponse`
+     - `ClaudeGenerator.Generate()` now uses `agent.StripGitEnv()` and `agent.FormatExecError()`
+     - Added `parseSummaryFromResult()` shared between both generators
+     ```go
+     type PrompterGenerator struct {
+         Prompter agent.Prompter
+         Model    string
+     }
+     
+     func (g *PrompterGenerator) Generate(ctx context.Context, input Input) (*checkpoint.Summary, error) {
+         // ... builds prompt, calls g.Prompter.Prompt(), parses result
+     }
+     ```
+
+   - **`cmd/entire/cli/summarize/summarize.go`** — **MODIFIED**
+     - Added `settings` import
+     - Changed nil-generator fallback from `&ClaudeGenerator{}` to `defaultGenerator()`
+     - Added `defaultGenerator()` function that loads settings, resolves agent, returns `PrompterGenerator` or falls back to `ClaudeGenerator`
+
+   - **`cmd/entire/cli/summarize/claude_test.go`** — **MODIFIED**
+     - Removed `TestStripGitEnv` (now in `agent/cli_helpers_test.go`)
+
+4. Errors and fixes:
+   - **Lint: `errcheck` on settings type assertion**: `val, _ := sectionOpts[key].(string)` → Fixed by adding `ok` check: `val, ok := sectionOpts[key].(string); if !ok { return "" }`
+   - **Lint: `ireturn` on `defaultGenerator()`**: Factory function returns `Generator` interface → Added `//nolint:ireturn` comment since it's intentional
+   - **Lint: `noctx` in test**: `exec.Command("sh", "-c", "exit 42")` → Changed to `exec.CommandContext(context.Background(), ...)`
+   - **Lint: 4 `wrapcheck` errors**: Errors from interface methods and external packages not wrapped:
+     - `agent.FormatExecError(err, ...)` in `claudecode/prompter.go` → wrapped: `fmt.Errorf("claude prompt failed: %w", ...)`
+     - `prompter.Prompt(...)` error in `wingman_review.go` → wrapped: `fmt.Errorf("agent review prompt failed: %w", err)`
+     - `g.Prompter.Prompt(...)` error in `summarize/claude.go` → wrapped: `fmt.Errorf("summarize prompt failed: %w", err)`
+     - `agent.FormatExecError(err, ...)` in `summarize/claude.go` → wrapped: `fmt.Errorf("summarize CLI failed: %w", ...)`
+   - **Test failure `TestPrompt_WorkDir/custom_workdir`**: Used `/tmp/test-repo` which doesn't exist as real directory → Fixed by using `t.TempDir()`. Also split into two separate test functions to avoid race condition with shared `capturedCmd` variable and parallel subtests.
+   - **Pre-existing timeout in `TestRunExplain_SessionFlagFiltersListView`**: 10 minute timeout in go-git tree diff — unrelated to changes, not fixed.
+
+5. Problem Solving:
+   - Successfully designed and implemented the `Prompter` interface expansion of the Agent API
+   - Consolidated duplicated code (`stripGitEnv`, CLI response types, exec error handling) into `agent/cli_helpers.go`
+   - Made wingman agent/model configurable via settings while maintaining backward compatibility
+   - Made summarize agent/model configurable via settings with `PrompterGenerator` + `defaultGenerator()` factory
+   - Kept `ClaudeGenerator` for backward compatibility (tests use `CommandRunner` injection)
+   - Handled `triggerAutoApply` correctly — stays as direct CLI since `--continue` is Claude-specific
+
+6. All user messages:
+   - Initial context restoration message: "This session is being continued from a previous conversation that ran out of context..." (providing full summary of previous conversation context, ending with plan mode active)
+   - No other explicit user messages during this session — the user approved the plan via ExitPlanMode tool and the assistant proceeded with implementation autonomously.
+
+7. Pending Tasks:
+   - Task 7 (Run fmt, lint, and tests) is functionally complete — all modified package tests pass, lint passes. The only unrun verification is integration tests as part of `test:ci`, which timed out due to a pre-existing issue in `TestRunExplain_SessionFlagFiltersListView`.
+   - No explicit user request to commit or push yet.
+
+8. Current Work:
+   All 7 implementation tasks are complete:
+   - Task 1-6: All code changes implemented and verified
+   - Task 7: `mise run fmt` passes, `mise run lint` passes (0 issues), all modified package tests pass with `go test -race`
+   
+   The full `mise run test:ci` command timed out due to a pre-existing issue in `TestRunExplain_SessionFlagFiltersListView` (stuck in go-git tree diff for 10+ minutes), which is unrelated to the Prompter interface changes. All packages modified by these changes pass their tests individually.
+
+   Last commands run:
+   ```
+   go test -race -timeout 120s ./cmd/entire/cli/agent/... ./cmd/entire/cli/settings/... ./cmd/entire/cli/summarize/...  # all pass
+   go test -race -timeout 120s -run "Wingman|wingman|ReviewHas" ./cmd/entire/cli/...  # all pass
+   ```
+
+9. Optional Next Step:
+   The implementation is complete and verified. The natural next step would be to notify the user that all tasks are done and ask if they want to commit the changes. The user has not yet explicitly asked for a commit.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dip/.claude/projects/-Users-dip-Repositories-cli/c551cf96-b121-495b-b191-6ca6784fe2e1.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+<task-notification>
+<task-id>b984307</task-id>
+<output-file>/private/tmp/claude-501/-Users-dip-Repositories-cli/tasks/b984307.output</output-file>
+<status>failed</status>
+<summary>Background command "Run all tests (unit + integration)" failed with exit code 1</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-dip-Repositories-cli/tasks/b984307.output
+
+---
+
+Have you validated it's all working as expected? What's the new command structure?
+
+---
+
+Ok, but now let's also update the command to allow defining the agent+model?
+
+---
+
+We do have entire wingman enable, so we can append via parameter or make an interactive flow based on agents installed already or BOTH!
+
+---
+
+Commit all changes one by one and update the PR description.
+
+---
+
+If the review is done and the user doesn't react for let's say 20s, could we just automatically prompt the main session? Is that possible from outside since it's not using any hooks?
+
+---
+
+How's the ralph-loop-agent doing it though?
+
+---
+
+The reviewer should actually work in the background, that's completely fine. It's the main process that should pick up the Review as soon as it's done. But this is getting a bit nasty because we would basically have to bump the session on every stop hook for as long as the reviewer is still working in the background so the main session stop hook can pick up the review once review is done and review file exists.
+
+---
+
+Let's do 1!
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Session starts as a continuation** from a previous conversation that ran out of context. The summary provided covers:
+   - Previous work on the Prompter interface plan (Steps 1-7 all completed)
+   - All code changes implemented and verified
+   - Pre-existing timeout in `TestRunExplain_SessionFlagFiltersListView` (unrelated)
+
+2. **Background task failure notification** - `test:ci` failed due to the pre-existing `TestRunExplain_SessionFlagFiltersListView` timeout (go-git tree diff). All modified packages pass individually.
+
+3. **User asks**: "Have you validated it's all working as expected? What's the new command structure?"
+   - Ran fresh tests for all modified packages (all pass)
+   - Ran wingman tests (all pass)
+   - Explained the new Prompter architecture: call flow before/after, configuration via settings, what stays unchanged
+
+4. **User asks**: "Ok, but now let's also update the command to allow defining the agent+model?"
+   - Entered plan mode to explore wingman enable command and agent detection patterns
+   - Asked user where the config should be (wingman enable flags, internal commands, or both)
+   - User clarified: "We do have entire wingman enable, so we can append via parameter or make an interactive flow based on agents installed already or BOTH!"
+
+5. **Plan created and approved** for adding `--agent`/`--model` flags + interactive picker to `wingman enable`
+
+6. **Implementation**:
+   - Task 8: Added `--agent`/`--model` flags, interactive picker (`huh.NewSelect`), `resolveWingmanEnableAgent()`, `resolveWingmanEnableModel()`, `findPrompterAgents()`
+   - Task 9: Updated `wingman status` to show agent/model via `resolveWingmanAgent()`/`resolveWingmanModel()`
+   - Task 10: Added tests (8 new tests)
+   - Task 11: Fixed lint issues:
+     - `goconst`: replaced string literals with `testAgentName` and `testSettingsEnabled` constants
+     - `ireturn` on `defaultGenerator()` in summarize.go: nolint directive kept being stripped by `golangci-lint --fix`. Fixed by adding `summarize.Generator` to `ireturn.allow` in `.golangci.yaml`
+
+7. **User asks**: "Commit all changes one by one and update the PR description."
+   - Created 7 separate commits, each for a logical change
+   - Pushed to remote
+   - Updated PR #302 description with comprehensive summary
+
+8. **Review from wingman** arrived at `.entire/REVIEW.md`:
+   - Fixed shell injection concern in `prompter_test.go` - inlined JSON response directly instead of concatenating variable
+   - First attempt (env var approach) failed because `Prompt()` overwrites `cmd.Env`
+   - Reverted to inline approach
+   - Other review items were about pre-existing code outside PR scope
+
+9. **User asks**: "If the review is done and the user doesn't react for let's say 20s, could we just automatically prompt the main session? Is that possible from outside since it's not using any hooks?"
+   - Explained three options: Stop hook polling, short-window opportunistic, accept current UX
+
+10. **User asks**: "How's the ralph-loop-agent doing it though?"
+    - Searched for Ralph Wiggum plugin
+    - Found it uses Stop hook to block exit and feed same prompt back
+    - Explained the mechanism
+
+11. **User says**: "The reviewer should actually work in the background, that's completely fine. It's the main process that should pick up the Review as soon as it's done. But this is getting a bit nasty because we would basically have to bump the session on every stop hook for as long as the reviewer is still working in the background so the main session stop hook can pick up the review once review is done and review file exists."
+    - Proposed 3 options: blocking wait, short-window opportunistic, accept current UX
+
+12. **User says**: "Let's do 1!" (blocking wait in Stop hook)
+    - Entered plan mode
+    - Explored Stop hook handler, hook response format, wingman lifecycle
+
+13. **Key finding from exploration**: The Stop hook CANNOT inject `additionalContext` to re-prompt the agent. Only `UserPromptSubmit` and `SessionStart` hooks can inject context. The Stop hook can only output `systemMessage` (notifications).
+
+14. **Current state**: In plan mode, exploring how to implement the blocking Stop hook approach. Just discovered that the Stop hook fundamentally cannot re-prompt the agent with the current hook protocol. Need to figure out if/how Ralph does it differently or if we need a different approach.
+
+Key files modified in this session:
+- `cmd/entire/cli/wingman.go` - added --agent/--model flags, interactive picker, status output
+- `cmd/entire/cli/wingman_test.go` - 8 new tests
+- `.golangci.yaml` - added `summarize.Generator` to ireturn allow list
+- `cmd/entire/cli/agent/claudecode/prompter_test.go` - fixed shell injection pattern
+- `cmd/entire/cli/summarize/summarize.go` - renamed `defaultGenerator` to `resolveGenerator` (nolint issue)
+
+Files from previous session (already committed):
+- `cmd/entire/cli/agent/cli_helpers.go` (NEW)
+- `cmd/entire/cli/agent/cli_helpers_test.go` (NEW)
+- `cmd/entire/cli/agent/prompter.go` (NEW)
+- `cmd/entire/cli/agent/claudecode/prompter.go` (NEW)
+- `cmd/entire/cli/agent/claudecode/prompter_test.go` (NEW)
+- `cmd/entire/cli/agent/claudecode/claude.go` (MODIFIED - added CommandRunner field)
+- `cmd/entire/cli/settings/settings.go` (MODIFIED - added WingmanAgent/Model, SummarizeAgent/Model)
+- `cmd/entire/cli/settings/settings_test.go` (MODIFIED - added tests)
+- `cmd/entire/cli/wingman_review.go` (MODIFIED - uses Prompter, resolveWingmanAgent/Model)
+- `cmd/entire/cli/wingman_lifecycle.go` (MODIFIED)
+- `cmd/entire/cli/summarize/claude.go` (MODIFIED - added PrompterGenerator)
+- `cmd/entire/cli/summarize/summarize.go` (MODIFIED - added resolveGenerator)
+- `cmd/entire/cli/summarize/claude_test.go` (MODIFIED - removed TestStripGitEnv)
+
+Summary:
+1. Primary Request and Intent:
+
+The conversation spans multiple related tasks on the `dipree/entire-wingman` branch (PR #302):
+
+**A. Prompter Interface (completed, committed):** Expand the Agent API with a `Prompter` optional interface so wingman and summarize can invoke any registered agent with a prompt. Consolidate duplicated CLI invocation code. Make agent/model configurable via settings.
+
+**B. Wingman Enable Command Enhancement (completed, committed):** Add `--agent` and `--model` flags to `entire wingman enable`, plus an interactive picker (using `huh` library) for TTY users. Update `wingman status` to show configured agent/model.
+
+**C. Auto-Prompt on Review Completion (in progress, in plan mode):** Make the main Claude Code session automatically pick up a completed wingman review without user interaction. The user wants the Stop hook to block/wait for the background review to finish, then re-prompt the agent. This was inspired by the Ralph Wiggum plugin's approach.
+
+**Key user quotes:**
+- "Ok, but now let's also update the command to allow defining the agent+model?"
+- "We do have entire wingman enable, so we can append via parameter or make an interactive flow based on agents installed already or BOTH!"
+- "Commit all changes one by one and update the PR description."
+- "If the review is done and the user doesn't react for let's say 20s, could we just automatically prompt the main session?"
+- "How's the ralph-loop-agent doing it though?"
+- "The reviewer should actually work in the background, that's completely fine. It's the main process that should pick up the Review as soon as it's done."
+- "Let's do 1!" (referring to Stop hook blocking wait approach)
+
+2. Key Technical Concepts:
+
+- **Prompter interface** — optional interface on Agent API: `Prompt(ctx, prompt, PromptOptions) (*PromptResult, error)` + `CLICommand() string`
+- **Agent registry** — `agent.List()`, `agent.Get()`, `agent.DetectAll()`, factory pattern with sorted deterministic iteration
+- **Hook response protocol** — Three types: `hookResponse` with `hookSpecificOutput` (injects `additionalContext`), `systemMessage` only (notification), silent (no output)
+- **Hook event types** — `SessionStart` and `UserPromptSubmit` can inject `additionalContext`; Stop hook can ONLY output `systemMessage`
+- **Ralph Wiggum plugin** — Uses Stop hook to block exit and feed same prompt back, enabling autonomous loops
+- **Session phase state machine** — `ACTIVE → IDLE` on TurnEnd, `IDLE → ACTIVE` on TurnStart
+- **huh library** — Interactive forms with `NewAccessibleForm()` wrapper for accessibility
+- **Settings-driven configuration** — `strategy_options.wingman.agent/model` and `strategy_options.summarize.agent/model`
+- **CommandRunner injection** — Test pattern: `func(ctx context.Context, name string, args ...string) *exec.Cmd`
+- **golangci-lint `fix: true`** — Auto-fixes including `nolintlint` which strips nolint directives, creating circular issues with ireturn
+
+3. Files and Code Sections:
+
+- **`cmd/entire/cli/agent/cli_helpers.go`** (NEW, committed)
+   - Consolidates `CLIResponse`, `StripGitEnv()`, `FormatExecError()` from wingman and summarize
+   ```go
+   type CLIResponse struct { Result string `json:"result"` }
+   func StripGitEnv(env []string) []string { ... }
+   func FormatExecError(err error, cliName, stderr string) error { ... }
+   ```
+
+- **`cmd/entire/cli/agent/prompter.go`** (NEW, committed)
+   - Defines Prompter optional interface
+   ```go
+   type PromptOptions struct {
+       Model, WorkDir, AllowedTools, PermissionMode, OutputFormat string
+       IsolateFromGit *bool
+       ExtraEnv []string
+   }
+   type PromptResult struct { Text string }
+   type Prompter interface {
+       Agent
+       Prompt(ctx context.Context, prompt string, opts PromptOptions) (*PromptResult, error)
+       CLICommand() string
+   }
+   ```
+
+- **`cmd/entire/cli/agent/claudecode/prompter.go`** (NEW, committed)
+   - Claude Code Prompter implementation — builds `claude --print --setting-sources "" ...` from PromptOptions
+   - Compile-time assertion: `var _ agent.Prompter = (*ClaudeCodeAgent)(nil)`
+
+- **`cmd/entire/cli/agent/claudecode/prompter_test.go`** (NEW, committed, then amended for review)
+   - Tests: valid JSON, text output, command args, workdir, git isolation, extra env, errors
+   - Fixed shell injection: inlined JSON response instead of string concatenation
+
+- **`cmd/entire/cli/agent/claudecode/claude.go`** (MODIFIED, committed)
+   - Added `CommandRunner` field to `ClaudeCodeAgent`
+   ```go
+   type ClaudeCodeAgent struct {
+       CommandRunner func(ctx context.Context, name string, args ...string) *exec.Cmd
+   }
+   ```
+
+- **`cmd/entire/cli/settings/settings.go`** (MODIFIED, committed)
+   - Added `WingmanAgent()`, `WingmanModel()`, `SummarizeAgent()`, `SummarizeModel()` and private `strategyOptionString(section, key)` helper
+
+- **`cmd/entire/cli/wingman.go`** (MODIFIED, committed)
+   - Added `--agent`/`--model` flags to `newWingmanEnableCmd()`
+   - Added interactive picker functions:
+   ```go
+   func resolveWingmanEnableAgent(cmd *cobra.Command, agentFlag string) (string, error)
+   func resolveWingmanEnableModel(cmd *cobra.Command, modelFlag string) (string, error)
+   func findPrompterAgents() []agent.Agent
+   ```
+   - Updated status to show: `Agent: claude-code` / `Model: opus`
+   - Added `huh` and `agent` imports
+
+- **`cmd/entire/cli/wingman_review.go`** (MODIFIED, committed)
+   - Added `resolveWingmanAgent()`, `resolveWingmanModel()`, `callAgentForReview()`
+   - Removed `wingmanCLIResponse`, `wingmanStripGitEnv()`
+   - `triggerAutoApply()` skips for non-claude agents
+
+- **`cmd/entire/cli/summarize/summarize.go`** (MODIFIED, committed)
+   - Renamed `defaultGenerator()` to `resolveGenerator()` — returns `Generator` interface
+   - Loads settings, resolves agent via Prompter, falls back to `ClaudeGenerator`
+
+- **`cmd/entire/cli/summarize/claude.go`** (MODIFIED, committed)
+   - Added `PrompterGenerator` struct
+   - Removed `stripGitEnv()`, `claudeCLIResponse`
+
+- **`.golangci.yaml`** (MODIFIED, committed)
+   - Added `github.com/entireio/cli/cmd/entire/cli/summarize.Generator` to `ireturn.allow`
+
+- **`cmd/entire/cli/wingman_test.go`** (MODIFIED, committed)
+   - 8 new tests: `TestFindPrompterAgents`, `TestResolveWingmanEnableAgent_ValidFlag`, `TestResolveWingmanEnableAgent_UnknownAgent`, `TestResolveWingmanEnableAgent_NonPrompterAgent`, `TestResolveWingmanEnableModel_WithFlag`, `TestResolveWingmanEnableModel_NonInteractive`, `TestWingmanEnable_WritesAgentModel`, `TestWingmanEnable_NoAgentModel_DefaultsAtRuntime`
+
+- **`cmd/entire/cli/hooks.go`** (READ ONLY — critical for current work)
+   - Hook response format:
+   ```go
+   type hookResponse struct {
+       SystemMessage      string              `json:"systemMessage,omitempty"`
+       HookSpecificOutput *hookSpecificOutput `json:"hookSpecificOutput,omitempty"`
+   }
+   type hookSpecificOutput struct {
+       HookEventName     string `json:"hookEventName"`
+       AdditionalContext string `json:"additionalContext,omitempty"`
+   }
+   ```
+   - Three output functions: `outputHookResponse()` (SessionStart), `outputHookMessage()` (notification only), `outputHookResponseWithContextAndMessage()` (UserPromptSubmit)
+
+- **`cmd/entire/cli/wingman_lifecycle.go`** (READ for current work)
+   - `handleWingmanTurnStart()` — injects review via `outputHookResponseWithContextAndMessage()` on UserPromptSubmit
+   - `handleWingmanTurnEnd()` — triggers review, auto-apply, notifications via `outputHookMessage()` on Stop
+
+- **`cmd/entire/cli/lifecycle.go`** (READ for current work)
+   - `DispatchLifecycleEvent()` routes events; `handleLifecycleTurnEnd()` handles Stop hook
+
+4. Errors and Fixes:
+
+- **`goconst` lint errors**: String `"claude-code"` and `'{"strategy": "manual-commit", "enabled": true}'` had multiple occurrences with existing constants `testAgentName` and `testSettingsEnabled`. Fixed by using the existing constants.
+
+- **`ireturn` lint error on `defaultGenerator()`/`resolveGenerator()`**: The `//nolint:ireturn` directive was repeatedly stripped by `golangci-lint --fix` (due to `fix: true` in config + `nolintlint` linter removing "unused" nolints). Fixed by adding `github.com/entireio/cli/cmd/entire/cli/summarize.Generator` to `ireturn.allow` in `.golangci.yaml`.
+
+- **Shell injection in test** (`prompter_test.go:28`): Review flagged `"printf '%s' '"+response+"'"` pattern. First fix attempt (env var approach) failed because `Prompt()` overwrites `cmd.Env` after `CommandRunner` returns. Fixed by inlining the JSON directly: `printf '{"result":"Hello from Claude"}'`.
+
+- **Pre-existing test timeout**: `TestRunExplain_SessionFlagFiltersListView` times out after 10 minutes in go-git tree diff. Unrelated to changes, not fixed.
+
+5. Problem Solving:
+
+- **Completed**: Prompter interface expansion, shared CLI helpers, settings-driven agent/model config, wingman enable flags + interactive picker, PR commits and description update.
+- **In progress**: Auto-prompt on review completion via Stop hook blocking wait. Key blocker discovered: the Stop hook protocol does NOT support `additionalContext` injection or re-prompting. Only `UserPromptSubmit` and `SessionStart` hooks can inject context. Need to determine how Ralph Wiggum achieves re-prompting from the Stop hook, or find an alternative approach.
+
+6. All User Messages:
+
+1. "This session is being continued from a previous conversation that ran out of context..." (context restoration with full summary)
+2. "Have you validated it's all working as expected? What's the new command structure?"
+3. "Ok, but now let's also update the command to allow defining the agent+model?"
+4. "We do have entire wingman enable, so we can append via parameter or make an interactive flow based on agents installed already or BOTH!" (clarification after AskUserQuestion was rejected)
+5. "Commit all changes one by one and update the PR description."
+6. "If the review is done and the user doesn't react for let's say 20s, could we just automatically prompt the main session? Is that possible from outside since it's not using any hooks?"
+7. "How's the ralph-loop-agent doing it though?"
+8. "The reviewer should actually work in the background, that's completely fine. It's the main process that should pick up the Review as soon as it's done. But this is getting a bit nasty because we would basically have to bump the session on every stop hook for as long as the reviewer is still working in the background so the main session stop hook can pick up the review once review is done and review file exists."
+9. "Let's do 1!" (referring to Stop hook blocking wait approach)
+
+7. Pending Tasks:
+
+- **Auto-prompt via Stop hook blocking wait** — Currently in plan mode exploring how to implement this. The critical finding is that the Stop hook CANNOT inject `additionalContext` to re-prompt the agent with the current hook protocol. Only `systemMessage` (notifications) can be returned from Stop hooks. Need to either:
+  1. Discover how Ralph Wiggum actually achieves re-prompting from Stop hooks (may use a different mechanism than our hook wrapper)
+  2. Find a way to extend the hook protocol to support re-prompting from Stop hooks
+  3. Propose an alternative approach to the user
+- The prompter_test.go review fix still needs to be committed (it was made after the 7 commits were pushed)
+
+8. Current Work:
+
+In **plan mode** exploring how to implement the user's request: "Let's do 1!" — a blocking wait in the Stop hook that polls for REVIEW.md and, when it appears, re-prompts the agent to address the review.
+
+Two exploration agents were launched:
+1. First explored the Stop hook handler, wingman lifecycle, auto-apply flow, session phases, and hook timeouts
+2. Second explored the Claude Code hook protocol in detail
+
+**Critical blocker discovered**: The Stop hook fundamentally cannot inject `additionalContext` or trigger a re-prompt. The `hookSpecificOutput` with `additionalContext` is only supported for `SessionStart` and `UserPromptSubmit` hook events. The Stop hook can only output `systemMessage` (shown to user, not injected into agent conversation).
+
+The plan file at `/Users/dip/.claude/plans/tidy-booping-fountain.md` still contains the previous plan (wingman enable flags) and needs to be updated for this new task.
+
+9. Optional Next Step:
+
+Continue in plan mode to resolve the Stop hook re-prompting blocker. The user explicitly said "Let's do 1!" (blocking Stop hook approach). The immediate next step is to:
+
+1. Research whether the Claude Code Stop hook actually supports re-prompting at the agent level (Ralph Wiggum claims to do this) — possibly our hook wrapper is limiting what gets passed through
+2. Check if we can extend `outputHookResponse` / `hookSpecificOutput` to work with Stop hooks, or if Claude Code itself rejects `additionalContext` from Stop hooks
+3. If Stop hook re-prompting is truly impossible, present the finding to the user and propose alternatives (e.g., using a different hook event, or modifying the hook protocol)
+
+The user's exact words were: "The reviewer should actually work in the background, that's completely fine. It's the main process that should pick up the Review as soon as it's done." and "Let's do 1!" (the blocking wait approach).
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dip/.claude/projects/-Users-dip-Repositories-cli/c551cf96-b121-495b-b191-6ca6784fe2e1.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+<task-notification>
+<task-id>bcea2ee</task-id>
+<output-file>/private/tmp/claude-501/-Users-dip-Repositories-cli/tasks/bcea2ee.output</output-file>
+<status>completed</status>
+<summary>Background command "Run full CI test suite" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-dip-Repositories-cli/tasks/bcea2ee.output
+
+---
+
+Review the changes again for correctness and validity.
+
+---
+
+What's this?   - 90s blocking for experimental feature — The user explicitly requested this behavior. The fallback is safe (REVIEW.md persists for next UserPromptSubmit).
+   Not gating behind a flag for now.
+
+---
+
+During the timeout we have to actively check/poll if the background agent is done reviewing!
+
+---
+
+It doesn't work as expected, in the other session I have open. While the review is active it doesn't actually pause/halt agent, it stops.
+
+---
+
+Mh... what if we intercept the commit hook instead?
+
+---
+
+I was thinking about the commit hook when the agent commits on behalf of the user, when we start the review, if we can block until it's done.
+
+---
+
+Yes
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Session starts as a continuation** from a previous conversation. The summary covers extensive prior work on:
+   - Prompter interface implementation (completed)
+   - Wingman enable command enhancement with --agent/--model flags (completed)
+   - Auto-prompt on review completion (in progress, in plan mode)
+   - Critical finding: Stop hooks cannot inject `additionalContext` - only `UserPromptSubmit` and `SessionStart` hooks support it
+
+2. **Plan mode exploration**: The assistant explored how Ralph Wiggum plugin achieves re-prompting from Stop hooks. Found no references to Ralph in the codebase. Confirmed Stop hooks have no re-prompting mechanism.
+
+3. **User approved plan**: The plan was for "Auto-Inject Wingman Review from Stop Hook" - blocking the Stop hook waiting for review completion, then outputting `additionalContext`.
+
+4. **Implementation phase**: 
+   - Added `outputStopHookResponseWithContext()` to hooks.go
+   - Added `waitForWingmanReview()` polling function to wingman_lifecycle.go
+   - Modified `handleWingmanTurnEnd()` to block and inject
+   - Added tests
+   - Updated docs
+
+5. **Review phase**: Reviewer found critical partial write race condition - REVIEW.md could be read while partially written. Fixed by reordering checks: only read REVIEW.md after lock file is removed.
+
+6. **User tested and reported failure**: "It doesn't work as expected, in the other session I have open. While the review is active it doesn't actually pause/halt agent, it stops."
+
+7. **User suggested intercepting commit hook**: "What if we intercept the commit hook instead?"
+
+8. **Assistant explained**: For auto-commit, the commit happens inside SaveStep() which is inside the Stop hook handler. Blocking in post-commit hook = blocking Stop hook. Same problem.
+
+9. **User agreed to revert**: Said "Yes" to reverting the blocking changes.
+
+Key files modified:
+- `cmd/entire/cli/wingman_lifecycle.go` - Added blocking wait logic (to be reverted)
+- `cmd/entire/cli/hooks.go` - Added `outputStopHookResponseWithContext()` (to be reverted)
+- `cmd/entire/cli/hooks_test.go` - Added test (to be reverted)
+- `cmd/entire/cli/wingman_test.go` - Added 4 tests (to be reverted)
+- `docs/architecture/wingman.md` - Added docs section (to be reverted)
+- `cmd/entire/cli/agent/claudecode/prompter_test.go` - Shell injection fix from previous session (keep this)
+
+The user's most recent explicit request was "Yes" - agreeing to revert the blocking changes since they don't add value.
+
+Summary:
+1. Primary Request and Intent:
+
+This session is a continuation of previous work on the `dipree/entire-wingman` branch (PR #302). The conversation covered:
+
+**A. Previous session work (already committed):** Prompter interface, wingman enable --agent/--model flags, settings-driven agent/model config — all completed and committed in 7 commits.
+
+**B. Auto-prompt on review completion (this session's main task):** The user wanted the main Claude Code session to automatically pick up a completed wingman review without user interaction. They said: "The reviewer should actually work in the background, that's completely fine. It's the main process that should pick up the Review as soon as it's done." They chose option 1 ("Let's do 1!") — a blocking wait in the Stop hook.
+
+**C. Discovery that blocking doesn't work:** After implementation, the user tested it and reported: "It doesn't work as expected, in the other session I have open. While the review is active it doesn't actually pause/halt agent, it stops." Claude Code shows the agent as "stopped" while the Stop hook blocks, and `additionalContext` from Stop hooks is not processed.
+
+**D. Commit hook idea explored and rejected:** The user asked "What if we intercept the commit hook instead?" — referring to the auto-commit post-commit hook. The assistant explained this is the same blocking problem since post-commit runs inside SaveStep() which runs inside the Stop hook handler.
+
+**E. User agreed to revert:** When asked "Should I revert the blocking changes since they don't add value?", the user said "Yes".
+
+2. Key Technical Concepts:
+   - **Claude Code hook protocol**: `SessionStart` and `UserPromptSubmit` hooks support `additionalContext` injection. Stop hooks can only output `systemMessage` (notifications). Stop hooks cannot re-prompt the agent.
+   - **Hook response format**: `hookResponse` with `systemMessage` and optional `hookSpecificOutput` containing `hookEventName` and `additionalContext`
+   - **Wingman review lifecycle**: Detached subprocess spawned by `triggerWingmanReview()` → 10s settle delay → diff → claude review → writes REVIEW.md → removes lock file (in defer)
+   - **Delivery paths**: Primary (UserPromptSubmit injection), Synchronous Stop hook injection (attempted, doesn't work), Background auto-apply (fallback)
+   - **Partial write race condition**: `os.WriteFile` truncates then writes — REVIEW.md must only be read after lock file removal to guarantee complete write
+   - **Auto-commit strategy**: Commits happen inside `SaveStep()` which runs inside the Stop hook handler — blocking anywhere in this chain blocks the Stop hook
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/wingman_lifecycle.go`** (MODIFIED — to be reverted)
+     - Added constants `wingmanStopHookReviewTimeout` (90s) and `wingmanReviewPollInterval` (2s)
+     - Added `waitForWingmanReview()` polling function
+     - Modified `handleWingmanTurnEnd()` to block and inject via `outputStopHookResponseWithContext`
+     - Original `handleWingmanTurnEnd` before modification:
+     ```go
+     func handleWingmanTurnEnd(sessionID string, totalChanges int, relModifiedFiles, relNewFiles, relDeletedFiles, allPrompts []string, commitMessage string) {
+         repoRoot, err := paths.RepoRoot()
+         if err != nil { return }
+         strat := GetStrategy()
+         if totalChanges > 0 && strat.Name() == strategy.StrategyNameAutoCommit && settings.IsWingmanEnabled() {
+             triggerWingmanReview(WingmanPayload{...})
+         }
+         triggerWingmanAutoApplyIfPending(repoRoot)
+         outputWingmanStopNotification(repoRoot)
+     }
+     ```
+
+   - **`cmd/entire/cli/hooks.go`** (MODIFIED — to be reverted)
+     - Added `outputStopHookResponseWithContext()` with `hookEventName: "Stop"`
+     ```go
+     func outputStopHookResponseWithContext(additionalContext, message string) error {
+         resp := hookResponse{
+             SystemMessage: message,
+             HookSpecificOutput: &hookSpecificOutput{
+                 HookEventName:     "Stop",
+                 AdditionalContext: additionalContext,
+             },
+         }
+         if err := json.NewEncoder(os.Stdout).Encode(resp); err != nil {
+             return fmt.Errorf("failed to encode hook response: %w", err)
+         }
+         return nil
+     }
+     ```
+
+   - **`cmd/entire/cli/hooks_test.go`** (MODIFIED — to be reverted)
+     - Added `TestHookResponse_StopWithContext`
+
+   - **`cmd/entire/cli/wingman_test.go`** (MODIFIED — to be reverted)
+     - Added 4 tests: `TestWaitForWingmanReview_ReviewAppears`, `_NoActionableIssues`, `_LockRemoved`, `_Timeout`
+
+   - **`docs/architecture/wingman.md`** (MODIFIED — to be reverted)
+     - Added "Synchronous Stop Hook Injection" section and two new constants to the table
+
+   - **`cmd/entire/cli/agent/claudecode/prompter_test.go`** (MODIFIED — KEEP this change)
+     - Shell injection fix from previous session's review: inlined JSON response instead of string concatenation
+     ```go
+     // Before:
+     response := `{"result":"Hello from Claude"}`
+     return exec.CommandContext(ctx, "sh", "-c", "printf '%s' '"+response+"'")
+     // After:
+     return exec.CommandContext(ctx, "sh", "-c", `printf '{"result":"Hello from Claude"}'`)
+     ```
+
+   - **`cmd/entire/cli/wingman_review.go`** (READ ONLY — critical for understanding)
+     - `runWingmanReview()`: Lock removed in `defer` (line 89-95) AFTER `os.WriteFile(reviewPath, ...)` (line 157) — this ordering is what makes "lock gone + REVIEW.md exists" a safe signal
+     - `callAgentForReview()`: Uses Prompter interface with read-only tools
+     - `resolveWingmanAgent()`, `resolveWingmanModel()`: Settings-driven agent/model resolution
+
+   - **`cmd/entire/cli/lifecycle.go`** (READ ONLY)
+     - `handleLifecycleTurnEnd()`: The Stop hook handler that calls `strat.SaveStep()` then `handleWingmanTurnEnd()`
+     - Confirmed: only one stdout output per hook invocation
+
+   - **`cmd/entire/cli/hooks.go`** (READ ONLY — existing functions)
+     - `outputHookResponse()` — SessionStart with additionalContext
+     - `outputHookMessage()` — systemMessage only (notifications)
+     - `outputHookResponseWithContextAndMessage()` — UserPromptSubmit with additionalContext + systemMessage
+
+4. Errors and Fixes:
+
+   - **errcheck lint errors in test goroutines**: `_ = os.WriteFile(...)` in goroutines flagged by errcheck. Fixed by checking error and panicking: `if err := os.WriteFile(...); err != nil { panic(...) }`
+   
+   - **Partial write race condition** (found by reviewer): `waitForWingmanReview` originally checked REVIEW.md before checking the lock file. This could catch a partially-written file mid-`os.WriteFile` (which truncates then writes), conclude no actionable issues, and delete the review permanently. Fixed by reordering: only read REVIEW.md after lock file is removed. The lock is removed in a `defer` in `runWingmanReview` that runs after WriteFile completes.
+
+   - **Blocking approach doesn't work** (found by user testing): User reported "it doesn't actually pause/halt agent, it stops." Claude Code shows the agent as stopped while the Stop hook blocks, and `additionalContext` from Stop hooks is not processed by Claude Code. This is a fundamental limitation of the hook protocol.
+
+   - **Commit hook idea doesn't help**: For auto-commit, the post-commit hook fires inside SaveStep() which is inside the Stop hook handler. Blocking there = blocking the Stop hook. Same problem.
+
+5. Problem Solving:
+
+   - **Solved**: Implementation of blocking wait + poll loop + Stop hook injection (code works, tests pass, lint clean)
+   - **Solved**: Partial write race condition in `waitForWingmanReview`
+   - **Not solved**: Auto-prompting the agent when a wingman review completes. The Stop hook approach fails because Claude Code doesn't process `additionalContext` from Stop hooks and shows the agent as "stopped" during the hook's execution. The commit hook approach has the same blocking problem. The fundamental constraint is that no hook mechanism can re-prompt an agent after its turn ends.
+   - **Current state**: User agreed to revert all blocking changes. The existing flow (review runs in background, picked up on next UserPromptSubmit) remains the working approach.
+
+6. All User Messages:
+   1. "This session is being continued from a previous conversation..." (session restoration with full summary)
+   2. (Plan mode approved the blocking wait plan)
+   3. "Review the changes again for correctness and validity."
+   4. "What's this? - 90s blocking for experimental feature — The user explicitly requested this behavior..."
+   5. "During the timeout we have to actively check/poll if the background agent is done reviewing!"
+   6. "It doesn't work as expected, in the other session I have open. While the review is active it doesn't actually pause/halt agent, it stops."
+   7. "Mh... what if we intercept the commit hook instead?"
+   8. "I was thinking about the commit hook when the agent commits on behalf of the user, when we start the review, if we can block until it's done."
+   9. "Yes" (agreeing to revert the blocking changes)
+
+7. Pending Tasks:
+   - **Revert all blocking wait changes** from `wingman_lifecycle.go`, `hooks.go`, `hooks_test.go`, `wingman_test.go`, and `docs/architecture/wingman.md`
+   - **Keep** the `prompter_test.go` shell injection fix (from previous session's review)
+   - After reverting, run `mise run fmt && mise run lint && mise run test:ci` to verify clean state
+
+8. Current Work:
+   The user confirmed "Yes" to reverting the blocking changes. The following need to be reverted:
+   - `wingman_lifecycle.go`: Remove `wingmanStopHookReviewTimeout`, `wingmanReviewPollInterval` constants, `waitForWingmanReview()` function, and the blocking wait logic in `handleWingmanTurnEnd()` (restore original simple flow)
+   - `hooks.go`: Remove `outputStopHookResponseWithContext()` function
+   - `hooks_test.go`: Remove `TestHookResponse_StopWithContext`
+   - `wingman_test.go`: Remove `TestWaitForWingmanReview_*` (4 tests)
+   - `docs/architecture/wingman.md`: Remove "Synchronous Stop Hook Injection" section and the two new constant rows
+   - Keep: `prompter_test.go` shell injection fix
+
+9. Optional Next Step:
+   Revert all blocking wait changes as the user explicitly agreed: when asked "Should I revert the blocking changes since they don't add value?" the user said "Yes". After reverting, run verification (`mise run fmt && mise run lint && mise run test:ci`). The only uncommitted change that should remain is the `prompter_test.go` shell injection fix from the previous session's review.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dip/.claude/projects/-Users-dip-Repositories-cli/c551cf96-b121-495b-b191-6ca6784fe2e1.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+All right, commit, then merge latest main into this bracnh

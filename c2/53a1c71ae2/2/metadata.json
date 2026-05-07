@@ -1,0 +1,74 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "c253a1c71ae2",
+  "session_id": "90f3ff3b-83c8-4125-bbc4-c02734981f54",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T17:29:09.129745Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 2,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "7acc8132a549",
+  "token_usage": {
+    "input_tokens": 193,
+    "cache_creation_tokens": 290013,
+    "cache_read_tokens": 11459892,
+    "output_tokens": 50062,
+    "api_call_count": 118
+  },
+  "session_metrics": {
+    "turn_count": 15
+  },
+  "summary": {
+    "intent": "Enhance the summary TUI detail pane to show all available session data from the insights SQLite DB, including scores, stats, code context, and full facet evidence that was previously hidden or omitted.",
+    "outcome": "Implemented a full redesign of the detail pane with 4 grouped boxes (SUMMARY, CODE, LEARNINGS, SIGNALS) using flat scroll layout, adding scores, token breakdown, files touched, tool usage, implementation rationale, tradeoffs, codebase patterns, and all facet types with evidence rendering. Followed up with a spacing fix between sub-sections after visual review.",
+    "learnings": {
+      "repo": [
+        "The insights.db has 16 tables: sessions (2,633 rows), tool_calls (16,029), files_touched (10,788), learnings (2,269), friction (616), codebase_patterns (422), implementation_rationale (333), tradeoffs (248), review_rule_signals (212), missing_context_signals (189), repeated_user_instructions (103), failure_loops (102), skill_signals (55), suggestions (0), cache_meta (1).",
+        "Facets backfilling: sessions are stored with has_facets=0 initially; entire improve/insights/memory-loop finds sessions without facets, reads transcripts from checkpoint branch, condenses them, sends to LLM for extraction, writes results to facet tables, then marks has_facets=1.",
+        "The summarytui detail pane is driven by a SessionRow struct that already contained all the missing data fields (scores, token breakdown, facet evidence) — the rendering layer was simply not using them.",
+        "Friction in renderDetailContent was gated on HasSummary — this was intentional and preserved in the redesign.",
+        "The Codex companion adversarial review script hits ENOBUFS (buffer overflow) on large repos when trying to run git diff internally — it cannot complete against repos with very large diffs."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/summarytui/detail_page.go",
+          "finding": "renderSubSection helper added with currentLen parameter to determine whether to prepend a blank spacer line before each sub-section (except the first), enabling visual separation between sub-sections inside boxes."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/detail_page.go",
+          "finding": "renderSummaryBox rewritten to include overall score + sub-scores inline, token breakdown (input/cache/output), API call count, formatDuration output, and agent percentage, in addition to intent/outcome. Blank line inserted between intent/outcome content and score/stats block."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/detail_page.go",
+          "finding": "renderCodeBox is a new function rendering files touched, tool usage sorted by count (compact single line), implementation rationale, tradeoffs, and codebase patterns as sub-sections."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/detail_page.go",
+          "finding": "renderSignalsBox is a new function rendering all facet types (Friction, Failure Loops, Repeated Instructions, Missing Context, Skill Signals, Review Rules, Repo Gotchas, Workflow Gaps) with evidence rendered as indented ↳ lines."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root_test.go",
+          "finding": "sampleRowsForTest() updated to include all new SessionRow fields for integration test coverage."
+        }
+      ],
+      "workflow": [
+        "Subagent-driven development used for tasks 1-4 (formatDuration, renderSummaryBox, renderCodeBox, renderSignalsBox); the orchestrator handled task 5 (integration/wiring) directly because it required coordinating changes across multiple files simultaneously.",
+        "Visual companion server (http://localhost:65000) used effectively for mockup review during brainstorming — user selected layout option B (compact grouped) from rendered HTML mockup.",
+        "replace_all on function call sites caused a parameter-order bug when the replacement string inadvertently reordered arguments; fixed by editing the function signature instead and verifying call sites with Grep.",
+        "After visual review of the running TUI (screenshot), a follow-up spacing fix was needed — sub-section spacing was not visible in tests but was immediately apparent in the rendered UI."
+      ]
+    },
+    "friction": [
+      "Codex adversarial review companion script failed with ENOBUFS on both foreground and background attempts — the repo's git diff is too large for the script's internal buffer. Review was skipped entirely.",
+      "replace_all usage on renderSubSection call sites introduced a parameter-order bug (len(allLines) landed in the title position) requiring manual correction of the function signature and all call sites.",
+      "The visual companion server required a separate startup step and the URL had to be communicated out-of-band; one startup attempt failed silently before succeeding."
+    ],
+    "open_items": [
+      "The 23 pre-existing golangci-lint issues in other packages were not addressed — they are out of scope for this change but remain.",
+      "The suggestions table in insights.db has 0 rows — this was noted but not investigated.",
+      "No adversarial design review was completed due to the Codex companion buffer overflow; the spec shipped without that validation step."
+    ]
+  }
+}

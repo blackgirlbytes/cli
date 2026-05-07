@@ -1,0 +1,96 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "6e84a0a45e2e",
+  "session_id": "08774980-a9e2-4ef4-a696-0a7e232eafc9",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-02T22:53:54.851713Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "cmd/entire/cli/improve_cmd.go",
+    "cmd/entire/cli/insights_cmd.go",
+    "cmd/entire/cli/memory_loop_cmd.go",
+    "cmd/entire/cli/memory_loop_cmd_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "df343dd25f41",
+  "token_usage": {
+    "input_tokens": 216,
+    "cache_creation_tokens": 228723,
+    "cache_read_tokens": 17408496,
+    "output_tokens": 38465,
+    "api_call_count": 175
+  },
+  "session_metrics": {
+    "turn_count": 15
+  },
+  "summary": {
+    "intent": "Improve the summary TUI layout and add a checkpoint-specific view, then fix memory-loop refresh to scope backfill correctly to the target branch.",
+    "outcome": "Summary TUI layout was polished (spacing, nav width, detail pane alignment, scrollable detail with mouse), checkpoint prefix filtering was added to the summary command, and memory-loop refresh was fixed to backfill only sessions within the resolved scope before distilling memories.",
+    "learnings": {
+      "repo": [
+        "summarytui lives in cmd/entire/cli/summarytui/ with root.go, styles.go, detail_page.go, keys.go",
+        "Viewport sizing must happen in resize() with a pointer receiver, not inside View() which uses a value receiver — changes in View() are silently discarded",
+        "MouseWheelEnabled must be explicitly set to true on the bubbletea viewport; it does not default to true",
+        "backfillSummaries is in insights_cmd.go; backfillFacets is in improve_cmd.go — split across files",
+        "queryMemoryLoopRows for repo scope filters by checkpoint reachability from main (merged commits), not by the session's branch metadata field — so sessions from feature branches that merged to main are correctly included",
+        "resolveMemoryLoopScope produces a scope with Branch or OwnerID set, which queryMemoryLoopRows uses to filter"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "finding": "verticalChrome constant must be incremented when adding blank lines to the filter bar area to keep viewport height calculation correct"
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "finding": "Viewport is initialized in newRootModel and resized in resize(); renderDetailPane must not touch viewport dimensions since it has a value receiver"
+        },
+        {
+          "path": "cmd/entire/cli/summary_cmd.go",
+          "finding": "When a checkpoint prefix is provided, defaultBranch should be set to empty string so the TUI's filterRepo doesn't exclude sessions on non-default branches"
+        },
+        {
+          "path": "cmd/entire/cli/memory_loop_cmd.go",
+          "finding": "Scope resolution must happen before backfill; original code ran backfill on global last-N sessions before scope was resolved, causing off-branch sessions to get summaries/facets generated"
+        },
+        {
+          "path": "cmd/entire/cli/insights_cmd.go",
+          "finding": "backfillSummaries was refactored to accept pre-queried rows (ForRows variant) to allow caller-controlled scoping"
+        },
+        {
+          "path": "cmd/entire/cli/improve_cmd.go",
+          "finding": "backfillFacets was refactored to accept pre-queried rows (ForRows variant) to allow caller-controlled scoping"
+        }
+      ],
+      "workflow": [
+        "git checkout -- <path> restores deleted files from the last commit without touching staged/unstaged modifications elsewhere",
+        "When many files are accidentally deleted, 'git checkout HEAD -- cmd/' restores the entire subtree at once",
+        "t.Parallel() and t.Chdir() cannot be combined in Go tests — the runtime panics",
+        "bubbletea mouse support requires both tea.WithMouseCellMotion() in program options AND MouseWheelEnabled=true on the viewport component"
+      ]
+    },
+    "friction": [
+      "User accidentally deleted multiple files mid-session, requiring all edits to be re-applied from scratch",
+      "The detail pane scroll didn't work because MouseWheelEnabled was never set — silent failure with no error",
+      "viewport size changes in View() with value receiver were silently discarded, causing incorrect height calculations",
+      "memory-loop refresh was backfilling wrong-branch sessions before scope was resolved — only caught by user observation, not tests",
+      "Test for backfill debug output broke after reorder because the test session had no OwnerID and was filtered out by the now-earlier scope resolution"
+    ],
+    "open_items": [
+      "The ineffassign lint warning on summary_cmd.go:184 is pre-existing and was not fixed — needs investigation",
+      "Arrow key navigation for left nav currently competes with viewport scroll; only mouse/trackpad scroll was added for detail pane — keyboard scrolling of detail pane not implemented"
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-02T22:53:18.360764Z",
+    "agent_lines": 24,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 24,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

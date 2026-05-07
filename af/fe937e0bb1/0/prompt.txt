@@ -1,0 +1,215 @@
+find parts which are talking to the entire API via HTTP - add a global request handler to use the bearer token obtained via the cli login flow
+
+---
+
+find parts which are talking to the entire API via HTTP - add a global request handler to use the bearer token obtained via the cli login flow
+
+---
+
+CLI API comms
+
+---
+
+CLI API comms
+
+---
+
+Using the Trails API changes proposed in https://github.com/entirehq/entire.io/pull/1160 (or you can find the local checkout of the repo in ../trails-api), list the various current trails commands already supported and propose changing them to use the API
+
+---
+
+Using the Trails API changes proposed in https://github.com/entirehq/entire.io/pull/1160 (or you can find the local checkout of the repo in ../trails-api), list the various current trails commands already supported and propose changing them to use the API
+
+---
+
+let's start with phase 1 of the plan
+
+---
+
+let's start with phase 1 of the plan
+
+---
+
+why am I getting this error "authentication expired or invalid — run 'entire login' to re-authenticate" when running "entire trail list" after just having completed the login procedure?
+
+---
+
+why am I getting this error "authentication expired or invalid — run 'entire login' to re-authenticate" when running "entire trail list" after just having completed the login procedure?
+
+---
+
+which API base url is the trail list command using? does it respect the ENTIRE_API_BASE_URL environment variable?
+
+---
+
+which API base url is the trail list command using? does it respect the ENTIRE_API_BASE_URL environment variable?
+
+---
+
+no I was just suspecting the new command wouldn't honor the env variable. so we can possibly exclude the "environment mismatch" cause above. continue running the debugging steps with me to figure out the issue
+
+---
+
+no I was just suspecting the new command wouldn't honor the env variable. so we can possibly exclude the "environment mismatch" cause above. continue running the debugging steps with me to figure out the issue
+
+---
+
+Looking at the revised trail API spec in ../trails-api), update how we're using the trails API to include the proper host owner and repository parameters
+
+---
+
+Looking at the revised trail API spec in ../trails-api), update how we're using the trails API to include the proper host owner and repository parameters
+
+---
+
+add the following mapping for git hosts: github (i.e. github.com) -> gh
+
+---
+
+add the following mapping for git hosts: github (i.e. github.com) -> gh
+
+---
+
+add the following mapping to the trails API request url construction or parameters for git hosts: github (i.e. github.com) -> gh
+
+---
+
+add the following mapping to the trails API request url construction or parameters for git hosts: github (i.e. github.com) -> gh
+
+---
+
+we're now using the proper URL scheme - why am I still seeing a http 401 from the `/api/v1/trails/...` endpoint when running `entire trail list` against my localhost instance?
+
+---
+
+we're now using the proper URL scheme - why am I still seeing a http 401 from the `/api/v1/trails/...` endpoint when running `entire trail list` against my localhost instance?
+
+---
+
+commit all relevant changes made until this far, then from a clean git state add some debug logging to the API handler code to print out the HTTP request headers including auth token
+
+---
+
+commit all relevant changes made until this far, then from a clean git state add some debug logging to the API handler code to print out the HTTP request headers including auth token
+
+---
+
+commit and push the current state, open a draft pr
+
+---
+
+commit and push the current state, open a draft pr
+
+---
+
+undo the debug output changes
+
+---
+
+undo the debug output changes
+
+---
+
+is the behavior right now for "entire trail list" to only show open but not closed/merged trails?
+
+---
+
+is the behavior right now for "entire trail list" to only show open but not closed/merged trails?
+
+---
+
+change the entire trail create command so that it first attempts to create the desired branch locally, then pushes it, then performs the API operations to create the trail on the service
+
+---
+
+change the entire trail create command so that it first attempts to create the desired branch locally, then pushes it, then performs the API operations to create the trail on the service
+
+---
+
+remove all references to git-based storage of trails i.e. the "entire/trails/v1" branch
+
+---
+
+remove all references to git-based storage of trails i.e. the "entire/trails/v1" branch
+
+---
+
+prepare to remove storing trails metadata in the `entire/trails/v1` orphan branch since we're switching to having the trails stored in the database via our API.
+Keep operations and hooks that try to resolve trails for checkpoints or vice versa. Validate that the API operations for Trails currently support provide all necessary functionality and highlight any potential gaps
+
+---
+
+prepare to remove storing trails metadata in the `entire/trails/v1` orphan branch since we're switching to having the trails stored in the database via our API.
+Keep operations and hooks that try to resolve trails for checkpoints or vice versa. Validate that the API operations for Trails currently support provide all necessary functionality and highlight any potential gaps
+
+---
+
+commit these changes
+
+---
+
+commit these changes
+
+---
+
+push these changes and update the PR description
+
+---
+
+push these changes and update the PR description
+
+---
+
+Fix the trail create command collecting but not passing the trail status parameter to the API
+
+---
+
+Fix the trail create command collecting but not passing the trail status parameter to the API
+
+---
+
+in @cmd/entire/cli/api/client.go check out the following hint
+Body read twice when CheckResponse precedes DecodeJSON
+
+Medium Severity
+
+CheckResponse calls defer resp.Body.Close() on non-2xx responses. But checkTrailResponse then checks resp.StatusCode after CheckResponse has already consumed and closed the body. Since callers also defer resp.Body.Close(), the body gets closed multiple times. More critically, if the response handling flow changes such that someone tries to read the body after a CheckResponse error, the body is already consumed and closed.
+
+---
+
+in @cmd/entire/cli/api/client.go check out the following hint
+Body read twice when CheckResponse precedes DecodeJSON
+
+Medium Severity
+
+CheckResponse calls defer resp.Body.Close() on non-2xx responses. But checkTrailResponse then checks resp.StatusCode after CheckResponse has already consumed and closed the body. Since callers also defer resp.Body.Close(), the body gets closed multiple times. More critically, if the response handling flow changes such that someone tries to read the body after a CheckResponse error, the body is already consumed and closed.
+
+---
+
+there's a potential issue with removing all labels or assignees from a trail based on this hint:
+Removing all labels silently fails due to omitempty
+
+Medium Severity
+
+The Labels field in TrailUpdateRequest uses json:"labels,omitempty", which omits both nil and empty slices from the JSON output. When a user removes all labels via --remove-label, buildTrailUpdateRequest computes an empty []string{} and assigns it to req.Labels. Because of omitempty, this empty slice is dropped from the serialized PATCH payload, so the server never receives the instruction to clear labels. The old code wrote directly to the store, where an empty slice was correctly persisted.
+
+change the types so we're properly able to distinguish between no value i.e. no change and empty value i.e. reset to empty for these fields
+
+---
+
+there's a potential issue with removing all labels or assignees from a trail based on this hint:
+Removing all labels silently fails due to omitempty
+
+Medium Severity
+
+The Labels field in TrailUpdateRequest uses json:"labels,omitempty", which omits both nil and empty slices from the JSON output. When a user removes all labels via --remove-label, buildTrailUpdateRequest computes an empty []string{} and assigns it to req.Labels. Because of omitempty, this empty slice is dropped from the serialized PATCH payload, so the server never receives the instruction to clear labels. The old code wrote directly to the store, where an empty slice was correctly persisted.
+
+change the types so we're properly able to distinguish between no value i.e. no change and empty value i.e. reset to empty for these fields
+
+---
+
+commit and push
+
+---
+
+commit and push

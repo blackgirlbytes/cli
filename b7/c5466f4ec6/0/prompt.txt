@@ -1,0 +1,858 @@
+can you review these changes and also compare them against the other open OpenCode related PRs and the official OpenCode docs
+
+---
+
+The plugin stores transcripts at ~/.opencode/sessions/entire/<sanitized-path>/<sessionId>.json. This is a custom location (not OpenCode's native ~/.local/share/opencode/storage/), which is fine since the plugin controls the writes. The Go side mirrors this with SanitizePathForOpenCode(). PR #220 took a different
+  approach (reading from OpenCode's native storage), but this PR's approach is more reliable since it controls the format.
+
+so ~/.opencode/sessions/entire/<sanitized-path>/<sessionId>.json is completely made up path?
+
+---
+
+entire isn't using any path outside of the repo yet, right?
+
+---
+
+hmm, but thinking more now: in general session logs are always bound to the path, right? So having them in the repo might be right anyway? so we could just add them to .git/entire-sessions and maybe it's enough to just have them there? How does resume work then, we feed data back into sqlite!?
+
+---
+
+ok, then I agree we should go with os.TempDir()
+
+---
+
+can you look at this next: 
+
+Tool names (FileModificationTools):
+
+  The PR defines: edit_file, write, write_file, create_file, patch
+
+  OpenCode's actual tool names from source: edit, write, patch
+
+  Issue: edit_file, write_file, create_file don't exist in OpenCode. The real tool names are edit, write, and patch. The current list appears to be borrowed from Claude Code's tool names. Since the plugin writes tool call data using OpenCode's part format, only the actual OpenCode tool names would appear. This means
+  edit and write will match (they're in the list as write), but edit_file is wrong — the real tool is just edit. You'd miss edits.
+
+What's your suggested approach?
+
+---
+
+but wondering now: so basically we condens this into an OpenCode like script?
+
+---
+
+yeah we want some kind of log, and I feel generating it Claude Code like is a good idea for now. But if it's JSON it's not identical to Claude Code so maybe we should fix that?
+
+---
+
+yes
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Initial Request**: User asked to review changes on `feat/add-opencode` branch and compare against other open OpenCode-related PRs and official OpenCode docs.
+
+2. **Review Phase**: I gathered:
+   - The branch has 3 commits: `cdee530e Add OpenCode agent support`, `1b9f3a04 Address PR review feedback`, `2694a843 Store OpenCode transcripts outside repo`
+   - 18 files changed, ~2,169 lines added
+   - 5 open OpenCode PRs (#415 current, #341 adrianmg, #220 ammarateya, #315 MementoMori123, #257 Avyukth)
+   - Fetched OpenCode official docs - plugin system, events, tool names
+   - Full diff review across all files
+
+3. **Comprehensive Review Delivered**: I provided a detailed review covering:
+   - Comparison table of all open PRs
+   - Correctness vs OpenCode Plugin Docs
+   - Tool names issue (FileModificationTools wrong)
+   - Transcript storage path concerns
+   - Code quality strengths and issues
+   - 7 recommendations
+
+4. **User Question about `~/.opencode/sessions/entire/`**: User pointed out this is a "completely made up path" - I confirmed it is, explaining OpenCode's actual directory structure.
+
+5. **User Question about storing outside repo**: User asked if Entire stores anything outside the repo. I investigated and found that Entire reads from agent-owned directories (`~/.claude/projects/`, `~/.gemini/tmp/`) but OpenCode is the odd one out - it invents a path and has the plugin write to it.
+
+6. **User suggested `.git/entire-sessions`**: User wondered if transcripts should be in the repo, and asked about resume/feeding back to SQLite. I explained the data flow and confirmed resume doesn't need Entire to feed anything back - OpenCode manages its own SQLite.
+
+7. **User agreed on `os.TempDir()`**: I made changes:
+   - `entire_plugin.ts`: Added `import { tmpdir } from "node:os"`, changed path to `${tmpdir()}/entire-opencode/${sanitized}`
+   - `opencode.go`: Changed `GetSessionDir` to use `os.TempDir()` instead of `os.UserHomeDir()`, removed `os.UserHomeDir` dependency
+   - `lifecycle_test.go`: Updated test fixture paths
+   - Tests passed
+
+8. **User asked about FileModificationTools**: I verified OpenCode's actual tool names from source: `edit` (EditToolName), `write` (WriteToolName), `patch` (PatchToolName). Changed:
+   - `types.go`: `["edit_file", "write", "write_file", "create_file", "patch"]` → `["edit", "write", "patch"]`
+   - `transcript_test.go`: `edit_file` → `edit`, `write_file` → `write`
+   - `summarize_test.go`: `edit_file` → `edit`, `run_command` → `bash`
+   - Tests passed
+
+9. **User asked about condensed transcript format**: Wondered if we're generating an "OpenCode like script". I explained the full lifecycle of transcript data through the pipeline.
+
+10. **User suggested JSONL**: Said since it's JSON it's not identical to Claude Code, asked if we should fix that. I explained the benefits - line-based slicing, shared chunking, fewer agent-specific branches in explain.go/condensation/summarize.
+
+11. **User approved JSONL conversion**: Said "yes" to making the change.
+
+12. **JSONL Conversion Work Started**: I created a task and began making changes:
+   - **Plugin (entire_plugin.ts)**: Rewrote to write JSONL (one message per line) instead of JSON blob. Changed file extension from `.json` to `.jsonl`. Both `writeTranscriptFromMemory` and `writeTranscriptWithFallback` now produce JSONL.
+   - **types.go**: Removed `Transcript` struct wrapper, kept `Message` type. Updated comments.
+   - **opencode.go**: 
+     - Simplified `ChunkTranscript` to use `agent.ChunkJSONL`
+     - Simplified `ReassembleTranscript` to use `agent.ReassembleJSONL`
+     - Changed `ResolveSessionFile` extension from `.json` to `.jsonl`
+   
+   **Still remaining when interrupted**:
+   - `transcript.go`: Needs full rewrite to parse JSONL lines instead of JSON
+   - `explain.go`: Remove OpenCode cases from `scopeTranscriptForCheckpoint` and `transcriptOffset`
+   - `manual_commit_condensation.go`: Remove OpenCode-specific branches from `countTranscriptItems`, `extractUserPrompts`, `calculateTokenUsage`
+   - `summarize.go`: Remove `buildCondensedTranscriptFromOpenCode`, update switch to fall through
+   - All test files: Update fixtures from JSON to JSONL format
+   - Need to remove unused `json` import from `opencode.go`
+   - Need to remove unused `opencode` import from `explain.go` and `manual_commit_condensation.go`
+   - Run tests
+
+The `ReassembleJSONL` function exists in the agent package (confirmed by grep), returning `[]byte` not `([]byte, error)`, so the `ReassembleTranscript` signature returning `([]byte, error)` needs to wrap it properly - looking at Claude Code's implementation: `return agent.ReassembleJSONL(chunks), nil` - that's the pattern used.
+
+Let me check the current opencode.go for the ReassembleTranscript - it currently says:
+```go
+func (a *OpenCodeAgent) ReassembleTranscript(chunks [][]byte) ([]byte, error) {
+	return agent.ReassembleJSONL(chunks)
+}
+```
+But `ReassembleJSONL` returns `[]byte`, not `([]byte, error)`. This needs to be `return agent.ReassembleJSONL(chunks), nil`.
+
+Also need to check if `json` import is still needed in `opencode.go` after removing the JSON chunking code. It's still used in `ReadSession` → `ExtractModifiedFiles` which calls `ParseTranscript` in transcript.go. But `json` is imported in `opencode.go` itself - let me check... The `json.Unmarshal` was used in ChunkTranscript and ReassembleTranscript which are now removed. Need to check if json is used elsewhere in that file. Looking at the code: `ParseHookInput` uses `agent.ReadAndParseHookInput` (not json directly), `ReadSession` calls `ExtractModifiedFiles` (defined in transcript.go). So `json` import may now be unused in opencode.go and would need to be removed (or it would cause a compile error).
+
+Actually wait - I need to also check if `fmt` is still used since we removed the Sprintf in ChunkTranscript. Looking at the file: yes, `fmt` is still used in error wrapping in ReadTranscript, ReadSession, WriteSession, GetSessionDir.
+
+And `encoding/json` - is it used? Looking at opencode.go after the edits: no direct json calls remain. The `json` package was used in ChunkTranscript (json.Unmarshal, json.Marshal) and ReassembleTranscript (json.Unmarshal, json.Marshal), both now removed. So `encoding/json` needs to be removed from the import.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to review the `feat/add-opencode` branch changes (PR #415 — Add OpenCode agent support) and compare them against other open OpenCode-related PRs (#341, #220, #315, #257) and the official OpenCode documentation. After receiving the review, the user engaged in a series of discussions about specific issues found, requesting fixes for three problems:
+   - **Transcript storage path**: Change from invented `~/.opencode/sessions/entire/` to `os.TempDir()/entire-opencode/` since the path was squatting on OpenCode's namespace
+   - **FileModificationTools**: Fix incorrect tool names (Claude Code names vs actual OpenCode names)
+   - **Transcript format**: Convert from JSON blob to JSONL (one message per line) to match Claude Code's format and eliminate agent-specific branches in downstream consumers
+
+2. Key Technical Concepts:
+   - OpenCode plugin system: TypeScript plugins in `.opencode/plugins/`, Bun runtime, event-driven (`session.created`, `message.updated`, `message.part.updated`, `session.idle`, `session.compacted`, `session.deleted`)
+   - OpenCode stores sessions in SQLite at `~/.local/share/opencode/storage/` — no file-based transcripts
+   - Entire's transcript pipeline: Plugin writes ephemeral file → Go hook handler reads it → saved to shadow branch → condensed to `entire/checkpoints/v1` on user commit
+   - JSONL vs JSON format: JSONL enables line-based slicing/chunking, reusing Claude Code's code paths
+   - OpenCode's actual tool names: `edit`, `write`, `patch` (not `edit_file`, `write_file`, `create_file`)
+   - `agent.ChunkJSONL` and `agent.ReassembleJSONL` — shared JSONL utilities in the agent package
+   - The `Transcript` wrapper struct (`{session_id, messages}`) is no longer needed with JSONL — each line IS a message
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/agent/opencode/entire_plugin.ts`** — TypeScript plugin embedded in Go binary via `go:embed`
+     - Changed transcript path from `~/.opencode/sessions/entire/` to `${tmpdir()}/entire-opencode/`
+     - Converted from JSON blob output to JSONL (one message per line)
+     - File extension changed from `.json` to `.jsonl`
+     - Full rewritten file (most recent state):
+       - `writeTranscriptFromMemory`: now writes `lines.join("\n") + "\n"` instead of `JSON.stringify(transcript)`
+       - `writeTranscriptWithFallback`: same JSONL conversion
+       - All `transcript_path` references in hook payloads use `.jsonl` extension
+
+   - **`cmd/entire/cli/agent/opencode/types.go`** — Type definitions
+     - Removed `Transcript` struct (was `{SessionID, Messages}`)
+     - `Message` struct kept unchanged (still the per-line schema)
+     - `FileModificationTools` changed from `["edit_file", "write", "write_file", "create_file", "patch"]` to `["edit", "write", "patch"]`
+     - Comments updated to reference JSONL format
+
+   - **`cmd/entire/cli/agent/opencode/opencode.go`** — Main agent implementation
+     - `GetSessionDir`: Changed from `os.UserHomeDir()` + `~/.opencode/sessions/entire/` to `os.TempDir()` + `entire-opencode/`
+     - `ResolveSessionFile`: Extension changed from `.json` to `.jsonl`
+     - `ChunkTranscript`: Simplified from 60+ line custom JSON chunker to: `return agent.ChunkJSONL(content, maxSize)`
+     - `ReassembleTranscript`: Simplified to: `return agent.ReassembleJSONL(chunks)` — **NOTE: `ReassembleJSONL` returns `[]byte` not `([]byte, error)`, needs `, nil` appended**
+     - **NOTE: `encoding/json` import is now unused and needs to be removed (will cause compile error)**
+
+   - **`cmd/entire/cli/agent/opencode/transcript.go`** — Transcript parsing (267 lines)
+     - **NEEDS FULL REWRITE** — currently parses JSON blob, needs to parse JSONL lines
+     - Key functions that need updating: `ParseTranscript`, `parseTranscriptFile`, `GetTranscriptPosition`, `ExtractModifiedFilesFromOffset`, `ExtractModifiedFiles`, `ExtractPrompts`, `ExtractSummary`, `SliceFromMessage` (can be deleted — line-based slicing replaces it), `ExtractAllUserPrompts`, `CalculateTokenUsageFromBytes`, `CalculateTokenUsage`
+
+   - **`cmd/entire/cli/agent/opencode/lifecycle_test.go`** — Hook event parsing tests
+     - Updated test fixture paths from `.opencode/sessions/entire/` to `entire-opencode/`
+
+   - **`cmd/entire/cli/agent/opencode/transcript_test.go`** — Transcript tests
+     - Tool names updated: `edit_file` → `edit`, `write_file` → `write`
+     - **NEEDS FULL REWRITE** — test fixtures are JSON format, need JSONL
+
+   - **`cmd/entire/cli/explain.go`** — Explain command
+     - **NEEDS UPDATE**: Remove OpenCode cases from `scopeTranscriptForCheckpoint` (line ~540) and `transcriptOffset` (line ~1542) — OpenCode can now fall through to the default line-based path
+     - Remove `opencode` import
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation.go`** — Condensation logic
+     - **NEEDS UPDATE**: Remove OpenCode-specific branches from `countTranscriptItems` (line ~478), `extractUserPrompts` (line ~516), `calculateTokenUsage` (line ~564)
+     - For `countTranscriptItems` and `calculateTokenUsage`, OpenCode JSONL can fall through to the JSONL line-counting path
+     - For `extractUserPrompts`, OpenCode JSONL lines have different schema than Claude Code JSONL, so may still need OpenCode-specific parsing of individual lines
+
+   - **`cmd/entire/cli/summarize/summarize.go`** — Summarize/condense
+     - **NEEDS UPDATE**: Remove `buildCondensedTranscriptFromOpenCode` function, update `BuildCondensedTranscriptFromBytes` switch to remove OpenCode case
+     - OpenCode JSONL lines need their own parser since the per-line schema differs from Claude Code
+     - Updated `extractGeminiToolDetail` → `extractGenericToolDetail` (already done in earlier commit)
+
+   - **`cmd/entire/cli/summarize/summarize_test.go`** — Summarize tests
+     - Tool names already updated: `edit_file` → `edit`, `run_command` → `bash`
+     - **NEEDS UPDATE**: Test fixtures from JSON to JSONL format
+
+   - **`cmd/entire/cli/agent/opencode/hooks.go`** — Hook install/uninstall (no changes needed for JSONL)
+   - **`cmd/entire/cli/agent/opencode/lifecycle.go`** — Lifecycle event parsing (no changes needed for JSONL)
+   - **`cmd/entire/cli/agent/opencode/plugin.go`** — `go:embed` directive (no changes needed)
+   - **`cmd/entire/cli/agent/registry.go`** — Added `AgentNameOpenCode`/`AgentTypeOpenCode` constants
+   - **`cmd/entire/cli/hooks_cmd.go`** — Added opencode import for registration
+   - **`cmd/entire/cli/setup.go`** — Added OpenCode to uninstall flow
+   - **`cmd/entire/cli/strategy/common.go`** — Added OpenCode detection in `ReadAgentTypeFromTree`
+
+4. Errors and Fixes:
+   - **Edit uniqueness errors**: When editing `summarize_test.go`, the string `run_command` appeared in both Gemini and OpenCode tests. Fixed by providing more surrounding context to uniquely identify the OpenCode instance.
+   - **Tab vs space matching**: An edit to `summarize_test.go` failed because the diff showed spaces but the actual file had tabs. Fixed by reading the exact content and matching it precisely.
+   - **`ReassembleJSONL` return type mismatch**: `agent.ReassembleJSONL` returns `[]byte` but `ReassembleTranscript` interface requires `([]byte, error)`. The current code writes `return agent.ReassembleJSONL(chunks)` which is a compile error — needs `return agent.ReassembleJSONL(chunks), nil`. **This is not yet fixed.**
+   - **Unused `encoding/json` import**: After simplifying `ChunkTranscript`/`ReassembleTranscript` in `opencode.go`, the `encoding/json` import is likely unused. **This is not yet fixed and will cause a compile error.**
+
+5. Problem Solving:
+   - Identified that `~/.opencode/sessions/entire/` was squatting on OpenCode's namespace — resolved by using `os.TempDir()`
+   - Identified that `FileModificationTools` used Claude Code tool names instead of OpenCode's actual tool names — resolved by checking OpenCode source and using `edit`, `write`, `patch`
+   - Identified that JSON transcript format created unnecessary agent-specific code branches — in progress converting to JSONL to unify with Claude Code's format handling
+   - Noted but not yet addressed: `session.error` event not handled, `FormatResumeCommand` using unverified `--session` flag, no integration tests, dead code after switch statements in explain.go, `removeAgentHooks` hardcoded per-agent
+
+6. All User Messages:
+   - "can you review these changes and also compare them against the other open OpenCode related PRs and the official OpenCode docs"
+   - "so ~/.opencode/sessions/entire/<sanitized-path>/<sessionId>.json is completely made up path?"
+   - "entire isn't using any path outside of the repo yet, right?"
+   - "hmm, but thinking more now: in general session logs are always bound to the path, right? So having them in the repo might be right anyway? so we could just add them to .git/entire-sessions and maybe it's enough to just have them there? How does resume work then, we feed data back into sqlite!?"
+   - "ok, then I agree we should go with os.TempDir()"
+   - "can you look at this next: [FileModificationTools issue quote] What's your suggested approach?"
+   - "but wondering now: so basically we condens this into an OpenCode like script?"
+   - "yeah we want some kind of log, and I feel generating it Claude Code like is a good idea for now. But if it's JSON it's not identical to Claude Code so maybe we should fix that?"
+   - "yes" (approving JSONL conversion)
+
+7. Pending Tasks:
+   - **Task #1 (in_progress)**: Convert OpenCode transcript format from JSON to JSONL — partially complete
+   - Remaining work for JSONL conversion:
+     1. Fix `opencode.go` compile errors (`encoding/json` unused import, `ReassembleJSONL` return value)
+     2. Rewrite `transcript.go` to parse JSONL lines instead of JSON
+     3. Update `explain.go` to remove OpenCode-specific cases
+     4. Update `manual_commit_condensation.go` to remove/simplify OpenCode-specific branches
+     5. Update `summarize.go` to handle OpenCode JSONL
+     6. Update all test fixtures from JSON to JSONL format
+     7. Run `mise run fmt && mise run lint && mise run test:ci`
+
+8. Current Work:
+   Actively converting OpenCode's transcript format from JSON to JSONL. Three files have been fully updated (plugin.ts, types.go, opencode.go), but the conversion is incomplete. The transcript.go file (the core parser) and all downstream consumers (explain.go, manual_commit_condensation.go, summarize.go) plus tests still need updating. There are also known compile errors in the current state of opencode.go that need fixing before tests can run.
+
+9. Optional Next Step:
+   Continue the JSONL conversion. The user said "yes" to the question "Want me to make this change?" regarding converting OpenCode transcripts to JSONL. The immediate next steps are:
+   1. Fix `opencode.go` compile errors (remove unused `encoding/json` import, fix `ReassembleTranscript` return)
+   2. Rewrite `transcript.go` — change all parsers from JSON blob to JSONL line-by-line parsing, remove `SliceFromMessage` and `Transcript`-based functions
+   3. Remove OpenCode branches from `explain.go` (let it fall through to line-based Claude Code path)
+   4. Remove OpenCode branches from `manual_commit_condensation.go` (let line counting fall through; keep content-level parsing for OpenCode message schema)
+   5. Update `summarize.go` to parse JSONL lines for OpenCode condensation
+   6. Rewrite all test fixtures from JSON to JSONL
+   7. Run full test suite
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+what where the other things you found in review?
+
+---
+
+3. No integration tests — Claude Code and Gemini have integration tests in cmd/entire/cli/integration_test/ that simulate hook flows (session-start → turn-start → turn-end → commit → session-end). OpenCode has none, so the full hook→checkpoint→condense pipeline is untested.
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Context from previous session**: The conversation is a continuation of a previous session that ran out of context. The previous session covered:
+   - Review of `feat/add-opencode` branch (PR #415) adding OpenCode agent support
+   - Comparison against other open PRs and official OpenCode docs
+   - Three fixes already completed: transcript storage path (→ os.TempDir()), FileModificationTools (→ correct tool names), and starting JSON→JSONL conversion
+   - The JSONL conversion was partially complete when context ran out
+
+2. **Resuming JSONL conversion**: The assistant continued the JSONL conversion work, reading current file states and making the remaining changes:
+   - Fixed `opencode.go` compile errors (unused `encoding/json` import, `ReassembleTranscript` return type)
+   - Rewrote `transcript.go` entirely (from JSON blob parsing to JSONL line-by-line parsing)
+   - Updated `explain.go` (removed OpenCode-specific cases, removed unused import)
+   - Updated `manual_commit_condensation.go` (removed OpenCode case from `countTranscriptItems`, updated comments)
+   - Updated `summarize.go` (changed to use `ParseMessages` instead of `ParseTranscript`)
+   - Rewrote `transcript_test.go` (JSONL fixtures, removed SliceFromMessage tests)
+   - Updated `summarize_test.go` (JSONL fixtures, updated invalid JSON test)
+
+3. **Errors encountered and fixed**:
+   - `ReassembleJSONL` returns `[]byte` not `([]byte, error)` → added `, nil`
+   - Unused `encoding/json` import → removed
+   - Lint: `wrapcheck` on `ChunkJSONL` → wrapped the error
+   - `ChunkTranscript` test with maxSize 350 failed because JSONL lines exceeded 350 bytes → increased to 500
+   - `ReassembleTranscript_Empty` test: `ReassembleJSONL(nil)` returns `[]byte{}` (non-nil) → changed test from `result != nil` to `len(result) != 0`
+   - Unused `strings` import in transcript.go after removing `countLines` → removed
+   - Unused `countLines` function in transcript.go → removed
+
+4. **User asked about other review findings**: After JSONL conversion was complete, user asked "what where the other things you found in review?" Assistant listed 5 remaining findings:
+   1. `session.error` event not handled
+   2. `FormatResumeCommand` using unverified `--session` flag
+   3. No integration tests for OpenCode
+   4. Dead code after switch statements in explain.go
+   5. `removeAgentHooks` hardcoded per-agent
+
+5. **User selected integration tests**: User quoted finding #3 about no integration tests and the assistant began investigating the existing test infrastructure by reading:
+   - `testenv.go` - test environment setup (TestEnv, NewSession, hook runners)
+   - `hooks.go` - hook simulation helpers (HookRunner, GeminiHookRunner, Session, GeminiSession)
+   - `transcript.go` - Claude Code transcript builder
+   - `agent_test.go` - agent detection and session operation tests
+   - `agent_strategy_test.go` - full hook flow composition tests
+   - `lifecycle.go` - OpenCode hook names and event parsing
+
+The assistant was in the process of understanding the test infrastructure to create OpenCode integration tests when the summary was requested.
+
+Key observations about what's needed for OpenCode integration tests:
+- TestEnv has `ClaudeProjectDir` and `GeminiProjectDir` but no `OpenCodeProjectDir`
+- Need to add `ENTIRE_TEST_OPENCODE_PROJECT_DIR` to `cliEnv()`
+- Need an `OpenCodeHookRunner` similar to `GeminiHookRunner`
+- Need `OpenCodeSession` with `CreateOpenCodeTranscript` that writes JSONL
+- OpenCode hooks: `session-start`, `turn-start`, `turn-end`, `session-end`, `compaction`
+- Hook payloads: `{"session_id": "...", "transcript_path": "..."}` (and `turn-start` adds `"prompt": "..."`)
+- Command structure: `entire hooks opencode <hook-name>`
+
+Summary:
+1. Primary Request and Intent:
+   The user initially asked to review changes on the `feat/add-opencode` branch and compare against other open OpenCode-related PRs and official docs. This was done in a previous session. After receiving the review, the user engaged in fixing specific issues:
+   - **Transcript storage path** (completed in prior session): Changed from invented `~/.opencode/sessions/entire/` to `os.TempDir()/entire-opencode/`
+   - **FileModificationTools** (completed in prior session): Fixed incorrect tool names to match OpenCode source (`edit`, `write`, `patch`)
+   - **JSON→JSONL conversion** (completed in this session): Converted OpenCode transcript format from JSON blob to JSONL (one message per line) to unify with Claude Code's format and eliminate agent-specific branches in downstream consumers
+   - **Other review findings** (user asked to list them): 5 remaining items were identified
+   - **Integration tests** (user selected this as next task): User quoted the finding about no integration tests and the assistant began investigating the existing test infrastructure to create OpenCode integration tests
+
+2. Key Technical Concepts:
+   - OpenCode plugin system: TypeScript plugins in `.opencode/plugins/`, Bun runtime, event-driven
+   - JSONL format: one JSON message per line, enables line-based slicing/chunking, reuses Claude Code's code paths
+   - OpenCode JSONL per-line schema: `{"id":"...","role":"user|assistant","content":"...","time":{...},"tokens":{...},"parts":[...]}` — different from Claude Code's `{"type":"user|assistant","uuid":"...","message":{...}}`
+   - `agent.ChunkJSONL` and `agent.ReassembleJSONL` — shared JSONL utilities in the agent package
+   - Integration test infrastructure: `TestEnv`, `HookRunner`, `GeminiHookRunner`, `Session`, `GeminiSession`, `TranscriptBuilder`
+   - OpenCode hooks: `session-start`, `turn-start`, `turn-end`, `session-end`, `compaction` — dispatched via `entire hooks opencode <hook-name>`
+   - Hook payloads: `{"session_id":"...","transcript_path":"..."}` (turn-start adds `"prompt":"..."`)
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/agent/opencode/opencode.go`** — Main agent implementation
+     - Removed unused `encoding/json` import
+     - Fixed `ReassembleTranscript` to return `agent.ReassembleJSONL(chunks), nil` (ReassembleJSONL returns `[]byte`, not `([]byte, error)`)
+     - Wrapped `ChunkJSONL` error for wrapcheck linter
+     - File extension `.jsonl` for `ResolveSessionFile`
+     - `GetSessionDir` uses `os.TempDir()` + `entire-opencode/`
+
+   - **`cmd/entire/cli/agent/opencode/transcript.go`** — Full rewrite from JSON to JSONL parsing
+     - Replaced `ParseTranscript(*Transcript)` with `ParseMessages([]Message)` using `bufio.Reader` line-by-line parsing
+     - Replaced `parseTranscriptFile` with `parseMessagesFromFile`
+     - Removed `SliceFromMessage` (line-based slicing via `transcript.SliceFromLine` handles OpenCode now)
+     - All functions updated to work with `[]Message` instead of `*Transcript`
+     - Removed unused `countLines` helper and `strings` import
+     - Key function: `ParseMessages(data []byte) ([]Message, error)` — parses JSONL, silently skips invalid lines
+
+   - **`cmd/entire/cli/agent/opencode/types.go`** — Type definitions (already updated in prior session)
+     - `Transcript` struct removed (was `{SessionID, Messages}`)
+     - `Message` struct kept unchanged (per-line schema)
+     - `FileModificationTools`: `["edit", "write", "patch"]`
+
+   - **`cmd/entire/cli/agent/opencode/transcript_test.go`** — Full rewrite with JSONL fixtures
+     - Test fixture `testTranscriptJSONL` — 4 JSONL lines (2 user, 2 assistant with tools)
+     - `writeTestTranscript` uses `.jsonl` extension
+     - Removed all `SliceFromMessage`/`ParseTranscript` tests
+     - Added `TestParseMessages`, `TestParseMessages_Empty`, `TestParseMessages_InvalidLines`
+     - Chunk tests use maxSize 500 (JSONL lines are ~370-400 bytes for assistant messages)
+     - `TestReassembleTranscript_Empty` checks `len(result) != 0` instead of `result != nil`
+
+   - **`cmd/entire/cli/explain.go`** — Removed OpenCode-specific branches
+     - `scopeTranscriptForCheckpoint`: OpenCode now falls through to `transcript.SliceFromLine`
+     - `transcriptOffset`: OpenCode now falls through to `countLines`
+     - Removed unused `opencode` import
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation.go`** — Simplified OpenCode branches
+     - `countTranscriptItems`: Removed OpenCode case (falls through to JSONL line-counting)
+     - `extractUserPrompts`: Kept OpenCode case (different per-line schema), updated comment to "uses JSONL"
+     - `calculateTokenUsage`: Kept OpenCode case (different token schema), updated comment to "uses JSONL"
+
+   - **`cmd/entire/cli/summarize/summarize.go`** — Updated OpenCode condensation
+     - `buildCondensedTranscriptFromOpenCode`: Changed from `opencode.ParseTranscript` to `opencode.ParseMessages`
+     - Updated comment to "parses OpenCode JSONL transcript"
+
+   - **`cmd/entire/cli/summarize/summarize_test.go`** — Updated test fixtures
+     - 3 OpenCode tests converted from JSON blob to JSONL string concatenation
+     - `TestBuildCondensedTranscriptFromBytes_OpenCodeInvalidJSONL`: Changed expectation from error to 0 entries (JSONL silently skips invalid lines)
+
+   - **`cmd/entire/cli/agent/opencode/entire_plugin.ts`** — TypeScript plugin (updated in prior session)
+     - Writes JSONL (`lines.join("\n") + "\n"`) instead of JSON blob
+     - Uses `.jsonl` extension
+     - Transcript dir: `${tmpdir()}/entire-opencode/${sanitized}`
+
+   - **`cmd/entire/cli/agent/opencode/lifecycle.go`** — OpenCode hook event parsing (read for integration test planning)
+     - Hook names: `session-start`, `turn-start`, `turn-end`, `session-end`, `compaction`
+     - `ParseHookEvent` maps hook names to normalized `agent.Event` types
+     - Payloads use `sessionInfoRaw` (`session_id`, `transcript_path`) and `turnStartRaw` (adds `prompt`)
+
+   - **Integration test infrastructure** (read for understanding, not yet modified):
+     - `integration_test/testenv.go`: `TestEnv` struct with `ClaudeProjectDir`, `GeminiProjectDir`, `NewSession()`, `NewGeminiSession()`, hook simulation convenience methods
+     - `integration_test/hooks.go`: `HookRunner` (Claude), `GeminiHookRunner`, `Session`, `GeminiSession` types
+     - `integration_test/transcript.go`: `TranscriptBuilder` for Claude Code JSONL format
+     - `integration_test/agent_test.go`: Agent detection, hook installation, session operation tests
+     - `integration_test/agent_strategy_test.go`: Full hook flow composition tests (agent→strategy→checkpoint→rewind)
+
+4. Errors and Fixes:
+   - **`ReassembleJSONL` return type mismatch**: `agent.ReassembleJSONL` returns `[]byte`, not `([]byte, error)`. Fixed by changing `return agent.ReassembleJSONL(chunks)` to `return agent.ReassembleJSONL(chunks), nil`
+   - **Unused `encoding/json` import in opencode.go**: After simplifying ChunkTranscript/ReassembleTranscript, no direct json calls remained. Fixed by removing the import.
+   - **Lint `wrapcheck` on `ChunkJSONL`**: `return agent.ChunkJSONL(content, maxSize)` flagged because error from external package not wrapped. Fixed by wrapping: `chunks, err := agent.ChunkJSONL(...); if err != nil { return nil, fmt.Errorf("failed to chunk opencode transcript: %w", err) }`
+   - **ChunkTranscript test maxSize 350 too small**: JSONL assistant message lines are ~370-400 bytes, exceeding the 350 byte maxSize limit. `ChunkJSONL` returns error when a single line exceeds maxSize. Fixed by increasing maxSize to 500 in both `TestChunkTranscript_SplitsLargeContent` and `TestChunkTranscript_RoundTrip`.
+   - **`ReassembleTranscript_Empty` nil check**: `ReassembleJSONL(nil)` returns `[]byte{}` (non-nil empty slice), not `nil`. Test expected `result != nil` to be false. Fixed by changing to `len(result) != 0`.
+   - **Unused `countLines` function and `strings` import**: Added `countLines` helper in transcript.go but nothing called it. Removed function and the now-unused `strings` import.
+
+5. Problem Solving:
+   - **JSONL conversion completed successfully**: All files updated, tests pass, lint clean. The key insight was that while line-counting and line-slicing can be shared with Claude Code's JSONL path, content-level parsing (extracting prompts, tokens, building condensed transcripts) still needs OpenCode-specific code because the per-line schema differs.
+   - **All tests pass**: `mise run fmt && mise run lint && mise run test:ci` all green.
+   - **Integration tests investigation started**: Read through all test infrastructure files to understand patterns for creating OpenCode equivalents.
+
+6. All User Messages:
+   - (Context from previous session — see summary in system message for full list)
+   - "what where the other things you found in review?"
+   - "3. No integration tests — Claude Code and Gemini have integration tests in cmd/entire/cli/integration_test/ that simulate hook flows (session-start → turn-start → turn-end → commit → session-end). OpenCode has none, so the full hook→checkpoint→condense pipeline is untested."
+
+7. Pending Tasks:
+   - **Create OpenCode integration tests** — The user explicitly selected this as the next task to work on. This requires:
+     - Adding `OpenCodeProjectDir` to `TestEnv` and `cliEnv()`
+     - Creating `OpenCodeHookRunner` (similar to `GeminiHookRunner`) that runs `entire hooks opencode <hook-name>`
+     - Creating `OpenCodeSession` with `CreateOpenCodeTranscript` that writes JSONL in OpenCode format
+     - Creating convenience methods on `TestEnv` for OpenCode hook simulation
+     - Writing integration tests covering the full hook flow: session-start → turn-start → make changes → turn-end → commit → condense → session-end
+   - Other review findings not yet addressed (but user hasn't asked for them):
+     - `session.error` event not handled
+     - `FormatResumeCommand` unverified `--session` flag
+     - Dead code after switch statements
+     - `removeAgentHooks` hardcoded per-agent
+
+8. Current Work:
+   The JSONL conversion task (#1) was completed and marked done. The user then asked about other review findings, and selected "No integration tests" as the next item to work on. The assistant began investigating the existing integration test infrastructure by reading:
+   - `testenv.go` (TestEnv setup, NewSession, hook runners, convenience methods)
+   - `hooks.go` (HookRunner, GeminiHookRunner, Session/GeminiSession types with full hook simulation)
+   - `transcript.go` (TranscriptBuilder for Claude Code JSONL)
+   - `agent_test.go` (detection, hook install, session operations for Claude and Gemini)
+   - `agent_strategy_test.go` (full hook flow composition tests)
+   - `lifecycle.go` (OpenCode hook names and event parsing)
+   
+   The assistant was about to start implementing the OpenCode integration test infrastructure when the summary was requested.
+
+9. Optional Next Step:
+   Continue creating OpenCode integration tests. The user explicitly quoted: "No integration tests — Claude Code and Gemini have integration tests in cmd/entire/cli/integration_test/ that simulate hook flows (session-start → turn-start → turn-end → commit → session-end). OpenCode has none, so the full hook→checkpoint→condense pipeline is untested."
+   
+   The next concrete steps are:
+   1. Add `OpenCodeProjectDir` field to `TestEnv` in `testenv.go` and `ENTIRE_TEST_OPENCODE_PROJECT_DIR` to `cliEnv()`
+   2. Add `OpenCodeHookRunner` to `hooks.go` with methods: `SimulateOpenCodeSessionStart`, `SimulateOpenCodeTurnStart`, `SimulateOpenCodeTurnEnd`, `SimulateOpenCodeSessionEnd` — running `entire hooks opencode <hook-name>` with appropriate JSON payloads
+   3. Add `OpenCodeSession` and `CreateOpenCodeTranscript` that writes JSONL in OpenCode's Message format
+   4. Add convenience methods on `TestEnv` for OpenCode hooks
+   5. Create integration test file (e.g., `setup_opencode_hooks_test.go` or similar) with tests covering:
+      - Agent detection and registration
+      - Hook installation
+      - Full hook flow: session-start → turn-start → file changes → turn-end → checkpoint creation → commit → condense → session-end
+      - Verify rewind works with OpenCode checkpoints
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Context from previous sessions**: This is a continuation of work on the `feat/add-opencode` branch (PR #415) adding OpenCode agent support. Previous sessions covered:
+   - Review of the branch and comparison against other PRs/official docs
+   - Three fixes completed: transcript storage path (→ os.TempDir()), FileModificationTools (→ correct tool names), JSON→JSONL conversion
+   - After JSONL conversion, user asked about other review findings
+   - User selected "No integration tests" as the next task to work on
+   - The assistant began investigating existing test infrastructure when the previous session ran out of context
+
+2. **This session**: The conversation resumed from the previous session's summary. The assistant was asked to continue without asking questions, picking up the integration test task.
+
+3. **Files read for understanding test infrastructure**:
+   - `testenv.go` - TestEnv struct, NewTestEnv, cliEnv, helper methods
+   - `hooks.go` - HookRunner (Claude), GeminiHookRunner, Session, GeminiSession types
+   - `transcript.go` - TranscriptBuilder for Claude Code JSONL format
+   - `agent_test.go` - Agent detection, hook installation, session operation tests
+   - `agent_strategy_test.go` - Full hook flow composition tests
+   - `opencode/lifecycle.go` - OpenCode hook names and event parsing
+   - `opencode/types.go` - OpenCode message types, hook payload types
+   - `opencode/hooks.go` - InstallHooks, AreHooksInstalled, plugin file management
+   - `opencode/plugin.go` - Plugin template embedding
+   - `opencode/opencode.go` - Main agent implementation (already read, in system context)
+   - `opencode/transcript.go` - JSONL parsing (already read, in system context)
+   - `setup_test.go` - TestMain that builds the CLI binary
+   - `setup_gemini_hooks_test.go` - Gemini hook setup tests (for reference pattern)
+   - `settings/settings.go` - EntireSettings struct with DisallowUnknownFields()
+
+4. **Tasks created** (5 tasks):
+   - Task #2: Add OpenCodeProjectDir to TestEnv and cliEnv ✅
+   - Task #3: Add OpenCodeHookRunner and OpenCodeSession to hooks.go ✅
+   - Task #4: Add OpenCode agent detection and session tests ✅
+   - Task #5: Add OpenCode full hook flow integration tests ✅
+   - Task #6: Run fmt, lint, and tests (in progress)
+
+5. **Changes made**:
+
+   a. **testenv.go** - Added `OpenCodeProjectDir` field, temp dir creation, env var in `cliEnv()`, removed `"agent"` field from settings.json writer, made `agentName` parameter unused (`_`) in `InitEntireWithAgent`/`InitEntireWithAgentAndOptions`, removed it from `initEntireInternal`
+
+   b. **hooks.go** - Added `OpenCodeHookRunner` struct with methods (`SimulateOpenCodeSessionStart`, `SimulateOpenCodeTurnStart`, `SimulateOpenCodeTurnEnd`, `SimulateOpenCodeSessionEnd`), `OpenCodeSession` struct with `CreateOpenCodeTranscript`, and convenience methods on `TestEnv`. Added `strings` import.
+
+   c. **agent_test.go** - Added `_ "github.com/entireio/cli/cmd/entire/cli/agent/opencode"` import for registration, added `TestOpenCodeAgentDetection`, `TestOpenCodeHookInstallation`, `TestOpenCodeSessionOperations`, `TestOpenCodeHelperMethods` test functions.
+
+   d. **opencode_hooks_test.go** (new file) - Created with `TestOpenCodeHookFlow`, `TestOpenCodeAgentStrategyComposition`, `TestOpenCodeRewind`, `TestOpenCodeMultiTurnCondensation` tests.
+
+6. **Errors encountered**:
+   - **`json: unknown field "agent"` in settings parsing**: `initEntireInternal` was writing `"agent": "opencode"` to settings.json, but `EntireSettings` struct doesn't have an `agent` field and uses `DisallowUnknownFields()`. This caused the CLI to fall back to default strategy, and a log line was emitted to stdout before JSON output, corrupting `GetRewindPoints()` JSON parsing. Fix: removed the `"agent"` field from the settings map in `initEntireInternal`, made `agentName` params unused.
+   
+   - **Test failures with "No files were modified during this session"**: Some tests showed "No files were modified during this session / Skipping commit" — this suggests the file changes weren't detected by the turn-end hook. This is likely because the transcript was created AFTER files were written but BEFORE turn-start, so the pre-prompt state already included those files as untracked.
+
+   - **Broken `initEntireInternal` call**: After removing `agentName` from `initEntireInternal`, there's still a call at line 297 with the old signature `env.initEntireInternal(strategyName, "", strategyOptions)` that needs to be fixed (from `InitEntireWithOptions`).
+
+7. **Current state**: 
+   - Format and lint pass
+   - Unit tests pass
+   - Integration tests FAIL with the `"agent"` field error
+   - The fix to remove the `"agent"` field was partially applied — `initEntireInternal` signature changed but there's a remaining caller (`InitEntireWithOptions` at line 297) still passing the old argument count
+   - The OpenCode tests may also have issues with file change detection timing (files created before turn-start are seen as pre-existing)
+
+Summary:
+1. Primary Request and Intent:
+   The user is working on the `feat/add-opencode` branch (PR #415) adding OpenCode agent support to the CLI. In a previous session, the user reviewed the branch, fixed transcript storage path, FileModificationTools, and completed JSON→JSONL conversion. The user then asked about remaining review findings and explicitly selected **"No integration tests"** as the next task: "Claude Code and Gemini have integration tests in cmd/entire/cli/integration_test/ that simulate hook flows (session-start → turn-start → turn-end → commit → session-end). OpenCode has none, so the full hook→checkpoint→condense pipeline is untested." The task is to create comprehensive OpenCode integration tests following existing Claude Code and Gemini patterns.
+
+2. Key Technical Concepts:
+   - OpenCode hooks: `session-start`, `turn-start`, `turn-end`, `session-end`, `compaction` — dispatched via `entire hooks opencode <hook-name>`
+   - Hook payloads: `{"session_id":"...","transcript_path":"..."}` (turn-start adds `"prompt":"..."`)
+   - OpenCode JSONL format: one Message per line with `{"id":"...","role":"user|assistant","content":"...","time":{...},"tokens":{...},"parts":[...]}`
+   - Integration test infrastructure: `TestEnv`, `HookRunner`, `GeminiHookRunner`, `Session`, `GeminiSession`, `TranscriptBuilder`
+   - `EntireSettings` struct uses `DisallowUnknownFields()` — only recognized JSON fields are allowed
+   - Agent is resolved from hook command path and checkpoint metadata, NOT from settings.json
+   - OpenCode implements `agent.HookSupport` via plugin file (`.opencode/plugins/entire.ts`), not JSON config
+   - Test binary is built once in `TestMain` and shared across all integration tests
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/integration_test/testenv.go`** — Core test environment setup
+     - Added `OpenCodeProjectDir` field to `TestEnv` struct
+     - Added temp dir creation with symlink resolution in `NewTestEnv`
+     - Added `ENTIRE_TEST_OPENCODE_PROJECT_DIR` to `cliEnv()`
+     - Removed `"agent"` field from settings.json writer in `initEntireInternal` (was causing `DisallowUnknownFields` error)
+     - Changed `InitEntireWithAgent` and `InitEntireWithAgentAndOptions` to use `_ agent.AgentName` (unused param)
+     - Changed `initEntireInternal` signature from `(strategyName string, agentName agent.AgentName, strategyOptions map[string]any)` to `(strategyName string, strategyOptions map[string]any)`
+     - **IMPORTANT**: There's a remaining broken caller at line 297 — `InitEntireWithOptions` still calls `env.initEntireInternal(strategyName, "", strategyOptions)` with the OLD 3-arg signature
+     ```go
+     func (env *TestEnv) InitEntireWithOptions(strategyName string, strategyOptions map[string]any) {
+         env.T.Helper()
+         env.initEntireInternal(strategyName, "", strategyOptions) // BUG: needs to be env.initEntireInternal(strategyName, strategyOptions)
+     }
+     ```
+
+   - **`cmd/entire/cli/integration_test/hooks.go`** — Hook simulation infrastructure
+     - Added `strings` import
+     - Added `OpenCodeHookRunner` struct with `runOpenCodeHookWithInput`, `runOpenCodeHookInRepoDir`, `SimulateOpenCodeSessionStart`, `SimulateOpenCodeTurnStart`, `SimulateOpenCodeTurnEnd`, `SimulateOpenCodeSessionEnd`
+     - Added `OpenCodeSession` struct with `ID`, `TranscriptPath`, `env`, `msgCounter` fields
+     - Added `NewOpenCodeSession` method on `TestEnv` — creates session with ID pattern `opencode-session-N` and transcript path in `OpenCodeProjectDir`
+     - Added `CreateOpenCodeTranscript` — builds JSONL with user message + assistant message with tool parts for file changes
+     - Added convenience methods on `TestEnv`: `SimulateOpenCodeSessionStart`, `SimulateOpenCodeTurnStart`, `SimulateOpenCodeTurnEnd`, `SimulateOpenCodeSessionEnd`
+     - Hook runner passes `ENTIRE_TEST_OPENCODE_PROJECT_DIR` env var and runs commands via `entire hooks opencode <hook-name>`
+
+   - **`cmd/entire/cli/integration_test/agent_test.go`** — Agent detection and session tests
+     - Added `_ "github.com/entireio/cli/cmd/entire/cli/agent/opencode"` import for registration
+     - Added `TestOpenCodeAgentDetection` — tests agent registration, `.opencode` dir detection, `opencode.json` detection
+     - Added `TestOpenCodeHookInstallation` — tests plugin file installation and idempotency
+     - Added `TestOpenCodeSessionOperations` — tests ReadSession with JSONL transcript (ModifiedFiles extraction), WriteSession
+     - Added `TestOpenCodeHelperMethods` — tests FormatResumeCommand, GetHookConfigPath, ProtectedDirs, IsPreview
+
+   - **`cmd/entire/cli/integration_test/opencode_hooks_test.go`** (NEW FILE) — Full hook flow tests
+     - `TestOpenCodeHookFlow` — full flow: session-start → turn-start → file changes → turn-end → checkpoint → commit with shadow hooks → session-end → verify condensation
+     - `TestOpenCodeAgentStrategyComposition` — agent + strategy composition: ReadSession, hook flow, verify rewind points
+     - `TestOpenCodeRewind` — two turns, rewind to first checkpoint, verify file restoration
+     - `TestOpenCodeMultiTurnCondensation` — turn + commit + verify ValidateCheckpoint on metadata branch
+
+   - **`cmd/entire/cli/settings/settings.go`** — Read to understand settings parsing
+     - `EntireSettings` struct has: Strategy, Enabled, LocalDev, LogLevel, StrategyOptions, Telemetry — NO `Agent` field
+     - Uses `dec.DisallowUnknownFields()` in `loadFromFile`
+     - This is why writing `"agent": "opencode"` to settings.json caused parse failures
+
+   - **`cmd/entire/cli/agent/opencode/lifecycle.go`** — Read to understand hook events
+     - Hook names: `session-start`, `session-end`, `turn-start`, `turn-end`, `compaction`
+     - `ParseHookEvent` maps to `agent.SessionStart`, `agent.TurnStart`, `agent.TurnEnd`, `agent.Compaction`, `agent.SessionEnd`
+     - Payloads: `sessionInfoRaw` (session_id, transcript_path) and `turnStartRaw` (adds prompt)
+
+   - **`cmd/entire/cli/agent/opencode/types.go`** — Read to understand message format
+     - `sessionInfoRaw`: `{SessionID, TranscriptPath}`
+     - `turnStartRaw`: `{SessionID, TranscriptPath, Prompt}`
+     - `Message` struct: `{ID, Role, Content, Time, Tokens, Cost, Parts}`
+     - `FileModificationTools`: `["edit", "write", "patch"]`
+
+   - **`cmd/entire/cli/agent/opencode/hooks.go`** — Read to understand hook installation
+     - Plugin file at `.opencode/plugins/entire.ts`
+     - `InstallHooks` returns 1 (plugin installed) or 0 (already present)
+     - `AreHooksInstalled` checks for marker string in plugin file
+
+4. Errors and fixes:
+   - **`json: unknown field "agent"` in settings.json**: `initEntireInternal` wrote `"agent": "opencode"` to settings.json, but `EntireSettings` uses `DisallowUnknownFields()`. This caused: (a) settings load failure with fallback to default strategy, (b) INFO log line emitted to stdout before JSON, (c) `GetRewindPoints()` JSON unmarshal failure (`invalid character '/' after top-level value`).
+     - Fix: Removed the `"agent"` field from the settings map. Changed `initEntireInternal` to not accept `agentName` parameter. Made `agentName` params unused (`_`) in public methods.
+     - **INCOMPLETE**: `InitEntireWithOptions` at line 297 still calls `initEntireInternal` with old 3-arg signature — this will cause a compile error.
+
+   - **"No files were modified during this session / Skipping commit"**: In some test cases (TestOpenCodeRewind, TestOpenCodeAgentStrategyComposition), the turn-end hook reported no files modified. This is because the files were created before turn-start, so they were counted as pre-existing untracked files. The transcript listed them as modified (via tool calls), but the strategy detects changes by comparing git status before and after. Fix: need to ensure files are created AFTER turn-start or adjust test flow.
+
+5. Problem Solving:
+   - Successfully created the full OpenCode integration test infrastructure following existing Claude Code and Gemini patterns
+   - Identified and partially fixed the settings.json `"agent"` field issue
+   - Still need to fix: (a) compile error from `InitEntireWithOptions` calling old signature, (b) test flow timing issue where files must be created after turn-start for change detection to work, (c) re-run integration tests to verify fixes
+
+6. All user messages:
+   - "This session is being continued from a previous conversation that ran out of context. [detailed summary of previous work]... Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on."
+
+7. Pending Tasks:
+   - Fix compile error: `InitEntireWithOptions` at line 297 still calls `initEntireInternal(strategyName, "", strategyOptions)` with old 3-arg signature — needs to be `initEntireInternal(strategyName, strategyOptions)`
+   - Fix test flow timing: Some OpenCode tests create files BEFORE turn-start, causing "No files modified" because files are counted as pre-existing. Need to create files AFTER turn-start or create transcript AFTER file changes and before turn-end
+   - Re-run `mise run fmt && mise run lint && mise run test:ci` to verify all fixes
+
+8. Current Work:
+   Was in the middle of fixing the `"agent"` field issue in `testenv.go`. Applied the fix to remove the agent field from settings.json and updated `initEntireInternal` signature, but left a compile error at line 297 where `InitEntireWithOptions` still uses the old 3-argument call:
+   ```go
+   env.initEntireInternal(strategyName, "", strategyOptions)  // OLD - compile error
+   ```
+   needs to be:
+   ```go
+   env.initEntireInternal(strategyName, strategyOptions)  // NEW
+   ```
+
+9. Optional Next Step:
+   Fix the remaining compile error in `InitEntireWithOptions`, then re-run integration tests. After that, fix the test flow timing issue where OpenCode tests create files before `turn-start` (causing "No files were modified" — need to match the pattern in `TestOpenCodeHookFlow` which correctly creates files after turn-start). Then run `mise run fmt && mise run lint && mise run test:ci` to verify everything passes.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+are you stuck?
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Context from previous sessions**: This is a continuation of work on the `feat/add-opencode` branch (PR #415) adding OpenCode agent support. Previous sessions covered review, fixes (transcript storage path, FileModificationTools, JSON→JSONL conversion), and then started on integration tests.
+
+2. **This session starts**: The conversation was resumed from a previous session that ran out of context. The summary indicated the task was to create OpenCode integration tests, with several tasks already completed but some issues remaining:
+   - Task #2-5 completed (OpenCodeProjectDir, OpenCodeHookRunner, agent tests, hook flow tests)
+   - Task #6 (run fmt, lint, tests) was in progress
+   - A compile error existed at `InitEntireWithOptions` line 297
+   - Test flow timing issues where files created before turn-start weren't detected
+
+3. **First action**: Read current state of testenv.go, hooks.go, and opencode_hooks_test.go to understand what needed fixing.
+
+4. **Fix 1 - Compile error**: Fixed `InitEntireWithOptions` at line 297 changing `env.initEntireInternal(strategyName, "", strategyOptions)` to `env.initEntireInternal(strategyName, strategyOptions)` — removing the extra empty string argument that was left from the old 3-argument signature.
+
+5. **Build verification**: `go build ./...` compiled successfully.
+
+6. **Format and lint**: Both passed.
+
+7. **Unit tests**: Ran targeted unit tests on strategy, agent, checkpoint, session packages — all passed.
+
+8. **Integration test run**: Ran OpenCode integration tests with `-run 'TestOpenCode'`. Results:
+   - TestOpenCodeAgentStrategyComposition (both strategies): FAIL - "No files were modified during this session"
+   - TestOpenCodeMultiTurnCondensation: FAIL - same issue
+   - TestOpenCodeRewind: FAIL - same issue
+   - TestOpenCodeHookFlow/auto-commit: Turn-end worked, committed successfully
+   - TestOpenCodeHookFlow/manual-commit: Turn-end created shadow branch, but condensation failed
+
+9. **Root cause investigation for "No files modified"**: Files were created BEFORE turn-start, so the pre-prompt state already included them as untracked. When turn-end compared to pre-prompt state, no new changes were detected.
+
+10. **Root cause investigation for manual-commit condensation failure**: 
+    - Added temporary debug logging to `gitCommitWithShadowHooks` (prepare-commit-msg output, commit message, post-commit output)
+    - First run showed prepare-commit-msg added the `Entire-Checkpoint` trailer correctly, but post-commit produced no output
+    - Added `ENTIRE_LOG_LEVEL=debug` env var to post-commit hook
+    - Debug logs revealed: `"should_condense":false` despite `"has_new":true`
+    - The issue was in `HandleCondense` at line 494: for non-ACTIVE sessions, it calls `filesOverlapWithContent()` which compares committed file content with shadow branch content
+    - The test was modifying `feature.go` AGAIN before committing (adding `\n// committed`), so the content didn't match the shadow branch version
+    - Fix: Don't modify the file content between turn-end and commit
+
+11. **First round of fixes applied**: Rewrote opencode_hooks_test.go with:
+    - Removed the extra file modification before commit in TestOpenCodeHookFlow
+    - Moved file creation after turn-start in TestOpenCodeAgentStrategyComposition (but incorrectly just "touched" same content)
+    - Moved file creation after turn-start in TestOpenCodeRewind
+    - Moved file creation after turn-start in TestOpenCodeMultiTurnCondensation
+    - Removed debug logging from testenv.go
+
+12. **Second test run results**:
+    - TestOpenCodeHookFlow/manual-commit: PASS
+    - TestOpenCodeMultiTurnCondensation: PASS
+    - TestOpenCodeRewind: PASS
+    - TestOpenCodeHookFlow/auto-commit: FAIL - "cannot create empty commit: clean working tree" (auto-commit already committed during turn-end)
+    - TestOpenCodeAgentStrategyComposition (both strategies): FAIL - file existed before turn-start, touching with same content didn't help
+
+13. **Final fixes applied** (where conversation was interrupted):
+    - TestOpenCodeHookFlow: Made commit conditional on `strategyName == strategy.StrategyNameManualCommit`
+    - TestOpenCodeAgentStrategyComposition: Removed `env.WriteFile` before hook flow (transcript doesn't need actual file for ReadSession), created file AFTER turn-start only
+    - Removed temporary debug logging from testenv.go
+
+14. **User messages during session**:
+    - "are you still working?" — while waiting for slow unit tests
+    - "are you stuck?" — when tests were taking long
+
+Files modified:
+- `cmd/entire/cli/integration_test/testenv.go` — Fixed compile error at InitEntireWithOptions, added/removed temp debug logging
+- `cmd/entire/cli/integration_test/opencode_hooks_test.go` — Major rewrite to fix test flow ordering and strategy-specific behavior
+
+Summary:
+1. Primary Request and Intent:
+   The user is continuing work from a previous session on the `feat/add-opencode` branch (PR #415). The specific task is creating comprehensive OpenCode integration tests in `cmd/entire/cli/integration_test/`. The previous session created the test infrastructure and test files but left with compile errors, test flow timing issues, and failing integration tests. The user's instruction was: "Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on."
+
+2. Key Technical Concepts:
+   - OpenCode hooks: `session-start`, `turn-start`, `turn-end`, `session-end` dispatched via `entire hooks opencode <hook-name>`
+   - Hook flow timing: Files MUST be created AFTER `turn-start` (UserPromptSubmit equivalent) so the strategy's pre-prompt state capture doesn't include them as pre-existing
+   - Content-aware overlap check: For manual-commit strategy's `PostCommit` condensation, `filesOverlapWithContent()` compares committed file content with shadow branch content — content must MATCH for condensation to proceed
+   - Auto-commit vs manual-commit: Auto-commit creates the commit during `turn-end`, while manual-commit requires a separate user commit with `GitCommitWithShadowHooks`
+   - `EntireSettings` uses `DisallowUnknownFields()` — unknown JSON fields in settings.json cause parse failures
+   - Session state stored in `.git/entire-sessions/<session-id>.json` with `WorktreePath` used for worktree matching
+   - Shadow branch naming: `entire/<HEAD-hash[:7]>-<worktreeHash[:6]>`
+
+3. Files and Code Sections:
+   - **`cmd/entire/cli/integration_test/testenv.go`**
+     - Core test environment setup; contains `InitEntireWithOptions`, `GitCommitWithShadowHooks`, and other test helpers
+     - Fixed compile error at line 297: changed `env.initEntireInternal(strategyName, "", strategyOptions)` to `env.initEntireInternal(strategyName, strategyOptions)`
+     - Added and then removed temporary debug logging in `gitCommitWithShadowHooks` for prepare-commit-msg output, commit message content, and post-commit debug env var
+     - Final state: debug logging removed, back to original logging behavior
+
+   - **`cmd/entire/cli/integration_test/opencode_hooks_test.go`** (rewritten multiple times)
+     - Contains 4 test functions for OpenCode hook flows
+     - Final version has these key fixes applied:
+     ```go
+     // TestOpenCodeHookFlow - commit is conditional on strategy
+     if strategyName == strategy.StrategyNameManualCommit {
+         env.GitCommitWithShadowHooks("Add feature", "feature.go")
+     }
+     ```
+     ```go
+     // TestOpenCodeAgentStrategyComposition - transcript created without actual file for ReadSession
+     session := env.NewOpenCodeSession()
+     transcriptPath := session.CreateOpenCodeTranscript("Add a feature", []FileChange{
+         {Path: "feature.go", Content: "package main\n// new feature"},
+     })
+     // ... ReadSession test ...
+     // Then file created AFTER turn-start
+     env.WriteFile("feature.go", "package main\n// new feature")
+     ```
+     ```go
+     // TestOpenCodeRewind - files created AFTER turn-start
+     if err := env.SimulateOpenCodeTurnStart(session.ID, transcriptPath, "Create file1"); err != nil {
+         t.Fatalf("turn-start error: %v", err)
+     }
+     env.WriteFile("file1.go", "package main\n// file1 v1")
+     session.CreateOpenCodeTranscript("Create file1", []FileChange{...})
+     ```
+
+   - **`cmd/entire/cli/integration_test/hooks.go`** (read, not modified in this session)
+     - Contains `OpenCodeHookRunner`, `OpenCodeSession`, and convenience methods on `TestEnv`
+     - `CreateOpenCodeTranscript` builds JSONL with user/assistant messages and tool parts
+
+   - **`cmd/entire/cli/integration_test/agent_test.go`** (read, not modified in this session)
+     - Contains `TestOpenCodeAgentDetection`, `TestOpenCodeHookInstallation`, `TestOpenCodeSessionOperations`, `TestOpenCodeHelperMethods` — all passing
+
+   - **`cmd/entire/cli/agent/opencode/opencode.go`** (read from prior session context)
+     - OpenCode agent implementation with `ReadSession`, `WriteSession`, `GetSessionDir` etc.
+
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** (read for debugging)
+     - `PrepareCommitMsg` — finds sessions, adds `Entire-Checkpoint` trailer
+     - `PostCommit` — finds sessions, calls `HandleCondense` which uses `filesOverlapWithContent()` for non-ACTIVE sessions (line 494-496)
+     - Key code causing condensation failure:
+     ```go
+     shouldCondense := h.hasNew
+     if shouldCondense && !state.Phase.IsActive() {
+         shouldCondense = filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, state.FilesTouched)
+     }
+     ```
+
+4. Errors and fixes:
+   - **Compile error in `InitEntireWithOptions`**: Called `initEntireInternal` with 3 args but signature was changed to 2 args in previous session. Fixed by removing the extra `""` argument.
+   
+   - **"No files were modified during this session / Skipping commit"** (3 tests): Files were created BEFORE `turn-start`, so they were captured in the pre-prompt state as pre-existing untracked files. Turn-end compared git status and saw no new changes. Fixed by moving all `env.WriteFile()` calls to AFTER `SimulateOpenCodeTurnStart()`.
+   
+   - **Manual-commit condensation failure** (`should_condense: false` despite `has_new: true`): The test modified `feature.go` content BETWEEN turn-end and commit (`"package main\n// new feature\n// committed"` vs `"package main\n// new feature"`). The `filesOverlapWithContent()` check in `PostCommit` detected the content mismatch and refused to condense. Fixed by removing the extra file modification — committing the same content that was on the shadow branch.
+   
+   - **Auto-commit "cannot create empty commit: clean working tree"**: Auto-commit strategy already commits files during turn-end, so `GitCommitWithShadowHooks` found nothing to commit. Fixed by making the commit conditional: `if strategyName == strategy.StrategyNameManualCommit`.
+   
+   - **TestOpenCodeAgentStrategyComposition still failing after first fix**: "Touching" the file with same content after turn-start didn't help because git doesn't detect a change when content is identical. Fixed by NOT creating the actual file before the hook flow (transcript doesn't need it for ReadSession), and only creating it after turn-start.
+
+5. Problem Solving:
+   - Used `ENTIRE_LOG_LEVEL=debug` env var on post-commit hook subprocess to get detailed logs revealing the `should_condense: false` decision
+   - Traced through `PrepareCommitMsg` → `filterSessionsWithNewContent` → `sessionHasNewContent` → `countTranscriptItems` code path to understand the condensation pipeline
+   - Investigated potential worktree path mismatch, env var issues, and settings loading problems before finding the actual content-mismatch root cause
+
+6. All user messages:
+   - "Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on." (session resumption with detailed context summary)
+   - "are you still working?" (during slow unit test run)
+   - "are you stuck?" (when tests appeared to hang)
+
+7. Pending Tasks:
+   - Run the updated OpenCode integration tests to verify all 4 test functions pass
+   - Run `mise run fmt && mise run lint && mise run test:ci` to verify everything passes (including existing Claude/Gemini tests aren't broken)
+   - Task #6 is still marked as in_progress
+
+8. Current Work:
+   Just wrote the final version of `opencode_hooks_test.go` with all fixes applied:
+   - `TestOpenCodeHookFlow`: Conditional commit for manual-commit only
+   - `TestOpenCodeAgentStrategyComposition`: Transcript created without actual file, file created after turn-start
+   - `TestOpenCodeRewind`: Files created after turn-start
+   - `TestOpenCodeMultiTurnCondensation`: File created after turn-start
+   
+   Had NOT yet run the tests to verify these final fixes work.
+
+9. Optional Next Step:
+   Run the OpenCode integration tests to verify the latest fixes pass all 4 test functions:
+   ```
+   go test -timeout 120s -count=1 -tags=integration -v -run 'TestOpenCode' ./cmd/entire/cli/integration_test/...
+   ```
+   Then run the full test suite: `mise run fmt && mise run lint && mise run test:ci`
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+<task-notification>
+<task-id>b013bf3</task-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/tasks/b013bf3.output</output-file>
+<status>failed</status>
+<summary>Background command "Run all tests (unit + integration)" failed with exit code 1</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/tasks/b013bf3.output
+
+---
+
+TestRunExplain_SessionFlagFiltersListView this is an existing test?
+
+---
+
+but why is the test having a large tree?
+
+---
+
+oh, it runs against the cli repo?
+
+---
+
+yes
+
+---
+
+can you tell me which file this change is in? I think I make this a dedictated PR

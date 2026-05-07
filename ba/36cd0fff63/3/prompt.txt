@@ -1,0 +1,158 @@
+Implement the following plan:
+
+# Fix Kiro CI auth: inject SQLite auth DB instead of SSO cache file
+
+## Context
+
+The previous commit wrote a token to `~/.aws/sso/cache/kiro-auth-token.json`, but `kiro-cli-chat` does **not** read from that path. Investigation shows:
+
+- `kiro-cli-chat` stores auth in a **SQLite database** at a platform-specific path:
+  - macOS: `~/Library/Application Support/kiro-cli/data.sqlite3`
+  - Linux (CI): `~/.local/share/kiro-cli/data.sqlite3`
+- The `auth_kv` table has two rows needed for auth:
+  - `kirocli:odic:device-registration` — OAuth client registration (client_id, client_secret, etc.)
+  - `kirocli:odic:token` — access/refresh tokens with expiry
+- The `migrations` table must also be populated (kiro-cli-chat may refuse to use a DB without migration records)
+- `kiro-cli-chat whoami -f json` validates auth is working
+
+## Changes
+
+### 1. Both workflows — replace "Inject Kiro auth token" step
+
+Replace the current step that writes to `~/.aws/sso/cache/` with one that creates the SQLite database:
+
+```yaml
+- name: Inject Kiro auth token
+  if: <agent> == 'kiro'
+  run: |
+    mkdir -p ~/.local/share/kiro-cli
+    DB_PATH="$HOME/.local/share/kiro-cli/data.sqlite3"
+    sqlite3 "$DB_PATH" <<'SQL'
+    CREATE TABLE IF NOT EXISTS migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL, migration_time INTEGER NOT NULL);
+    INSERT OR IGNORE INTO migrations (id, version, migration_time) VALUES (1,0,0),(2,1,0),(3,2,0),(4,3,0),(5,4,0),(6,5,0),(7,6,0),(8,7,0),(9,8,0);
+    CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value BLOB);
+    CREATE TABLE IF NOT EXISTS conversations (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS conversations_v2 (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, value TEXT, updated_at TEXT);
+    SQL
+    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('kirocli:odic:device-registration', '$KIRO_DEVICE_REG');"
+    sqlite3 "$DB_PATH" "INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('kirocli:odic:token', '$KIRO_AUTH_TOKEN');"
+    kiro-cli-chat whoami -f json
+  env:
+    KIRO_AUTH_TOKEN: ${{ secrets.KIRO_AUTH_TOKEN }}
+    KIRO_DEVICE_REG: ${{ secrets.KIRO_DEVICE_REG }}
+```
+
+**Wait — SQL injection risk with `'$VAR'` in SQL.** The values are JSON containing single quotes potentially. Better approach: use parameterized inserts or base64-encode the secrets and decode in the step. Safest approach: write a small script that uses `sqlite3` with `.import` or heredoc-safe quoting.
+
+Actually, the simplest safe approach: write the JSON values to temp files, then use `readfile()` or just read them in with a subshell. But `sqlite3` CLI doesn't have great parameterization. The safest approach for JSON that might contain quotes:
+
+```yaml
+  run: |
+    mkdir -p ~/.local/share/kiro-cli
+    DB="$HOME/.local/share/kiro-cli/data.sqlite3"
+    sqlite3 "$DB" <<'SQL'
+    CREATE TABLE IF NOT EXISTS migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL, migration_time INTEGER NOT NULL);
+    INSERT OR IGNORE INTO migrations (id,version,migration_time) VALUES (1,0,0),(2,1,0),(3,2,0),(4,3,0),(5,4,0),(6,5,0),(7,6,0),(8,7,0),(9,8,0);
+    CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value BLOB);
+    CREATE TABLE IF NOT EXISTS conversations (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS conversations_v2 (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, value TEXT, updated_at TEXT);
+    SQL
+    # Use Python to safely insert JSON (avoids SQL injection from quotes in JSON)
+    python3 -c "
+    import sqlite3, os
+    db = sqlite3.connect(os.path.expanduser('~/.local/share/kiro-cli/data.sqlite3'))
+    db.execute('INSERT OR REPLACE INTO auth_kv (key, value) VALUES (?, ?)',
+               ('kirocli:odic:device-registration', os.environ['KIRO_DEVICE_REG']))
+    db.execute('INSERT OR REPLACE INTO auth_kv (key, value) VALUES (?, ?)',
+               ('kirocli:odic:token', os.environ['KIRO_AUTH_TOKEN']))
+    db.commit()
+    "
+    kiro-cli-chat whoami -f json
+```
+
+### 2. `e2e/agents/kiro.go` — remove SIGV4 bootstrap path
+
+Since we removed all SIGV4 env vars from CI, the SIGV4 validation code in `Bootstrap()` is dead code for CI. However, it's harmless and could be useful if SIGV4 support is added later. **Leave it for now** — it just won't trigger since `AMAZON_Q_SIGV4` is never set.
+
+### 3. Secrets to configure
+
+Two GitHub secrets needed (split for clarity and independent rotation):
+
+| Secret | Source | Content |
+|--------|--------|---------|
+| `KIRO_AUTH_TOKEN` | `sqlite3 ~/Library/Application\ Support/kiro-cli/data.sqlite3 "SELECT value FROM auth_kv WHERE key='kirocli:odic:token';"` | JSON with access_token, refresh_token, expires_at, region, scopes |
+| `KIRO_DEVICE_REG` | `sqlite3 ~/Library/Application\ Support/kiro-cli/data.sqlite3 "SELECT value FROM auth_kv WHERE key='kirocli:odic:device-registration';"` | JSON with client_id, client_secret, client_secret_expires_at, region, scopes |
+
+**Token refresh:** The access_token expires (currently hourly), but the refresh_token is long-lived. `kiro-cli-chat` auto-refreshes using the refresh_token + device-registration client credentials. So as long as the refresh_token and device-registration are valid, CI auth will keep working.
+
+**Device registration expiry:** The `client_secret_expires_at` field controls when the device registration expires. When it does, re-run `kiro-cli-chat login --license free --use-device-flow` and update both secrets.
+
+## Files to modify
+
+- `.github/workflows/e2e-isolated.yml` — replace "Inject Kiro auth token" step
+- `.github/workflows/e2e.yml` — replace "Inject Kiro auth token" step
+
+## Local verification
+
+Before pushing, verify the approach works locally:
+
+```bash
+# 1. Create a temp SQLite DB mimicking CI (Linux path but on macOS for testing)
+mkdir -p /tmp/kiro-test
+DB="/tmp/kiro-test/data.sqlite3"
+rm -f "$DB"
+
+# 2. Export the auth values from your real DB
+export KIRO_AUTH_TOKEN=$(sqlite3 ~/Library/Application\ Support/kiro-cli/data.sqlite3 "SELECT value FROM auth_kv WHERE key='kirocli:odic:token';")
+export KIRO_DEVICE_REG=$(sqlite3 ~/Library/Application\ Support/kiro-cli/data.sqlite3 "SELECT value FROM auth_kv WHERE key='kirocli:odic:device-registration';")
+
+# 3. Create the DB with the CI script logic
+sqlite3 "$DB" <<'SQL'
+CREATE TABLE IF NOT EXISTS migrations (id INTEGER PRIMARY KEY, version INTEGER NOT NULL, migration_time INTEGER NOT NULL);
+INSERT OR IGNORE INTO migrations (id,version,migration_time) VALUES (1,0,0),(2,1,0),(3,2,0),(4,3,0),(5,4,0),(6,5,0),(7,6,0),(8,7,0),(9,8,0);
+CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value BLOB);
+CREATE TABLE IF NOT EXISTS conversations (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS conversations_v2 (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, value TEXT, updated_at TEXT);
+SQL
+python3 -c "
+import sqlite3, os
+db = sqlite3.connect('$DB')
+db.execute('INSERT OR REPLACE INTO auth_kv (key, value) VALUES (?, ?)',
+           ('kirocli:odic:device-registration', os.environ['KIRO_DEVICE_REG']))
+db.execute('INSERT OR REPLACE INTO auth_kv (key, value) VALUES (?, ?)',
+           ('kirocli:odic:token', os.environ['KIRO_AUTH_TOKEN']))
+db.commit()
+"
+
+# 4. Point kiro-cli-chat at the test DB and verify
+# NOTE: kiro-cli-chat uses XDG_DATA_HOME or platform default.
+# On macOS it uses ~/Library/Application Support/kiro-cli/
+# We can test by temporarily moving the real DB and symlinking,
+# OR just verify the DB contents are correct:
+sqlite3 "$DB" "SELECT key, length(value) FROM auth_kv;"
+# Expected: both rows present with reasonable value lengths
+
+# 5. On Linux (CI), the path is ~/.local/share/kiro-cli/data.sqlite3
+# kiro-cli-chat should find it automatically via XDG_DATA_HOME default
+```
+
+## Verification on CI
+
+Push and run `e2e-isolated` with `agent=kiro`. The `kiro-cli-chat whoami -f json` at the end of the inject step will fail fast if auth doesn't work.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/7682603d-1d7b-49cc-900b-ee77433e7db4.jsonl
+
+---
+
+can I test this works locally? can you write a script that does what the gh action does to test that auth works?
+
+---
+
+[Request interrupted by user for tool use]

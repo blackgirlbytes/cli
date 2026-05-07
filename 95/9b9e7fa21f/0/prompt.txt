@@ -1,0 +1,220 @@
+I don't know about you but I am definitely done 🤣
+
+---
+
+uhh...what happened in that last run? https://github.com/entireio/cli/actions/runs/22749960064/job/65982225451
+
+---
+
+okay, I'll rerun it.
+
+how the heck did the installation get truncated??
+
+---
+
+yeah let's raise a PR, it's looking close if not done
+
+---
+
+https://github.com/entireio/cli/actions/runs/22749960064/job/65982881784 green!
+
+let's fire off another one
+
+---
+
+/pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>a9dbbe12ecdf8c291</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Review PR code quality" completed</summary>
+<result>Now I have a clear picture. Let me analyze the diff against the project guidelines and for correctness issues.
+
+**Reviewing PR #632 (branch: alex/copilot-e2e-fix)**
+
+Files changed:
+- `/Users/alex/workspace/cli/.worktrees/5/e2e/agents/copilot-cli.go`
+- `/Users/alex/workspace/cli/.worktrees/5/e2e/testutil/repo.go`
+
+---
+
+**Summary of changes:**
+
+1. **copilot-cli.go - `IsTransientError`**: Added `"old_str is required"` to the transient error patterns list.
+2. **copilot-cli.go - `RunPrompt`**: After running the command, if exit code is 0 but stdout contains `"old_str is required"` AND stderr contains `"Total code changes:     +0 -0"`, synthesize an error so the transient-retry mechanism kicks in.
+3. **copilot-cli.go - `StartSession`**: Replaced inline args with explicit `exec.LookPath` resolution, explicit env var forwarding via `env KEY=VAL`, and unsets `CI`/`GITHUB_ACTIONS`/`ENTIRE_TEST_TTY` in the tmux session.
+4. **repo.go - `SetupRepo`**: For copilot-cli agent, creates `.github/copilot-instructions.md` to prevent a blocking startup notice.
+
+---
+
+**Issue Analysis:**
+
+I checked for the following and found one notable issue:
+
+**Important (Confidence: 82) - Double `PATH` forwarding in `StartSession`**
+
+In `copilot-cli.go` `StartSession`, the new code builds `args` that start with `env PATH=... COPILOT_GITHUB_TOKEN=... HOME=... TERM=...`, then passes `args[0]` (which is `"env"`) as the `command` parameter to `NewTmuxSession`. Inside `NewTmuxSession` (tmux.go line 37-42), the function *always* prepends its own `env PATH=<shellQuote(os.Getenv("PATH"))>` to the command string. So the final tmux command will look like:
+
+```
+env -u CI -u GITHUB_ACTIONS -u ENTIRE_TEST_TTY PATH='...' env COPILOT_GITHUB_TOKEN='...' PATH='...' HOME='...' TERM='...' /path/to/copilot --model gpt-4.1 --allow-all
+```
+
+`PATH` is set twice -- once by `NewTmuxSession` and once by the explicit `envArgs` in `StartSession`. This is not a bug (the inner `PATH=` from the copilot code will take precedence over the outer one from `NewTmuxSession`), but it is redundant and slightly confusing. However, since the values are identical (both come from `os.Getenv("PATH")`), this is harmless and low-impact. Confidence is below the threshold for reporting as something that must be fixed, but worth noting.
+
+Let me double-check one more thing -- the `shellQuote` interaction. `NewTmuxSession` calls `shellQuote` on the command and each arg. The `args` being passed include strings like `COPILOT_GITHUB_TOKEN=<token_value>`. These will be individually shell-quoted by `NewTmuxSession`, which is correct.
+
+Wait -- actually, let me re-read `NewTmuxSession` more carefully. The `command` argument is `args[0]` which is `"env"`, and `args[1:]` are the rest. But `NewTmuxSession` builds its own `env -u ... PATH=... <command> <args...>` string. So the resulting command will be:
+
+```
+env -u CI -u GITHUB_ACTIONS -u ENTIRE_TEST_TTY PATH='...' 'env' 'COPILOT_GITHUB_TOKEN=...' 'PATH=...' 'HOME=...' 'TERM=...' '/path/to/copilot' '--model' 'gpt-4.1' '--allow-all'
+```
+
+This nests `env` inside `env`. The outer `env` (from `NewTmuxSession`) handles unsets and PATH; the inner `env` (from `StartSession`) handles additional variable forwarding. This works but is a bit awkward since you end up running `env ... env ... copilot`.
+
+**Critical/Important issues with confidence >= 80: None found.**
+
+The changes are correct and well-structured. Here is my assessment:
+
+- The transient error detection for `old_str is required` is properly dual-gated: it appears in `IsTransientError` for the retry mechanism, AND in `RunPrompt` to synthesize an error when exit code is 0 (since `IsTransientError` only fires when `err != nil`). This is a correct and necessary two-part fix.
+- The `exec.LookPath` call in `StartSession` resolves the binary to an absolute path before passing it through tmux's `env` wrapper, avoiding PATH resolution issues inside the tmux shell. Good practice.
+- The env var forwarding list (`COPILOT_GITHUB_TOKEN`, `PATH`, `HOME`, `TERM`) is reasonable for an auth-dependent CLI tool in a tmux session.
+- Unsetting `CI`, `GITHUB_ACTIONS`, `ENTIRE_TEST_TTY` prevents copilot from entering non-interactive CI mode, which is the correct behavior for interactive session tests.
+- The `.github/copilot-instructions.md` workaround in `repo.go` follows the same pattern as the existing opencode config block, is agent-specific, and includes a clear comment explaining the reason.
+- The new copilot instructions file is not committed to git (just written to the working directory), which means it will show up as an untracked file. This is fine for E2E tests -- the agent works in a disposable temp repo anyway.
+- Comments are clear and explain the "why" throughout.
+
+**No high-confidence issues (>= 80) found.** The code is clean, follows existing patterns in the codebase, and the changes are well-motivated with good explanatory comments. The only minor observation (redundant `PATH` forwarding due to `NewTmuxSession` always adding it) is cosmetic and does not affect correctness.</result>
+<usage><total_tokens>35252</total_tokens><tool_uses>9</tool_uses><duration_ms>62768</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-5/tasks/a9dbbe12ecdf8c291.output
+
+---
+
+<task-notification>
+<task-id>adadda4311ba36d3a</task-id>
+<tool-use-id>toolu_013ExV51t9zMcjz7i3mmhboD</tool-use-id>
+<status>completed</status>
+<summary>Agent "Hunt silent failures in PR" completed</summary>
+<result>Now I have a complete picture of the changes. Here is my review.
+
+---
+
+## Error Handling Audit: PR #632 (`alex/copilot-e2e-fix`)
+
+### Summary
+
+Two files changed: `/Users/alex/workspace/cli/.worktrees/5/e2e/agents/copilot-cli.go` and `/Users/alex/workspace/cli/.worktrees/5/e2e/testutil/repo.go`. This PR fixes Copilot CLI E2E test issues by (1) detecting a silent success-with-no-changes failure mode, (2) resolving environment variable forwarding into tmux sessions, and (3) creating a `.github/copilot-instructions.md` to prevent a startup blocker. The changes are in E2E test infrastructure, not production code.
+
+---
+
+### Issue 1: Silent `SendKeys` error discarded in startup loop
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/5/e2e/agents/copilot-cli.go`, line 162
+
+**Severity:** MEDIUM
+
+**Issue Description:** Inside the startup dialog dismissal loop, `s.SendKeys("Enter")` returns an error that is silently discarded with `_ = s.SendKeys("Enter")`. If sending the Enter key fails (tmux session died, pipe broken, etc.), the loop will continue iterating, waiting 500ms each time, and eventually either match the prompt by luck or time out at `WaitFor` with a misleading error message about "waiting for startup prompt" rather than "failed to send Enter key."
+
+**Hidden Errors:** Broken pipe to tmux, tmux session crash, permission errors on the tmux socket.
+
+**User Impact:** A developer debugging a failed E2E test would see "waiting for startup prompt: context deadline exceeded" and investigate why Copilot is not showing its prompt, when the real problem is that the Enter keystroke never reached tmux. This is a misdirection that could waste significant debugging time.
+
+**Recommendation:** Check the error from `SendKeys` and either fail fast or include the error in the subsequent `WaitFor` failure message.
+
+**Example:**
+```go
+if err := s.SendKeys("Enter"); err != nil {
+    _ = s.Close()
+    return nil, fmt.Errorf("dismissing startup dialog: send Enter failed: %w", err)
+}
+```
+
+---
+
+### Issue 2: Silent `Close` error discarded on failure paths
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/5/e2e/agents/copilot-cli.go`, lines 155 and 166
+
+**Severity:** LOW (test code, cleanup path)
+
+**Issue Description:** On both failure paths in `StartSession`, `s.Close()` errors are discarded with `_ = s.Close()`. If the tmux session cannot be cleaned up (e.g., `tmux kill-session` fails), this leaves orphaned tmux sessions that could interfere with subsequent test runs or consume resources.
+
+**User Impact:** Minimal in practice since these are test cleanup paths, but orphaned tmux sessions accumulating during repeated E2E runs could cause confusing resource exhaustion. This is a minor issue given it is test infrastructure.
+
+**Recommendation:** At minimum, log the close error via `t` if a `*testing.T` were available here (it is not in this function signature). Since `StartSession` does not have access to `t`, the blank identifier is a reasonable pragmatic choice. No change strictly required, but worth noting.
+
+---
+
+### Issue 3: `IsTransientError` matches on stdout/stderr substrings -- could false-positive
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/5/e2e/agents/copilot-cli.go`, lines 43-45
+
+**Severity:** MEDIUM
+
+**Issue Description:** The new `"old_str is required"` pattern is added to the `IsTransientError` substring check list. This function checks `combined := out.Stdout + out.Stderr` for any occurrence of the string. If a user's prompt or file content being edited coincidentally contains "old_str is required" as text, and the command also fails for a non-transient reason, `IsTransientError` would return `true`, causing the test framework to retry the scenario rather than reporting the real error.
+
+However, this is partially mitigated by the separate check in `RunPrompt` (lines 114-117) which requires BOTH "old_str is required" in stdout AND "Total code changes: +0 -0" in stderr. The `IsTransientError` check is broader.
+
+**User Impact:** A non-transient failure could be misclassified as transient, causing the test to silently retry up to 3 times before ultimately failing with a generic "exhausted N scenario attempts" message instead of the real error.
+
+**Recommendation:** This is an acceptable tradeoff for E2E test retry heuristics. The dual-condition check in `RunPrompt` is the right approach. The broader check in `IsTransientError` acts as a safety net for cases where the error propagates differently. No change needed, but worth documenting the false-positive risk in a comment.
+
+---
+
+### Issue 4: Missing `COPILOT_GITHUB_TOKEN` silently produces a session without auth
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/5/e2e/agents/copilot-cli.go`, lines 132-135
+
+**Severity:** HIGH
+
+**Issue Description:** The env var forwarding loop silently skips any env var that is empty or unset. For `PATH`, `HOME`, and `TERM`, this is fine -- they will nearly always be set. But `COPILOT_GITHUB_TOKEN` is the auth token that Copilot CLI needs to function. If it is not set, the code silently omits it, and the tmux session launches Copilot without authentication. Copilot will then either fail with a cryptic auth error deep into the test, or worse, fall back to `gh auth` which may or may not work depending on the environment.
+
+The comment on line 129 even says "session lacks auth tokens (COPILOT_GITHUB_TOKEN)" -- acknowledging this is critical -- yet the code does not validate its presence.
+
+**User Impact:** A developer running E2E tests without `COPILOT_GITHUB_TOKEN` set would get a test failure from Copilot's auth layer, far removed from the actual problem (missing env var). The error message would come from Copilot itself, not from the test framework, making it harder to diagnose.
+
+**Recommendation:** Either warn or fail early if `COPILOT_GITHUB_TOKEN` is not set. At minimum, log a warning. Alternatively, if `gh auth` is an acceptable fallback, document that explicitly.
+
+**Example:**
+```go
+if os.Getenv("COPILOT_GITHUB_TOKEN") == "" {
+    // Could also be a hard error depending on whether gh auth is acceptable
+    return nil, fmt.Errorf("COPILOT_GITHUB_TOKEN is not set; copilot-cli interactive session requires authentication")
+}
+```
+
+---
+
+### Issue 5 (Positive): Synthetic error for silent success-with-no-changes is well done
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/5/e2e/agents/copilot-cli.go`, lines 110-117
+
+This is a good pattern. The code detects a specific silent failure mode (exit 0 but no actual code changes due to a tool parameter bug) and surfaces it as an explicit error. The dual-condition check (`old_str is required` in stdout AND `+0 -0` in stderr) reduces false positives. The error message is clear and actionable. The comment explains the "why." This is exactly how silent failures should be handled.
+
+---
+
+### Issue 6 (Positive): `repo.go` changes use `t.Fatalf` correctly
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/5/e2e/testutil/repo.go`, lines 80-88
+
+The new Copilot-specific setup code in `SetupRepo` properly uses `t.Fatalf` for both `os.MkdirAll` and `os.WriteFile` errors, with descriptive messages that include the operation that failed. This follows the existing patterns in the file (see the OpenCode block immediately below). No issues here.
+
+---
+
+### Overall Assessment
+
+The most significant finding is **Issue 4** (missing auth token silently skipped). The env var forwarding loop was written to be resilient by skipping missing vars, but `COPILOT_GITHUB_TOKEN` is not optional -- it is the authentication mechanism. Silently omitting it trades an early, clear failure for a late, confusing one.
+
+**Issue 1** (discarded `SendKeys` error) is a real debugging hazard. When the Enter key fails to send, the resulting timeout error will point developers in the wrong direction.
+
+The remaining issues are minor or informational. The core change -- surfacing Copilot's silent "old_str is required" failure as an explicit error -- is well-implemented and is a textbook example of converting a silent failure into an actionable one.</result>
+<usage><total_tokens>34590</total_tokens><tool_uses>7</tool_uses><duration_ms>70900</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-5/tasks/adadda4311ba36d3a.output
+
+---
+
+yeah fix it

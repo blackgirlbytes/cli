@@ -1,0 +1,393 @@
+Implement the following plan:
+
+# Plan: Add checkpoints.json to Trails + Semantic Trail Titles
+
+## Context
+
+Two issues with the trail system:
+
+1. **Missing `checkpoints.json`**: The web app (PR entirehq/entire.io#738) expects each trail on `entire/trails` to have a `checkpoints.json` linking checkpoints to the trail. The CLI only writes `metadata.json` and `discussion.json`.
+
+2. **Useless trail titles**: `AutoCreateTrail` uses `HumanizeBranchName()` which produces garbage like "Dipree/blacksmith agent integration". The user's prompt is available at TurnStart and should be used instead.
+
+## Part A: checkpoints.json
+
+### A1. Add types to trail package
+**File**: `cmd/entire/cli/trail/trail.go`
+
+```go
+type CheckpointRef struct {
+    CheckpointID string    `json:"checkpoint_id"`
+    CommitSHA    string    `json:"commit_sha"`
+    CreatedAt    time.Time `json:"created_at"`
+    Summary      string    `json:"summary,omitempty"`
+}
+
+type Checkpoints struct {
+    Checkpoints []CheckpointRef `json:"checkpoints"`
+}
+```
+
+### A2. Update trail store to read/write checkpoints.json
+**File**: `cmd/entire/cli/trail/store.go`
+
+- Add `checkpointsFile = "checkpoints.json"` constant
+- Update `Write()` signature: add `checkpoints *Checkpoints` parameter. When nil, write empty `{"checkpoints":[]}`. Write blob to `<trailPath>/checkpoints.json`
+- Update all `Write()` callers: `trail_cmd.go:AutoCreateTrail`, `trail_cmd.go:runTrailCreate`, `store.go:Update`
+- Update `Read()` to return `*Checkpoints` as 3rd return value
+- Add `AddCheckpoint(trailID ID, ref CheckpointRef) error` — reads existing, prepends new ref (newest first), writes back via `Write()`
+- Update `Update()` to preserve existing checkpoints (read them, pass through to Write)
+
+### A3. Link checkpoints to trails on condensation (manual-commit)
+**File**: `cmd/entire/cli/strategy/manual_commit_condensation.go`
+
+Add `Prompts []string` field to `CondenseResult` (in `manual_commit_types.go`). Populate it in `CondenseSession()` from `sessionData.Prompts`.
+
+**File**: `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+In `condenseAndUpdateState()`, after successful `CondenseSession()` (line 811), call:
+```go
+appendCheckpointToTrail(repo, result.CheckpointID, head.Hash(), result.Prompts)
+```
+
+New helper (in `manual_commit_hooks.go`):
+```go
+func appendCheckpointToTrail(repo *git.Repository, cpID id.CheckpointID, commitSHA plumbing.Hash, prompts []string) {
+    branchName := GetCurrentBranchName(repo)
+    if branchName == "" {
+        return
+    }
+    defaultBranch := GetDefaultBranchName(repo)
+    if branchName == defaultBranch {
+        return
+    }
+    store := trail.NewStore(repo)
+    existing, err := store.FindByBranch(branchName)
+    if err != nil || existing == nil {
+        return
+    }
+    var summary string
+    if len(prompts) > 0 {
+        summary = truncateForSummary(prompts[len(prompts)-1], 200)
+    }
+    _ = store.AddCheckpoint(existing.TrailID, trail.CheckpointRef{
+        CheckpointID: cpID.String(),
+        CommitSHA:    commitSHA.String(),
+        CreatedAt:    time.Now().UTC(),
+        Summary:      summary,
+    })
+}
+```
+
+### A4. Link checkpoints to trails (auto-commit)
+**File**: `cmd/entire/cli/strategy/auto_commit.go`
+
+In `SaveStep()`, after successful metadata commit (after line 163):
+```go
+appendCheckpointToTrail(repo, cpID, codeResult.CommitHash, nil)
+// Summary: use ctx.CommitMessage since prompts aren't extracted at this point
+```
+
+Actually, auto-commit's `StepContext` doesn't have prompts. Use `ctx.CommitMessage` as summary, or pass nil and skip summary.
+
+## Part B: Semantic Trail Titles
+
+### B1. Pass prompt through to trail auto-creation
+**File**: `cmd/entire/cli/lifecycle.go`
+
+```go
+// Line 149: change
+autoCreateTrailOnTurnStart()
+// to
+autoCreateTrailOnTurnStart(event.Prompt)
+```
+
+Update `autoCreateTrailOnTurnStart` signature to `(prompt string)`. Pass through:
+```go
+AutoCreateTrail(repo, branchName, baseBranch, prompt)
+```
+
+### B2. Use prompt for trail title
+**File**: `cmd/entire/cli/trail_cmd.go`
+
+Update `AutoCreateTrail` to accept `prompt string`:
+```go
+func AutoCreateTrail(repo *git.Repository, branchName, baseBranch, prompt string) error {
+    ...
+    title := titleFromPrompt(prompt)
+    if title == "" {
+        title = trail.HumanizeBranchName(branchName)
+    }
+    ...
+}
+```
+
+Add helper:
+```go
+func titleFromPrompt(prompt string) string {
+    if prompt == "" {
+        return ""
+    }
+    line, _, _ := strings.Cut(prompt, "\n")
+    title := strings.TrimSpace(line)
+    if len(title) > 80 {
+        title = title[:77] + "..."
+    }
+    return title
+}
+```
+
+### B3. Update CLAUDE.md
+Document `checkpoints.json` format and prompt-based title generation.
+
+## Files Summary
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/trail/trail.go` | Add `CheckpointRef`, `Checkpoints` types |
+| `cmd/entire/cli/trail/store.go` | Write/read `checkpoints.json`, add `AddCheckpoint()` |
+| `cmd/entire/cli/trail_cmd.go` | Update `AutoCreateTrail` for prompt, update `Write()` calls, add `titleFromPrompt` |
+| `cmd/entire/cli/strategy/manual_commit_types.go` | Add `Prompts` to `CondenseResult` |
+| `cmd/entire/cli/strategy/manual_commit_condensation.go` | Populate `Prompts` in result |
+| `cmd/entire/cli/strategy/manual_commit_hooks.go` | Add `appendCheckpointToTrail` helper, call after condensation |
+| `cmd/entire/cli/strategy/auto_commit.go` | Call `appendCheckpointToTrail` after save |
+| `cmd/entire/cli/lifecycle.go` | Pass `event.Prompt` to `autoCreateTrailOnTurnStart` |
+| `CLAUDE.md` | Document changes |
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dip/.claude/projects/-Users-dip-Repositories-cli/6b3dad3f-ee84-4682-9ad8-d78cf89af4e0.jsonl
+
+---
+
+How about we just generate a title and description for the trail in the background?
+
+---
+
+What do you recommend? Like it would be great to spawn a cheap model from the active agent in the background, non blocking to keep things updated. But I'm now wondering that this should only happen once but in the beginning there's little context available?
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Initial Request**: User provided a detailed implementation plan for two features:
+   - Part A: Add `checkpoints.json` to Trails
+   - Part B: Semantic Trail Titles (using user prompt instead of branch name)
+
+2. **Implementation Phase**: I read all relevant files, created task items, and implemented the plan step by step:
+   - Added types to trail/trail.go
+   - Updated trail/store.go (Write, Read, Update, AddCheckpoint)
+   - Updated trail_cmd.go (AutoCreateTrail with prompt, titleFromPrompt helper)
+   - Added Prompts to CondenseResult
+   - Added appendCheckpointToTrail helper in manual_commit_hooks.go
+   - Wired into auto_commit.go SaveStep
+   - Passed event.Prompt through lifecycle.go
+   - Updated store_test.go for new signatures
+   - Updated CLAUDE.md
+
+3. **Lint Errors**: 
+   - First: `errcheck` on `_ = store.AddCheckpoint(...)` - fixed with nolint comment
+   - Second: `gosec` G104 on same line - added `gosec` to nolint directive
+
+4. **All tests passed**: `mise run fmt && mise run lint && mise run test:ci` all green.
+
+5. **User's second request**: "How about we just generate a title and description for the trail in the background?" - This shifted the conversation from the completed implementation to a NEW feature: using an LLM to generate better trail titles and descriptions.
+
+6. **Plan mode exploration**: I entered plan mode to explore the design space. Key findings:
+   - Summarize package uses Claude CLI subprocess (claude --print --model sonnet)
+   - No existing goroutine/background patterns in production code
+   - Hook processes exit after returning, so goroutines would be killed
+   - Race conditions with concurrent writes to entire/trails branch
+
+7. **User clarification**: User asked "What do you recommend?" and noted tension between "only once" and "little context at beginning"
+
+8. **My recommendation**: Generate at first condensation (PostCommit), not TurnStart
+   - Rich context available (prompts + transcript + files)
+   - Only once per trail
+   - No concurrency issues
+   - Piggybacks on existing summarize flow
+
+9. **User approved**: "Yes, at first condensation"
+
+10. **Current state**: I was reading the summarize package files (claude.go, summarize.go) to understand the exact API before writing the plan file. I had read both files completely when the summary was requested. Plan mode is still active.
+
+Let me now compile all the details needed for the summary.
+
+Summary:
+1. Primary Request and Intent:
+   The user provided a detailed implementation plan with two parts:
+   - **Part A**: Add `checkpoints.json` to the trail system so the web app (PR entirehq/entire.io#738) can link checkpoints to trails. The CLI only wrote `metadata.json` and `discussion.json`.
+   - **Part B**: Replace garbage trail titles from `HumanizeBranchName()` with titles derived from the user's prompt.
+   
+   After completing this implementation, the user then asked to **enhance trail titles further** by using an LLM to generate proper titles and descriptions in the background, rather than just truncating the first line of the prompt.
+
+2. Key Technical Concepts:
+   - **Trail system**: Branch-centric work tracking on `entire/trails` orphan branch, sharded storage `<trail_id[:2]>/<trail_id[2:]>/`
+   - **Strategy pattern**: `ManualCommitStrategy` and `AutoCommitStrategy` with different checkpoint flows
+   - **Condensation**: Process of copying session data from shadow branches to permanent `entire/checkpoints/v1` branch during PostCommit
+   - **Summarize package**: Uses Claude CLI subprocess (`claude --print --output-format json --model sonnet`) with git env isolation
+   - **Hook lifecycle**: Each hook event (TurnStart, TurnEnd, PostCommit) is a separate CLI process invocation - goroutines would be killed on process exit
+   - **Race conditions**: `store.Write()` does read-modify-write on `entire/trails` branch with no mutual exclusion; concurrent writers can lose updates
+   - **ClaudeGenerator**: Subprocess-based LLM invocation with `stripGitEnv()`, runs in `os.TempDir()`, supports model selection
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/trail/trail.go`** — Added new types for checkpoint references
+     ```go
+     type CheckpointRef struct {
+         CheckpointID string    `json:"checkpoint_id"`
+         CommitSHA    string    `json:"commit_sha"`
+         CreatedAt    time.Time `json:"created_at"`
+         Summary      string    `json:"summary,omitempty"`
+     }
+     
+     type Checkpoints struct {
+         Checkpoints []CheckpointRef `json:"checkpoints"`
+     }
+     ```
+
+   - **`cmd/entire/cli/trail/store.go`** — Core store changes for checkpoints.json support
+     - Added `checkpointsFile = "checkpoints.json"` constant
+     - Changed `Write()` signature: `func (s *Store) Write(metadata *Metadata, discussion *Discussion, checkpoints *Checkpoints) error` — writes empty `{"checkpoints":[]}` when nil
+     - Changed `Read()` return: `func (s *Store) Read(trailID ID) (*Metadata, *Discussion, *Checkpoints, error)` — reads checkpoints best-effort
+     - Updated `Update()` to preserve existing checkpoints through read/write cycle
+     - Added `AddCheckpoint()` method that prepends new ref (newest first):
+       ```go
+       func (s *Store) AddCheckpoint(trailID ID, ref CheckpointRef) error {
+           metadata, discussion, checkpoints, err := s.Read(trailID)
+           if err != nil { return fmt.Errorf("failed to read trail for checkpoint update: %w", err) }
+           if checkpoints == nil { checkpoints = &Checkpoints{Checkpoints: []CheckpointRef{}} }
+           checkpoints.Checkpoints = append([]CheckpointRef{ref}, checkpoints.Checkpoints...)
+           return s.Write(metadata, discussion, checkpoints)
+       }
+       ```
+
+   - **`cmd/entire/cli/trail/store_test.go`** — Updated all `Write()` calls to pass 3rd arg `nil`, all `Read()` calls to capture 4th return value
+
+   - **`cmd/entire/cli/trail_cmd.go`** — Updated AutoCreateTrail and added titleFromPrompt
+     - `AutoCreateTrail` now accepts `prompt string` parameter
+     - Added `titleFromPrompt()` helper:
+       ```go
+       func titleFromPrompt(prompt string) string {
+           if prompt == "" { return "" }
+           line, _, _ := strings.Cut(prompt, "\n")
+           title := strings.TrimSpace(line)
+           if len(title) > 80 { title = title[:77] + "..." }
+           return title
+       }
+       ```
+     - All `store.Write()` calls updated to pass `nil` for checkpoints
+
+   - **`cmd/entire/cli/strategy/manual_commit_types.go`** — Added `Prompts []string` field to `CondenseResult`
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation.go`** — Populated `Prompts: sessionData.Prompts` in CondenseResult
+
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** — Major changes:
+     - Added `"time"` and `"github.com/entireio/cli/cmd/entire/cli/trail"` imports
+     - Added call to `appendCheckpointToTrail()` after successful `CondenseSession()` in `condenseAndUpdateState()`
+     - Added helper functions:
+       ```go
+       func appendCheckpointToTrail(repo *git.Repository, cpID id.CheckpointID, commitSHA plumbing.Hash, prompts []string) {
+           branchName := GetCurrentBranchName(repo)
+           if branchName == "" { return }
+           defaultBranch := GetDefaultBranchName(repo)
+           if branchName == defaultBranch { return }
+           store := trail.NewStore(repo)
+           existing, err := store.FindByBranch(branchName)
+           if err != nil || existing == nil { return }
+           var summary string
+           if len(prompts) > 0 { summary = truncateForSummary(prompts[len(prompts)-1], 200) }
+           //nolint:errcheck,gosec // best-effort: trail checkpoint linking is non-critical
+           store.AddCheckpoint(existing.TrailID, trail.CheckpointRef{
+               CheckpointID: cpID.String(), CommitSHA: commitSHA.String(),
+               CreatedAt: time.Now().UTC(), Summary: summary,
+           })
+       }
+       
+       func truncateForSummary(s string, maxLen int) string {
+           line, _, _ := strings.Cut(s, "\n")
+           line = strings.TrimSpace(line)
+           if len(line) <= maxLen { return line }
+           if maxLen <= 3 { return line[:maxLen] }
+           return line[:maxLen-3] + "..."
+       }
+       ```
+
+   - **`cmd/entire/cli/strategy/auto_commit.go`** — Added `appendCheckpointToTrail(repo, cpID, codeResult.CommitHash, nil)` after successful metadata commit in `SaveStep()`
+
+   - **`cmd/entire/cli/lifecycle.go`** — Updated `autoCreateTrailOnTurnStart` to accept and pass `prompt string`:
+     ```go
+     func autoCreateTrailOnTurnStart(prompt string) { ... }
+     ```
+     Called with `autoCreateTrailOnTurnStart(event.Prompt)` in `handleLifecycleTurnStart`
+
+   - **`CLAUDE.md`** — Documented checkpoints.json format, checkpoint linking behavior, prompt-based title generation, and storage structure
+
+   - **`cmd/entire/cli/summarize/claude.go`** — READ ONLY. Key details for planned LLM trail title generation:
+     - `ClaudeGenerator` struct with `ClaudePath`, `Model`, `CommandRunner` fields
+     - Invokes `claude --print --output-format json --model <model> --setting-sources ""`
+     - Runs in `os.TempDir()`, strips `GIT_*` env vars
+     - Parses JSON response `{"result": "<json-string>"}`
+     - Default model is `"sonnet"`
+
+   - **`cmd/entire/cli/summarize/summarize.go`** — READ ONLY. Key details:
+     - `GenerateFromTranscript(ctx, transcriptBytes, filesTouched, agentType, generator)` entry point
+     - `Generator` interface: `Generate(ctx, Input) (*checkpoint.Summary, error)`
+     - `Input` struct: `{Transcript []Entry, FilesTouched []string}`
+     - `BuildCondensedTranscriptFromBytes()` handles multi-agent parsing
+     - `FormatCondensedTranscript()` formats for LLM consumption
+
+4. Errors and fixes:
+   - **errcheck lint error**: `_ = store.AddCheckpoint(...)` flagged by errcheck linter. Fixed by adding `//nolint:errcheck` comment.
+   - **gosec G104 lint error**: Same line flagged by gosec for unhandled error. Fixed by extending nolint to `//nolint:errcheck,gosec // best-effort: trail checkpoint linking is non-critical`.
+
+5. Problem Solving:
+   - Successfully implemented Part A (checkpoints.json) and Part B (prompt-based titles) with all tests passing
+   - Identified that hook processes exit after returning, making goroutines unsuitable for background LLM generation
+   - Identified race condition risk with concurrent writes to `entire/trails` branch
+   - Recommended generating trail title/description at first condensation (PostCommit) to get richer context without concurrency issues
+
+6. All user messages:
+   - "Implement the following plan: [detailed plan for checkpoints.json and semantic trail titles]"
+   - "How about we just generate a title and description for the trail in the background?"
+   - "What do you recommend? Like it would be great to spawn a cheap model from the active agent in the background, non blocking to keep things updated. But I'm now wondering that this should only happen once but in the beginning there's little context available?"
+   - (Selected "Yes, at first condensation" from the options presented)
+
+7. Pending Tasks:
+   - **Design and implement LLM-based trail title/description generation at first condensation time**. The user approved generating at PostCommit/condensation time. Plan mode is active. The plan file at `/Users/dip/.claude/plans/wondrous-finding-raven.md` needs to be written with the implementation details. Implementation has NOT started yet.
+
+8. Current Work:
+   I am in **plan mode** designing the LLM-based trail title/description generation feature. The user approved the approach: "Yes, at first condensation." I had just finished reading the summarize package files (`claude.go` and `summarize.go`) to understand the exact Claude CLI invocation pattern, the `Generator` interface, `Input` struct, and `FormatCondensedTranscript()` formatting. I was about to write the plan file with the concrete implementation approach before calling `ExitPlanMode`.
+
+   Key design decisions already made:
+   - Generate at first condensation (PostCommit), not TurnStart
+   - Only once per trail (need tracking mechanism)
+   - Use haiku model for speed/cost
+   - Gated on `settings.IsSummarizeEnabled()`
+   - Trail starts with `titleFromPrompt()`, gets LLM-enhanced at first checkpoint commit
+   - Reuse existing Claude CLI subprocess infrastructure from summarize package
+
+9. Optional Next Step:
+   Write the plan file with concrete implementation details for LLM-based trail title/description generation, then call `ExitPlanMode` for user approval. The plan should cover:
+   - New function in summarize package for generating trail title+description
+   - Integration point in `condenseAndUpdateState()` or `appendCheckpointToTrail()` in `manual_commit_hooks.go`
+   - Equivalent integration in `auto_commit.go`
+   - Tracking mechanism (e.g., checking if Description is empty) to ensure it only runs once
+   - Prompt template for the LLM
+   
+   User's exact approval: Selected "Yes, at first condensation" for "Generate during PostCommit alongside existing summarization. Rich context, no concurrency, only once per trail. Uses haiku for speed/cost."
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dip/.claude/projects/-Users-dip-Repositories-cli/6edd18ba-782c-4019-88d9-018079feea08.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+[Request interrupted by user for tool use]

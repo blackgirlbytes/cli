@@ -1,0 +1,29 @@
+Review the changes in https://github.com/entireio/cli/compare/more-migration-speedups?expand=1.
+
+The following should be true:
+* Re-running a migration does not duplicate all the previously migrated checkpoints or make more generations (unless there are new checkpoints since the migration was last run)
+* If a migration was interrupted and then re-run, it should copy any checkpoints that aren't in v2
+* Any new checkpoints are added to v2 when the migration command is re-run
+* `--force` runs the migration as if it was from scratch, bypassing any of the "skips"
+* full.jsonl should not be in v2 (it should be raw_transcript or something similar - I forgot exactly what we called it, but it's not full.jsonl anymore)
+
+---
+
+# Review findings:
+
+## Finding 1 (cmd/entire/cli/migrate.go:1129-1137) [added]
+[P1] Interrupted multi-session migrations can stay incomplete
+
+The rerun path only scans sessions already present in the v2 summary. If the first run is interrupted after writing session 0 to /main but before writing later v1 sessions, the rerun treats the checkpoint as existing and never compares against the v1 session list, so those missing sessions are never copied into v2.
+
+## Finding 2 (cmd/entire/cli/checkpoint/v2_committed.go:175-190) [added]
+[P2] Legacy full.jsonl is treated as complete v2 data
+
+This makes reruns skip checkpoints whose /full artifacts are still stored as full.jsonl/content_hash.txt. That avoids duplicate generations, but it leaves full.jsonl in v2 permanently, which contradicts the stated requirement that v2 should use raw_transcript/raw_transcript_hash.txt instead.
+
+## My request for Codex:
+I have `show-compact = "!f() { git show \"refs/entire/checkpoints/v2/main:${1:0:2}/${1:2}/0/transcript.jsonl\"; }; f"` but I want a version that shows me the raw_transcript file in full
+
+---
+
+output the exact line for my gitconfig

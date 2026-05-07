@@ -1,0 +1,123 @@
+Implement the following plan:
+
+# Plan: Add `[Y/n/a]` to Commit Prompt & Simplify `commit_linking`
+
+## Context
+
+The `commit_linking` setting currently has complex setup-time logic: `isFirstSetup` detection, `migrateProjectSettings()`, struct-copy-and-strip to exclude `commit_linking` from `settings.local.json`, and duplicated save blocks. This complexity caused bugs during manual testing (local settings overriding project settings, hook binary mismatches).
+
+The better UX: let users discover `commit_linking: "always"` through the commit prompt itself with `[Y/n/a]`. When they pick `a`, it writes the preference to `settings.local.json`. This is a personal preference, so local settings is the right home. This eliminates all the setup-time complexity.
+
+## Implementation Steps
+
+### Step 1: Modify `askConfirmTTY` to support three-way response
+
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+- Add `ttyConfirmResult` type with `ttyConfirmYes`, `ttyConfirmNo`, `ttyConfirmAlways` constants
+- Change `askConfirmTTY` return type from `bool` to `ttyConfirmResult`
+- Update hint from `[Y/n]` to `[Y/n/a]`
+- Add `"a", "always"` case returning `ttyConfirmAlways`
+- Update all early returns (test mode, Gemini CLI, TTY failure) to return result type instead of bool
+
+### Step 2: Add `saveCommitLinkingAlways` helper
+
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+Add helper that loads existing `settings.local.json` (via `settings.LoadFromFile`), sets `CommitLinking = "always"`, and saves back via `settings.SaveLocal(ctx, ...)`. Must load existing file first to preserve other local overrides (especially `Enabled` which is not `omitempty`).
+
+```go
+func saveCommitLinkingAlways(ctx context.Context) error {
+    localPath, err := paths.AbsPath(ctx, settings.EntireSettingsLocalFile)
+    if err != nil {
+        return fmt.Errorf("resolving local settings path: %w", err)
+    }
+    local, err := settings.LoadFromFile(localPath)
+    if err != nil {
+        return fmt.Errorf("loading local settings: %w", err)
+    }
+    local.CommitLinking = settings.CommitLinkingAlways
+    return settings.SaveLocal(ctx, local)
+}
+```
+
+### Step 3: Update `PrepareCommitMsg` call site
+
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks.go` (lines 359-381)
+
+Change the `source="message"` branch to handle three-way result:
+- `ttyConfirmNo` → return nil (don't link, same as before)
+- `ttyConfirmAlways` → call `saveCommitLinkingAlways(ctx)`, log warning if it fails (non-fatal), then fall through to add trailer
+- `ttyConfirmYes` → fall through to add trailer (same as before)
+
+Both `ttyConfirmYes` and `ttyConfirmAlways` add the trailer.
+
+### Step 4: Simplify `setup.go`
+
+**File:** `cmd/entire/cli/setup.go`
+
+**In `runEnableInteractive`** (lines 156-280):
+- Remove `isFirstSetup` check (line 173)
+- Remove commit_linking initialization block (lines 189-199)
+- Remove `settings.Strategy = ""` line (line 199)
+- Replace complex save blocks (lines 222-241 and 260-272) with simple helper:
+
+```go
+saveSettings := func() error {
+    if shouldUseLocal {
+        return SaveEntireSettingsLocal(ctx, settings)
+    }
+    return SaveEntireSettings(ctx, settings)
+}
+```
+
+**In `setupAgentHooksNonInteractive`** (lines 598-690):
+- Remove `isFirstSetup` check (line 616)
+- Remove commit_linking initialization block (lines 633-641)
+
+**Remove `migrateProjectSettings` function entirely** (lines 726-747).
+
+### Step 5: Clean up `config.go`
+
+**File:** `cmd/entire/cli/config.go`
+
+Remove `CommitLinkingAlways` and `CommitLinkingPrompt` aliases — they were only used in `setup.go` which no longer needs them.
+
+### Step 6: Run checks and update tests
+
+- `mise run fmt && mise run lint && mise run test:ci`
+- Existing tests should pass — `GetCommitLinking()` default behavior unchanged, integration tests use `ENTIRE_TEST_TTY=1` which returns `ttyConfirmYes`
+
+## What doesn't change
+
+- `settings.go`: `CommitLinking` field, `GetCommitLinking()`, constants, validation in `loadFromFile`/`mergeJSON` — all stay as-is
+- `PrepareCommitMsg`: the `commitLinking == settings.CommitLinkingAlways` auto-link path stays (for users who already have the setting)
+- Editor flow (no `-m` flag): still adds trailer with comment, no prompt
+- Agent fast path (no TTY): still auto-links, no prompt
+- Deprecated `Strategy` field: left alone, `omitempty` handles cleanup on next save
+
+## Migration Behavior
+
+| User type | Behavior |
+|-----------|----------|
+| New user | Sees `[Y/n/a]` on first commit, can pick `a` to auto-link forever |
+| Existing user (no `commit_linking` set) | Same prompt as before, now with `a` option |
+| User who already has `commit_linking: "always"` | Auto-links, no prompt (unchanged) |
+| User who picks `a` at prompt | `settings.local.json` gets `commit_linking: "always"`, future commits auto-link |
+
+## Verification
+
+1. `mise run fmt && mise run lint` — passes
+2. `mise run test:ci` — all tests pass
+3. Manual testing:
+   - `git commit -m "test"` with active session → prompt shows `[Y/n/a]`
+   - Press `a` → commit links, `settings.local.json` now has `commit_linking: "always"`
+   - Next `git commit -m "test"` → auto-links without prompt
+   - Fresh `entire enable` → no `commit_linking` in settings (clean)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/258a514e-cd22-4513-94b6-49095182e3fa.jsonl
+
+---
+
+commit and push this

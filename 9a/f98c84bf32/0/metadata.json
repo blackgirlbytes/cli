@@ -1,0 +1,74 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "9af98c84bf32",
+  "session_id": "49456f2f-51c7-4bbd-b8f8-3df6da366c33",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-01T04:08:12.720505Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "0ff7fb2f362a",
+  "token_usage": {
+    "input_tokens": 3563,
+    "cache_creation_tokens": 194544,
+    "cache_read_tokens": 5623083,
+    "output_tokens": 57858,
+    "api_call_count": 61
+  },
+  "session_metrics": {
+    "turn_count": 6
+  },
+  "summary": {
+    "intent": "Understand the memory loop architecture, then design and begin implementing an MCP server that allows Claude to pull memories on demand as an alternative to hook-based injection.",
+    "outcome": "Architecture questions fully answered; MCP server design spec written and approved; implementation plan created; Tasks 1-4 of 8 completed (dependency added, server scaffold with mode gating, search_memories handler, save_memory handler in progress).",
+    "learnings": {
+      "repo": [
+        "Memory loop has two independent axes: mode (off/manual/auto controls injection) and activation_policy (review/auto controls whether generated memories become active or stay candidate).",
+        "Refresh is always manual — 'auto' mode only controls hook-based injection at turn start, not generation.",
+        "Repo-scope memories always require explicit promotion regardless of activation_policy, as a governance guard against one person's memories steering everyone's Claude sessions.",
+        "The project had no existing MCP server — Claude Code interacted with the CLI purely through hooks (push model); MCP adds a pull model.",
+        "manual mode currently has no compelling use case; with MCP it gains identity: no hook push but Claude can pull via MCP on demand.",
+        "AddManualRecord sets Status: StatusActive for manual records, not StatusCandidate — save_memory handler needed to bypass this and create candidates directly.",
+        "fingerprintForRecord needed to be exported for the save_memory dedup pre-check."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/lifecycle.go",
+          "line": 282,
+          "end_line": 282,
+          "finding": "Injection gate: if mode != ModeAuto, maybeInjectMemoryLoop returns nil immediately — no manual injection mechanism exists."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "finding": "AddManualRecord sets Status: StatusActive (not StatusCandidate) and handles dedup via findReconcileIndex — incompatible with spec requirement for save_memory to create candidates."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "finding": "PreviewSelection is too restrictive for MCP search — filters out candidates via passesInjectionGate and returns empty on empty queries. Search handler needs its own filter+score path."
+        }
+      ],
+      "workflow": [
+        "t.Parallel() cannot be combined with t.Chdir() in Go tests — causes panic; subagent caught this deviation correctly.",
+        "When a new package imports an external library, go.mod/go.sum only update when the import is first added to source code, not when go get is run alone.",
+        "Subagent-driven development pattern used: dispatch implementer per task with full context, verify tests pass, then mark complete before proceeding to next task."
+      ]
+    },
+    "friction": [
+      "SelectRelevant/PreviewSelection reuse was blocked by passesInjectionGate — search handler needed a custom filter+score path that couldn't reuse existing injection code directly.",
+      "AddManualRecord's hardcoded StatusActive conflicted with the spec's StatusCandidate requirement for save_memory, requiring either bypassing it or exporting fingerprintForRecord.",
+      "User interrupted the plan writing twice mid-stream, requiring 'continue' prompts to resume.",
+      "mcp-go library API had to be fetched via context7 MCP tool since it wasn't in the codebase — added lookup overhead."
+    ],
+    "open_items": [
+      "Task 4 (save_memory handler) was in progress at transcript end — export of fingerprintForRecord and handler implementation not yet verified.",
+      "Task 5 (cobra command registration for entire mcp-server) not yet started.",
+      "Task 6 (hooks.go modification to install mcpServers.entire in .claude/settings.json) not yet started.",
+      "Task 7 (fmt/lint/test:ci) not yet started.",
+      "Task 8 (integration smoke test: MCP server responds, hook installation writes mcpServers) not yet started.",
+      "manual mode naming/removal decision was deferred — the MCP work gives it a purpose but the UX question of whether to rename or document it was not resolved.",
+      "off mode behavior with MCP: spec says tools return 'memory loop is disabled' but implementation not yet written or tested."
+    ]
+  }
+}

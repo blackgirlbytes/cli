@@ -1,0 +1,95 @@
+Implement the following plan:
+
+# Plan: Add Tests for `factoryaidroid.go`
+
+## Context
+
+The main agent implementation file `cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go` has no unit tests. The sibling files (`hooks.go`, `lifecycle.go`, `transcript.go`) all have tests, but the core Agent interface methods are untested. This is a coverage gap for the identity methods, transcript handling, hook parsing, session stubs, and presence detection.
+
+## Approach
+
+Create `cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go` following the same patterns used by:
+- `claudecode/claude_test.go` (simple assertion style)
+- `geminicli/gemini_test.go` (subtests for variants, temp dirs for filesystem tests)
+
+## Tests to Write
+
+### Identity & Config Methods (simple assertions)
+- `TestNewFactoryAIDroidAgent` — returns non-nil `*FactoryAIDroidAgent`
+- `TestName` — returns `agent.AgentNameFactoryAIDroid`
+- `TestType` — returns `agent.AgentTypeFactoryAIDroid`
+- `TestDescription` — returns non-empty string
+- `TestProtectedDirs` — returns `[".factory"]`
+- `TestGetHookConfigPath` — returns `".factory/settings.json"`
+- `TestSupportsHooks` — returns `true`
+
+### `DetectPresence` (filesystem, uses `t.Chdir` — cannot use `t.Parallel`)
+- Subtest: `.factory` directory exists → `(true, nil)`
+- Subtest: no `.factory` directory → `(false, nil)`
+
+### Transcript Methods
+- `TestReadTranscript` — writes temp JSONL file, reads it back, verifies content
+- `TestReadTranscript_MissingFile` — non-existent path returns error
+- `TestChunkTranscript_SmallContent` — single JSONL line returns 1 chunk
+- `TestChunkTranscript_LargeContent` — multi-line JSONL exceeding maxSize returns multiple chunks; verify each chunk is valid JSONL
+- `TestChunkTranscript_RoundTrip` — chunk then reassemble preserves content
+- `TestReassembleTranscript_SingleChunk` — pass-through
+- `TestReassembleTranscript_MultipleChunks` — concatenation with newlines
+
+### `ParseHookInput` (uses `strings.NewReader`)
+- Valid JSON with `session_id` and `transcript_path` → correct `HookInput`
+- Empty input → error
+- Invalid JSON → error
+
+### Session Stubs (all return errors/"not implemented")
+- `TestGetSessionID` — extracts `input.SessionID`
+- `TestGetSessionDir` — returns `"not implemented"` error
+- `TestReadSession` — returns `"not implemented"` error
+- `TestWriteSession` — returns `"not implemented"` error
+
+### Other
+- `TestResolveSessionFile` — `filepath.Join(dir, id+".jsonl")`
+- `TestFormatResumeCommand` — `"droid --session-id " + id`
+
+## Key Files
+- **Create:** `cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go`
+- **Reference:** `cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go` (file under test)
+- **Reference:** `cmd/entire/cli/agent/factoryaidroid/types.go` (`sessionInfoRaw` struct)
+- **Pattern ref:** `cmd/entire/cli/agent/claudecode/claude_test.go`, `cmd/entire/cli/agent/geminicli/gemini_test.go`
+
+## Notes
+- All tests use `t.Parallel()` except `TestDetectPresence` (uses `t.Chdir`)
+- Factory AI Droid uses JSONL format (not JSON like Gemini), so chunk/reassemble delegates to `agent.ChunkJSONL`/`agent.ReassembleJSONL`
+- `ParseHookInput` uses `agent.ReadAndParseHookInput[sessionInfoRaw]` generically — tests confirm the JSON fields map correctly to `HookInput`
+
+## Verification
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.REDACTED.jsonl
+
+---
+
+git st
+
+---
+
+[Request interrupted by user]
+
+---
+
+add factoryaidroid to integration test folder like agent_test.go
+
+---
+
+[Request interrupted by user]
+
+---
+
+add factoryaidroid to integration test folder like agent_test.go
+
+---
+
+[Request interrupted by user for tool use]

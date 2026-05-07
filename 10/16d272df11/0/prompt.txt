@@ -1,0 +1,393 @@
+Implement the following plan:
+
+# Plan: Benchmark and Optimize `entire enable` Command
+
+## Context
+
+The `enable_performance_optimzations` branch already has the `benchutil` package and mise.toml tasks for benchmarking. The `entire status` command was optimized separately. Now we tackle `entire enable`, focusing on startup time in a new repo.
+
+The non-interactive path (`entire enable --agent claude-code` → `setupAgentHooksNonInteractive()`) is the benchmark target since interactive prompts can't be benchmarked deterministically.
+
+## Identified Hot Spots
+
+Tracing the non-interactive enable path reveals these redundant operations:
+
+| Redundancy | Calls | Cost |
+|---|---|---|
+| `GetHooksDir()` → `git rev-parse --git-path hooks` | 2x (InstallGitHook + IsGitHookInstalled in EnsureSetup) | Process spawn each time |
+| `settings.Load()` via `isLocalDev()` | 2-3x (InstallGitHook + CheckAndWarnHookManagers) | 2 file reads + JSON parse each |
+| `OpenRepository()` → `GetWorktreePath()` → `git rev-parse --show-toplevel` | 2x (empty check in RunE + EnsureSetup) | Process spawn + go-git open each |
+| `EnsureEntireGitignore()` | 2x (setupEntireDirectory + EnsureSetup) | File read + string compare each |
+| `IsGitHookInstalled()` in EnsureSetup | 1x after InstallGitHook already ran | GetHooksDir exec + 4 file reads |
+
+## Implementation
+
+### Step 1: Create benchmark (`cmd/entire/cli/bench_enable_test.go`)
+
+New file with benchmarks for `setupAgentHooksNonInteractive()`:
+- `BenchmarkEnableCommand/NewRepo_ClaudeCode` — fresh repo, first enable
+- `BenchmarkEnableCommand/ReEnable_ClaudeCode` — already-enabled repo, re-run
+
+Uses `benchutil.NewBenchRepo()` + `os.Chdir` (not parallelizable per CLAUDE.md exceptions). Pattern: `b.StopTimer()` for setup, `b.StartTimer()` for the measured call, `paths.ClearRepoRootCache()` between iterations.
+
+### Step 2: Cache `GetHooksDir()` result
+
+**File:** `cmd/entire/cli/strategy/hooks.go`
+
+Add a CWD-keyed cache (same pattern as `paths.RepoRoot()`). Add `ClearHooksDirCache()` for tests. The hooks dir doesn't change during a single CLI invocation.
+
+### Step 3: Make `OpenRepository()` use `paths.RepoRoot()`
+
+**File:** `cmd/entire/cli/strategy/common.go:560`
+
+Replace `GetWorktreePath()` with `paths.RepoRoot()` — same `git rev-parse --show-toplevel` but cached. By the time `OpenRepository()` runs in the enable flow, `paths.RepoRoot()` cache is already warm from `setup.go:71`.
+
+### Step 4: Pass `localDev` to `InstallGitHook()` and `CheckAndWarnHookManagers()`
+
+**Files:** `strategy/hooks.go`, `strategy/hook_managers.go`, `setup.go`, `manual_commit.go`, `auto_commit.go`
+
+Currently `InstallGitHook()` calls `hookCmdPrefix()` → `isLocalDev()` → `settings.Load()` which re-reads 2 JSON files. The caller already knows `localDev`. Add a `localDev` parameter to eliminate the redundant reads.
+
+Same for `CheckAndWarnHookManagers()` which also calls `hookCmdPrefix()`.
+
+Update all callers (5-6 call sites in setup.go, manual_commit.go, auto_commit.go).
+
+### Step 5: Eliminate redundant work in `EnsureSetup()`
+
+**Files:** `strategy/manual_commit.go`, `strategy/auto_commit.go`, `setup.go`
+
+Add `EnsureSetupWithOpts(opts)` alongside the existing parameterless `EnsureSetup()` (preserves backward compat, no interface change):
+
+```go
+type EnsureSetupOpts struct {
+    SkipGitignore bool            // Already called EnsureEntireGitignore
+    SkipHookCheck bool            // Already installed hooks
+    Repo          *git.Repository // Reuse already-opened repo
+    LocalDev      bool            // For InstallGitHook fallback
+}
+```
+
+In `setup.go`, the enable paths pass:
+- `SkipGitignore: true` (setupEntireDirectory already called it)
+- `SkipHookCheck: true` (InstallGitHook already ran)
+- `Repo: repo` (from the empty-repo check, when available)
+
+### Step 6: Add E2E wall-clock timing script (`mise run bench:enable`)
+
+**File:** `mise.toml` — new task `bench:enable`
+
+A shell script that measures real wall-clock time of the full compiled `entire enable --agent claude-code` binary in a fresh git repo. This captures the true end-to-end startup time including process launch, Go runtime init, and all I/O — not just the Go function internals.
+
+The script:
+1. Builds the `entire` binary once via `mise run build`
+2. Creates a temp git repo with an initial commit
+3. Runs `entire enable --agent claude-code --telemetry=false` N times (default 10), capturing wall-clock time via Go's `time` or the built-in `time` command
+4. Reports min/median/max/mean times
+5. Cleans up
+
+This is non-deterministic but gives a clear before/after signal. Run it on main first, note the numbers, then run on the feature branch.
+
+```toml
+[tasks."bench:enable"]
+description = "Measure wall-clock time of 'entire enable' in a fresh repo"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUNS="${BENCH_RUNS:-10}"
+
+echo "=== Building entire binary ==="
+mise run build
+
+ENTIRE="$(pwd)/entire"
+if [ ! -x "$ENTIRE" ]; then
+  echo "Build failed — binary not found"
+  exit 1
+fi
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+times=()
+for i in $(seq 1 "$RUNS"); do
+  # Fresh repo each run
+  dir="$tmpdir/repo-$i"
+  mkdir -p "$dir"
+  git -C "$dir" init -q
+  git -C "$dir" commit --allow-empty -m "init" -q
+
+  # Measure wall-clock time (milliseconds)
+  start=$(python3 -c 'import time; print(int(time.time()*1000))')
+  (cd "$dir" && "$ENTIRE" enable --agent claude-code --telemetry=false) >/dev/null 2>&1
+  end=$(python3 -c 'import time; print(int(time.time()*1000))')
+  elapsed=$((end - start))
+  times+=("$elapsed")
+  printf "  Run %2d: %d ms\n" "$i" "$elapsed"
+done
+
+# Stats via python
+printf "\n=== Results (%d runs) ===\n" "$RUNS"
+python3 -c "
+import statistics
+t = [$(IFS=,; echo "${times[*]}")]
+print(f'  Min:    {min(t)} ms')
+print(f'  Median: {int(statistics.median(t))} ms')
+print(f'  Mean:   {int(statistics.mean(t))} ms')
+print(f'  Max:    {max(t)} ms')
+print(f'  Stdev:  {int(statistics.stdev(t))} ms')
+"
+"""
+```
+
+Usage: Run on main first to get a baseline, then on the feature branch to compare.
+
+```bash
+# On main
+git stash && git checkout main
+mise run bench:enable    # note the median
+git checkout - && git stash pop
+
+# On feature branch (after optimizations)
+mise run bench:enable    # compare median
+```
+
+### Step 7: Verify against main
+
+```bash
+# Go benchmarks (deterministic, statistical comparison)
+BENCH_PATTERN=BenchmarkEnableCommand mise run bench:compare
+
+# E2E wall-clock (real binary, non-deterministic but shows real-world impact)
+mise run bench:enable
+```
+
+## Files Changed
+
+| File | Change |
+|---|---|
+| `cmd/entire/cli/bench_enable_test.go` | **New** — enable benchmarks |
+| `cmd/entire/cli/strategy/hooks.go` | Cache `GetHooksDir()`, add `localDev` param to `InstallGitHook()` |
+| `cmd/entire/cli/strategy/hook_managers.go` | Add `localDev` param to `CheckAndWarnHookManagers()` |
+| `cmd/entire/cli/strategy/common.go` | `OpenRepository()` uses `paths.RepoRoot()` |
+| `cmd/entire/cli/strategy/manual_commit.go` | Add `EnsureSetupWithOpts()` |
+| `cmd/entire/cli/strategy/auto_commit.go` | Add `EnsureSetupWithOpts()` |
+| `cmd/entire/cli/setup.go` | Pass opts through to eliminate redundant work |
+| `mise.toml` | New `bench:enable` task for E2E wall-clock timing |
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci` — all tests pass
+2. `mise run bench` — Go benchmarks run
+3. `BENCH_PATTERN=BenchmarkEnableCommand mise run bench:compare` — statistical comparison to main
+4. `mise run bench:enable` — E2E wall-clock timing of compiled binary
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/a5a6ab7c-cc6a-41a5-ac6f-e8c9ed8a868b.jsonl
+
+---
+
+[Request interrupted by user]
+
+---
+
+actually wait let's not jump right into it right away. i like to do this step by step with me in the loop.
+
+rollback any changes taht you've already made.
+
+the first think we shoudl do it just make a benchmark for teh existing workflow. Let's do that.
+
+---
+
+how can i just run the benchmark for the enable benchmark and compare against main by getting a pritned output
+
+---
+
+whats the command?
+
+---
+
+getting this output which means there is some mistake. It's also not formatted well:
+
+Installing benchstat...
+=== Benchmarking current branch (enable_performance_optimzations) ===
+
+=== Benchmarking base (main) ===
+
+=== Switching back to enable_performance_optimzations ===
+
+=== Results (base=main vs current=enable_performance_optimzations) ===
+
+REDACTED.lYultJXrq7/old.txt:39: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/old.txt:73: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/old.txt:107: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/old.txt:140: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/old.txt:173: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/old.txt:208: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/old.txt:210: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/old.txt:212: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/old.txt:214: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/old.txt:216: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:39: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:73: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:107: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:138: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:171: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:206: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:208: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:210: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:212: parsing iteration count: invalid syntax
+REDACTED.lYultJXrq7/new.txt:214: parsing iteration count: invalid syntax
+goos: darwin
+goarch: arm64
+pkg: github.com/entireio/cli/cmd/entire/cli
+cpu: Apple M4 Pro
+                                     │ REDACTED.lYultJXrq7/old.txt │ REDACTED.lYultJXrq7/new.txt │
+                                     │                                 sec/op                                  │                     sec/op                       vs base                │
+EnableCommand/NewRepo_ClaudeCode-12                                                               36.37m ± ∞ ¹                                      36.08m ± ∞ ¹       ~ (p=1.000 n=1) ²
+EnableCommand/ReEnable_ClaudeCode-12                                                              32.40m ± ∞ ¹                                      32.97m ± ∞ ¹       ~ (p=1.000 n=1) ²
+geomean                                                                                           34.33m                                            34.49m        +0.48%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                     │ REDACTED.lYultJXrq7/old.txt │ REDACTED.lYultJXrq7/new.txt │
+                                     │                                  B/op                                   │                      B/op                        vs base                │
+EnableCommand/NewRepo_ClaudeCode-12                                                              821.6Ki ± ∞ ¹                                     844.5Ki ± ∞ ¹       ~ (p=1.000 n=1) ²
+EnableCommand/ReEnable_ClaudeCode-12                                                             248.3Ki ± ∞ ¹                                     248.0Ki ± ∞ ¹       ~ (p=1.000 n=1) ²
+geomean                                                                                          451.6Ki                                           457.7Ki        +1.34%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                     │ REDACTED.lYultJXrq7/old.txt │ REDACTED.lYultJXrq7/new.txt │
+                                     │                                allocs/op                                │                    allocs/op                     vs base                │
+EnableCommand/NewRepo_ClaudeCode-12                                                               1.175k ± ∞ ¹                                      1.169k ± ∞ ¹       ~ (p=1.000 n=1) ²
+EnableCommand/ReEnable_ClaudeCode-12                                                               902.0 ± ∞ ¹                                       901.0 ± ∞ ¹       ~ (p=1.000 n=1) ²
+geomean                                                                                           1.029k                                            1.026k        -0.31%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+---
+
+is this ready to test? did you fix the invalid syntac issue? and the formatting?
+
+---
+
+this si what im seeing:
+
+=== Switching back to enable_performance_optimzations ===
+
+=== Results (base=main vs current=enable_performance_optimzations) ===
+
+REDACTED.c2z6SAcVLn/old.txt:39: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/old.txt:73: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/old.txt:107: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/old.txt:141: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/old.txt:174: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/old.txt:209: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/old.txt:211: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/old.txt:213: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/old.txt:215: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/old.txt:217: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:39: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:73: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:107: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:141: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:174: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:210: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:212: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:214: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:216: parsing iteration count: invalid syntax
+REDACTED.c2z6SAcVLn/new.txt:218: parsing iteration count: invalid syntax
+goos: darwin
+goarch: arm64
+pkg: github.com/entireio/cli/cmd/entire/cli
+cpu: Apple M4 Pro
+                                     │ REDACTED.c2z6SAcVLn/old.txt │ REDACTED.c2z6SAcVLn/new.txt │
+                                     │                                 sec/op                                  │                     sec/op                       vs base                │
+EnableCommand/NewRepo_ClaudeCode-12                                                               36.60m ± ∞ ¹                                      35.56m ± ∞ ¹       ~ (p=1.000 n=1) ²
+EnableCommand/ReEnable_ClaudeCode-12                                                              36.07m ± ∞ ¹                                      32.53m ± ∞ ¹       ~ (p=1.000 n=1) ²
+geomean                                                                                           36.33m                                            34.01m        -6.38%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                     │ REDACTED.c2z6SAcVLn/old.txt │ REDACTED.c2z6SAcVLn/new.txt │
+                                     │                                  B/op                                   │                      B/op                        vs base                │
+EnableCommand/NewRepo_ClaudeCode-12                                                             1019.8Ki ± ∞ ¹                                     945.7Ki ± ∞ ¹       ~ (p=1.000 n=1) ²
+EnableCommand/ReEnable_ClaudeCode-12                                                             248.3Ki ± ∞ ¹                                     248.3Ki ± ∞ ¹       ~ (p=1.000 n=1) ²
+geomean                                                                                          503.2Ki                                           484.6Ki        -3.71%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                     │ REDACTED.c2z6SAcVLn/old.txt │ REDACTED.c2z6SAcVLn/new.txt │
+                                     │                                allocs/op                                │                    allocs/op                     vs base                │
+EnableCommand/NewRepo_ClaudeCode-12                                                               1.176k ± ∞ ¹                                      1.176k ± ∞ ¹       ~ (p=1.000 n=1) ²
+EnableCommand/ReEnable_ClaudeCode-12                                                               902.0 ± ∞ ¹                                       902.0 ± ∞ ¹       ~ (p=1.000 n=1) ²
+geomean                                                                                           1.030k                                            1.030k        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+
+i want an output table of the rows being the tests, then columns for time in ms, b/op and allocs/op. right now there is an ugly file path as the column header
+
+---
+
+no this just isn't working at all:
+
+
+Stashing uncommitted changes...
+Saved working directory and index state On enable_performance_optimzations: bench:compare auto-stash
+
+=== Benchmarking base (main) ===
+
+=== Switching back to enable_performance_optimzations ===
+
+=== Results (base=main vs current=enable_performance_optimzations) ===
+
+REDACTED.535u0usLzY/old.txt:6: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/old.txt:7: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/old.txt:8: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/old.txt:9: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/old.txt:10: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/old.txt:12: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/old.txt:13: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/old.txt:14: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/old.txt:15: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/old.txt:16: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:6: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:7: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:8: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:9: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:10: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:12: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:13: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:14: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:15: parsing iteration count: invalid syntax
+REDACTED.535u0usLzY/new.txt:16: parsing iteration count: invalid syntax
+goos: darwin
+goarch: arm64
+pkg: github.com/entireio/cli/cmd/entire/cli
+cpu: Apple M4 Pro
+                         │ EnableCommand │
+                         │    sec/op     │
+*/NewRepo_ClaudeCode-12     36.48m ± ∞ ¹
+*/ReEnable_ClaudeCode-12    36.08m ± ∞ ¹
+geomean                     36.28m
+¹ need >= 6 samples for confidence interval at level 0.95
+
+                         │ EnableCommand │
+                         │     B/op      │
+*/NewRepo_ClaudeCode-12    854.7Ki ± ∞ ¹
+*/ReEnable_ClaudeCode-12   248.3Ki ± ∞ ¹
+geomean                    460.6Ki
+¹ need >= 6 samples for confidence interval at level 0.95
+
+                         │ EnableCommand │
+                         │   allocs/op   │
+*/NewRepo_ClaudeCode-12     1.173k ± ∞ ¹
+*/ReEnable_ClaudeCode-12     902.5 ± ∞ ¹
+geomean                     1.029k
+¹ need >= 6 samples for confidence interval at level 0.95
+[bench:compare] ERROR task failed
+
+this shouldn't be this hard. the ask if very simple:
+
+- for a given benchmark test, print out the performance in ms, b/op, allocs/op in a table for the current branch and the main branch and show the performance difference vetween the two. I don't need to see anything else.
