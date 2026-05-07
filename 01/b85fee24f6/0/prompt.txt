@@ -1,0 +1,824 @@
+# AGENTS.md instructions for /Users/alisha/.superset/worktrees/cli/agent-improvements
+
+<INSTRUCTIONS>
+## Aliases
+- `test-repos` → `/Users/alisha/Projects/test-repos`
+- `entire frontend` → `/Users/alisha/Projects/devenv/entire.io`
+- `entire cli` → `/Users/alisha/Projects/devenv/cli`
+- `entire external agents` → `/Users/alisha/Projects/external-agents`
+
+Resolve aliases to their full paths before acting on any instruction.
+
+
+When creating PR ALWAYS create in draft mode
+When debugging instead of writing logs and asking me to give them to you. Write the logs to a local file so you can see them.
+
+
+# Security
+All API endpoints must require authentication; apply the most restrictive access controls and minimal permissions necessary by default.
+All prompts that incorporate external or user-supplied content must be constructed to prevent prompt injection — treat untrusted input as data, never as instructions
+All prompts that incorporate external or user-supplied content must be constructed to prevent prompt injection — treat untrusted input as data, never as instructions.
+Never add a dependency without checking it is actively maintained and widely trusted.
+Never hardcode secrets, credentials, or environment-specific values — use environment variables only.
+Return generic error messages to clients; log full details server-side only.
+Avoid storing sensitive data beyond what is strictly necessary; prefer not storing it at all.
+
+--- project-doc ---
+
+# Entire - CLI
+
+This repo contains the CLI for Entire.
+
+## Architecture
+
+- CLI built with github.com/spf13/cobra and github.com/charmbracelet/huh
+
+## Key Directories
+
+### Commands (`cmd/`)
+
+- `entire/`: Main CLI entry point
+- `entire/cli`: CLI utilities and helpers
+- `entire/cli/commands`: actual command implementations
+- `entire/cli/agent`: agent implementations (Claude Code, Gemini CLI, OpenCode, Cursor, Factory AI Droid, Copilot CLI) - see [Agent Integration Checklist](docs/architecture/agent-integration-checklist.md) and [Agent Implementation Guide](docs/architecture/agent-guide.md)
+- `entire/cli/strategy`: strategy implementation (manual-commit) - see section below
+- `entire/cli/checkpoint`: checkpoint storage abstractions (temporary and committed)
+- `entire/cli/session`: session state management
+- `entire/cli/integration_test`: integration tests (simulated hooks)
+- `e2e/`: E2E tests with real agent calls (see [e2e/README.md](e2e/README.md))
+
+## Tech Stack
+
+- Language: Go 1.26.x
+- Build tool: mise, go modules
+- Linting: golangci-lint
+
+## Development
+
+### Running Tests
+
+```bash
+mise run test
+```
+
+### Running Integration Tests
+
+```bash
+mise run test:integration
+```
+
+### Running All Tests (CI)
+
+```bash
+mise run test:ci
+```
+
+This runs unit tests, integration tests, and the E2E canary (Vogon agent) in sequence. Integration tests use the `//go:build integration` build tag and are located in `cmd/entire/cli/integration_test/`.
+
+### Running E2E Canary Tests (Vogon Agent)
+
+The Vogon agent is a deterministic fake agent that exercises the full E2E test suite without making any API calls. Named after the Vogons from The Hitchhiker's Guide to the Galaxy — bureaucratic, procedural, and deterministic to a fault.
+
+```bash
+mise run test:e2e:canary           # Run all E2E tests with the Vogon agent
+mise run test:e2e:canary TestFoo   # Run a specific test
+```
+
+- **Runs as part of `test:ci`** — canary failures block merges
+- **No API calls, no cost** — safe to run freely, unlike real agent E2E tests
+- **If a canary test fails, the bug is in the CLI or test infrastructure**, not in an agent
+- Located in `e2e/vogon/` (binary) and `cmd/entire/cli/agent/vogon/` (Agent interface)
+- The binary parses prompts via regex, creates/modifies/deletes files, and fires lifecycle hooks
+- **IMPORTANT: When changing E2E test prompt wording**, the Vogon binary (`e2e/vogon/main.go`) parses prompts with hardcoded regexes. New phrasing may not match existing patterns — always run `mise run test:e2e:canary` after changing prompt text and fix Vogon's parsing if tests fail.
+
+### Running E2E Tests (Only When Explicitly Requested)
+
+**IMPORTANT: Do NOT run E2E tests proactively.** E2E tests make real API calls to agents, which consume tokens and cost money. Only run them when the user explicitly asks for E2E testing.
+
+```bash
+mise run test:e2e [filter]                          # All agents, filtered
+mise run test:e2e --agent claude-code [filter]       # Claude Code only
+mise run test:e2e --agent gemini-cli [filter]        # Gemini CLI only
+mise run test:e2e --agent opencode [filter]          # OpenCode only
+mise run test:e2e --agent cursor [filter]            # Cursor only
+mise run test:e2e --agent factoryai-droid [filter]   # Factory AI Droid only
+mise run test:e2e --agent copilot-cli [filter]       # Copilot CLI only
+```
+
+E2E tests:
+
+- Use the `//go:build e2e` build tag
+- Located in `e2e/tests/`
+- See [`e2e/README.md`](e2e/README.md) for full documentation (structure, debugging, adding agents)
+- Test real agent interactions (Claude Code, Gemini CLI, OpenCode, Cursor, Factory AI Droid, Copilot CLI, or Vogon creating files, committing, etc.)
+- Validate checkpoint scenarios documented in `docs/architecture/checkpoint-scenarios.md`
+- Support multiple agents via `E2E_AGENT` env var (`claude-code`, `gemini`, `opencode`, `cursor`, `factoryai-droid`, `copilot-cli`, `vogon`)
+
+**Environment variables:**
+
+- `E2E_AGENT` - Agent to test with (default: `claude-code`)
+- `E2E_CLAUDE_MODEL` - Claude model to use (default: `haiku` for cost efficiency)
+- `E2E_TIMEOUT` - Timeout per prompt (default: `2m`)
+
+### Test Parallelization
+
+**Always use `t.Parallel()` in tests.** Every top-level test function and subtest should call `t.Parallel()` unless it modifies process-global state (e.g., `os.Chdir()`).
+
+```go
+func TestFeature_Foo(t *testing.T) {
+    t.Parallel()
+    // ...
+}
+
+// Integration tests with TestEnv
+func TestFeature_Bar(t *testing.T) {
+    t.Parallel()
+    env := NewFeatureBranchEnv(t)
+    // ...
+}
+```
+
+**Exception:** Tests that modify process-global state cannot be parallelized. This includes `os.Chdir()`/`t.Chdir()` and `os.Setenv()`/`t.Setenv()` — Go's test framework will panic if these are used after `t.Parallel()`.
+
+### Git in Tests
+
+**Tests that touch git state must use an isolated temp repo — never the real repo CWD.**
+
+Many handlers (lifecycle, strategy, hooks) resolve the git repo from CWD via `OpenRepository`, `GetGitCommonDir`, `DetectFileChanges`, etc. Without isolation, tests can create session state files, shadow branches, or other artifacts in the real `.git/` directory.
+
+Use the `testutil` helpers:
+
+```go
+tmpDir := t.TempDir()
+testutil.InitRepo(t, tmpDir)                    // git init + user config + disable GPG
+testutil.WriteFile(t, tmpDir, "f.txt", "init")  // create a file
+testutil.GitAdd(t, tmpDir, "f.txt")             // stage it
+testutil.GitCommit(t, tmpDir, "init")           // commit (needs at least one commit for HEAD)
+t.Chdir(tmpDir)                                 // redirect CWD-based git resolution
+```
+
+`testutil.InitRepo` configures `user.name`, `user.email`, and disables GPG signing — safe for CI environments without global git config.
+
+**Do NOT** shell out to `git init`/`git commit` directly without setting user config and `--no-gpg-sign`, and **do NOT** run lifecycle/strategy handlers from the real repo CWD in tests.
+
+### Linting and Formatting
+
+```bash
+mise run fmt && mise run lint
+```
+
+### Before Every Commit (REQUIRED)
+
+**CI will fail if you skip these steps:**
+
+```bash
+mise run fmt      # Format code (CI enforces gofmt)
+mise run lint     # Lint check (CI enforces golangci-lint)
+mise run test:ci  # Run all tests (unit + integration)
+```
+
+Or combined: `mise run fmt && mise run lint && mise run test:ci`
+
+**Common CI failures from skipping this:**
+
+- `gofmt` formatting differences → run `mise run fmt`
+- Lint errors → run `mise run lint` and fix issues
+- Test failures → run `mise run test` and fix
+
+### Code Duplication Prevention
+
+Before implementing Go code, use `/go:discover-related` to find existing utilities and patterns that might be reusable.
+
+**Check for duplication:**
+
+```bash
+mise run dup           # Comprehensive check (threshold 50) with summary
+mise run dup:staged    # Check only staged files
+mise run lint          # Normal lint includes dupl at threshold 75 (new issues only)
+mise run lint:full     # All issues at threshold 75
+```
+
+**Tiered thresholds:**
+
+- **75 tokens** (lint/CI) - Blocks on serious duplication (~20+ lines)
+- **50 tokens** (dup) - Advisory, catches smaller patterns (~10+ lines)
+
+When duplication is found:
+
+1. Check if a helper already exists in `common.go` or nearby utility files
+2. If not, consider extracting the duplicated logic to a shared helper
+3. If duplication is intentional (e.g., test setup), add a `//nolint:dupl` comment with explanation
+
+## Code Patterns
+
+### Error Handling
+
+The CLI uses a specific pattern for error output to avoid duplication between Cobra and main.go.
+
+**How it works:**
+
+- `root.go` sets `SilenceErrors: true` globally - Cobra never prints errors
+- `main.go` prints errors to stderr, unless the error is a `SilentError`
+- Commands return `NewSilentError(err)` when they've already printed a custom message
+
+**When to use `SilentError`:**
+Use `NewSilentError()` when you want to print a custom, user-friendly error message instead of the raw error:
+
+```go
+// In a command's RunE function:
+if _, err := paths.WorktreeRoot(); err != nil {
+    cmd.SilenceUsage = true  // Don't show usage for prerequisite errors
+    fmt.Fprintln(cmd.ErrOrStderr(), "Not a git repository. Please run 'entire enable' from within a git repository.")
+    return NewSilentError(errors.New("not a git repository"))
+}
+```
+
+**When NOT to use `SilentError`:**
+For normal errors where the default error message is sufficient, just return the error directly. main.go will print it:
+
+```go
+// Normal error - main.go will print "unknown strategy: foo"
+return fmt.Errorf("unknown strategy: %s", name)
+```
+
+**Key files:**
+
+- `errors.go` - Defines `SilentError` type and `NewSilentError()` constructor
+- `root.go` - Sets `SilenceErrors: true` on root command
+- `main.go` - Checks for `SilentError` before printing
+
+### Settings
+
+All settings access should go through the `settings` package (`cmd/entire/cli/settings/`).
+
+**Why a separate package:**
+The `settings` package exists to avoid import cycles. The `cli` package imports `strategy`, so `strategy` cannot import `cli`. The `settings` package provides shared settings loading that both can use.
+
+**Usage:**
+
+```go
+import "github.com/entireio/cli/cmd/entire/cli/settings"
+
+// Load full settings object
+s, err := settings.Load()
+if err != nil {
+    // handle error
+}
+if s.Enabled {
+    // ...
+}
+
+// Or use convenience functions
+if settings.IsSummarizeEnabled() {
+    // ...
+}
+```
+
+**Do NOT:**
+
+- Read `.entire/settings.json` or `.entire/settings.local.json` directly with `os.ReadFile`
+- Duplicate settings parsing logic in other packages
+- Create new settings helpers without adding them to the `settings` package
+
+**Memory loop personal scope:** The canonical personal identifier for `entire memory-loop ... --scope me` is the active local GitHub username from `gh auth status --hostname github.com`. Persist it as `owner_id`; do not key personal scope off `owner_email` or `git user.name`.
+
+**Memory loop personal scope:** The canonical personal identifier for `entire memory-loop ... --scope me` is the active local GitHub username from `gh auth status --hostname github.com`. Persist it as `owner_id`; do not key personal scope off `owner_email` or `git user.name`.
+
+**Key files:**
+
+- `settings/settings.go` - `EntireSettings` struct, `Load()`, and helper methods
+- `config.go` - Higher-level config functions that use settings (for `cli` package consumers)
+
+### Logging vs User Output
+
+- **Internal/debug logging**: Use `logging.Debug/Info/Warn/Error(ctx, msg, attrs...)` from `cmd/entire/cli/logging/`. Writes to `.entire/logs/`.
+- **User-facing output**: Use `fmt.Fprint*(cmd.OutOrStdout(), ...)` or `cmd.ErrOrStderr()`.
+
+Don't use `fmt.Print*` for operational messages (checkpoint saves, hook invocations, strategy decisions) - those should use the `logging` package.
+
+**Privacy**: Don't log user content (prompts, file contents, commit messages). Log only operational metadata (IDs, counts, paths, durations).
+
+### Git Operations
+
+We use github.com/go-git/go-git for most git operations, but with important exceptions:
+
+#### go-git v5 Bugs - Use CLI Instead
+
+**Do NOT use go-git v5 for `checkout` or `reset --hard` operations.**
+
+go-git v5 has a bug where `worktree.Reset()` with `git.HardReset` and `worktree.Checkout()` incorrectly delete untracked directories even when they're listed in `.gitignore`. This would destroy `.entire/` and `.worktrees/` directories.
+
+Use the git CLI instead:
+
+```go
+// WRONG - go-git deletes ignored directories
+worktree.Reset(&git.ResetOptions{
+    Commit: hash,
+    Mode:   git.HardReset,
+})
+
+// CORRECT - use git CLI
+cmd := exec.CommandContext(ctx, "git", "reset", "--hard", hash.String())
+```
+
+See `HardResetWithProtection()` in `common.go` and `CheckoutBranch()` in `git_operations.go` for examples.
+
+Regression tests in `hard_reset_test.go` verify this behavior - if go-git v6 fixes this issue, those tests can be used to validate switching back.
+
+#### Repo Root vs Current Working Directory
+
+**Always use repo root (not `os.Getwd()`) when working with git-relative paths.**
+
+Git commands like `git status` and `worktree.Status()` return paths relative to the **repository root**, not the current working directory. When an agent runs from a subdirectory (e.g., `/repo/frontend`), using `os.Getwd()` to construct absolute paths will produce incorrect results for files in sibling directories.
+
+```go
+// WRONG - breaks when running from subdirectory
+cwd, _ := os.Getwd()  // e.g., /repo/frontend
+absPath := filepath.Join(cwd, file)  // file="api/src/types.ts" → /repo/frontend/api/src/types.ts (WRONG)
+
+// CORRECT - use repo root
+repoRoot, _ := paths.WorktreeRoot()
+absPath := filepath.Join(repoRoot, file)  // → /repo/api/src/types.ts (CORRECT)
+```
+
+This also affects path filtering. The `paths.ToRelativePath()` function rejects paths starting with `..`, so computing relative paths from cwd instead of repo root will filter out files in sibling directories:
+
+```go
+// WRONG - filters out sibling directory files
+cwd, _ := os.Getwd()  // /repo/frontend
+relPath := paths.ToRelativePath("/repo/api/file.ts", cwd)  // returns "" (filtered out as "../api/file.ts")
+
+// CORRECT - keeps all repo files
+repoRoot, _ := paths.WorktreeRoot()
+relPath := paths.ToRelativePath("/repo/api/file.ts", repoRoot)  // returns "api/file.ts"
+```
+
+**When to use `os.Getwd()`:** Only when you actually need the current directory (e.g., finding agent session directories that are cwd-relative).
+
+**When to use repo root:** Any time you're working with paths from git status, git diff, or any git-relative file list.
+
+Test case in `state_test.go`: `TestFilterAndNormalizePaths_SiblingDirectories` documents this bug pattern.
+
+### Session Strategy (`cmd/entire/cli/strategy/`)
+
+The CLI uses a manual-commit strategy for managing session data and checkpoints. The strategy implements the `Strategy` interface defined in `strategy.go`.
+
+#### Strategy Interface
+
+The `Strategy` interface provides:
+
+- `SaveStep()` - Save session step checkpoint (code + metadata)
+- `SaveTaskStep()` - Save subagent task step checkpoint
+- `GetRewindPoints()` / `Rewind()` - List and restore to checkpoints
+- `GetSessionLog()` / `GetSessionInfo()` - Retrieve session data
+- `ListSessions()` / `GetSession()` - Session discovery
+
+#### How It Works
+
+The manual-commit strategy (`manual_commit*.go`) does not modify the active branch - no commits are created on the working branch. Instead it:
+
+- Creates shadow branch `entire/<HEAD-commit-hash[:7]>-<worktreeHash[:6]>` per base commit + worktree
+- **Worktree-specific branches** - each git worktree gets its own shadow branch namespace, preventing conflicts
+- **Supports multiple concurrent sessions** - checkpoints from different sessions in the same directory interleave on the same shadow branch
+- Condenses session logs to permanent `entire/checkpoints/v1` branch on user commits
+- Builds git trees in-memory using go-git plumbing APIs
+- Rewind restores files from shadow branch commit tree (does not use `git reset`)
+- **Location-independent transcript resolution** - transcript paths are always computed dynamically from the current repo location (via `agent.GetSessionDir` + `agent.ResolveSessionFile`), never stored in checkpoint metadata. This ensures restore/rewind works after repo relocation or across machines.
+- **Copilot token scoping** - Copilot CLI `session.shutdown` contains session-wide token aggregates. Checkpoint metadata must stay scoped to `CheckpointTranscriptStart`; condensation may separately backfill full-session Copilot totals into session state for `entire status`.
+- Tracks session state in `.git/entire-sessions/` (shared across worktrees)
+- **Shadow branch migration** - if user does stash/pull/rebase (HEAD changes without commit), shadow branch is automatically moved to new base commit
+- **Orphaned branch cleanup** - if a shadow branch exists without a corresponding session state file, it is automatically reset when a new session starts
+- PrePush hook can push `entire/checkpoints/v1` branch alongside user pushes
+- Safe to use on main/master since it never modifies commit history
+
+#### Key Files
+
+- `strategy.go` - Interface definition and context structs (`StepContext`, `TaskStepContext`, `RewindPoint`, etc.)
+- `common.go` - Helpers for metadata extraction, tree building, rewind validation, `ListCheckpoints()`
+- `session.go` - Session/checkpoint data structures
+- `push_common.go` - PrePush logic for pushing `entire/checkpoints/v1` branch
+- `manual_commit.go` - Manual-commit strategy main implementation
+- `manual_commit_types.go` - Type definitions: `SessionState`, `CheckpointInfo`, `CondenseResult`
+- `manual_commit_session.go` - Session state management (load/save/list session states)
+- `manual_commit_condensation.go` - Condense logic for copying logs to `entire/checkpoints/v1`
+- `manual_commit_rewind.go` - Rewind implementation: file restoration from checkpoint trees
+- `manual_commit_git.go` - Git operations: checkpoint commits, tree building
+- `manual_commit_logs.go` - Session log retrieval and session listing
+- `manual_commit_hooks.go` - Git hook handlers (prepare-commit-msg, post-commit, pre-push)
+- `manual_commit_reset.go` - Shadow branch reset/cleanup functionality
+- `session_state.go` - Package-level session state functions (`LoadSessionState`, `SaveSessionState`, `ListSessionStates`, `FindMostRecentSession`)
+- `hooks.go` - Git hook installation
+
+#### Checkpoint Package (`cmd/entire/cli/checkpoint/`)
+
+- `checkpoint.go` - Data types (`Checkpoint`, `TemporaryCheckpoint`, `CommittedCheckpoint`)
+- `store.go` - `GitStore` struct wrapping git repository
+- `temporary.go` - Shadow branch operations (`WriteTemporary`, `ReadTemporary`, `ListTemporary`)
+- `committed.go` - Metadata branch operations (`WriteCommitted`, `ReadCommitted`, `ListCommitted`)
+
+#### Session Package (`cmd/entire/cli/session/`)
+
+- `session.go` - Session data types and interfaces
+- `state.go` - `StateStore` for managing `.git/entire-sessions/` files
+- `phase.go` - Session phase state machine (phases, events, transitions, actions)
+
+#### Session Phase State Machine
+
+Sessions track their lifecycle through phases managed by a state machine in `session/phase.go`:
+
+**Phases:** `ACTIVE`, `IDLE`, `ENDED`
+
+**Events:**
+
+- `TurnStart` - Agent begins a turn (UserPromptSubmit hook)
+- `TurnEnd` - Agent finishes a turn (Stop hook)
+- `GitCommit` - A git commit was made (PostCommit hook)
+- `SessionStart` - New session started
+- `SessionStop` - Session explicitly stopped
+
+**Key transitions:**
+
+- `IDLE + TurnStart → ACTIVE` - Agent starts working
+- `ACTIVE + TurnEnd → IDLE` - Agent finishes turn
+- `ACTIVE + GitCommit → ACTIVE` - User commits while agent is working (condense immediately)
+- `IDLE + GitCommit → IDLE` - User commits between turns (condense immediately)
+- `ENDED + GitCommit → ENDED` - Post-session commit (condense if files touched)
+
+The state machine emits **actions** (e.g., `ActionCondense`, `ActionUpdateLastInteraction`) that hook handlers dispatch to strategy-specific implementations.
+
+#### Metadata Structure
+
+**Shadow branches** (`entire/<commit-hash[:7]>-<worktreeHash[:6]>`):
+
+```
+.entire/metadata/<session-id>/
+├── full.jsonl               # Session transcript
+├── prompt.txt               # Checkpoint-scoped user prompts
+└── tasks/<tool-use-id>/     # Task checkpoints
+    ├── checkpoint.json      # UUID mapping for rewind
+    └── agent-<id>.jsonl     # Subagent transcript
+```
+
+**Metadata branch** (`entire/checkpoints/v1`) - sharded checkpoint format:
+
+```
+<checkpoint-id[:2]>/<checkpoint-id[2:]>/
+├── metadata.json            # CheckpointSummary (aggregated stats)
+├── 0/                       # First session (0-based indexing)
+│   ├── metadata.json        # Session-specific metadata
+│   ├── full.jsonl           # Session transcript
+│   ├── prompt.txt           # Checkpoint-scoped user prompts
+│   ├── content_hash.txt     # SHA256 of transcript
+│   └── tasks/<tool-use-id>/ # Task checkpoints (if applicable)
+│       ├── checkpoint.json  # UUID mapping
+│       └── agent-<id>.jsonl # Subagent transcript
+├── 1/                       # Second session (if multiple sessions)
+│   ├── metadata.json
+│   ├── full.jsonl
+│   └── ...
+└── ...
+```
+
+**Multi-session metadata.json format:**
+
+```json
+{
+  "checkpoint_id": "abc123def456",
+  "session_id": "2026-01-13-uuid", // Current/latest session
+  "session_ids": ["2026-01-13-uuid1", "2026-01-13-uuid2"], // All sessions
+  "session_count": 2, // Number of sessions in this checkpoint
+  "strategy": "manual-commit",
+  "created_at": "2026-01-13T12:00:00Z",
+  "files_touched": ["file1.txt", "file2.txt"] // Merged from all sessions
+}
+```
+
+When multiple sessions are condensed to the same checkpoint (same base commit):
+
+- Sessions are stored in numbered subfolders using 0-based indexing (`0/`, `1/`, `2/`, etc.)
+- Latest session is always in the highest-numbered folder
+- `session_ids` array tracks all sessions, `session_count` increments
+
+**Session State** (filesystem, `.git/entire-sessions/`):
+
+```
+<session-id>.json            # Active session state (base_commit, checkpoint_count, etc.)
+```
+
+Session state and committed checkpoint metadata carry `owner_id` alongside `owner_name`/`owner_email`. `owner_id` is the durable identifier used for personal memory-loop scoping and should be propagated into the insights cache.
+
+Session state and committed checkpoint metadata carry `owner_id` alongside `owner_name`/`owner_email`. `owner_id` is the durable identifier used for personal memory-loop scoping and should be propagated into the insights cache.
+
+#### Checkpoint ID Linking
+
+The strategy uses a **12-hex-char random checkpoint ID** (e.g., `a3b2c4d5e6f7`) as the stable identifier linking user commits to metadata.
+
+**How checkpoint IDs work:**
+
+1. **Generated once per checkpoint**: When condensing session metadata to the metadata branch
+
+2. **Added to user commits** via `Entire-Checkpoint` trailer:
+   - **Manual-commit**: Added via `prepare-commit-msg` hook (user can remove it before committing)
+
+3. **Used for directory sharding** on `entire/checkpoints/v1` branch:
+   - Path format: `<id[:2]>/<id[2:]>/`
+   - Example: `a3b2c4d5e6f7` → `a3/b2c4d5e6f7/`
+   - Creates 256 shards to avoid directory bloat
+
+4. **Appears in commit subject** on `entire/checkpoints/v1` commits:
+   - Format: `Checkpoint: a3b2c4d5e6f7`
+   - Makes `git log entire/checkpoints/v1` readable and searchable
+
+**Bidirectional linking:**
+
+```
+User commit → Metadata:
+  Extract "Entire-Checkpoint: a3b2c4d5e6f7" trailer
+  → Read a3/b2c4d5e6f7/ directory from entire/checkpoints/v1 tree at HEAD
+
+Metadata → User commits:
+  Given checkpoint ID a3b2c4d5e6f7
+  → Search user branch history for commits with "Entire-Checkpoint: a3b2c4d5e6f7" trailer
+```
+
+Note: Commit subjects on `entire/checkpoints/v1` (e.g., `Checkpoint: a3b2c4d5e6f7`) are
+for human readability in `git log` only. The CLI always reads from the tree at HEAD.
+
+**Example:**
+
+```
+User's commit (on main branch):
+  "Implement login feature
+
+  Entire-Checkpoint: a3b2c4d5e6f7"
+       ↓ ↑
+       Linked via checkpoint ID
+       ↓ ↑
+entire/checkpoints/v1 commit:
+  Subject: "Checkpoint: a3b2c4d5e6f7"
+
+  Tree: a3/b2c4d5e6f7/
+    ├── metadata.json (checkpoint_id: "a3b2c4d5e6f7")
+    ├── full.jsonl (session transcript)
+    └── prompt.txt
+```
+
+#### Commit Trailers
+
+**On user's active branch commits:**
+
+- `Entire-Checkpoint: <checkpoint-id>` - 12-hex-char ID linking to metadata on `entire/checkpoints/v1`
+  - Added via `prepare-commit-msg` hook; user can remove it before committing to skip linking
+
+**On shadow branch commits (`entire/<commit-hash[:7]>-<worktreeHash[:6]>`):**
+
+- `Entire-Session: <session-id>` - Session identifier
+- `Entire-Metadata: <path>` - Path to metadata directory within the tree
+- `Entire-Task-Metadata: <path>` - Path to task metadata directory (for task checkpoints)
+- `Entire-Strategy: manual-commit` - Strategy that created the commit
+
+**On metadata branch commits (`entire/checkpoints/v1`):**
+
+Commit subject: `Checkpoint: <checkpoint-id>` (or custom subject for task checkpoints)
+
+Trailers:
+
+- `Entire-Session: <session-id>` - Session identifier
+- `Entire-Strategy: <strategy>` - Strategy name (manual-commit)
+- `Entire-Agent: <agent-name>` - Agent name (optional, e.g., "Claude Code")
+- `Ephemeral-branch: <branch>` - Shadow branch name (optional)
+- `Entire-Metadata-Task: <path>` - Task metadata path (optional, for task checkpoints)
+
+**Note:** The strategy keeps active branch history clean - the only addition to user commits is the single `Entire-Checkpoint` trailer. It never creates commits on the active branch (the user creates them manually). All detailed session data (transcripts, prompts, context) is stored on the `entire/checkpoints/v1` orphan branch or shadow branches.
+
+#### Multi-Session Behavior
+
+**Concurrent Sessions:**
+
+- When a second session starts in the same directory while another has uncommitted checkpoints, a warning is shown
+- Both sessions can proceed - their checkpoints interleave on the same shadow branch
+- Each session's `RewindPoint` includes `SessionID` and `SessionPrompt` to help identify which checkpoint belongs to which session
+- On commit, all sessions are condensed together with archived sessions in numbered subfolders
+- Note: Different git worktrees have separate shadow branches (worktree-specific naming), so concurrent sessions in different worktrees do not conflict
+
+**Orphaned Shadow Branches:**
+
+- A shadow branch is "orphaned" if it exists but has no corresponding session state file
+- This can happen if the state file is manually deleted or lost
+- When a new session starts with an orphaned branch, the branch is automatically reset
+- If the existing session DOES have a state file (concurrent session in same directory), a `SessionIDConflictError` is returned
+
+**Shadow Branch Migration (Pull/Rebase):**
+
+- If user does stash → pull → apply (or rebase), HEAD changes but work isn't committed
+- The shadow branch would be orphaned at the old commit
+- Detection: base commit changed AND old shadow branch still exists (would be deleted if user committed)
+- Action: shadow branch is renamed from `entire/<old-hash>-<worktreeHash>` to `entire/<new-hash>-<worktreeHash>`
+- Session continues seamlessly with checkpoints preserved
+
+#### When Modifying the Strategy
+
+- The strategy must implement the full `Strategy` interface
+- Test with `mise run test` - strategy tests are in `*_test.go` files
+- **Update both CLAUDE.md and AGENTS.md** when modifying the strategy to keep documentation current
+
+# Important Notes
+
+- **Before committing:** Follow the "Before Every Commit (REQUIRED)" checklist above - CI will fail without it
+- Integration tests: run `mise run test:integration` when changing integration test code
+- When adding new features, ensure they are well-tested and documented.
+- Always check for code duplication and refactor as needed.
+
+## Go Code Style
+
+- Write lint-compliant Go code on the first attempt. Before outputting Go code, mentally verify it passes `golangci-lint` (or your specific linter).
+- Follow standard Go idioms: proper error handling, no unused variables/imports, correct formatting (gofmt), meaningful names.
+- Handle all errors explicitly—don't leave them unchecked.
+- Reference `.golangci.yml` for enabled linters before writing Go code.
+
+## Accessibility
+
+The CLI supports an accessibility mode for users who rely on screen readers. This mode uses simpler text prompts instead of interactive TUI elements.
+
+### Environment Variable
+
+- `ACCESSIBLE=1` (or any non-empty value) enables accessibility mode
+- Users can set this in their shell profile (`.bashrc`, `.zshrc`) for persistent use
+
+### Implementation Guidelines
+
+When adding new interactive forms or prompts using `huh`:
+
+**In the `cli` package:**
+Use `NewAccessibleForm()` instead of `huh.NewForm()`:
+
+```go
+// Good - respects ACCESSIBLE env var
+form := NewAccessibleForm(
+    huh.NewGroup(
+        huh.NewSelect[string]().
+            Title("Choose an option").
+            Options(...).
+            Value(&choice),
+    ),
+)
+
+// Bad - ignores accessibility setting
+form := huh.NewForm(...)
+```
+
+**In the `strategy` package:**
+Use the `isAccessibleMode()` helper. Note that `WithAccessible()` is only available on forms, not individual fields, so wrap confirmations in a form:
+
+```go
+form := huh.NewForm(
+    huh.NewGroup(
+        huh.NewConfirm().
+            Title("Confirm action?").
+            Value(&confirmed),
+    ),
+)
+if isAccessibleMode() {
+    form = form.WithAccessible(true)
+}
+if err := form.Run(); err != nil { ... }
+```
+
+### Key Points
+
+- Always use the accessibility helpers for any `huh` forms/prompts
+- Test new interactive features with `ACCESSIBLE=1` to ensure they work
+- The accessible mode is documented in `--help` output
+
+</INSTRUCTIONS>
+
+---
+
+<environment_context>
+  <cwd>/Users/alisha/.superset/worktrees/cli/agent-improvements</cwd>
+  <shell>zsh</shell>
+  <current_date>2026-04-02</current_date>
+  <timezone>America/Los_Angeles</timezone>
+</environment_context>
+
+---
+
+hello
+
+---
+
+when generating summaries I want it to include similar insights to what this claude
+  plugin does.
+  https://github.com/anthropics/claude-code/tree/main/plugins/explanatory-output-style
+  how can that be added in addition to what we are already gathering
+
+---
+
+pros and cons of each
+
+---
+
+I like the gated. let the user decide and have it apply to all agents we support. if the user doesn't enable it for live injection then it should revert to option 1. where summary tries to generate it. summary needs to handle both cases
+
+---
+
+should just be "explanatory_insights": {
+          
+          "live_injection": true
+        } and always have it be in summary
+
+---
+
+hmm for summarization we can't rely on the live injection flag. older sessions may have the insights and the toggle could be off
+
+---
+
+new top level summary fields
+
+---
+
+yes
+
+---
+
+yes
+
+---
+
+approve
+
+---
+
+1
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f63-e3ec-7c21-b66e-1f0ff7eb2b46","status":{"completed":"Task 1 is implemented in [settings.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/settings/settings.go) and [settings_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/settings/settings_test.go).\n\nWhat changed:\n- Added `IsExplanatoryInsightsLiveInjectionEnabled(ctx context.Context) bool` and `(*EntireSettings).IsExplanatoryInsightsLiveInjectionEnabled() bool`.\n- The helper reads `strategy_options.summarize.explanatory_insights.live_injection`.\n- Missing, malformed, or wrong-typed nested config fails closed to `false`.\n- Added tests for default false, explicit true through `Load`, and malformed nested shapes.\n\nVerification:\n- `go test ./cmd/entire/cli/settings -run 'TestIsExplanatoryInsightsLiveInjection|TestIsCheckpointsV2Enabled|TestLoad_'` passed.\n- I also ran `gofmt -w cmd/entire/cli/settings/settings.go cmd/entire/cli/settings/settings_test.go` and reran the same targeted tests; they still passed.\n\nSelf-review:\n- The new helper is nil-safe and does not depend on any side effects.\n- No changes were made outside the two requested files, and I did not commit anything."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f65-1f2e-7062-8c69-c02fc3a0c0a4","status":{"completed":"✅"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f65-71a4-7343-9ce1-da087c07b2a4","status":{"completed":"No findings.\n\nResidual risk: the new package-level wrapper `IsExplanatoryInsightsLiveInjectionEnabled(ctx)` is only indirectly covered via `Load(...)` plus the instance helper path in [settings_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/settings/settings_test.go). That is acceptable for this task because the wrapper is trivial, but if this settings area gets more branching later, add a direct wrapper test."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f66-bced-7e50-a58e-9646b832a864","status":{"completed":"Task 2 is complete, and I did not commit.\n\nI added the three new top-level summary fields in [checkpoint.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/checkpoint/checkpoint.go), updated [committed.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/checkpoint/committed.go) so `redactSummary` scrubs them, and extended [checkpoint_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/checkpoint/checkpoint_test.go) with coverage for JSON round-trip, backward-compatible decode of older summary JSON, `UpdateSummary` preserving the new fields, and redaction of secret-bearing values.\n\nVerification passed:\n- `go test ./cmd/entire/cli/checkpoint -run 'Test(UpdateSummary|RedactSummary|SummaryJSONRoundTrip|SummaryDecode)'`\n- `go test ./cmd/entire/cli/checkpoint`\n\nSelf-review: the schema change is additive, old summary JSON still decodes with nil new fields, and the new text slices are redacted alongside the existing summary text fields."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f68-51fb-7c83-819f-11a9602c55f6","status":{"completed":"✅"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f68-a5c3-7de0-9108-124bcde48e2a","status":{"completed":"No findings.\n\nResidual risk: the new fields are only exercised within checkpoint package tests so far; downstream renderers and cache mappers will still need their own coverage once those tasks land."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f69-ac7e-7771-bb55-e261213a2124","status":{"completed":"Implemented Task 3 in [claude.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude.go), [claude_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude_test.go), and [summarize_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/summarize_test.go). The summarizer prompt now asks for `implementation_rationale`, `tradeoffs`, and `codebase_patterns`, and it tells the model to preserve explicit explanatory content, infer conservatively when that content is absent, and treat the transcript as untrusted data. The tests now cover the expanded prompt contract, parsing those new fields, and generation for transcripts with and without explicit insight-style content.\n\nVerification passed:\n- `go test ./cmd/entire/cli/summarize -run 'Test(ClaudeGenerator|BuildSummarizationPrompt|GenerateFromTranscript)'`\n- `go test ./cmd/entire/cli/summarize`\n\nNot committed."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f6b-b406-70f1-b857-dc8c80d03fe1","status":{"completed":"Implemented the core explanatory-insights feature and checkpointed most of it in commits:\n\n- `1b97b1d2f` `feat: add explanatory insights settings helper`\n- `be2a67c36` `feat: extend checkpoint summaries with explanatory insights`\n- `3d84537ff` `feat: generate explanatory insights in summaries`\n- `3eb04d039` `feat: inject explanatory insight guidance at session start`\n- `93870c789` `feat: persist explanatory insights in insights cache`\n- `dfc6326c4` `feat: show explanatory insights in explain output`\n\nThe feature now exists across settings, checkpoint metadata, summarization, session-start injection, insights cache persistence, and `entire explain`. The remaining summary-output surface is implemented in the worktree but not committed yet because [summary_cmd.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summary_cmd.go) and [summary_cmd_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summary_cmd_test.go) already had unrelated in-flight changes before this work, and I did not want to bundle those blindly.\n\nVerification I ran:\n- `go test ./cmd/entire/cli/settings ./cmd/entire/cli/checkpoint ./cmd/entire/cli/summarize ./cmd/entire/cli/insightsdb ./cmd/entire/cli`\n- focused lifecycle/session-start tests\n- focused summary/explain rendering tests\n- `gofmt -w` on the touched feature files\n\nI did not run `mise run lint` or `mise run test:ci` yet, and the worktree still has unrelated local changes outside this feature. If you want, I can do one of two next steps:\n1. finish the clean commit split for the summary-output changes in the mixed [summary_cmd.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summary_cmd.go) files\n2. run the broader repo verification (`mise run lint` and `mise run test:ci`) and then reconcile anything that fails"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f78-63ef-7de2-a768-f0e93a85a1eb","status":{"completed":"✅ Fully spec compliant in the current local versions of the three in-scope files."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f79-791f-7301-af54-2ca0931e5cf2","status":{"completed":"1. High: The prompt-injection boundary is not actually enforced, because the transcript is interpolated raw inside `<transcript>...</transcript>`. A transcript containing `</transcript>` can break out of the untrusted-data section and inject new instructions, which defeats the security comment and the new contract requirement. [cmd/entire/cli/summarize/claude.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude.go):15 [cmd/entire/cli/summarize/claude.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude.go):96\n\n2. Medium: The JSON parse error path includes the full raw model response in the returned error. If the model echoes transcript content or hostile input before failing JSON parsing, that untrusted content gets surfaced directly to callers and likely user-visible output, which cuts against the repo’s “generic errors to clients” and “treat transcript as untrusted data” guidance. [cmd/entire/cli/summarize/claude.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude.go):88\n\n3. Medium: `TestClaudeGenerator_GitIsolation` can pass even if git env isolation is broken. It only checks `capturedCmd.Env`, but `exec.Cmd.Env == nil` means the subprocess inherits the parent environment, including `GIT_*`. In that failure mode the loop sees nothing and the test still passes, so it does not reliably prove isolation. [cmd/entire/cli/summarize/claude_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude_test.go):45\n\n4. Medium: The new “explicit insight content” tests do not actually verify the behavior they describe. Both tests hard-code the generator response to include the expected rationale/tradeoff/pattern fields, then assert those fields exist. If prompt wording regresses, marker handling breaks, or conservative inference stops working, these tests still pass because the mock output is independent of the transcript. They only cover JSON plumbing, not the new behavior. [cmd/entire/cli/summarize/summarize_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/summarize_test.go):684 [cmd/entire/cli/summarize/summarize_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/summarize_test.go):705"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f7d-210c-7971-a9d1-a366b86bd15b","status":{"completed":"1. Medium: [`summarize_test.go:742`](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/summarize_test.go#L742) `TestGenerateFromTranscript_NilGenerator` is still nondeterministic and can cross the unit-test boundary into the real `claude` CLI. On a machine where `claude` is installed and authenticated, this test can make a real external call, consume tokens, and still “pass” without asserting any concrete behavior. This should be replaced with a stubbed default-generator seam or an explicit fake, not a best-effort “should not panic” check.\n\n2. Medium: [`summarize_test.go:684`](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/summarize_test.go#L684) and [`summarize_test.go:707`](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/summarize_test.go#L707) improved the explicit/implicit insight coverage, but each test still validates only one explanatory bucket. Both mocked responses populate `implementation_rationale`, `tradeoffs`, and `codebase_patterns`; a regression affecting the unasserted fields under these prompt modes would still slip through.\n\n3. Low: Most tests in [`claude_test.go:61`](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude_test.go#L61), [`claude_test.go:103`](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude_test.go#L103), [`summarize_test.go:17`](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/summarize_test.go#L17), and [`summarize_test.go:653`](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/summarize_test.go#L653) omit `t.Parallel()` despite the repo convention. That is mostly a test-maintainability issue, but it also reduces the chance of catching hidden shared-state assumptions early. The `t.Setenv` case should stay serial; most of the rest appear parallel-safe.\n\n`go test ./cmd/entire/cli/summarize` passes on the current local tree."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019d4f80-c984-77d0-8611-c1221ddb5f91","status":{"completed":"No findings in [claude.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude.go), [claude_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude_test.go), or [summarize_test.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/summarize_test.go) based on the current local code.\n\nResidual risk: the reviewed tests still don’t pin behavior for syntactically valid but schema-incomplete summary JSON, so cases like `{}` or missing insight arrays would currently be accepted by [claude.go](/Users/alisha/.superset/worktrees/cli/agent-improvements/cmd/entire/cli/summarize/claude.go). That’s a test gap more than a demonstrated regression.\n\nVerification: `go test ./cmd/entire/cli/summarize` and `go test -race ./cmd/entire/cli/summarize` both passed locally."}}
+</subagent_notification>

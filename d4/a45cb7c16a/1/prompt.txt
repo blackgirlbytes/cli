@@ -1,0 +1,76 @@
+Implement the following plan:
+
+# Plan: Deprecation warning for `strategy` field in settings
+
+## Context
+
+The `auto-commit` strategy was removed and `manual-commit` is the only strategy. Users may still have `"strategy": "auto-commit"` in their settings files. Because `DisallowUnknownFields()` is used, this causes a hard error — breaking the CLI.
+
+## Changes (~20 lines of production code)
+
+### 1. `cmd/entire/cli/settings/settings.go`
+
+Add deprecated `Strategy` field to struct:
+```go
+// Deprecated: no longer used. Exists to tolerate old settings files.
+Strategy string `json:"strategy,omitempty"`
+```
+
+Add helper:
+```go
+func FilesWithDeprecatedStrategy() []string {
+    var files []string
+    for _, rel := range []string{EntireSettingsFile, EntireSettingsLocalFile} {
+        abs, _ := paths.AbsPath(rel)
+        s, err := LoadFromFile(abs)
+        if err != nil || s.Strategy == "" { continue }
+        files = append(files, rel)
+    }
+    return files
+}
+```
+
+### 2. `cmd/entire/cli/status.go`
+
+In `runStatus()` after status line, and in `runStatusDetailed()` after effective status:
+```go
+for _, f := range settings.FilesWithDeprecatedStrategy() {
+    fmt.Fprintf(w, "Warning: %s contains deprecated \"strategy\" field. Remove it to silence this warning.\n", f)
+}
+```
+
+### 3. `cmd/entire/cli/doctor.go`
+
+In `runSessionsFix()` at the start:
+```go
+for _, f := range settings.FilesWithDeprecatedStrategy() {
+    fmt.Fprintf(cmd.OutOrStdout(), "Warning: %s contains deprecated \"strategy\" field. Remove it to silence this warning.\n", f)
+}
+```
+
+### 4. Tests
+
+- `settings_test.go`: Loading with `"strategy": "auto-commit"` succeeds; `FilesWithDeprecatedStrategy` detects it
+- `status_test.go`: Status shows warning when strategy field present
+- `doctor_test.go`: Doctor shows warning when strategy field present (use `setupGitRepoForPhaseTest`)
+
+## Files to modify
+
+- `cmd/entire/cli/settings/settings.go` — add field + helper
+- `cmd/entire/cli/status.go` — add warning (2 places)
+- `cmd/entire/cli/doctor.go` — add warning (1 place)
+- `cmd/entire/cli/settings/settings_test.go` — add tests
+- `cmd/entire/cli/status_test.go` — add tests
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.REDACTED.jsonl
+
+---
+
+I do want a warning message more user friendly, and entire doctor should display the warning at the end of the prompt

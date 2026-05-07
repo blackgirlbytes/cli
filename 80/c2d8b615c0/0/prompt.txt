@@ -1,0 +1,363 @@
+/pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>ad402ff82b6524a50</task-id>
+<tool-use-id>toolu_01GEYsbqhhYkLt9QGrNrwLGw</tool-use-id>
+<status>completed</status>
+<summary>Agent "Silent failure analysis" completed</summary>
+<result>Important finding. The PrePush command **always returns nil** (line 211), so the `remote` from `args[0]` is passed to `PrePush` but the caller never sees the error. And `markActiveSessionsPushed` runs **after** the checkpoint push succeeds (line 27 in `manual_commit_push.go`), which is correct -- it only marks if the push actually succeeded.
+
+Now I have a complete picture. Let me compile my analysis.
+
+---
+
+## Error Handling Audit Report
+
+### Branch: `alex/stop-hook-updates-remote-checkpoints`
+### Scope: `pushFinalizedCheckpointsIfNeeded`, `markActiveSessionsPushed`, and their integration
+
+---
+
+### Finding 1: Dead Error Handling Code in `pushFinalizedCheckpointsIfNeeded`
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 2171-2179
+
+**Severity:** MEDIUM
+
+**Issue Description:**
+The two error handling branches in `pushFinalizedCheckpointsIfNeeded` can never execute. Both `pushBranchIfNeeded` and `PushTrailsBranch` delegate to `doPushBranch`, which **always returns nil** -- it swallows all errors internally with `fmt.Fprintf(os.Stderr, ...)` messages and returns `nil` unconditionally (see `push_common.go` lines 86-109). This means the `logging.Warn` calls at lines 2172-2173 and 2178-2179 are dead code.
+
+```go
+if err := pushBranchIfNeeded(ctx, remote, paths.MetadataBranchName); err != nil {
+    // This branch can NEVER execute
+    logging.Warn(logCtx, "failed to push finalized checkpoints",
+        slog.String("error", err.Error()))
+}
+```
+
+**Hidden Errors:** None directly hidden by *this* code, because the errors are already being swallowed one layer deeper in `doPushBranch`. But the dead code here gives a false impression that push failures are being handled by this function when they are not -- `doPushBranch` handles them by printing to stderr and returning nil.
+
+**User Impact:** Minimal in practice. The push failure messages from `doPushBranch` still reach the user via stderr. However, the dead error-handling code is misleading to future developers who might think this function has its own error recovery when it does not. If `doPushBranch` is ever changed to propagate errors, this code would suddenly become live and would silently absorb them without user-facing feedback.
+
+**Recommendation:** This is not a correctness issue but a code clarity concern. Consider either:
+1. Adding a comment noting that `pushBranchIfNeeded` currently never returns non-nil but the error handling is defensive for API contract changes, or
+2. Removing the error checks since they're dead code (less defensive but more honest).
+
+The existing pattern is consistent with how `doPushBranch` works -- errors are printed to stderr *inside* `doPushBranch` and never propagated. The new code is not *worse* than the existing pattern; it's just unnecessarily wrapping something that can't fail.
+
+---
+
+### Finding 2: In-Memory State Cleared But No Guarantee of Persistence on Push Failure Path
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_hooks.go`, line 2154
+
+**Severity:** MEDIUM
+
+**Issue Description:**
+`pushFinalizedCheckpointsIfNeeded` clears `state.PushedDuringTurnRemote` on the in-memory `*SessionState` at line 2154:
+
+```go
+state.PushedDuringTurnRemote = "" // Always clear, even on error
+```
+
+This in-memory state is then persisted by the caller chain: `HandleTurnEnd` returns to `lifecycle.go:775`, and `SaveSessionState` is called at `lifecycle.go:780`. However, if `SaveSessionState` at line 780 fails (and that failure is only logged as a warning, not propagated), then:
+
+1. The in-memory state says `PushedDuringTurnRemote = ""`
+2. The on-disk state still says `PushedDuringTurnRemote = "origin"`
+3. On the next prompt start, `InitializeSession` would clear it (line 1831), so this is self-healing
+
+This is a narrow window of inconsistency but it self-heals because `InitializeSession` also clears `PushedDuringTurnRemote`. The design correctly has a belt-and-suspenders approach.
+
+**User Impact:** If `SaveSessionState` fails after `HandleTurnEnd`, and the process is killed before the next `InitializeSession`, the stale `PushedDuringTurnRemote` flag would cause a spurious push on the next turn end. This is harmless (it would push data that's already pushed or push a slightly newer version) and self-correcting.
+
+**Recommendation:** No change needed. The self-healing behavior via `InitializeSession` is correctly documented and tested (`TestShadow_NewPromptClearsPushedDuringTurnRemote`). This is a well-designed idempotent cleanup pattern.
+
+---
+
+### Finding 3: `markActiveSessionsPushed` -- Best-Effort Approach is Appropriate But Has a Subtle Race Window
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_push.go`, lines 41-65
+
+**Severity:** LOW (acknowledged race, not practically exploitable)
+
+**Issue Description:**
+`markActiveSessionsPushed` runs in the PrePush hook context (a separate git process), while `HandleTurnEnd` runs in the agent's lifecycle context. There's a TOCTOU window:
+
+1. PrePush calls `ListSessionStates()` and gets sessions with their current phase
+2. Between `ListSessionStates()` and `SaveSessionState()`, the agent's `HandleTurnEnd` could fire (if the push is very slow)
+3. `HandleTurnEnd` reads state, sees `PushedDuringTurnRemote = ""`, does not push
+4. `markActiveSessionsPushed` writes `PushedDuringTurnRemote = "origin"` to disk
+5. Next prompt's `InitializeSession` clears it -- no push of finalized data happens
+
+This race is mitigated by several factors:
+- PrePush runs synchronously in the git push process, which blocks the terminal
+- `HandleTurnEnd` runs asynchronously from the agent stop hook
+- The window is extremely small (milliseconds)
+- The consequence is a missed optimization (stale transcript on remote), not data loss
+- `InitializeSession` cleans up the stale flag
+
+The error handling within `markActiveSessionsPushed` itself is sound: `ListSessionStates` failure is logged and causes early return (no sessions are incorrectly marked). Individual `SaveSessionState` failures are logged per-session and don't stop iteration over remaining sessions.
+
+**User Impact:** In the extremely unlikely race scenario, the remote would have a provisional transcript instead of the finalized one. The next push would bring the remote up to date.
+
+**Recommendation:** No change needed. The race is inherent to cross-process coordination via filesystem state. The code correctly logs all failure modes and the worst case is a missed push that self-corrects. If you wanted to be more defensive, you could add a log message summarizing how many sessions were marked (e.g., "marked N sessions as pushed to origin"), but this is optional.
+
+---
+
+### Finding 4: No User-Facing Feedback on Push Failure in `pushFinalizedCheckpointsIfNeeded`
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 2164-2180
+
+**Severity:** MEDIUM
+
+**Issue Description:**
+The function prints a user-facing message when it **starts** pushing (line 2169):
+```go
+fmt.Fprintf(os.Stderr, "[entire] Pushing finalized checkpoint transcripts to %s...\n", remote)
+```
+
+But there is no user-facing success or failure message after the push completes. If both pushes succeed, the user sees "Pushing finalized checkpoint transcripts to origin..." and then... nothing. If they fail, the user sees the same "Pushing..." message and then silence (the `logging.Warn` calls are dead code per Finding 1, and `doPushBranch` has its own internal stderr messages for failure, but not for success).
+
+Compare this to the PrePush flow where `doPushBranch` prints its own status messages (syncing, warnings). Those messages *do* reach the user because `doPushBranch` prints to stderr directly. So the user *will* see errors from the underlying push layer, but the outer function doesn't provide its own completion feedback.
+
+**User Impact:** The user sees "Pushing finalized checkpoint transcripts to origin..." and then either the inner `doPushBranch` messages (if there are issues) or silence (if it succeeds or if there's nothing to push). This is consistent with how the PrePush handler works but could be slightly confusing -- the user might wonder if the finalization push completed.
+
+**Recommendation:** This is consistent with the existing push patterns in the codebase, so no change is strictly required. However, consider adding a brief success log after the push:
+```go
+logging.Info(logCtx, "finalized checkpoint push completed",
+    slog.String("remote", remote))
+```
+
+---
+
+### Finding 5: Logging Quality -- `slog.String("error", err.Error())` vs `slog.Any("error", err)`
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 2172-2173 and 2178-2179
+
+**Severity:** LOW
+
+**Issue Description:**
+The error logging in `pushFinalizedCheckpointsIfNeeded` uses `slog.String("error", err.Error())`:
+
+```go
+logging.Warn(logCtx, "failed to push finalized checkpoints",
+    slog.String("error", err.Error()))
+```
+
+While `markActiveSessionsPushed` uses `slog.Any("error", err)`:
+
+```go
+logging.Warn(logCtx, "failed to list session states for push marking",
+    slog.Any("error", err),
+)
+```
+
+Using `slog.Any("error", err)` preserves the full error chain (including wrapped errors via `%w`), while `slog.String("error", err.Error())` flattens it to a string. The two new functions are inconsistent with each other.
+
+**User Impact:** Minor -- both produce readable log messages. But `slog.Any` is more useful for structured log consumers.
+
+**Recommendation:** Use `slog.Any("error", err)` consistently in both functions for error attributes.
+
+---
+
+### Overall Assessment
+
+**Is the "best-effort" push approach appropriate?** YES. This is the correct design for several reasons:
+
+1. **The push is an optimization, not a correctness requirement.** The provisional transcript is already on the remote from the original PrePush. The finalized transcript is an improvement, not a necessity. Missing it means slightly less complete data on the remote, which will be corrected by the next push.
+
+2. **Blocking on push failure would harm the user.** `HandleTurnEnd` runs during the agent's stop hook. If the push blocked or failed the hook, it could leave the session in an inconsistent state (preventing cleanup, phase transitions, etc.). The comment at line 2127-2130 correctly identifies this tradeoff.
+
+3. **The flag has proper lifecycle management.** `PushedDuringTurnRemote` is cleared in three places:
+   - `HandleTurnEnd` (normal path, line 2154)
+   - `InitializeSession` (defensive cleanup on new prompt, line 1831)
+   - Session state file deletion (when session is reset)
+   
+   This belt-and-suspenders approach means stale flags cannot accumulate.
+
+4. **Partial failure cannot leave inconsistent state.** The worst case is: checkpoints pushed to remote have provisional transcripts instead of finalized ones. This is strictly a data freshness issue, not a corruption issue.
+
+**Could partial failures leave inconsistent state?** The main risk is `markActiveSessionsPushed` marking some sessions but not others (if `SaveSessionState` fails mid-iteration). This is handled correctly -- the loop continues to attempt remaining sessions, and each failure is logged individually. Sessions that don't get marked simply won't trigger a finalized push, which is the safe default.
+
+**Is there adequate logging for debugging failures?** Yes, with one caveat: the error handling branches in `pushFinalizedCheckpointsIfNeeded` are dead code (Finding 1), so if `pushBranchIfNeeded` were ever changed to return errors, the logging is ready. The underlying `doPushBranch` function handles its own stderr messaging for failures. The `markActiveSessionsPushed` function logs at appropriate levels for all failure modes.
+
+---
+
+### Summary of Findings
+
+| # | Severity | File | Issue |
+|---|----------|------|-------|
+| 1 | MEDIUM | `manual_commit_hooks.go:2171-2179` | Dead error handling code -- `pushBranchIfNeeded` always returns nil |
+| 2 | MEDIUM | `manual_commit_hooks.go:2154` | In-memory clear without guaranteed persistence (self-healing) |
+| 3 | LOW | `manual_commit_push.go:41-65` | TOCTOU race between PrePush and HandleTurnEnd (benign) |
+| 4 | MEDIUM | `manual_commit_hooks.go:2164-2180` | No user-facing completion feedback after push attempt |
+| 5 | LOW | `manual_commit_hooks.go:2172` vs `manual_commit_push.go:46` | Inconsistent error attribute style (`slog.String` vs `slog.Any`) |
+
+**No CRITICAL findings.** The overall error handling design is sound. The best-effort pattern is well-justified and properly documented. The self-healing lifecycle management of `PushedDuringTurnRemote` across `HandleTurnEnd` and `InitializeSession` is a good defensive pattern.</result>
+<usage><total_tokens>72262</total_tokens><tool_uses>25</tool_uses><duration_ms>164269</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-4/tasks/ad402ff82b6524a50.output
+
+---
+
+<task-notification>
+<task-id>a4dda12d690afc870</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Test coverage analysis" completed</summary>
+<result>Good. The integration tests run the actual binary, so they exercise the full lifecycle including `transitionSessionTurnEnd` -> `HandleTurnEnd` -> `SaveSessionState`.
+
+Now I have a thorough understanding of all the production code and tests. Let me compile my analysis.
+
+---
+
+## Test Coverage Analysis: Turn-End Push Feature
+
+### 1. Summary
+
+The test coverage for this PR is **solid overall**. The feature has a clear three-part architecture (marking sessions on push, pushing on turn-end, clearing on new prompt), and each part has dedicated tests at both unit and integration levels. The tests focus on behavioral outcomes (flag state after operations) rather than implementation details, which is a good sign. There are a few gaps worth noting, but nothing critically dangerous.
+
+### 2. Critical Gaps
+
+**None rated 8-10.** The core behavioral paths are well-covered.
+
+### 3. Important Improvements
+
+**3a. `markActiveSessionsPushed` with multiple ACTIVE sessions (Criticality: 6/10)**
+
+The `markActiveSessionsPushed` function iterates over ALL session states and marks every qualifying session. The existing tests only verify behavior with a single session at a time. There is no test verifying that when multiple ACTIVE sessions with `TurnCheckpointIDs` exist simultaneously, ALL of them get their `PushedDuringTurnRemote` set.
+
+This matters because the `for _, state := range states` loop could have subtle bugs (e.g., modifying a loop variable instead of the persisted state). The current code correctly calls `SaveSessionState(ctx, state)` inside the loop, but the `state` variable is a pointer (`*SessionState` from `ListSessionStates`), and this nuance should be validated.
+
+**What it would catch:** A regression where only the first or last session gets marked, while concurrent sessions in other worktrees/directories are missed.
+
+**File:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_push_test.go`
+
+---
+
+**3b. `pushFinalizedCheckpointsIfNeeded` when `isPushSessionsDisabled` returns true (Criticality: 5/10)**
+
+The `pushFinalizedCheckpointsIfNeeded` function has an early return when `isPushSessionsDisabled(ctx)` is true (line 2160). This path is not tested anywhere. While the flag IS still cleared (line 2154 runs before the check), the behavioral difference -- that push is skipped when settings disable it -- is not verified.
+
+**What it would catch:** A regression where reordering the `isPushSessionsDisabled` check before the flag-clearing line would cause `PushedDuringTurnRemote` to remain set indefinitely when push is disabled, potentially causing repeated push attempts on every subsequent turn end.
+
+**Files:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_hooks.go` (line 2154 vs 2160 ordering), `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/phase_postcommit_test.go`
+
+---
+
+**3c. `markActiveSessionsPushed` when `pushSessionsBranchCommon` fails (Criticality: 5/10)**
+
+In `PrePush`, `markActiveSessionsPushed` is called AFTER `pushSessionsBranchCommon` succeeds. If `pushSessionsBranchCommon` returns an error, `PrePush` returns early (line 22-24) and `markActiveSessionsPushed` is never called. This is correct behavior (don't mark sessions if the push didn't happen), but there is no test verifying this ordering guarantee.
+
+**What it would catch:** A regression where someone moves `markActiveSessionsPushed` before the push call, causing sessions to be marked as "pushed" when the push actually failed, leading to a spurious turn-end push of potentially stale data.
+
+**File:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_push.go` (line 27 ordering)
+
+---
+
+**3d. `markActiveSessionsPushed` skipping ENDED sessions (Criticality: 4/10)**
+
+The `ENDED` phase is not tested in `markActiveSessionsPushed`. While `ENDED` sessions are very unlikely to have `TurnCheckpointIDs` (they are cleared on turn end), the `IsActive()` check is the primary gate. An `ENDED` session with leftover `TurnCheckpointIDs` (due to a crash or bug) should not be marked. This is more of a completeness concern.
+
+**File:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_push_test.go`
+
+---
+
+**3e. Integration test does not verify actual push behavior (Criticality: 5/10)**
+
+The integration test `TestShadow_TurnEndPushFlagLifecycle` simulates the push flag by directly writing to session state (step 4) rather than exercising the actual `PrePush` hook. The `SimulateStop` call then verifies the flag is cleared. However, no integration test verifies the end-to-end flow where a `git push` triggers `PrePush`, which marks sessions, followed by a stop hook that triggers the finalized push. This is understandable given the difficulty of setting up a remote in integration tests, but worth noting.
+
+**What it would catch:** Integration issues where the `PrePush` hook's call to `markActiveSessionsPushed` doesn't work correctly in the full hook runner context (e.g., different working directory, subprocess isolation).
+
+**File:** `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/integration_test/turn_end_push_test.go`
+
+### 4. Test Quality Issues
+
+**4a. `TestHandleTurnEnd_PushesFinalizedCheckpoints` only verifies in-memory clearing, not persisted state**
+
+At line 2373 in `phase_postcommit_test.go`, the assertion checks `state.PushedDuringTurnRemote` on the in-memory object passed to `HandleTurnEnd`. This correctly tests that the function clears the field on the struct. However, in production, it is the *caller* (`transitionSessionTurnEnd` in lifecycle.go) that saves the state to disk after `HandleTurnEnd` returns. The unit test doesn't and can't verify this persistence step.
+
+The integration test `TestShadow_TurnEndPushFlagLifecycle` does verify persistence (it reads state from disk at step 7), so this is adequately covered at the integration level. This is not a gap per se, but the unit test's verification is slightly less strong than it appears.
+
+**4b. Test names are descriptive and follow project patterns -- this is good**
+
+The test names clearly describe what each test verifies: `TestHandleTurnEnd_PushesFinalizedCheckpoints`, `TestHandleTurnEnd_SkipsPushWhenNotFlagged`, `TestInitializeSession_ClearsPushedDuringTurnRemote`. These would make failures easy to diagnose.
+
+### 5. Positive Observations
+
+1. **Layered testing approach.** The PR has unit tests for `markActiveSessionsPushed` (the marking logic), unit tests for `HandleTurnEnd` (the consumption logic), a unit test for `InitializeSession` (the cleanup-on-new-prompt logic), and integration tests for the full lifecycle. This is the right strategy.
+
+2. **Best-effort error handling is well-tested.** `TestHandleTurnEnd_PushesFinalizedCheckpoints` correctly verifies that `HandleTurnEnd` returns `nil` even when the push fails (no remote configured in test). This matches the production intent where push failures should not break session cleanup.
+
+3. **Flag clearing is always-executed.** The code at line 2154 (`state.PushedDuringTurnRemote = ""`) runs before any conditional returns, ensuring the flag is always cleared. The tests verify this property.
+
+4. **Negative test case is present.** `TestHandleTurnEnd_SkipsPushWhenNotFlagged` and `TestShadow_TurnEndNoPushWhenNotFlagged` verify the "do nothing" path when no push happened during the turn. This prevents false triggers.
+
+5. **Crash recovery is tested.** `TestShadow_NewPromptClearsPushedDuringTurnRemote` explicitly tests the scenario where `PushedDuringTurnRemote` is left set (e.g., after a crash between push and stop) and verifies that `InitializeSession` clears it on the next prompt. This is an important edge case.
+
+6. **Filter logic in `markActiveSessionsPushed` has good boundary coverage.** Three tests cover the three conditions: ACTIVE+TurnCheckpointIDs (marks), IDLE+TurnCheckpointIDs (skips), and ACTIVE+no TurnCheckpointIDs (skips).
+
+7. **The `testTranscriptMinimal` constant extraction** is a clean refactoring that satisfies the `goconst` linter while keeping tests readable.</result>
+<usage><total_tokens>65147</total_tokens><tool_uses>39</tool_uses><duration_ms>182747</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-4/tasks/a4dda12d690afc870.output
+
+---
+
+<task-notification>
+<task-id>a83b42db65554afe1</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Code review for guidelines" completed</summary>
+<result>No AGENTS.md exists. This is fine.
+
+---
+
+Here is my review of the changes on branch `alex/stop-hook-updates-remote-checkpoints` compared to `main`.
+
+## Files Reviewed
+
+- `/Users/alex/workspace/cli/.worktrees/4/CLAUDE.md` -- documentation updates
+- `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/session/state.go` -- new `PushedDuringTurnRemote` field
+- `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/common_test.go` -- extracted `testTranscriptMinimal` constant
+- `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_hooks.go` -- `HandleTurnEnd` push logic and `pushFinalizedCheckpointsIfNeeded`
+- `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_push.go` -- `markActiveSessionsPushed` function
+- `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_push_test.go` -- unit tests for `markActiveSessionsPushed`
+- `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/manual_commit_test.go` -- unit test for `InitializeSession` clearing the flag
+- `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/strategy/phase_postcommit_test.go` -- unit tests for HandleTurnEnd push behavior
+- `/Users/alex/workspace/cli/.worktrees/4/cmd/entire/cli/integration_test/turn_end_push_test.go` -- integration tests for full lifecycle
+
+## Summary: No High-Confidence Issues Found
+
+The code meets project standards. All tests pass (`mise run test`, `mise run test:integration`) and lint is clean (`mise run lint`). Here are the key observations:
+
+**Correctness:**
+- `markActiveSessionsPushed` is called AFTER `pushSessionsBranchCommon` succeeds (early return on error at line 20-24 of `manual_commit_push.go`), so the flag is only set when checkpoints were actually pushed.
+- `pushFinalizedCheckpointsIfNeeded` runs AFTER `finalizeAllTurnCheckpoints` in `HandleTurnEnd` (lines 2131 then 2142 of `manual_commit_hooks.go`), so finalized transcripts are pushed, not provisional ones.
+- The in-memory `state.PushedDuringTurnRemote = ""` clearing (line 2154) is persisted by the caller `transitionSessionTurnEnd` in `lifecycle.go` at line 780 via `SaveSessionState`.
+- `InitializeSession` clears `PushedDuringTurnRemote` alongside `TurnCheckpointIDs` (line 1831), preventing stale flags from carrying over.
+
+**Error handling:** All push operations are best-effort with logged warnings, matching the established pattern. Errors from `pushBranchIfNeeded` and `PushTrailsBranch` are logged but not propagated, and `PushedDuringTurnRemote` is always cleared regardless of push success.
+
+**CLAUDE.md compliance:**
+- Tests using `t.Chdir()` correctly omit `t.Parallel()` (would panic).
+- Integration tests use `t.Parallel()` with `NewFeatureBranchEnv` for isolation.
+- Logging uses the `logging` package (not `fmt.Print*`) for operational messages. The single `fmt.Fprintf(os.Stderr, ...)` on line 2169 is user-facing output, which is the correct pattern per CLAUDE.md.
+- Git operations use `exec.CommandContext` with separate arguments (no shell interpolation), so the `remote` string has no injection risk.
+- Error handling is explicit throughout.
+- CLAUDE.md documentation is updated to reflect the new feature and key file descriptions.
+
+**Test coverage:** Thorough test pyramid -- 3 unit tests covering the `markActiveSessionsPushed` function's filtering logic, 2 unit tests for `HandleTurnEnd` push/no-push paths, 1 unit test for `InitializeSession` clearing the flag, and 3 integration tests covering the full lifecycle, no-push path, and stale flag cleanup on new prompt.
+
+**Minor observations (below reporting threshold):**
+- When `isPushSessionsDisabled` is true, `markActiveSessionsPushed` still writes the flag (which `pushFinalizedCheckpointsIfNeeded` will then clear without acting). This is benign but slightly wasteful.
+- If the user pushes to multiple remotes during a turn, only the last remote is recorded. This is a known limitation of the single-string design and is acceptable for typical workflows.</result>
+<usage><total_tokens>69814</total_tokens><tool_uses>41</tool_uses><duration_ms>277274</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-4/tasks/a83b42db65554afe1.output
+
+---
+
+do 1-3, clean up dead code

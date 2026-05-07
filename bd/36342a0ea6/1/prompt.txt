@@ -1,0 +1,176 @@
+Implement Task 1: Define The Shared Data Model
+
+You are implementing Task 1: Define The Shared Data Model.
+
+## Task Description
+
+**Files:**
+- Create: `cmd/entire/cli/why_model.go`
+- Test: `cmd/entire/cli/why_test.go`
+
+- [ ] **Step 1: Write the failing test for the model shape**
+
+Add a table-driven test in `cmd/entire/cli/why_test.go` that constructs a `whyBlock` directly and verifies the fields needed by both static and TUI renderers exist and preserve enrichment values.
+
+```go
+func TestWhyBlock_PreservesEntireMetadata(t *testing.T) {
+	t.Parallel()
+
+	block := whyBlock{
+		StartLine: 17,
+		EndLine:   28,
+		Commit: whyCommitInfo{
+			Hash:      "b550507521abcdef",
+			ShortHash: "b550507521",
+			Author:    "Victor Gutierrez",
+			WhenText:  "2 weeks ago",
+			Subject:   "Handle interrupt signals",
+		},
+		Entire: &whyEntireInfo{
+			CheckpointID: "a3b2c4d5e6f7",
+			Agent:        "Claude Code",
+			Summary:      "Add cross-platform signal handling for CLI shutdown.",
+			IsFallback:   false,
+		},
+		CodeLines: []string{"signals := []os.Signal{os.Interrupt}"},
+	}
+
+	if block.Entire == nil {
+		t.Fatal("expected Entire metadata")
+	}
+	if block.Entire.CheckpointID != "a3b2c4d5e6f7" {
+		t.Fatalf("checkpoint id = %q, want %q", block.Entire.CheckpointID, "a3b2c4d5e6f7")
+	}
+	if got, want := block.RangeText(), "17-28"; got != want {
+		t.Fatalf("range text = %q, want %q", got, want)
+	}
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `go test ./cmd/entire/cli -run TestWhyBlock_PreservesEntireMetadata`
+
+Expected: FAIL with undefined `whyBlock`, `whyCommitInfo`, `whyEntireInfo`, or `RangeText`.
+
+- [ ] **Step 3: Write the minimal shared model**
+
+Create `cmd/entire/cli/why_model.go` with focused types only.
+
+```go
+package cli
+
+type whyCommitInfo struct {
+	Hash      string
+	ShortHash string
+	Author    string
+	Email     string
+	WhenText  string
+	Subject   string
+}
+
+type whyEntireInfo struct {
+	CheckpointID string
+	Agent        string
+	Summary      string
+	IsFallback   bool
+}
+
+type whyDetailKind string
+
+const (
+	whyDetailCheckpoint whyDetailKind = "checkpoint"
+	whyDetailCommit     whyDetailKind = "commit"
+)
+
+type whyBlock struct {
+	StartLine int
+	EndLine   int
+	Commit    whyCommitInfo
+	Entire    *whyEntireInfo
+	CodeLines []string
+	Detail    whyDetailKind
+}
+
+func (b whyBlock) RangeText() string {
+	if b.StartLine == b.EndLine {
+		return itoa(b.StartLine)
+	}
+	return itoa(b.StartLine) + "-" + itoa(b.EndLine)
+}
+```
+
+Also add a tiny local helper in the same file to avoid dragging formatting logic into tests early:
+
+```go
+func itoa(v int) string {
+	return strconv.Itoa(v)
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `go test ./cmd/entire/cli -run TestWhyBlock_PreservesEntireMetadata`
+
+Expected: PASS
+
+## Context
+
+This is Task 1 of the approved `entire why` prototype plan. The feature is a commit-first, Entire-enriched blame browser. Task 1 is intentionally narrow: only define the shared data model needed by later static and TUI renderers.
+
+Follow existing Go repo patterns. Keep the new file focused and minimal. Do not implement parser/renderer/command behavior yet.
+
+## Important Constraints
+
+- You are not alone in the codebase. Do not revert edits you did not make.
+- Implement exactly Task 1 and nothing from later tasks.
+- Do not create any commits. This repo's workflow requires user approval between steps.
+- Use `apply_patch` for file edits.
+- Run only the targeted test from the task unless you need one extra sanity check.
+- Work from: `/Users/pfleidi/entire/cli/.worktrees/feat/entire-why`
+
+## Before You Begin
+
+If you have questions about requirements, acceptance criteria, or anything unclear, ask now.
+
+## Your Job
+
+Once you're clear on requirements:
+1. Implement exactly what Task 1 specifies
+2. Write the test and minimal implementation
+3. Verify implementation works
+4. Self-review
+5. Report back
+
+## Report Format
+
+When done, report:
+- **Status:** DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
+- What you implemented
+- What you tested and test results
+- Files changed
+- Self-review findings
+- Any issues or concerns
+
+---
+
+Approved. Implement only Task 1 exactly as described. Do not commit. Run the targeted failing test first, then the passing test, self-review, and report back with changed files and test results.
+
+---
+
+Spec review found one issue to fix before Task 1 is complete:
+
+- `cmd/entire/cli/why_test.go` only asserts `Entire.CheckpointID` and `RangeText()`. Expand the test so it verifies the other renderer-facing fields on `whyBlock` are preserved as constructed, including representative `Commit` fields, `CodeLines`, `Detail`, and remaining `whyEntireInfo` fields.
+
+Please fix only this Task 1 gap, rerun `go test ./cmd/entire/cli -run TestWhyBlock_PreservesEntireMetadata`, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+Code quality review found one important issue to fix for Task 1:
+
+- In `cmd/entire/cli/why_test.go`, expand the preservation test so it also populates and asserts `whyCommitInfo.Email`, and make sure `Detail` is set to and asserted against a defined non-empty enum value (`whyDetailCheckpoint` or `whyDetailCommit`).
+
+One reviewer suggestion should NOT be applied:
+- Keep the local `itoa()` helper in `why_model.go`. Task 1 explicitly required that helper, so do not inline `strconv.Itoa`.
+
+Please make only the required Task 1 test fix, rerun `go test ./cmd/entire/cli -run TestWhyBlock_PreservesEntireMetadata`, self-review, and report back. Do not widen scope and do not commit.

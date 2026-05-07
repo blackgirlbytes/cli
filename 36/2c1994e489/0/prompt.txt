@@ -1,0 +1,41 @@
+We're wiring the Entire CLI to detect GitHub's "protected ref" push rejection (GH013) and print a clear warning instead of the
+    misleading non-fast-forward message. Next: confirm you want approach A only, or A plus a proactive setup-time check. Detect it in the
+  push output. When the pre-push hook runs, the CLI already captures remote stderr (push_common.go:270). Extend that to
+     recognize GH013 / Cannot update this protected ref, and replace the generic "Warning: failed to push ... non-fast-forward" with a
+  loud,
+    specific message naming the ref and linking to the ruleset page. Cost: ~20 lines. Catches the real error whenever any agent's push
+  fails.
+
+---
+
+`[entire] Warning: failed to push entire/checkpoints/v1 after sync: non-fast-forward`
+
+this should be more pronounced, not just a warning. that's the main concern.
+
+---
+
+It should only display that if it can't push.
+
+---
+
+Please implement, don't push for me
+
+---
+
+-        fmt.Fprintf(os.Stderr, "[entire] Warning: failed to push %s after sync: %v\n", branchName, err)
++        var protectedErr *protectedRefError
++        if errors.As(err, &protectedErr) {
++            printProtectedRefBlock(os.Stderr, branchName, target)
++        } else {
++            fmt.Fprintf(os.Stderr, "[entire] Warning: failed to push %s after sync: %v\n", branchName, err)
++        }
+
+What's the point of this conditional
+
+---
+
+It should print the protected ref block only, not the warning. That's what I'm confused about.
+
+---
+
+Clean up the tests to remove the verbosity.

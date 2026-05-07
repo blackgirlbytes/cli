@@ -1,0 +1,85 @@
+Implement the following plan:
+
+# Fix PR Review Comments on Kiro Branch
+
+## Context
+
+PR #554 (Kiro agent integration) received 10 inline comments from Cursor Bugbot and Copilot. After investigating each, **2 are real code bugs** and **1 is a script format bug**. The rest are false positives or intentional design choices.
+
+---
+
+## Triage Summary
+
+| # | File | Claim | Verdict |
+|---|------|-------|---------|
+| 1 | `kiro/kiro.go` | ChunkTranscript JSONL corrupts JSON | **False positive** — 50MB threshold + single-line JSON handled correctly |
+| 2 | `e2e/agents/kiro.go` | WaitFor ignores pattern | **Intentional** — prevents false matches from TUI echo |
+| 3 | `kiro/lifecycle.go` | Stale session ID cache | **REAL BUG** — cache never cleared at stop |
+| 4 | `implement.md` | Typo "develpoment" | **False positive** — already correct |
+| 5 | `kiro/AGENT.md` | Wrong hook path | **False positive** — doc is accurate |
+| 6 | `kiro/kiro_test.go` | Incomplete DetectPresence test | **False positive** — test is complete |
+| 7 | `kiro/lifecycle.go` | Cache never cleared (same as #3) | **REAL BUG** (duplicate of #3) |
+| 8 | `manual_commit_hooks.go` | Fast path auto-links human commits | **Intentional** — ACTIVE session = agent is working |
+| 9 | `scripts/test-kiro-agent-integration.sh` | Wrong capture.json format | **REAL BUG** — bare hook map vs `kiroAgentFile` |
+| 10 | `.github/workflows/e2e.yml` | Kiro fails without auth | **False positive** — properly gated behind AWS OIDC |
+
+---
+
+## Changes to Make
+
+### 1. Clear session ID cache in `parseStop` (lifecycle.go)
+
+**Bug:** The `kiro-active-session` cache file persists after `parseStop`. If a new session starts and `agentSpawn` doesn't fire (e.g., Kiro is resumed), `parseUserPromptSubmit` reads the stale ID from the previous session.
+
+**Fix:** Add `k.clearCachedSessionID(ctx)` at the end of `parseStop` (after reading it). Add a helper method:
+
+```go
+func (k *KiroAgent) clearCachedSessionID(ctx context.Context) {
+    cachePath := k.sessionIDCachePath(ctx)
+    if err := os.Remove(cachePath); err != nil && !os.IsNotExist(err) {
+        logging.Warn(ctx, "kiro: failed to clear session ID cache", "err", err)
+    }
+}
+```
+
+**File:** `cmd/entire/cli/agent/kiro/lifecycle.go`
+- Add `clearCachedSessionID` method
+- Call it at end of `parseStop` (after line 174, before the return)
+- Add test: `TestSessionIDCaching_StopClearsCache` — verify cache file is removed after stop
+
+### 2. Fix capture.json format in test script
+
+**Bug:** `scripts/test-kiro-agent-integration.sh` writes hooks at top-level of `capture.json`, but Kiro expects `kiroAgentFile` format with `name`, `tools`, and `hooks` nesting.
+
+**Fix:** Wrap the hooks in the correct structure:
+
+```json
+{
+  "name": "capture",
+  "tools": ["shell"],
+  "hooks": {
+    "agentSpawn": [{"command": "cat > ..."}],
+    "userPromptSubmit": [{"command": "cat > ..."}],
+    "stop": [{"command": "cat > ..."}]
+  }
+}
+```
+
+**File:** `scripts/test-kiro-agent-integration.sh` (lines 53-59)
+
+---
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+The new `TestSessionIDCaching_StopClearsCache` test will verify the cache clearing behavior.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/7d500980-585e-442f-839d-e2308b5d8e1f.jsonl
+
+---
+
+commit

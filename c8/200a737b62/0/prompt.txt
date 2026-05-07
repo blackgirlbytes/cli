@@ -1,0 +1,337 @@
+Implement the following plan:
+
+# Remove Stored Transcript Path from Checkpoint Metadata
+
+## Context
+
+When running `entire resume`, the CLI restores session transcripts from checkpoints. Currently, checkpoint metadata stores a `transcript_path` field that embeds the original repository location, causing restoration to fail when the project moves.
+
+## The Problem
+
+Agents (Claude Code, Gemini CLI) store transcripts in directories derived from the repository path:
+- Claude: `~/.claude/projects/-Users-alice-projects-cli/session.jsonl`
+- Gemini: `~/.gemini/tmp/-Users-alice-projects-cli/chats/session.json`
+
+The "project directory" component (`-Users-alice-projects-cli`) is created by sanitizing the repo absolute path (`/Users/alice/projects/cli`), replacing non-alphanumeric characters with dashes.
+
+**When a project moves:**
+1. Checkpoint created on machine A: `/Users/alice/projects/cli`
+2. Transcript stored at: `~/.claude/projects/-Users-alice-projects-cli/session.jsonl`
+3. Checkpoint metadata saves: `.claude/projects/-Users-alice-projects-cli/session.jsonl`
+4. Project cloned on machine B: `/Users/bob/work/cli`
+5. Agent now stores transcripts at: `~/.claude/projects/-Users-bob-work-cli/session.jsonl`
+6. Resume tries to restore to: `~/.claude/projects/-Users-alice-projects-cli/session.jsonl` (WRONG!)
+
+This breaks cross-machine portability and even moving repos on the same machine.
+
+## Root Cause Analysis
+
+**Two different TranscriptPath fields:**
+
+1. **`session.State.TranscriptPath`** (runtime session state in `.git/entire-sessions/`):
+   - Points to the **live transcript file** during an active session
+   - Used for mid-session commit detection (when user commits before calling `Stop`)
+   - Updated on each turn from the agent's hook input
+   - **This one IS needed** - operational data for tracking active sessions
+
+2. **`CommittedMetadata.TranscriptPath`** (checkpoint metadata on `entire/checkpoints/v1` branch):
+   - Stored as home-relative path (e.g., `.claude/projects/-Users-alice-projects-cli/`)
+   - Intended for resume to restore transcript to original location
+   - **This one causes the bug** - embeds the sanitized repo path from checkpoint creation time
+
+**The stored path is unnecessary because:**
+- We can always compute the correct transcript path from the current repo location using `agent.GetSessionDir(repoRoot)`
+- The computed path automatically handles repo moves/clones
+- Even agents with "complex" path schemes (like Gemini's hashing) still derive paths from the repo location, so they have the same problem
+
+## Solution
+
+**Stop storing `transcript_path` in checkpoint metadata entirely.** Always compute the transcript path at restore time based on the current repo location.
+
+### Implementation
+
+1. **Remove `SessionTranscriptPath` from checkpoint writes** (`manual_commit_condensation.go`)
+   - Delete line that sets `SessionTranscriptPath: homeRelativePath(state.TranscriptPath)`
+   - This stops writing the field to new checkpoints
+
+2. **Update `RestoreLogsOnly()` to always compute transcript path** (`manual_commit_rewind.go`)
+   - Remove `resolveTranscriptPathFromMetadata()` call
+   - Always use `agent.GetSessionDir(repoRoot)` to compute session directory from current repo location
+   - Use `ResolveSessionFilePath()` to construct the full transcript path
+   - This makes restoration location-independent
+
+3. **Keep struct fields for backward compatibility**
+   - Keep `CommittedMetadata.TranscriptPath` field and JSON tag (old checkpoints may have it)
+   - Keep `WriteCommittedOptions.SessionTranscriptPath` field (not used anymore but avoids breaking API)
+   - Mark as deprecated in comments
+
+4. **Update auto-commit strategy similarly**
+   - Remove `TranscriptPath` writes in auto-commit condensation
+   - Update any restoration logic if needed
+
+### Why This Works
+
+- **Always uses current repo location**: `agent.GetSessionDir(repoRoot)` computes where the agent stores transcripts based on the CURRENT repo path
+- **Handles all repo moves**: Whether the repo moves on the same machine or is cloned to a different machine
+- **Simpler logic**: No fallback path resolution, no special cases
+- **Backward compatible**: Old checkpoints with `transcript_path` are ignored (we just compute the correct path anyway)
+
+## Critical Files to Modify
+
+1. **`cmd/entire/cli/strategy/manual_commit_condensation.go`** (line ~237)
+   - Remove: `SessionTranscriptPath: homeRelativePath(state.TranscriptPath),`
+   - This stops writing transcript path to new checkpoints
+
+2. **`cmd/entire/cli/strategy/manual_commit_rewind.go`** (lines 707-719)
+   - Replace stored path resolution with computed path resolution
+   - Always call `agent.GetSessionDir(repoRoot)` → `ResolveSessionFilePath()`
+   - Remove `resolveTranscriptPathFromMetadata()` call
+
+3. **`cmd/entire/cli/strategy/auto_commit.go`** (check for similar usage)
+   - Search for any `SessionTranscriptPath` or `TranscriptPath` writes
+   - Remove if present
+
+4. **Add deprecation comments** to struct fields:
+   - `cmd/entire/cli/checkpoint/checkpoint.go` - `CommittedMetadata.TranscriptPath`
+   - `cmd/entire/cli/checkpoint/checkpoint.go` - `WriteCommittedOptions.SessionTranscriptPath`
+
+## Related Files (Reference Only - No Changes)
+
+- `cmd/entire/cli/agent/claudecode/claude.go:162-175` - Claude's GetSessionDir (computes path from repo location)
+- `cmd/entire/cli/agent/geminicli/gemini.go:187-201` - Gemini's GetSessionDir (same pattern)
+- `cmd/entire/cli/strategy/common.go:244-257` - `homeRelativePath()` helper (can remain, might be used elsewhere)
+- `cmd/entire/cli/session/state.go:125-126` - Runtime `State.TranscriptPath` (keep as-is, different purpose)
+
+## Verification
+
+### Manual Testing
+
+1. **Test scenario 1**: Resume in moved repo
+   - Create checkpoint in `/tmp/test-repo`
+   - Move repo to `/tmp/different-location/test-repo`
+   - Run `entire resume` - should restore to new location's session dir
+
+2. **Test scenario 2**: Resume from different user
+   - Create checkpoint as user A at `/home/userA/project`
+   - Clone to user B at `/home/userB/project`
+   - Run `entire resume` - should restore to user B's home `.claude/projects/...`
+
+3. **Test scenario 3**: Old checkpoints with stored path
+   - Use a checkpoint that has `transcript_path` field (created before this change)
+   - Verify resume still works (computed path used, stored path ignored)
+
+4. **Test scenario 4**: New checkpoints without stored path
+   - Create new checkpoint after the change
+   - Verify checkpoint metadata doesn't have `transcript_path` field
+   - Verify resume works correctly
+
+### E2E Test
+
+**Create new test**: `cmd/entire/cli/e2e_test/resume_relocated_repo_test.go`
+
+Test validates that `entire resume` works correctly when a repository is moved to a different location:
+
+```go
+//go:build e2e
+
+package e2e_test
+
+import (
+    "os"
+    "path/filepath"
+    "testing"
+)
+
+// TestE2E_ResumeInRelocatedRepo verifies that entire resume works when
+// a repository is moved to a different location after checkpoint creation.
+// This validates that transcript paths are computed from current repo location,
+// not stored paths from checkpoint creation time.
+func TestE2E_ResumeInRelocatedRepo(t *testing.T) {
+    // Setup: Create repo at original location
+    originalDir := filepath.Join(t.TempDir(), "original-location", "repo")
+    // ... create test repo, enable entire, etc.
+
+    // Create a checkpoint via agent interaction
+    // ... prompt agent, get response, make commit, verify checkpoint created
+
+    // Get the checkpoint ID and session ID
+    // ... read from git commit trailer or checkpoint metadata
+
+    // Move the entire repository to a new location
+    newDir := filepath.Join(t.TempDir(), "new-location", "repo")
+    // ... move repo (os.Rename or copy)
+
+    // Verify the transcript would be in different project dirs
+    // Original: ~/.claude/projects/-original-location-repo/
+    // New: ~/.claude/projects/-new-location-repo/
+    // ... compute both paths and verify they differ
+
+    // Run entire resume in the new location
+    // ... cd to newDir, run "entire resume" command
+
+    // Verify transcript was restored to NEW location's session dir
+    // ... check that ~/.claude/projects/-new-location-repo/session.jsonl exists
+    // ... verify file contains expected session data
+
+    // Verify OLD location's session dir was NOT used
+    // ... verify ~/.claude/projects/-original-location-repo/session.jsonl does NOT exist
+}
+```
+
+**Test flow:**
+1. Create repo at `/tmp/test-ABC/original-location/repo`
+2. Enable entire, prompt agent, create checkpoint
+3. Move repo to `/tmp/test-ABC/new-location/repo`
+4. Run `entire resume` in new location
+5. Assert transcript restored to `~/.claude/projects/-tmp-test-ABC-new-location-repo/session.jsonl`
+6. Assert old path `~/.claude/projects/-tmp-test-ABC-original-location-repo/session.jsonl` not used
+
+**Key assertions:**
+- `agent.GetSessionDir()` returns path based on NEW location
+- Resume creates transcript file at NEW location's session dir
+- Checkpoint metadata's `transcript_path` field (if present) is ignored
+
+### Existing Tests
+
+Run full test suite to ensure no regressions:
+
+```bash
+mise run test          # Unit tests
+mise run test:integration  # Integration tests
+E2E_AGENT=claude-code E2E_CLAUDE_MODEL=haiku mise run test:e2e  # E2E tests (only run when explicitly requested)
+```
+
+## Risk Assessment
+
+**Very low risk** - This is a simplification:
+- Removes problematic code rather than adding complexity
+- Always computes from current state (more reliable than stored state)
+- Backward compatible (old checkpoints with stored paths are simply ignored)
+- Existing tests cover restoration functionality
+- Manual testing will validate cross-machine scenario
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.REDACTED.jsonl
+
+---
+
+commit the changes
+
+---
+
+that test should check if the session was created
+
+---
+
+entire resume need the branch name to resume it, entire resume branchname --force
+
+---
+
+the test is failing:
+Running tool: /Users/gtrrz-victor/.local/share/mise/installs/go/1.25.6/bin/go test -test.fullpath=true -timeout 30s -tags e2e,integration -run ^TestE2E_ResumeInRelocatedRepo$ -count=1 -race
+
+--- FAIL: TestE2E_ResumeInRelocatedRepo (13.27s)
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:31: entire enable output: Agent: Claude Code
+        
+        Installed 7 hooks for Claude Code - Anthropic's CLI coding assistant
+        ✓ Project configured (.entire/settings.json)
+        ✓ Created orphan branch 'entire/checkpoints/v1' for session metadata
+        
+        Ready.
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:34: Original repo location: REDACTED
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:37: Step 1: Running agent to create checkpoint
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:43: Step 2: Verifying file was created
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:47: Step 3: Committing with hooks to create checkpoint
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:51: Step 4: Verifying checkpoint was created
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:55: Checkpoint ID: 9234ea86e330
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:66: Step 5: Moving repository to new location
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:74: Moved repo to: REDACTED
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:82: Original session dir: /Users/gtrrz-victor/.REDACTED
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:83: New session dir:      /Users/gtrrz-victor/.REDACTED
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:89: Step 6: Opening repo at new location
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:98: Step 7: Running 'entire resume feature/e2e-test --force' in new location
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:100: Resume output:
+        Writing transcript to: /Users/gtrrz-victor/.REDACTED.jsonl
+        Session: 17be0b6e-2cbe-4b20-9c41-50923875f45f
+        
+        To continue this session, run:
+          claude -r 17be0b6e-2cbe-4b20-9c41-50923875f45f  # Create a file called hello.go with a simple Go program th...
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:103: Step 8: Verifying session was created at new location
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:106: 
+            Error Trace:    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:106
+            Error:          "Writing transcript to: /Users/gtrrz-victor/.REDACTED.jsonl\nSession: 17be0b6e-2cbe-4b20-9c41-50923875f45f\n\nTo continue this session, run:\n  claude -r 17be0b6e-2cbe-4b20-9c41-50923875f45f  # Create a file called hello.go with a simple Go program th...\n" does not contain "REDACTED"
+            Test:           TestE2E_ResumeInRelocatedRepo
+            Messages:       resume output should reference the new project directory
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:108: 
+            Error Trace:    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:108
+            Error:          "Writing transcript to: /Users/gtrrz-victor/.REDACTED.jsonl\nSession: 17be0b6e-2cbe-4b20-9c41-50923875f45f\n\nTo continue this session, run:\n  claude -r 17be0b6e-2cbe-4b20-9c41-50923875f45f  # Create a file called hello.go with a simple Go program th...\n" should not contain "REDACTED"
+            Test:           TestE2E_ResumeInRelocatedRepo
+            Messages:       resume output should NOT reference the old project directory
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:113: 
+            Error Trace:    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:113
+            Error:          Received unexpected error:
+                            open /Users/gtrrz-victor/.REDACTED: no such file or directory
+            Test:           TestE2E_ResumeInRelocatedRepo
+            Messages:       new session directory should exist after resume
+FAIL
+exit status 1
+FAIL    github.com/entireio/cli/cmd/entire/cli/e2e_test    15.646s
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+Running tool: /Users/gtrrz-victor/.local/share/mise/installs/go/1.25.6/bin/go test -test.fullpath=true -timeout 30s -tags e2e,integration -run ^TestE2E_ResumeInRelocatedRepo$ -count=1 -race
+
+--- FAIL: TestE2E_ResumeInRelocatedRepo (12.98s)
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:31: entire enable output: Agent: Claude Code
+        
+        Installed 7 hooks for Claude Code - Anthropic's CLI coding assistant
+        ✓ Project configured (.entire/settings.json)
+        ✓ Created orphan branch 'entire/checkpoints/v1' for session metadata
+        
+        Ready.
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:34: Original repo location: REDACTED
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:37: Step 1: Running agent to create checkpoint
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:43: Step 2: Verifying file was created
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:47: Step 3: Committing with hooks to create checkpoint
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:51: Step 4: Verifying checkpoint was created
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:55: Checkpoint ID: 941e86ade1e8
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:66: Step 5: Moving repository to new location
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:74: Moved repo to: REDACTED
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:82: Original session dir: /Users/gtrrz-victor/.REDACTED
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:83: New session dir:      /Users/gtrrz-victor/.REDACTED
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:89: Step 6: Opening repo at new location
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:98: Step 7: Running 'entire resume feature/e2e-test --force' in new location
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:100: Resume output:
+        Writing transcript to: /Users/gtrrz-victor/.REDACTED.jsonl
+        Session: 9dbc5c97-15b4-4874-b936-237168cb8415
+        
+        To continue this session, run:
+          claude -r 9dbc5c97-15b4-4874-b936-237168cb8415  # Create a file called hello.go with a simple Go program th...
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:103: Step 8: Verifying session was created at new location
+    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:113: 
+            Error Trace:    /Users/gtrrz-victor/wks/cli/cli/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go:113
+            Error:          Received unexpected error:
+                            open /Users/gtrrz-victor/.REDACTED: no such file or directory
+            Test:           TestE2E_ResumeInRelocatedRepo
+            Messages:       new session directory should exist after resume
+FAIL
+exit status 1
+FAIL    github.com/entireio/cli/cmd/entire/cli/e2e_test    15.409s
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+<task-notification>
+<task-id>bcab768</task-id>
+<output-file>/private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/tasks/bcab768.output</output-file>
+<status>completed</status>
+<summary>Background command "mise run fmt && mise run lint && mise run test:ci 2>&1 | tail -15" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-gtrrz-victor-wks-cli-cli/tasks/bcab768.output

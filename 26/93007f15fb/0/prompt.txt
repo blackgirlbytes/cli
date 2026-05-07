@@ -1,0 +1,57 @@
+Implement the following plan:
+
+# Fix: Avoid redundant []rune allocations in UTF-8 truncation
+
+## Context
+PR #444 review comments point out that both `TruncateDescription` and the condensation call site allocate `[]rune` unnecessarily — once to check length, then again inside `TruncateRunes`. This adds overhead especially for the common case where no truncation is needed.
+
+## Changes
+
+### 1. `cmd/entire/cli/stringutil/stringutil.go` — `TruncateRunes`
+Add a fast path using `utf8.RuneCountInString(s)` before allocating `[]rune`. This fixes the issue at the root so all callers benefit.
+
+```go
+func TruncateRunes(s string, maxRunes int, suffix string) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	suffixRunes := []rune(suffix)
+	truncateAt := maxRunes - len(suffixRunes)
+	if truncateAt < 0 {
+		truncateAt = 0
+	}
+	return string(runes[:truncateAt]) + suffix
+}
+```
+
+### 2. `cmd/entire/cli/strategy/messages.go` — `TruncateDescription`
+Remove the upfront `[]rune` conversion. Delegate entirely to `TruncateRunes` (which now has the fast path). Handle `maxLen < 3` with `TruncateRunes` using empty suffix.
+
+```go
+func TruncateDescription(s string, maxLen int) string {
+	if utf8.RuneCountInString(s) <= maxLen {
+		return s
+	}
+	if maxLen < 3 {
+		return stringutil.TruncateRunes(s, maxLen, "")
+	}
+	return stringutil.TruncateRunes(s, maxLen, "...")
+}
+```
+
+### 3. `cmd/entire/cli/strategy/manual_commit_condensation.go` — no change needed
+The call to `stringutil.TruncateRunes(prompt, 500, "...")` already benefits from the fast path added in step 1. No caller-side change required.
+
+## Verification
+```bash
+go test -race -run 'TestGenerateContextFromPrompts|TestTruncateDescription|TestTruncateRunes' ./cmd/entire/cli/strategy/ ./cmd/entire/cli/stringutil/
+mise run fmt && mise run lint
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/georgf/.claude/projects/-Users-georgf-src-entire-labs-cli/85773b9f-c9f9-4153-ab5d-0e75abb9005a.jsonl
+
+---
+
+commit this

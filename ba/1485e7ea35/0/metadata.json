@@ -1,0 +1,112 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "ba1485e7ea35",
+  "session_id": "a623a2b2-efb2-4374-996e-bae1e9e1ca6a",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-20T22:02:40.035266Z",
+  "branch": "soph/attach-session-id",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "cmd/entire/cli/attach.go",
+    "cmd/entire/cli/attach_test.go",
+    "cmd/entire/cli/attach_transcript.go"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "e62d82742bea",
+  "checkpoint_transcript_start": 358,
+  "token_usage": {
+    "input_tokens": 35,
+    "cache_creation_tokens": 34697,
+    "cache_read_tokens": 7339176,
+    "output_tokens": 10191,
+    "api_call_count": 26
+  },
+  "session_metrics": {
+    "turn_count": 15
+  },
+  "summary": {
+    "intent": "Run a structured three-agent code review (reuse, quality, efficiency) on recently changed files in the attach command, then fix all real issues found.",
+    "outcome": "All seven actionable findings were fixed: double transcript resolution eliminated, magic string replaced with constant, redundant agent lookup replaced with existing registry helper, repository opened once and threaded through, HEAD commit read once, session state loaded once, and dead code removed. Tests passed after changes.",
+    "learnings": {
+      "repo": [
+        "agent.GetByAgentType() at cmd/entire/cli/agent/registry.go:135-147 is the canonical way to look up an agent by type string — manual iteration over all agents is unnecessary.",
+        "strategy.StrategyNameManualCommit (cmd/entire/cli/strategy/common.go:39) is the constant for the 'manual-commit' strategy name.",
+        "openRepository / git.PlainOpen is called in multiple places (validateAttachPreconditions, resolveCheckpointID, GetGitAuthor, promptAmendCommit) — the repo should be opened once and threaded through.",
+        "The attach command went through a substantial rewrite that bypassed the strategy/condensation layer and writes directly to entire/checkpoints/v1, eliminating multiple prior bug classes.",
+        "Four agent implementations (claudecode, cursor, geminicli, factoryaidroid) each have their own GetSessionBaseDir following the same os.UserHomeDir + filepath.Join pattern — no shared helper exists yet.",
+        "addCheckpointTrailerWithComment in strategy/manual_commit_hooks.go still manually constructs trailer strings instead of using the new trailers package utilities — left unfixed as out of scope for this branch.",
+        "Gemini transcript normalization is handled via a type-switch on AgentTypeGemini in attach.go rather than an interface — no TranscriptNormalizer interface exists."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/attach.go",
+          "line": 93,
+          "end_line": 99,
+          "finding": "resolveAgentAndTranscript returned a transcript path that was discarded with _, then resolveAndValidateTranscript was called again immediately — causing doubled filesystem walks and potentially doubled PrepareTranscript sentinel waits (up to 3s each)."
+        },
+        {
+          "path": "cmd/entire/cli/attach.go",
+          "line": 152,
+          "end_line": 152,
+          "finding": "Magic string \"manual-commit\" used instead of existing constant strategy.StrategyNameManualCommit."
+        },
+        {
+          "path": "cmd/entire/cli/attach.go",
+          "line": 314,
+          "end_line": 331,
+          "finding": "resolveAgentForState manually iterated all agents comparing ag.Type() — replaced by agent.GetByAgentType() which does exactly this."
+        },
+        {
+          "path": "cmd/entire/cli/attach.go",
+          "line": 128,
+          "end_line": 128,
+          "finding": "openRepository (git.PlainOpen) was called 5 times in a single runAttach execution across validateAttachPreconditions, resolveCheckpointID, runAttach body, GetGitAuthor, and promptAmendCommit — none cached."
+        },
+        {
+          "path": "cmd/entire/cli/attach.go",
+          "line": 190,
+          "end_line": 203,
+          "finding": "HEAD commit (ref + commit object + message) read and parsed twice: once in resolveCheckpointID and once in promptAmendCommit, both parsing checkpoint trailers."
+        },
+        {
+          "path": "cmd/entire/cli/attach.go",
+          "line": 217,
+          "end_line": 218,
+          "finding": "session.NewStateStore created and session state loaded from disk twice: once in validateAttachPreconditions and again in saveAttachSessionState, even though the first result was already available."
+        },
+        {
+          "path": "cmd/entire/cli/attach_transcript.go",
+          "finding": "estimateSessionDuration was dead code — defined and tested but never called from any production path. Removed along with its test."
+        }
+      ],
+      "workflow": [
+        "The three-agent parallel review pattern (reuse / quality / efficiency) surfaces issues across multiple dimensions simultaneously and completes faster than sequential review.",
+        "Agents wrote intermediate review files to docs/requirements/attach-session-id/ — these were cleaned up after findings were applied.",
+        "Findings from separate agents overlapped significantly (e.g., redundant openRepository appeared in both efficiency and reuse reviews) — aggregating before fixing prevents double-work.",
+        "Some findings (table-driven tests, shared GetSessionBaseDir helper, Gemini interface) were explicitly skipped as not worth addressing without calling them failures — documenting the skip reason is useful."
+      ]
+    },
+    "friction": [
+      "Had to wait for all three background agents to complete before fixing — one agent (reuse) took noticeably longer (~743s) than the others.",
+      "Manually polling agent status with a bash check was needed while waiting for the slower reuse agent."
+    ],
+    "open_items": [
+      "addCheckpointTrailerWithComment in strategy/manual_commit_hooks.go still manually constructs trailer strings instead of using the new trailers package — needs updating in a follow-up.",
+      "Four agent implementations each duplicate GetSessionBaseDir with the same os.UserHomeDir + filepath.Join pattern — a shared HomeSubdir helper would eliminate the boilerplate but was deferred.",
+      "Gemini transcript normalization uses a type-switch instead of an interface (no TranscriptNormalizer interface exists) — adding one was considered over-engineering for now.",
+      "Three near-identical per-agent test functions (TestAttach_GeminiSuccess, TestAttach_CursorSuccess, TestAttach_FactoryAIDroidSuccess) could be table-driven but have agent-specific setup that complicates the refactor."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-20T22:02:39.209402Z",
+    "agent_lines": 60,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 60,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

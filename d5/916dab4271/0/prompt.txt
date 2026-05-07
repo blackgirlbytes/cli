@@ -1,0 +1,212 @@
+Implement the following plan:
+
+# Code Simplification: Kiro Agent Integration
+
+## Context
+
+The Kiro agent integration was recently added on this branch. The code is well-structured and functional, but a review reveals several small simplification opportunities — dead code, a magic number, redundant guards, and a minor SQL duplication. All changes preserve exact functionality.
+
+## Changes
+
+### 1. Remove dead if-branch in `ensureCachedTranscript`
+**File:** `cmd/entire/cli/agent/kiro/kiro.go:240-246`
+
+Both branches of the mock check return `cachePath, nil` — the `os.Stat` is meaningless:
+```go
+// Before:
+if os.Getenv("ENTIRE_TEST_KIRO_MOCK_DB") == "1" {
+    if _, err := os.Stat(cachePath); err == nil {
+        return cachePath, nil
+    }
+    return cachePath, nil  // same as above
+}
+
+// After:
+if os.Getenv("ENTIRE_TEST_KIRO_MOCK_DB") == "1" {
+    return cachePath, nil
+}
+```
+
+### 2. Replace hardcoded hook count with `len()`
+**File:** `cmd/entire/cli/agent/kiro/hooks.go:92`
+
+`return 5, nil` is a magic number that silently drifts if hooks are added/removed. Use `len(k.HookNames())` to keep it in sync:
+```go
+// Before:
+return 5, nil
+
+// After:
+return len(k.HookNames()), nil
+```
+
+### 3. Extract SQL string escaping helper
+**File:** `cmd/entire/cli/agent/kiro/kiro.go`
+
+`strings.ReplaceAll(cwd, "'", "''")` appears identically in both `querySessionID` (line 197) and `ensureCachedTranscript` (line 255). Extract a tiny helper:
+```go
+func escapeSQLString(s string) string {
+    return strings.ReplaceAll(s, "'", "''")
+}
+```
+Then use `escapeSQLString(cwd)` in both query builders.
+
+### 4. Remove always-true guard in `handlePrepareCommitMsg`
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks.go:412`
+
+`len(sessionsWithContent) > 0` is always true here — the function returned at line 374 if it was empty. Remove the guard and dedent:
+```go
+// Before:
+if len(sessionsWithContent) > 0 {
+    firstSession := sessionsWithContent[0]
+    if firstSession.AgentType != "" {
+        agentType = firstSession.AgentType
+    }
+    lastPrompt = s.getLastPrompt(ctx, repo, firstSession)
+}
+
+// After:
+firstSession := sessionsWithContent[0]
+if firstSession.AgentType != "" {
+    agentType = firstSession.AgentType
+}
+lastPrompt = s.getLastPrompt(ctx, repo, firstSession)
+```
+
+### 5. Simplify comment in `ensureCachedTranscript` mock path
+**File:** `cmd/entire/cli/agent/kiro/kiro.go:241`
+
+The comment says "return cache path if it exists, or empty" but both branches return `cachePath`. After fix #1, update comment to just:
+```go
+// In test mode, return the expected cache path without hitting SQLite.
+```
+
+## Files Modified
+
+1. `cmd/entire/cli/agent/kiro/kiro.go` — changes 1, 3, 5
+2. `cmd/entire/cli/agent/kiro/hooks.go` — change 2
+3. `cmd/entire/cli/strategy/manual_commit_hooks.go` — change 4
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/39762807-c4f6-471b-9500-715e519b67f1.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/kiro-oneshot
+Your branch is up to date with 'origin/alisha/kiro-oneshot'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   cmd/entire/cli/agent/kiro/hooks.go
+	modified:   cmd/entire/cli/agent/kiro/kiro.go
+	modified:   cmd/entire/cli/strategy/manual_commit_hooks.go
+
+no changes added to commit (use "git add" and/or "git commit -a")
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/kiro/hooks.go b/cmd/entire/cli/agent/kiro/hooks.go
+index 6f1404df..8cc7fd87 100644
+--- a/cmd/entire/cli/agent/kiro/hooks.go
++++ b/cmd/entire/cli/agent/kiro/hooks.go
+@@ -89,7 +89,7 @@ func (k *KiroAgent) InstallHooks(ctx context.Context, localDev bool, force bool)
+ 		return 0, fmt.Errorf("failed to write hooks config: %w", err)
+ 	}
+ 
+-	return 5, nil
++	return len(k.HookNames()), nil
+ }
+ 
+ // UninstallHooks removes the Entire hooks config file.
+diff --git a/cmd/entire/cli/agent/kiro/kiro.go b/cmd/entire/cli/agent/kiro/kiro.go
+index f3ded2e4..e74250b1 100644
+--- a/cmd/entire/cli/agent/kiro/kiro.go
++++ b/cmd/entire/cli/agent/kiro/kiro.go
+@@ -161,6 +161,13 @@ func (k *KiroAgent) GetHookConfigPath() string {
+ 	return filepath.Join(".kiro", hooksDir, HooksFileName)
+ }
+ 
++// --- SQLite helpers ---
++
++// escapeSQLString escapes single quotes for use in SQLite string literals.
++func escapeSQLString(s string) string {
++	return strings.ReplaceAll(s, "'", "''")
++}
++
+ // --- SQLite session resolution ---
+ 
+ // dbPath returns the path to Kiro's SQLite database.
+@@ -194,7 +201,7 @@ func (k *KiroAgent) querySessionID(ctx context.Context, cwd string) (string, err
+ 
+ 	query := fmt.Sprintf(
+ 		"SELECT json_extract(value, '$.conversation_id') FROM conversations_v2 WHERE key = '%s' ORDER BY updated_at DESC LIMIT 1",
+-		strings.ReplaceAll(cwd, "'", "''"),
++		escapeSQLString(cwd),
+ 	)
+ 
+ 	cmd := exec.CommandContext(ctx, "sqlite3", "-json", db, query)
+@@ -238,10 +245,7 @@ func (k *KiroAgent) ensureCachedTranscript(ctx context.Context, cwd, sessionID s
+ 
+ 	// Fetch fresh transcript from SQLite on every call (transcript grows during session)
+ 	if os.Getenv("ENTIRE_TEST_KIRO_MOCK_DB") == "1" {
+-		// In test mode, return cache path if it exists, or empty
+-		if _, err := os.Stat(cachePath); err == nil {
+-			return cachePath, nil
+-		}
++		// In test mode, return the expected cache path without hitting SQLite.
+ 		return cachePath, nil
+ 	}
+ 
+@@ -252,7 +256,7 @@ func (k *KiroAgent) ensureCachedTranscript(ctx context.Context, cwd, sessionID s
+ 
+ 	query := fmt.Sprintf(
+ 		"SELECT value FROM conversations_v2 WHERE key = '%s' ORDER BY updated_at DESC LIMIT 1",
+-		strings.ReplaceAll(cwd, "'", "''"),
++		escapeSQLString(cwd),
+ 	)
+ 
+ 	cmd := exec.CommandContext(ctx, "sqlite3", db, query)
+diff --git a/cmd/entire/cli/strategy/manual_commit_hooks.go b/cmd/entire/cli/strategy/manual_commit_hooks.go
+index 32d3ceca..7e3694d5 100644
+--- a/cmd/entire/cli/strategy/manual_commit_hooks.go
++++ b/cmd/entire/cli/strategy/manual_commit_hooks.go
+@@ -409,13 +409,11 @@ func (s *ManualCommitStrategy) PrepareCommitMsg(ctx context.Context, commitMsgFi
+ 	// Determine agent type and last prompt from session
+ 	var agentType types.AgentType
+ 	var lastPrompt string
+-	if len(sessionsWithContent) > 0 {
+-		firstSession := sessionsWithContent[0]
+-		if firstSession.AgentType != "" {
+-			agentType = firstSession.AgentType
+-		}
+-		lastPrompt = s.getLastPrompt(ctx, repo, firstSession)
++	firstSession := sessionsWithContent[0]
++	if firstSession.AgentType != "" {
++		agentType = firstSession.AgentType
+ 	}
++	lastPrompt = s.getLastPrompt(ctx, repo, firstSession)
+ 
+ 	// Prepare prompt for display: collapse newlines/whitespace, then truncate (rune-safe)
+ 	displayPrompt := stringutil.TruncateRunes(stringutil.CollapseWhitespace(lastPrompt), 80, "...")
+- Current branch: alisha/kiro-oneshot
+- Recent commits: 237ba90d Add commit steps to agent-integration skill phases
+09d30063 Add Kiro agent integration with E2E-first TDD
+526070a9 revert kiro code
+19acfef9 Restructure agent-integration skill for E2E-first TDD
+c38e2171 Add Kiro agent integration
+3e70f85b Merge branch 'main' into alisha/kiro-oneshot
+81ddee25 Merge pull request #544 from entireio/soph/release-0-4-8
+65897b98 credits for cursor community pr
+94e9f456 changelog for 0.4.8
+0c6c9b57 Merge pull request #538 from entireio/gtrrz-victor/replace-fmt-with-log-inside-agent-hooks
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

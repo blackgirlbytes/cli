@@ -1,0 +1,98 @@
+Apply the changes requested in this review:
+ ---
+  PR #688 Review: entire attach command
+
+  Overall Assessment
+
+  The PR is well-structured with good decomposition of runAttach into focused helper functions. The lifecycle.go refactor to consolidate session state loads is a
+  clean improvement. A few issues worth addressing:
+
+  Issues
+
+  1. attach.go is 669 lines — too much in one file
+
+  The file mixes command logic, trailer manipulation, transcript metadata extraction, Gemini normalization, and duration estimation. Per Go convention, these are
+  distinct concerns:
+
+  - appendCheckpointTrailer, isTrailerLine, trailerLineRe belong in the existing trailers package or a file near it — they're generic git trailer operations, not
+  attach-specific.
+  - normalizeGeminiTranscript is Gemini-specific and belongs in agent/geminicli/ or a Gemini-related file.
+  - estimateSessionDuration and extractTranscriptMetadata are transcript utilities that could live in transcript.go or the transcript package.
+
+  This would leave attach.go focused on command orchestration (~300 lines).
+
+  2. storeTranscript parameter ordering: logCtx, ctx
+
+  func storeTranscript(logCtx, ctx context.Context, ...) (...)
+
+  Go convention is ctx context.Context as the first parameter. Having two context parameters with logCtx before ctx is confusing. Consider passing only ctx and
+  deriving the logging context inside, or renaming for clarity (e.g., just use ctx and add the component attribute at the call site).
+
+  3. Direct type assertion on GetStrategy return
+
+  func condenseAndFinalizeSession(ctx context.Context, strat *strategy.ManualCommitStrategy, ...) (string, error) {
+
+  condenseAndFinalizeSession accepts *strategy.ManualCommitStrategy directly. This is fine today since GetStrategy returns that concrete type, but the Strategy
+  interface exists for a reason. CondenseSessionByID isn't on the interface — if it should be, add it. If this is intentionally strategy-specific, document the
+  coupling.
+
+  4. Redundant repo open in validateAttachPreconditions
+
+  repo, repoErr := strategy.OpenRepository(ctx)  // opened here
+  ...
+  // later in runAttach:
+  strat := GetStrategy(ctx)                        // opens repo again internally
+  ...
+  // and in promptAmendCommit:
+  repo, err := openRepository(ctx)                 // opened a third time
+
+  The repository is opened 3 separate times during a single runAttach call. Consider opening it once and threading it through, or at minimum note that this is
+  intentional (e.g., the validations are cheap enough not to care).
+
+  5. collectFileChanges silently degrades
+
+  Both ExtractModifiedFilesFromOffset and DetectFileChanges failures are logged as warnings but execution continues with potentially empty file lists. This is
+  defensible for a best-effort attach, but the user gets Checkpoint saved (transcript only, no uncommitted file changes detected) with no indication that detection
+   actually failed. Consider distinguishing "no changes found" from "detection failed" in the output.
+
+  6. agentSessionBaseDirs duplicates agent knowledge
+
+  The map hardcodes ~/.claude/projects and ~/.gemini/tmp in the CLI layer. This is agent-internal knowledge that should come from the agent interface (e.g.,
+  GetSessionBaseDir() string). As new agents are added, this map will drift from agent implementations.
+
+  7. Trailer parsing walks backward with fragile heuristics
+
+  appendCheckpointTrailer (lines 467-502) has a multi-pass backward scan checking for comment lines, blank separators, and trailer-formatted lines. This is complex
+   and the test cases, while good, don't cover edge cases like:
+  - Messages with only a subject line (no body, no trailing newline)
+  - Multi-paragraph bodies where the last paragraph happens to look like trailers
+
+  The git interpret-trailers command exists for exactly this purpose. Shelling out to it would be simpler and more correct.
+
+  8. Tests don't use t.Parallel() where they could
+
+  TestAttach_Success, TestAttach_SessionAlreadyTracked, TestAttach_WritesPromptFile, etc. use t.Chdir (via setupAttachTestRepo) which prevents parallelization. The
+   CLAUDE.md notes this exception, but the setup helper could be refactored to inject the working directory rather than using t.Chdir, enabling parallel execution.
+
+  Minor / Style
+
+  - Unused bytes import possibility: estimateSessionDuration uses bytes.Split on potentially large transcript data. bufio.Scanner would be more memory-efficient
+  for large transcripts (only allocates one line at a time).
+  - //nolint:nilerr in searchTranscriptInProjectDirs is fine but the walk callback could be extracted to a named function for readability.
+  - The removal of the transcriptTypeUser alias in transcript.go and renaming transcript params to lines are clean improvements.
+
+  What's Good
+
+  - Clean decomposition of runAttach into focused helpers with clear names
+  - The lifecycle.go consolidation eliminates a redundant LoadSessionState call — good simplification
+  - Thorough test coverage including Gemini subdirectory fallback, trailer edge cases, and metadata extraction
+  - Proper use of NewAccessibleForm for the amend prompt
+  - Agent auto-detection fallback is a nice UX touch
+
+  Recommendations (priority order)
+
+  1. Move trailer logic to trailers package (or use git interpret-trailers)
+  2. Fix storeTranscript parameter ordering
+  3. Move Gemini normalization to agent/geminicli/
+  4. Add GetSessionBaseDir to agent interface instead of hardcoding paths
+  5. Distinguish "no changes" from "detection failed" in user output

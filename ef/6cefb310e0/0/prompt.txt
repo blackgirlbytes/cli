@@ -1,0 +1,346 @@
+Should we not pass a valid repo path to `ag.GetSessionDir("")`?
+
+---
+
+Regarding `ag.ResolveSessionFile()`: How does that transcript file resolution work for agents that don't keep the transcript on disk and we need to run an export command, like `opencode`?
+
+---
+
+Do you need to add/update any tests based on this change above?
+
+---
+
+Commit and continue
+
+---
+
+Continue
+
+---
+
+Can you create a draft PR with a thorough description since this is a change that requires more context than usual?
+
+---
+
+Can you please check off the tests that are already implemented and try again?
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a17c879b217fbc853</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli/581df83f-fb6e-425e-a135-362f6ea16c5a/tasks/a17c879b217fbc853.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>I have a thorough understanding of the changes now. Here is my analysis.
+
+---
+
+## Efficiency Review
+
+### 1. Unnecessary work: `string(resolved)` allocation in `countTranscriptItems`
+
+**Location:** `manual_commit_condensation.go:161`
+
+```go
+sessionData.FullTranscriptLines = countTranscriptItems(state.AgentType, string(resolved))
+```
+
+`resolved` is a `[]byte` returned from `os.ReadFile`. Converting it to `string(resolved)` creates a full copy of the transcript in memory. For large transcripts this is a non-trivial allocation. `countTranscriptItems` takes a `string` parameter, so this is an interface-level issue -- the function signature forces the copy. However, this is a **pre-existing design**: `countTranscriptItems` already takes `string` throughout the codebase (e.g., line 829 `fullTranscript` is already a string). The new code simply follows the same pattern. **Severity: low.** This only runs in the fallback path (transcript was empty from the normal extraction), so it is not a hot-path amplification.
+
+### 2. Ordering of `sessionStateBackfillTokenUsage` before the skip gate
+
+**Location:** `manual_commit_condensation.go:147-149` (before the skip gate at line 168)
+
+```go
+if backfillUsage := sessionStateBackfillTokenUsage(ctx, ag, state.AgentType, sessionData.Transcript, sessionData.TokenUsage); backfillUsage != nil {
+    state.TokenUsage = backfillUsage
+}
+```
+
+When the session will be skipped (no transcript, no files), `sessionData.Transcript` is empty, so `sessionStateBackfillTokenUsage` hits the `len(transcript) > 0` check on line 471 and returns quickly (nil for non-Copilot agents, or falls through to the `checkpointUsage` nil checks). This is effectively a no-op in the skip case. **No real concern.**
+
+### 3. `resolveTranscriptFromAgentStorage` -- filesystem work on the fallback path
+
+This function does:
+- `paths.WorktreeRoot(ctx)` -- cached after first call (read-lock + string comparison), essentially free
+- `ag.GetSessionDir(repoRoot)` -- lightweight (env var check + filepath.Join)
+- `ag.ResolveSessionFile(sessionDir, state.SessionID)` -- for Codex, calls `findRolloutBySessionID` which does **up to 3 `filepath.Glob` calls** scanning date-sharded directories. This could be slow if the Codex sessions directory has thousands of files. For other agents, it is a simple `filepath.Join`.
+- `agent.AsTranscriptPreparer(ag)` -- type assertion, free
+- `preparer.PrepareTranscript(ctx, resolved)` -- for OpenCode, shells out to `opencode export`. This is a **blocking subprocess call** on the PostCommit hot path. However, this is the same pattern as `prepareTranscriptIfNeeded` which already runs in the pre-existing code path (line 150). This only runs when the agent implements `TranscriptPreparer` AND the normal path produced no transcript.
+- `os.ReadFile(resolved)` -- reads entire transcript into memory. Bounded by the transcript file size.
+
+**Key observation:** This entire fallback block only executes when `len(sessionData.Transcript) == 0 && ag != nil`. In the common case (Claude Code, Gemini CLI, Copilot CLI with transcript paths set), the transcript is already extracted by `extractOrCreateSessionData` and this block is skipped entirely. It only fires for the Codex-subagent case described in the comment.
+
+**Severity: low for the common case, acceptable for the targeted Codex fallback case.** However, the `findRolloutBySessionID` glob on the Codex sessions directory is worth noting -- if a user has many sessions, this could add measurable latency to PostCommit. This is a pre-existing concern with `ResolveSessionFile`, not introduced by this diff, but this diff creates a new call site for it.
+
+### 4. No TOCTOU issues
+
+The code does not pre-check file existence before reading. `os.ReadFile` is called directly, and failures are handled gracefully. The `resolveTranscriptFromAgentStorage` function returns nil on any error, including read failures. This is correct.
+
+### 5. No missed concurrency opportunities
+
+The fallback resolution is a sequential chain where each step depends on the previous (need repo root to get session dir, need session dir to resolve file, need file to read it). These cannot be parallelized.
+
+### 6. `extractOrCreateSessionData` refactoring -- no efficiency change
+
+The refactoring from inline `if/else` to a `switch` statement in `extractOrCreateSessionData` is a pure code organization change. The new `default` case that returns empty `ExtractedSessionData` is the key behavioral change -- it replaces a hard error (`"shadow branch not found and no live transcript available"`) with a soft empty result that flows into the fallback + skip gate. This is a correctness/resilience improvement, not an efficiency change.
+
+### 7. `writeTranscript` return type change
+
+The `committed.go` change from `error` to `(bool, error)` avoids setting phantom transcript/content-hash paths when the transcript was empty. This is a pure correctness fix. The only new work is checking `wroteTranscript` before assigning two string fields -- negligible.
+
+### 8. Memory: transcript bytes lifetime
+
+In `resolveTranscriptFromAgentStorage`, the `os.ReadFile` result is returned to the caller and assigned to `sessionData.Transcript`. This is the same pattern used by `extractSessionData` (line 811: `os.ReadFile(liveTranscriptPath)`). The transcript bytes will be held in memory through the rest of `CondenseSession` (redaction, chunking, writing to git) and then dropped when the function returns. This is the existing memory model -- no new unbounded growth.
+
+### 9. Skip gate prevents unnecessary downstream work
+
+The skip gate at line 168 is a net positive for efficiency: when there is genuinely nothing to condense, it avoids all of the following work:
+- `redactSessionTranscript` (JSONL parsing + regex redaction)
+- `getCheckpointStore` (opens git storage)
+- `GetGitAuthorFromRepo` (reads git config)
+- `calculateSessionAttributions` (diff computation)
+- `checkpoint.WriteCommitted` (git tree building + commit creation)
+
+And in `condenseAndUpdateState`, the `result.Skipped` check prevents incorrectly resetting session state counters.
+
+---
+
+## Summary
+
+**No significant efficiency issues found.** The new code paths are well-guarded:
+
+1. The transcript fallback (`resolveTranscriptFromAgentStorage`) only runs when the normal extraction found no transcript AND the agent is non-nil -- a narrow case primarily for Codex subagents.
+2. The skip gate prevents all expensive downstream work (redaction, attribution, git writes) when there is nothing to condense.
+3. The `writeTranscript` change is a correctness fix that prevents phantom paths, with zero efficiency overhead.
+4. The `WorktreeRoot` call in the fallback is cached. `sessionStateBackfillTokenUsage` short-circuits on empty transcripts.
+
+**One minor note worth tracking:** For Codex agents, `ResolveSessionFile` can do up to 3 `filepath.Glob` calls over date-sharded directories. If Codex sessions accumulate to large numbers, this could add latency to the fallback path. This is pre-existing behavior though -- the diff just adds a new call site for it. If this becomes a concern, the Codex `findRolloutBySessionID` function itself would need optimization (e.g., index or cache), not this callsite.</result>
+<usage><total_tokens>62888</total_tokens><tool_uses>26</tool_uses><duration_ms>111671</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a53087ffd5fb7c630</task-id>
+<tool-use-id>toolu_017coSoydQfDu13mRVbDRHev</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli/581df83f-fb6e-425e-a135-362f6ea16c5a/tasks/a53087ffd5fb7c630.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>I now have a complete picture. Here is my analysis.
+
+---
+
+## Code Reuse Review Findings
+
+### 1. `resolveTranscriptFromAgentStorage` duplicates existing transcript resolution logic
+
+**Significant duplication found.** The core of the new `resolveTranscriptFromAgentStorage` -- the `WorktreeRoot -> GetSessionDir -> ResolveSessionFile` chain -- is already implemented in two places:
+
+- **`cmd/entire/cli/transcript.go:21`** (`cli.resolveTranscriptPath`): Does the exact same `paths.WorktreeRoot(ctx)` -> `ag.GetSessionDir(repoRoot)` -> `ag.ResolveSessionFile(sessionDir, sessionID)` sequence and returns the resolved path. This is the closest match.
+
+- **`cmd/entire/cli/strategy/resolve_transcript.go:23`** (`strategy.resolveTranscriptPath`): Does similar resolution but from an *existing* `state.TranscriptPath` (re-resolving when the file has moved). This handles a different scenario (file exists but has been relocated) vs the new function (no path known yet, resolve from scratch).
+
+- **`cmd/entire/cli/strategy/manual_commit_rewind.go:738-744` and `:885-890`**: The same `GetSessionDir -> ResolveSessionFile` chain appears twice in the rewind code.
+
+The new function adds `PrepareTranscript` and `os.ReadFile` on top of path resolution, plus sets `state.TranscriptPath`. The path resolution core (steps 1-3) should reuse `cli.resolveTranscriptPath` from `transcript.go`, or the pattern should be extracted into a shared helper since the `strategy` package can't import `cli`. The recommended approach: extract the `WorktreeRoot -> GetSessionDir -> ResolveSessionFile` three-step chain into a function in a shared package (e.g., `agent` or `paths`) that both `cli` and `strategy` can call.
+
+### 2. `extractOrCreateSessionData` refactors existing inline logic -- not duplication
+
+**This is a clean extraction, not duplication.** The new `extractOrCreateSessionData` encapsulates the exact `if hasShadowBranch / else if transcriptPath / else` branching logic currently inline in `CondenseSession` (lines 132-160 of `manual_commit_condensation.go`). It adds a third `default` case that returns an `ExtractedSessionData` with only `FilesTouched` -- this is new behavior (allowing condensation to proceed without a transcript).
+
+However, the refactoring changes the error semantics: the current code returns an error when `!hasShadowBranch && state.TranscriptPath == ""`, while the new `extractOrCreateSessionData` treats that as a valid case (the `default` branch). This is an intentional behavioral change (best-effort transcript capture), but worth calling out explicitly.
+
+**One concern**: The new function receives `ag agent.Agent` as a parameter, but only uses it for `prepareTranscriptIfNeeded` in the `TranscriptPath` branch. The `hasShadowBranch` branch calls `extractSessionData`, which resolves the agent internally via `agent.GetByAgentType`. This inconsistency is inherited from the current code, not new.
+
+### 3. Test helpers -- `mockPreparerAgent` duplication
+
+**The `mockPreparerAgent` mock in the diff duplicates the existing one in `cmd/entire/cli/lifecycle_test.go:334`.** Both implement:
+- `agent.TranscriptPreparer` interface
+- Track a `prepareTranscriptCalled` bool
+- Create transcript files on disk when `PrepareTranscript` is called
+
+Since these are in different packages (`cli` vs `strategy`), direct reuse isn't possible without extracting to a shared test helper. The codebase already has this pattern -- `fakeExternalAgent` in `strategy/rewind_test.go` and `mockLifecycleAgent` in `lifecycle_test.go` are structurally identical mock agents in different packages.
+
+**Recommendation**: If the `strategy` package frequently needs agent mocks with `TranscriptPreparer` support, consider adding one to `cmd/entire/cli/agent/testutil/` (which already exists for hook test helpers). This would also benefit the existing `fakeExternalAgent` in `rewind_test.go`.
+
+### 4. `writeTranscript` return type change in `checkpoint/committed.go`
+
+**This is a clean bug fix, not duplication.** The current code unconditionally sets `filePaths.Transcript` and `filePaths.ContentHash` even when `writeTranscript` wrote nothing (the early `return nil` on line 653 when transcript is empty). The diff changes the return type to `(bool, error)` so the caller can skip setting those paths. There is only one caller (`writeSessionToSubdirectory`), so this is a contained change.
+
+### Summary of Findings
+
+| Item | Verdict | Action |
+|------|---------|--------|
+| `resolveTranscriptFromAgentStorage` | **Duplicates** `cli.resolveTranscriptPath` (transcript.go:21) and inline patterns in `manual_commit_rewind.go` | Extract shared `WorktreeRoot -> GetSessionDir -> ResolveSessionFile` helper, or call the existing logic |
+| `extractOrCreateSessionData` | **Clean extraction** of existing inline code with intentional behavioral change | No duplication concern, but document the semantic change |
+| `mockPreparerAgent` in strategy tests | **Duplicates** `mockPreparerAgent` in `lifecycle_test.go` | Consider shared mock in `agent/testutil/`; acceptable as-is given Go's package scoping |
+| `writeTranscript` return type change | **Bug fix**, no duplication | Clean and contained |</result>
+<usage><total_tokens>67084</total_tokens><tool_uses>57</tool_uses><duration_ms>195130</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abdc3cfe2b5227a6f</task-id>
+<tool-use-id>toolu_01VUHjeFoFSoiV9pAhr5SAFG</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli/581df83f-fb6e-425e-a135-362f6ea16c5a/tasks/abdc3cfe2b5227a6f.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Now I have a thorough understanding of the entire diff. Here is my review.
+
+---
+
+## Code Review Findings
+
+### 1. Semantic conflation: `condenseAndUpdateState` returns `false` for both error and skip (Medium)
+
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks.go` (line 1315)
+
+`condenseAndUpdateState` returns `bool` and now conflates two very different outcomes into `false`: "condensation failed with an error" and "condensation was intentionally skipped because there was nothing to condense." All callers store the result into `h.condensed` and branch on it (lines 1231, 1241, 1272, 1287). The downstream behavior for a skipped session should arguably differ from a failed one. For example:
+
+- Line 1272: `state.Phase == session.PhaseEnded && len(state.FilesTouched) == 0 && (handler.condensed || !hasNew)` -- when condensation was skipped (no transcript, no files) on an ENDED session, `handler.condensed` is `false`. This means the `FullyCondensed = true` path only triggers if `!hasNew`. But a skip *is* the signal that the session is fully condensed with nothing left to do. This may or may not be correct depending on how `hasNew` is computed for that session, but the logic is fragile because the distinction is lost.
+
+- Line 1287: `state.Phase.IsActive() && !handler.condensed` preserves the shadow branch when condensation wasn't successful. For a *skipped* session this means the shadow branch is preserved unnecessarily. Also, the shadow branch is not added to `shadowBranchesToDelete` when skipped (line 1324 is after the early return), so it survives cleanup. This seems intentional but only by accident of the early return position.
+
+**Suggestion:** Either return a richer type (e.g., a `condenseOutcome` enum with values `condensed`, `skipped`, `failed`) or return `(*CondenseResult, error)` directly and let the caller inspect `result.Skipped`. The current approach works but is a latent bug magnet.
+
+### 2. Redundant `agent.GetByAgentType` calls (Low)
+
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go`
+
+`CondenseSession` calls `agent.GetByAgentType(state.AgentType)` at line 116 to get `ag`. Then `extractOrCreateSessionData` receives `ag` as a parameter. But *inside* `extractSessionData` (line 664) and `extractSessionDataFromLiveTranscript` (line 739), each function calls `agent.GetByAgentType(state.AgentType)` **again** to obtain its own `ag` variable. So the agent is resolved up to 3 times for the same session. This is not expensive (it's a map lookup), but it obscures the data flow and could lead to confusion if someone thought `ag` could differ between calls.
+
+### 3. Side effect on `state.TranscriptPath` in a function named as a resolver (Low-Medium)
+
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go`, `resolveTranscriptFromAgentStorage`
+
+This function mutates `state.TranscriptPath` as a side effect (around line 461 in the diff). The function signature (`resolveTranscriptFromAgentStorage(ctx, ag, state) []byte`) suggests it returns data, not that it mutates state. Compare with `resolveTranscriptPath(state)` which also mutates state but at least has an explicit name suggesting path resolution.
+
+The mutation is documented in the docstring but callers skimming the code at the call site would see:
+
+```go
+if resolved := resolveTranscriptFromAgentStorage(ctx, ag, state); len(resolved) > 0 {
+```
+
+...and have no idea that `state` is also being modified. The test (`TestResolveTranscriptFromAgentStorage_CallsPrepareTranscript`, line 183) verifies this side effect, which is good, but the function would be clearer if it returned both the data and the resolved path, letting the caller decide what to store.
+
+### 4. `writeTranscript` return type is a boolean+error pair instead of a named result (Low)
+
+**File:** `cmd/entire/cli/checkpoint/committed.go`
+
+The signature change from `error` to `(bool, error)` is pragmatic and solves the phantom paths problem. However, `(bool, error)` is a weak return type -- the bool means "wrote something" which the caller must remember. A pattern like returning a small struct (`writeResult{wrote bool}`) or using a named return (`(wrote bool, err error)`) would be marginally more self-documenting at the call site. This is very minor.
+
+### 5. Copy-paste risk in `extractOrCreateSessionData` error wrapping (Low)
+
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go`, `extractOrCreateSessionData`
+
+The two non-default switch cases each wrap errors with different messages:
+- `"failed to extract session data: %w"`
+- `"failed to extract session data from live transcript: %w"`
+
+These are the same messages that the original inline code had. The extraction was clean and preserved the semantics correctly. No issue per se, but worth noting that `CondenseSession` used to additionally wrap with `fmt.Errorf(...)` in the caller, while now `extractOrCreateSessionData` wraps and `CondenseSession` passes through the `extractErr` directly (without re-wrapping). This is actually a *simplification* -- the error is wrapped once instead of potentially twice -- and is correct.
+
+### 6. Test parallelization gap (Low)
+
+**File:** `cmd/entire/cli/strategy/condense_skip_test.go`
+
+None of the tests call `t.Parallel()`. The CLAUDE.md guidelines say "Always use `t.Parallel()` in tests" with the exception for tests that modify process-global state. These tests use `t.Chdir()` and `t.Setenv()`, which are indeed incompatible with `t.Parallel()`, so this is correct but worth adding a brief comment explaining why (as the guidelines suggest for exceptions).
+
+The `committed_phantom_paths_test.go` tests *do* call `t.Parallel()` correctly.
+
+### 7. Unnecessary comment: "Skip gate" label (Nitpick)
+
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go`
+
+The comment `// Skip gate: if there is no transcript AND no files touched...` is useful -- it explains the *why* (avoid metadata-only stubs). The "Skip gate" label itself is a bit jargon-y but not harmful. This is fine.
+
+### 8. The `default` case in `extractOrCreateSessionData` silently succeeds (Medium)
+
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go`
+
+When neither shadow branch exists nor transcript path is set, the function returns `&ExtractedSessionData{FilesTouched: state.FilesTouched}` -- essentially empty data. The *old* code returned a hard error: `"shadow branch not found and no live transcript available"`. The new code instead returns success and relies on the skip gate + fallback resolution downstream.
+
+This is the intentional design change (best-effort transcript capture), but it means a previously-failing case now silently succeeds and may end up skipped. If the fallback resolution *also* silently fails (agent.GetSessionDir returns an error, or the file doesn't exist), the session is simply skipped with an Info log. For a session that genuinely has files touched but no transcript (e.g., a bug in hook payloads), this would result in a checkpoint with files but no transcript -- which the skip gate allows because `len(sessionData.FilesTouched) > 0` bypasses the skip. Whether that's desirable is a product question, but the fallback chain is well-structured.
+
+---
+
+### Summary
+
+The diff is well-structured overall. The `extractOrCreateSessionData` extraction is clean, the skip gate is well-placed (after filterFilesTouched, which could zero out files), and the `writeTranscript` return type change correctly prevents phantom paths. The test coverage is solid.
+
+The most actionable finding is **#1**: the `condenseAndUpdateState` return value losing the distinction between "failed" and "skipped." This could cause subtle issues in the PostCommit handler, particularly around `FullyCondensed` marking and shadow branch cleanup for ENDED sessions. Everything else is low severity.</result>
+<usage><total_tokens>77945</total_tokens><tool_uses>62</tool_uses><duration_ms>186387</duration_ms></usage>
+</task-notification>
+
+---
+
+Don't ever force push without my consent!
+
+---
+
+No, I don't want you to force push at all. There's no reason to force push other than the fact that you decided to amend a commit without my consent, either.
+
+---
+
+Yes, do that.
+
+---
+
+/review
+
+---
+
+Yes
+
+---
+
+Yes
+
+---
+
+/codex:adversarial-review --wait
+
+---
+
+Do it
+
+---
+
+/codex:adversarial-review
+
+---
+
+I don't think this fix is working: I have pushed a few checkpoints on this repo and it looks like:
+
+- Claude sessions which used to be captured arent' anymore
+- Codex sessions are listed but there still aren't any transcripts listed
+
+Relevant commits to debug:
+
+- 5ec6885de91676ae8a389eac1f6054d7ec55c139 (doesn't seem to contain any checkpoints)
+- fa2a365fb89b73a0cdefd56d6b59e0ccc771b1ff (doesn't have checkpoints/trailers)
+- 5930768ed9fcedb1d3f69128385acf7c043f4741 (contains checkpoint ID bc26a77f7fda but only has a codex session without logs and no transcripts at all)
+
+This needs additional work. It sounds like one potential cause for this might be the findings of the recent adversarial review but we should debug and double check this some more. Use the data I provided and see if you can find a root cause.
+
+---
+
+Yes
+
+---
+
+The dangling trailer issue. I'll look into the worktree session mismatch later.
+
+---
+
+Yes, try that.
+
+---
+
+How often have I told you not to try to commit without my consent? Re-read your instructions. Is there any confusion here?

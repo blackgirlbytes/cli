@@ -1,0 +1,75 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "8630b51df267",
+  "session_id": "49456f2f-51c7-4bbd-b8f8-3df6da366c33",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-01T01:25:15.559645Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 6,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "0ff7fb2f362a",
+  "token_usage": {
+    "input_tokens": 3550,
+    "cache_creation_tokens": 183711,
+    "cache_read_tokens": 3862964,
+    "output_tokens": 50583,
+    "api_call_count": 48
+  },
+  "session_metrics": {
+    "turn_count": 6
+  },
+  "summary": {
+    "intent": "Understand the memory loop architecture deeply, then design and begin implementing an MCP server that lets Claude pull memories on demand (as an alternative to hook-based push injection).",
+    "outcome": "Architecture questions answered thoroughly; design spec written for a two-tool MCP server (search_memories, save_memory); implementation plan created; mcp-go dependency staged; subagent dispatched to scaffold the MCP server package.",
+    "learnings": {
+      "repo": [
+        "Memory loop has two independent axes: mode (off/manual/auto) controls injection, activation_policy (review/auto) controls whether generated memories auto-activate.",
+        "manual mode currently has no compelling use case — auto+review policy already provides the same safety gate. The MCP server gives manual mode a real identity: no hook push, but Claude can pull via MCP.",
+        "Injection happens in UserPromptSubmit hook (lifecycle.go:282) and is gated strictly on mode == auto; there is no mid-conversation injection mechanism.",
+        "SelectRelevant uses token overlap + outcome bonus (+5 reinforced, -5 ineffective) + scope bonus (+3 personal) + cooldown penalty, packed into a 1200-byte budget with max 2 memories.",
+        "Facets are the intermediate representation between raw transcripts and memory candidates — structured signals (repeated instructions, missing context, friction points, skill opportunities, repo/workflow learnings) extracted per session before pattern analysis.",
+        "Memory records carry full provenance: source session IDs, evidence quotes, timestamps, injection counts. State lives in .entire/memory-loop.json and insights cache in .entire/insights.db.",
+        "No existing MCP server in the project — Claude Code interacts with entire purely through hooks (push model). The MCP addition flips this to a pull model.",
+        "The project uses github.com/mark3labs/mcp-go as the MCP library.",
+        "Hook installation reads/merges/writes .claude/settings.json — the MCP server registration will follow the same pattern, adding an mcpServers.entire entry."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/lifecycle.go",
+          "line": 282,
+          "end_line": 285,
+          "finding": "maybeInjectMemoryLoop exits immediately if mode != auto — manual and off modes get no injection, no staged/on-demand path exists"
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "finding": "AddManualRecord (or ManualRecordInput) exists for creating candidate records from outside the refresh pipeline — used by the planned save_memory MCP tool"
+        }
+      ],
+      "workflow": [
+        "Session used superpowers:brainstorming skill before design, superpowers:writing-plans before planning, and superpowers:subagent-driven-development for execution — a structured ideate→spec→plan→execute flow.",
+        "Self-review of spec caught a real ambiguity: SelectRelevant only returns StatusActive records (passesInjectionGate), but search_memories needs to support status:candidate filter — required a separate non-scored listing code path.",
+        "Subagent-driven development chosen over inline execution for this implementation; tasks decomposed into 8 discrete units with dependency ordering.",
+        "mcp-go dependency doesn't appear in go.mod until first import — adding it via go get before writing code is premature; it will be pulled when the first import is compiled."
+      ]
+    },
+    "friction": [
+      "User interrupted the assistant twice mid-response ('continue' needed twice) during the design presentation — likely due to response being cut off or tool call interruption.",
+      "AskUserQuestion tool was called multiple times during design to confirm choices, adding latency to what could have been a single consolidated prompt.",
+      "context7 MCP library docs were fetched to get mcp-go API but the transcript doesn't confirm whether the API details were accurate — implementer subagent may hit API shape mismatches.",
+      "go get for mcp-go didn't modify go.mod/go.sum because no code imports it yet — the dependency addition step was effectively a no-op until actual code is written."
+    ],
+    "open_items": [
+      "Task 2: Implement mcpserver/server.go scaffold with NewServer(), checkModeGate(), placeholder handlers and mode-gating tests.",
+      "Task 3: Implement search_memories handler reusing SelectRelevant scoring plus separate listing path for candidate-status queries.",
+      "Task 4: Implement save_memory handler using AddManualRecord with fingerprint dedup; export FingerprintForRecord if not already exported.",
+      "Task 5: Create mcp_server_cmd.go cobra command and register in root.go.",
+      "Task 6: Modify hooks.go InstallHooks/UninstallHooks/AreHooksInstalled to manage mcpServers.entire entry in .claude/settings.json.",
+      "Task 7: Run fmt, lint, test:ci across the full codebase.",
+      "Task 8: Integration smoke test — build CLI, verify MCP server responds over stdio, verify hook installation writes mcpServers block.",
+      "Decide whether to remove manual mode or keep it with the new MCP-pull semantic (design says keep it, but no final confirmation from user).",
+      "TUI keybinding for staging/injecting a memory was mentioned as a future nice-to-have but not scoped into this plan."
+    ]
+  }
+}

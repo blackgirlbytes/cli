@@ -1,0 +1,93 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "0f4abfb58059",
+  "session_id": "49456f2f-51c7-4bbd-b8f8-3df6da366c33",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-01T17:52:50.981692Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "cmd/entire/cli/skilldb/cache.go",
+    "cmd/entire/cli/skilldb/cache_test.go",
+    "cmd/entire/cli/skilltui/picker.go",
+    "cmd/entire/cli/skilltui/root.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "4f293b049ead",
+  "token_usage": {
+    "input_tokens": 3669,
+    "cache_creation_tokens": 551935,
+    "cache_read_tokens": 15910027,
+    "output_tokens": 72344,
+    "api_call_count": 127
+  },
+  "session_metrics": {
+    "turn_count": 9
+  },
+  "summary": {
+    "intent": "Understand the memory loop architecture deeply, then design and implement an MCP server that allows Claude to pull memories on demand as a complement to hook-based push injection.",
+    "outcome": "Full MCP server implementation shipped across 4 commits: `entire mcp-server` command with `search_memories` and `save_memory` tools, hook installation extended to write `mcpServers.entire` to `.claude/settings.json`, and 18 new passing tests.",
+    "learnings": {
+      "repo": [
+        "Memory loop has two independent controls: `mode` (off/manual/auto) controls hook injection, `activation_policy` (review/auto) controls whether generated memories auto-activate.",
+        "`manual` mode means no hook injection but full CLI/TUI access — not 'manually trigger injection'. This is considered misleading by the user.",
+        "Refresh (backfill summaries → backfill facets → pattern analysis → generation → reconciliation) is always manual; `auto` mode only controls injection.",
+        "Facets are structured metadata (repeated instructions, missing context signals, friction points, skill opportunities, repo/workflow learnings) extracted from summaries and used as input to pattern analysis.",
+        "Injection gate (`passesInjectionGate`) requires `StatusActive` — candidates, suppressed, and archived records never inject via hooks.",
+        "`AddManualRecord` sets `Status: StatusActive` for CLI-created records; MCP-created memories should use `StatusCandidate` to require human review — requires bypassing `AddManualRecord` or overriding status.",
+        "Pre-existing uncommitted changes in `skilldb/cache.go`, `skilldb/cache_test.go`, `skilltui/picker.go`, `skilltui/root.go` cause test failures unrelated to this work.",
+        "Subagents committed their own work incrementally; main session committed hooks/command changes separately.",
+        "`t.Parallel()` cannot be combined with `t.Chdir()` in Go tests — causes a panic."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/lifecycle.go",
+          "line": 282,
+          "end_line": 284,
+          "finding": "Injection gate: if mode != ModeAuto, maybeInjectMemoryLoop exits immediately. No manual injection path exists."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "finding": "fingerprintForRecord and makeRecordID were unexported; had to export as FingerprintForRecord and MakeRecordID for use in the MCP save_memory handler."
+        },
+        {
+          "path": "cmd/entire/cli/agent/claudecode/hooks.go",
+          "finding": "InstallHooks already had high maintidx lint score before MCP changes — pre-existing issue, not introduced by this work."
+        }
+      ],
+      "workflow": [
+        "Subagent-driven development pattern: dispatch implementer agents per task, verify tests after each, commit incrementally.",
+        "Hook-based injection is a push model (fires before Claude sees anything); MCP tools are a pull model (Claude calls them during conversation when it decides it needs context).",
+        "MCP server mode gating should check mode on every tool call, not just at startup, so mode changes take effect immediately without restarting the server.",
+        "For MCP search that needs to bypass the injection gate (to return candidates too), a separate filtering+scoring path is needed rather than reusing `SelectRelevant`/`PreviewSelection` directly.",
+        "The staging file pattern (write IDs to file, hook reads and deletes on next turn) was considered for manual injection but rejected as too clunky — MCP tool approach preferred."
+      ]
+    },
+    "friction": [
+      "The `entire mcp-server` cobra command initially had an unused `cmd` parameter that triggered a lint error.",
+      "`PreviewSelection` is too restrictive for MCP search (filters out candidates, returns empty on empty query) — required a custom scoring path in the handler.",
+      "Background test task notification arrived after the session concluded, requiring a retroactive explanation that the failure was pre-existing.",
+      "User interrupted the assistant mid-response twice, requiring 'continue' prompts to resume.",
+      "Finding the exact location of `UninstallHooks` required multiple grep attempts with different patterns."
+    ],
+    "open_items": [
+      "Consider removing `manual` mode entirely and simplifying to `off`/`auto` — user agreed it's misleading and `auto`+`activation_policy:review` covers the safe on-ramp use case.",
+      "TUI `i` keybinding to stage/inject a selected memory was mentioned but not implemented.",
+      "`--local-dev` flag for `entire enable` (using `go run` instead of binary for the MCP server entry) was mentioned in testing instructions but may not exist yet.",
+      "Pre-existing `skilldb` test failures need investigation and resolution.",
+      "The `InstallHooks` function maintidx lint issue is pre-existing but worth addressing separately."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-01T17:52:17.27283Z",
+    "agent_lines": 662,
+    "agent_removed": 0,
+    "human_added": 1717,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 2379,
+    "total_lines_changed": 0,
+    "agent_percentage": 27.826817990752417
+  }
+}

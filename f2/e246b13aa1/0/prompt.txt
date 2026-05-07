@@ -1,0 +1,92 @@
+We got a report yesterday from someone who enabled agents claude and codex using entire configure, then they manually committed, and they said reviewing with codex it seems to be an issue on the CLI on how it opens a session and if it fails it remains open and fallbacks to Claude Code which is the default value, here is their entire status, remotion-demos/public/screenshots/image.png\
+\
+Someone else internally said they saw the same where they committed using another agent, saw claude code, when they shouldn't have - don't have much more,but We shouldn't default to Claude Code, but to Unknown. Also, someone else reported internally that they had never used codex but saw an active session in entire status. so can you check out what's going on here
+
+---
+
+check entire.io repository, and i think the only one that is truley valid for this case is the additional concern for default agent name, where when there is no agent name found then uses claude code but should be "Unknown", which is present in both entireio/cli and entire.io so check this. regarding 1. there will be the .[whatever agent] sub directory from selecting the agent from configuration, this doesn't make sense "This affects entire explain and rewind point display." and we're talking about agent attribution that is incorrect/using claude code as a fallback when the agent can't be attributed. we'll tackle the rest later - first find everywhere where the fall back is claude code for agent and change to unknown in entireio/cli and entire.io please
+
+---
+
+can you write plan for this please using /superpowers:write-plan and then we'll make changes in a new brnach
+
+---
+
+<task-notification>
+<task-id>a9e40e2e4a22e87fc</task-id>
+<tool-use-id>toolu_01WmWF5WFGtY7xRFiEuWAqNq</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-unknown-agent/127afbf7-ba2f-4320-87e4-a27944e738ba/tasks/a9e40e2e4a22e87fc.output</output-file>
+<status>completed</status>
+<summary>Agent "Review plan chunk 2" completed</summary>
+<result>Now let me verify the context claims about the entire.io codebase to ensure the plan is accurate and complete.
+
+## Plan Review - Chunk 2
+
+**Status:** Issues Found
+
+**Issues:**
+
+1. **[Task 4, Step 1]: Missing verification step after changing the constant.** The task changes `LEGACY_FALLBACK_AGENT_NAME` but has no step to run tests or verify nothing breaks before committing. Since Tasks 5-7 depend on this constant, a test run here catches breakage early. A `npm test` step should be added before the commit.
+
+2. **[Task 5, Step 2]: Line numbers are approximate with no fallback guidance.** The plan says "Line ~105", "Line ~282", etc. but these are based on a point-in-time snapshot. If the file has changed, the implementer has no instruction on how to find the correct locations. Each replacement should include a searchable code pattern (e.g., "search for `?? "Claude Code"` in checkpoints.ts") rather than relying solely on line numbers. This is advisory for most tasks but becomes an issue here because there are 5 separate replacements and missing one would be a silent bug.
+
+3. **[Task 8, Step 2]: Migration timestamp may conflict.** The migration filename `20260402000000` uses midnight of the plan date. If other migrations are created on the same date, this could cause ordering issues. The plan should note to check existing migration filenames and adjust the timestamp if needed. Minor but worth noting since migration ordering matters.
+
+4. **[Task 9, Steps 3-4]: Insufficient guidance on test helper changes.** The plan includes a caveat ("Review whether this helper is used for test cases that specifically test Claude Code behavior or just as generic test data") but provides no concrete verification step. The implementer should `grep` for usages of `makeCheckpointData` in both test files to confirm no test explicitly depends on the "Claude Code" value for non-fallback assertions. If any do, the plan's simple find-and-replace would break those tests silently.
+
+5. **[Task 9, Step 5]: Test command is uncertain.** The plan says `npm test -- --run` then hedges with "Or whatever the test command is (check `package.json` scripts)." A plan ready for implementation should have the verified test command. This should be confirmed before the chunk is considered implementation-ready.
+
+6. **[Chunk 2, overall]: No final integration verification step.** After all 6 tasks in Chunk 2 are done, there is no step to run the full test suite one final time to confirm all changes work together. Individual task commits run tests in isolation, but the interaction between the constant change (Task 4) and all the consumers (Tasks 5-7) plus the test updates (Task 9) should be verified holistically.
+
+**Recommendations (advisory):**
+
+- Consider combining Tasks 4-7 into a single commit since they are logically one change (use the constant everywhere). Splitting them into 4 separate commits creates intermediate states where some files use the constant and others still have inline strings, which is confusing in git history.
+- The plan correctly notes that existing "Claude Code" rows in the DB should not be updated (Task 8 note). Consider adding a brief note about whether any backfill or data migration is needed for rows that were incorrectly attributed as "Claude Code" but were actually from unknown agents -- even if the answer is "no backfill needed," making it explicit prevents future questions.
+- Task 5 Step 1 says to add the import for `LEGACY_FALLBACK_AGENT_NAME` and to check if `constants` is already imported. The same instruction appears in Tasks 6 and 7. Consider noting that the implementer should verify the import path is correct relative to each file's location (`"../constants"` vs `"./constants"`).</result>
+<usage><total_tokens>26652</total_tokens><tool_uses>1</tool_uses><duration_ms>31235</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a72a4a9379c4ef7ab</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-unknown-agent/127afbf7-ba2f-4320-87e4-a27944e738ba/tasks/a72a4a9379c4ef7ab.output</output-file>
+<status>completed</status>
+<summary>Agent "Review plan chunk 1" completed</summary>
+<result>Now I have enough to do the review. Let me verify the `FallbackAgentType` mention in the file map vs what Task 3 actually does.
+
+## Plan Review - Chunk 1
+
+**Status:** Issues Found
+
+**Issues:**
+
+1. **File Map vs Tasks mismatch for `registry.go`**: The File Map says "Remove `DefaultAgentName` constant; add `FallbackAgentType` constant" for `cmd/entire/cli/agent/registry.go:125`. However, none of the three tasks actually remove `DefaultAgentName` or add a `FallbackAgentType` constant. Task 3 only adds a comment to the *test* file. The File Map entry is misleading and will confuse implementers -- either the File Map should be corrected to match the actual tasks (comment-only change to the test), or a task should be added that implements the registry.go changes described in the File Map.
+
+2. **File Map lists `setup.go:933` with no corresponding task**: The File Map includes `cmd/entire/cli/setup.go:933` with a note "(no change needed -- this is for `entire enable` agent selection, not attribution)". If no change is needed, it should not appear in the File Map. File Maps should only list files that are actually modified. This is a minor issue but could waste implementer time investigating what to do.
+
+3. **Task 1, Step 1: Test code has incomplete test bodies**: The three test functions (`TestReadAgentTypeFromTree_SingleClaudeDir_ReturnsClaudeCode`, `TestReadAgentTypeFromTree_MultipleAgentDirs_ReturnsUnknown`, `TestReadAgentTypeFromTree_MetadataJson_TakesPrecedence`) have placeholder comments like `// ... (needs proper git tree construction -- see implementation step)` instead of actual test implementations. The Note below acknowledges this and suggests using real temp repos, but the step says "Write failing tests" while providing skeleton code that won't actually test anything. The implementer is left to figure out how to construct proper git trees. Either provide complete test code or explicitly mark Step 1 as "design tests" and add a separate step for writing the actual implementation.
+
+4. **Task 1, Step 3: Implementation adds `.codex` and `.cursor` detection that doesn't exist today**: The current `ReadAgentTypeFromTree` (lines 692-708) only checks `.gemini`, `.claude`, and `.opencode`. The proposed implementation adds `.codex` and `.cursor` detection. This is scope creep beyond the stated goal of "change fallback from Claude Code to Unknown." While arguably useful, it should be called out explicitly as a new behavior addition, not just a refactor, since it changes what agents can be detected from tree inspection.
+
+5. **Task 2, Step 3: No test for the new validation error**: The plan adds a `--agent` required validation (`if agentFlag == ""`) but doesn't include a test step for this new behavior. Step 4 says "Run tests" but there's no step to write a test that verifies the error message when `--agent` is omitted. This is a behavioral change to a CLI command that should have test coverage.
+
+**Recommendations (advisory):**
+
+- The `buildTreeWithPaths` helper in Task 1 Step 1 constructs flat file entries, but `ReadAgentTypeFromTree` calls `tree.Tree(".claude")` which requires actual subtree objects in go-git's object model. The helper as written won't work for directory detection. The Note acknowledges this, but it would be cleaner to just show the `testutil.InitRepo`-based approach from the start rather than including dead code.
+
+- Task 3 (adding a comment to the test) is very low-value as a standalone task and commit. Consider folding it into Task 2 or Task 1 to reduce commit noise.
+
+- The `StringList()` function referenced in Task 2 Step 3 (`agent.StringList()`) should be verified to exist -- if it doesn't, the step will fail.</result>
+<usage><total_tokens>30248</total_tokens><tool_uses>8</tool_uses><duration_ms>49555</duration_ms></usage>
+</task-notification>
+
+---
+
+It shouldn't be "Agent", it should be "Unknown"
+and I see "Unknwon" in entire.io
+
+---
+
+Or see the repo overview page, it may attribute or the legend might say Unknown for "Agent" if this is the case, let's change it all to "Unknown"

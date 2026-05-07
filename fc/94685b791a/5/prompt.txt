@@ -1,0 +1,115 @@
+Implement the following plan:
+
+# Enable BM25 Full-Text Search + Hybrid Search in Turbopuffer
+
+## Context
+
+Checkpoint search is currently semantic-only (OpenAI embeddings → Turbopuffer cosine similarity). There's a TODO in `turbopuffer.ts:4` to add BM25 full-text search. BM25 excels at exact keyword matches (file names, function names, error messages) where semantic search can miss. Adding both and combining via rank fusion gives the best results.
+
+Turbopuffer supports BM25 natively via a `schema` declaration on upsert (`full_text_search: true` on string attributes) and a `rank_by` query parameter. The `text` attribute already contains the searchable content — we just need to declare it as full-text-searchable and update queries.
+
+## Files to Modify
+
+| File | Change |
+|------|--------|
+| `api/src/lib/turbopuffer.ts` | Add schema to upserts, replace single vector query with hybrid (vector + BM25 via reciprocal rank fusion) |
+| `api/scripts/test-search-index.ts` | Add schema to upsert, add BM25 + hybrid verification steps |
+| `api/scripts/backfill-search.ts` | Add schema to SDK upsert call so backfilled data is BM25-indexed |
+
+No route, frontend, or env changes needed — `searchCheckpoints()` signature stays the same, hybrid is transparent to callers.
+
+## Implementation
+
+### 1. `turbopuffer.ts` — Add schema to `indexCheckpoints()` upsert
+
+Add a `schema` field to the upsert request body so the `text` attribute gets BM25-indexed:
+
+```typescript
+body: JSON.stringify({
+  upserts,
+  distance_metric: "cosine_distance",
+  schema: {
+    text: {
+      type: "string",
+      full_text_search: {
+        language: "english",
+        stemming: true,
+        remove_stopwords: true,
+      },
+    },
+  },
+}),
+```
+
+### 2. `turbopuffer.ts` — Replace `searchCheckpoints()` with hybrid search
+
+Current: single vector cosine query on v1 API.
+
+New: fire vector + BM25 in parallel, merge via reciprocal rank fusion.
+
+```
+Vector query (v1):  POST /v1/vectors/:ns/query  { vector, top_k, distance_metric, include_attributes }
+BM25 query (v2):    POST /v2/namespaces/:ns/query  { rank_by: ["text", "BM25", query], top_k, include_attributes }
+```
+
+Both use the same hardcoded namespace (`checkpoints-5be1c302-...`) as the existing code.
+
+**Merge strategy — Reciprocal Rank Fusion (RRF):**
+```
+score(doc) = 1/(k + rank_vector) + 1/(k + rank_bm25)   where k=60
+```
+- Documents appearing in both result sets get boosted
+- Documents only in one set still appear but ranked lower
+- k=60 is the standard constant that prevents top-ranked items from dominating
+
+The function signature stays identical — callers see no change. `openaiApiKey` is still required for the vector half of the hybrid query. The BM25 query needs only the turbopuffer key and raw query text (no embedding).
+
+### 3. `backfill-search.ts` — Add schema to backfill upserts
+
+The backfill uses the `@turbopuffer/turbopuffer` SDK. Add schema to the `ns.upsert()` call:
+
+```typescript
+await ns.upsert({
+  vectors,
+  distance_metric: "cosine_distance",
+  schema: {
+    text: {
+      type: "string",
+      full_text_search: {
+        language: "english",
+        stemming: true,
+        remove_stopwords: true,
+      },
+    },
+  },
+});
+```
+
+### 4. `test-search-index.ts` — Update test script
+
+- Add schema to the upsert call
+- Add BM25 search verification step (query an exact keyword)
+- Add hybrid verification showing combined results
+
+## Verification
+
+1. Delete the test namespace: `curl -X DELETE` (to start fresh with new schema)
+2. Run `npx tsx scripts/test-search-index.ts --limit 5` — confirm upsert + schema works
+3. Verify BM25 results return for exact keyword queries
+4. Verify hybrid results combine both semantic and keyword matches
+5. Run `npx tsc --noEmit` — type check passes
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/a680cc5e-06bc-4b55-b4b6-38f7b2fa7e61.jsonl
+
+---
+
+do we need to re-run the backfill or is it just going to work as-is?
+
+---
+
+okay, we can do the re-index. in that case, while we're at it. let's set up the necessary plumbing to use the right namespace instead of the hardcoded one right now.
+
+---
+
+[Request interrupted by user for tool use]

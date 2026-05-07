@@ -1,0 +1,440 @@
+Implement the following plan:
+
+# Kiro Agent Integration Plan
+
+## Context
+
+Integrating Amazon's Kiro AI coding agent with the Entire CLI. Kiro has both an IDE and a CLI (`kiro-cli`), with a hook system very similar to Claude Code and Cursor. This integration will enable Entire's checkpoint/session lifecycle to work with Kiro CLI sessions.
+
+**Key finding:** Kiro's hook system is agent-scoped (hooks live in agent config files), unlike Claude Code/Cursor where hooks are workspace-level. Kiro also stores sessions in SQLite rather than individual transcript files. The test script phase is critical to capture actual hook payloads and validate assumptions.
+
+**Parameters:**
+- `AGENT_NAME`: Kiro
+- `AGENT_SLUG`: kiro
+- `AGENT_BIN`: kiro-cli (v1.26.2, at `/Users/alisha/.local/bin/kiro-cli`)
+- Config dir: `~/.kiro/` (agents, settings subdirs exist)
+
+## Phase 1: Research — Test Script & Payload Capture
+
+### 1.1 Create test script: `scripts/test-kiro-agent-integration.sh`
+
+Script structure:
+- **Static checks**: Verify `kiro-cli` binary, version, help, config dirs
+- **Hook wiring**: Create `.kiro/agents/entire-probe.json` agent config with hooks that dump stdin JSON to `.entire/tmp/probe-kiro-*/captures/<event>-<ts>.json`
+- **Run modes**: `--manual-live` (user runs `kiro-cli chat --agent entire-probe` and interacts, then presses Enter to collect)
+- **Capture collection**: Pretty-print all captured payloads
+- **Cleanup**: Remove probe agent config
+- **Verdict**: PASS/WARN/FAIL per event + COMPATIBLE/PARTIAL/INCOMPATIBLE
+
+Hook wiring strategy: Create a temporary agent config that wraps Kiro's default behavior and adds capture hooks for all 5 hook types (`agentSpawn`, `userPromptSubmit`, `preToolUse`, `postToolUse`, `stop`).
+
+### 1.2 Execute & Capture
+
+Run the script in `--manual-live` mode. Analyze captured JSON payloads to determine:
+- Does the payload include `session_id` / `conversation_id`?
+- Does it include `transcript_path`?
+- What extra fields exist beyond the documented `hook_event_name` + `cwd`?
+- Do `preToolUse`/`postToolUse` include enough info for SubagentStart/SubagentEnd?
+
+### 1.3 Compatibility Report
+
+**Expected lifecycle mapping:**
+
+| Kiro Hook | Entire EventType | Confidence |
+|-----------|-----------------|------------|
+| `agentSpawn` | `SessionStart` | HIGH |
+| `userPromptSubmit` | `TurnStart` | HIGH (has `prompt`) |
+| `stop` | `TurnEnd` | HIGH |
+| `preToolUse` (with matcher) | `SubagentStart` | MEDIUM (depends on tool ecosystem) |
+| `postToolUse` (with matcher) | `SubagentEnd` | MEDIUM |
+| (none) | `SessionEnd` | MISSING — handle via timeout/stop |
+| (none) | `Compaction` | MISSING |
+
+**Known gaps:**
+- No explicit `SessionEnd` hook — treat `stop` as both TurnEnd and potential SessionEnd
+- No `Compaction` hook — not available until Kiro adds one
+- Sessions in SQLite — transcript handling will be minimal (git-status only, like Cursor)
+- Hook installation via workspace agent config (`.kiro/agents/entire.json`) — user runs `kiro-cli chat --agent entire`
+
+**Design decisions (confirmed with user):**
+- **Hook scope**: Workspace agent config — create `.kiro/agents/entire.json` in the repo. User activates with `kiro-cli chat --agent entire` or sets as default.
+- **Transcripts**: Minimal/git-status only. No TranscriptAnalyzer. Skip SQLite reading. Can enhance later.
+
+## Phase 2: Implementation — Agent Package (TDD)
+
+Template: **Cursor agent** (closest match: IDE+CLI, similar hook model, no TranscriptAnalyzer)
+
+### 2.1 Registry constants
+
+**File: `cmd/entire/cli/agent/registry.go`** — Add:
+```go
+AgentNameKiro AgentName = "kiro"
+AgentTypeKiro AgentType = "Kiro"
+```
+
+### 2.2 Types — `cmd/entire/cli/agent/kiro/types.go`
+
+Define hook input structs based on captured payloads. Provisional structure:
+
+```go
+// KiroHooksFile represents the .kiro/agents/entire.json structure
+type KiroHooksFile struct { ... }
+
+// Hook input raw structs (adapt after payload capture)
+type agentSpawnRaw struct {
+    HookEventName string `json:"hook_event_name"`
+    CWD           string `json:"cwd"`
+    SessionID     string `json:"session_id"`     // TBD
+    // ... additional fields from capture
+}
+
+type userPromptSubmitRaw struct {
+    HookEventName string `json:"hook_event_name"`
+    CWD           string `json:"cwd"`
+    Prompt        string `json:"prompt"`
+    SessionID     string `json:"session_id"`     // TBD
+}
+
+type stopRaw struct { ... }
+type preToolUseRaw struct { ... }
+type postToolUseRaw struct { ... }
+```
+
+Test file: `types_test.go` — JSON deserialization tests
+
+### 2.3 Core Agent — `cmd/entire/cli/agent/kiro/kiro.go`
+
+Implement the `Agent` interface:
+
+| Method | Implementation |
+|--------|---------------|
+| `Name()` | `agent.AgentNameKiro` |
+| `Type()` | `agent.AgentTypeKiro` |
+| `Description()` | `"Kiro - AI-powered coding agent by Amazon"` |
+| `IsPreview()` | `true` |
+| `DetectPresence()` | Check for `.kiro/` directory in repo root |
+| `ProtectedDirs()` | `[".kiro"]` |
+| `GetSessionID()` | Extract from hook input |
+| `GetSessionDir()` | `~/.kiro/projects/<sanitized-path>/` (or env override) |
+| `ResolveSessionFile()` | `<sessionDir>/<sessionID>.json` |
+| `ReadSession()` | Read exported JSON if exists, or return minimal session |
+| `WriteSession()` | Write session JSON file |
+| `FormatResumeCommand()` | `"kiro-cli chat --resume"` |
+| `ReadTranscript()` | Read from session file if available |
+| `ChunkTranscript()` | Use `agent.ChunkJSON()` (JSON format) |
+| `ReassembleTranscript()` | Use `agent.ReassembleJSON()` |
+
+Test file: `kiro_test.go` — Identity methods, session management
+
+**Reusable utilities:**
+- `agent.ReadAndParseHookInput[T]()` from `cmd/entire/cli/agent/event.go`
+- `agent.ChunkJSON()` / `agent.ReassembleJSON()` from `cmd/entire/cli/agent/transcript.go` (or `ChunkJSONL`/`ReassembleJSONL` depending on format)
+- `paths.WorktreeRoot()` from `cmd/entire/cli/paths/`
+- `jsonutil.MarshalIndentWithNewline()` from `cmd/entire/cli/jsonutil/`
+
+### 2.4 Lifecycle — `cmd/entire/cli/agent/kiro/lifecycle.go`
+
+Implement `ParseHookEvent` (core contribution surface):
+
+| Hook Name | EventType | Key Fields |
+|-----------|-----------|------------|
+| `agent-spawn` | `SessionStart` | SessionID, SessionRef |
+| `user-prompt-submit` | `TurnStart` | SessionID, SessionRef, Prompt |
+| `stop` | `TurnEnd` | SessionID, SessionRef |
+| `pre-task` | `SubagentStart` | SessionID, ToolUseID, SubagentType (if delegation tool exists) |
+| `post-task` | `SubagentEnd` | SessionID, ToolUseID, SubagentID |
+
+Note: Kiro has a `delegate` tool — this could be the subagent equivalent. The pre/postToolUse hooks with matcher `delegate` could map to SubagentStart/SubagentEnd. Confirm during payload capture.
+
+Compile-time assertion: `var _ agent.HookSupport = (*KiroAgent)(nil)`
+
+Test file: `lifecycle_test.go` — ParseHookEvent for each hook, nil returns, malformed JSON
+
+### 2.5 Hooks — `cmd/entire/cli/agent/kiro/hooks.go`
+
+Implement `HookSupport` interface:
+
+**Hook installation approach:**
+1. Create/update `.kiro/agents/entire.json` in the repo root
+2. Agent config includes hooks pointing to `entire hooks kiro <verb>`
+3. Preserve existing agent config fields (tools, prompt, etc.)
+
+**HookNames:** `["agent-spawn", "user-prompt-submit", "stop", "pre-task", "post-task"]`
+
+**InstallHooks:**
+- Read/create `.kiro/agents/entire.json`
+- Add hooks section with `entire hooks kiro <verb>` commands
+- Support `localDev` mode with `go run ${KIRO_PROJECT_DIR}/cmd/entire/main.go hooks kiro <verb>`
+- Idempotent — skip if hooks already present
+
+**UninstallHooks:**
+- Read `.kiro/agents/entire.json`
+- Remove Entire hook entries
+- If agent config becomes empty, optionally remove the file
+
+**AreHooksInstalled:**
+- Check if `.kiro/agents/entire.json` exists and contains Entire hook commands
+
+Test file: `hooks_test.go` — Install, uninstall, idempotency, force reinstall
+
+### 2.6 Optional Interfaces — NOT implementing initially
+
+- **TranscriptAnalyzer**: Skip — Kiro uses SQLite, not parseable transcript files. File detection via git status (like Cursor).
+- **TranscriptPreparer**: Skip — no async flush mechanism known.
+- **TokenCalculator**: Skip — would need SQLite access or API info.
+- **SubagentAwareExtractor**: Skip — investigate after delegation tool is understood.
+
+## Phase 3: E2E Test Runner
+
+### 3.1 Agent runner: `e2e/agents/kiro.go`
+
+```go
+func init() {
+    if env := os.Getenv("E2E_AGENT"); env != "" && env != "kiro" { return }
+    Register(&Kiro{})
+}
+```
+
+| Method | Implementation |
+|--------|---------------|
+| `Name()` | `"kiro"` |
+| `Binary()` | `"kiro-cli"` |
+| `EntireAgent()` | `"kiro"` |
+| `PromptPattern()` | TBD from CLI observation (likely `❯` or similar) |
+| `TimeoutMultiplier()` | `1.5` (conservative estimate) |
+| `Bootstrap()` | Set up auth if needed for CI |
+| `IsTransientError()` | Check for rate limit / overloaded patterns |
+| `RunPrompt()` | `kiro-cli chat --no-interactive --agent entire "<prompt>"` |
+| `StartSession()` | `NewTmuxSession(...)` with `kiro-cli chat --agent entire` |
+
+### 3.2 mise.toml task
+
+Add `test:e2e:kiro` task following the pattern of existing E2E tasks.
+
+### 3.3 E2E test scenarios
+
+Existing agent-agnostic tests should work. No new Kiro-specific tests needed unless unique behaviors are discovered.
+
+## Phase 4: Wiring & Registration
+
+1. Add `AgentNameKiro` and `AgentTypeKiro` constants to `cmd/entire/cli/agent/registry.go`
+2. Import kiro package in the main CLI (check where other agents are imported — likely in `cmd/entire/main.go` or a registration file)
+3. Verify `entire enable kiro` works
+4. Verify `entire hooks kiro <verb>` subcommands are registered
+
+## Verification
+
+```bash
+mise run fmt        # Format code
+mise run lint       # Lint check
+mise run test:ci    # All tests (unit + integration)
+```
+
+Additionally:
+- `go test -c -tags=e2e ./e2e/tests` — compile-only E2E to verify agent runner compiles
+- Manual: `entire enable kiro` in a test repo, verify `.kiro/agents/entire.json` is created
+- Manual: Run `kiro-cli chat --agent entire` and verify hooks fire
+
+## Critical Files
+
+**New files:**
+- `scripts/test-kiro-agent-integration.sh` — Phase 1 test script
+- `cmd/entire/cli/agent/kiro/kiro.go` — Core agent
+- `cmd/entire/cli/agent/kiro/lifecycle.go` — ParseHookEvent
+- `cmd/entire/cli/agent/kiro/hooks.go` — HookSupport
+- `cmd/entire/cli/agent/kiro/types.go` — Hook input structs
+- `cmd/entire/cli/agent/kiro/kiro_test.go` — Core tests
+- `cmd/entire/cli/agent/kiro/lifecycle_test.go` — Lifecycle tests
+- `cmd/entire/cli/agent/kiro/hooks_test.go` — Hook tests
+- `e2e/agents/kiro.go` — E2E test runner
+
+**Modified files:**
+- `cmd/entire/cli/agent/registry.go` — Add `AgentNameKiro`, `AgentTypeKiro`
+- `mise.toml` — Add `test:e2e:kiro` task
+- Agent import registration (location TBD — find where other agents are imported)
+
+## Open Questions (to resolve during Phase 1)
+
+1. Does Kiro's hook payload include `session_id`/`conversation_id`?
+2. Does it include `transcript_path` or a session file reference?
+3. Can hooks be installed globally (not per-agent)? Or must user run `--agent entire`?
+4. Does Kiro's `delegate` tool fire preToolUse/postToolUse hooks (for subagent mapping)?
+5. What's the Kiro CLI prompt pattern for tmux-based E2E tests?
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-agent/80f2e1a1-645e-4137-9f1e-2e4a8a40a2a0.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/kiro-agent
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   cmd/entire/cli/agent/registry.go
+	modified:   cmd/entire/cli/checkpoint/temporary.go
+	modified:   cmd/entire/cli/explain.go
+	modified:   cmd/entire/cli/hooks_cmd.go
+	modified:   cmd/entire/cli/strategy/manual_commit_condensation.go
+	modified:   cmd/entire/cli/summarize/summarize.go
+	modified:   e2e/tests/main_test.go
+	modified:   mise.toml
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	cmd/entire/cli/agent/kiro/
+	e2e/agents/kiro.go
+	scripts/test-kiro-agent-integration.sh
+
+no changes added to commit (use "git add" and/or "git commit -a")
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/registry.go b/cmd/entire/cli/agent/registry.go
+index 3bdccf9c..4df7493b 100644
+--- a/cmd/entire/cli/agent/registry.go
++++ b/cmd/entire/cli/agent/registry.go
+@@ -107,6 +107,7 @@ const (
+ 	AgentNameClaudeCode AgentName = "claude-code"
+ 	AgentNameCursor     AgentName = "cursor"
+ 	AgentNameGemini     AgentName = "gemini"
++	AgentNameKiro       AgentName = "kiro"
+ 	AgentNameOpenCode   AgentName = "opencode"
+ )
+ 
+@@ -115,6 +116,7 @@ const (
+ 	AgentTypeClaudeCode AgentType = "Claude Code"
+ 	AgentTypeCursor     AgentType = "Cursor"
+ 	AgentTypeGemini     AgentType = "Gemini CLI"
++	AgentTypeKiro       AgentType = "Kiro"
+ 	AgentTypeOpenCode   AgentType = "OpenCode"
+ 	AgentTypeUnknown    AgentType = "Agent" // Fallback for backwards compatibility
+ )
+diff --git a/cmd/entire/cli/checkpoint/temporary.go b/cmd/entire/cli/checkpoint/temporary.go
+index 32af2a0e..0addba65 100644
+--- a/cmd/entire/cli/checkpoint/temporary.go
++++ b/cmd/entire/cli/checkpoint/temporary.go
+@@ -538,7 +538,7 @@ func (s *GitStore) ListAllTemporaryCheckpoints(ctx context.Context, sessionID st
+ 		branchCheckpoints, branchErr := s.listCheckpointsForBranch(ctx, branch.BranchName, sessionID, limit)
+ 		if branchErr != nil {
+ 			if errors.Is(branchErr, context.Canceled) || errors.Is(branchErr, context.DeadlineExceeded) {
+-				return nil, branchErr //nolint:wrapcheck // Propagating context cancellation
++				return nil, branchErr
+ 			}
+ 			continue // Skip branches we can't read
+ 		}
+diff --git a/cmd/entire/cli/explain.go b/cmd/entire/cli/explain.go
+index 26ba59e4..c39f751c 100644
+--- a/cmd/entire/cli/explain.go
++++ b/cmd/entire/cli/explain.go
+@@ -549,7 +549,7 @@ func scopeTranscriptForCheckpoint(fullTranscript []byte, startOffset int, agentT
+ 			return nil
+ 		}
+ 		return scoped
+-	case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeUnknown:
++	case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeKiro, agent.AgentTypeUnknown:
+ 		return transcript.SliceFromLine(fullTranscript, startOffset)
+ 	}
+ 	return transcript.SliceFromLine(fullTranscript, startOffset)
+@@ -1565,7 +1565,7 @@ func transcriptOffset(transcriptBytes []byte, agentType agent.AgentType) int {
+ 			return 0
+ 		}
+ 		return len(t.Messages)
+-	case agent.AgentTypeClaudeCode, agent.AgentTypeOpenCode, agent.AgentTypeCursor, agent.AgentTypeUnknown:
++	case agent.AgentTypeClaudeCode, agent.AgentTypeOpenCode, agent.AgentTypeCursor, agent.AgentTypeKiro, agent.AgentTypeUnknown:
+ 		return countLines(transcriptBytes)
+ 	}
+ 	return countLines(transcriptBytes)
+diff --git a/cmd/entire/cli/hooks_cmd.go b/cmd/entire/cli/hooks_cmd.go
+index 1e7e6c20..42be6468 100644
+--- a/cmd/entire/cli/hooks_cmd.go
++++ b/cmd/entire/cli/hooks_cmd.go
+@@ -6,6 +6,7 @@ import (
+ 	_ "github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
+ 	_ "github.com/entireio/cli/cmd/entire/cli/agent/cursor"
+ 	_ "github.com/entireio/cli/cmd/entire/cli/agent/geminicli"
++	_ "github.com/entireio/cli/cmd/entire/cli/agent/kiro"
+ 	_ "github.com/entireio/cli/cmd/entire/cli/agent/opencode"
+ 
+ 	"github.com/spf13/cobra"
+diff --git a/cmd/entire/cli/strategy/manual_commit_condensation.go b/cmd/entire/cli/strategy/manual_commit_condensation.go
+index 63effe7d..7fc81d32 100644
+--- a/cmd/entire/cli/strategy/manual_commit_condensation.go
++++ b/cmd/entire/cli/strategy/manual_commit_condensation.go
+@@ -246,7 +246,7 @@ func (s *ManualCommitStrategy) CondenseSession(ctx context.Context, repo *git.Re
+ 					slog.String("error", sliceErr.Error()))
+ 			}
+ 			scopedTranscript = scoped
+-		case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeUnknown:
++		case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeKiro, agent.AgentTypeUnknown:
+ 			scopedTranscript = transcript.SliceFromLine(sessionData.Transcript, state.CheckpointTranscriptStart)
+ 		}
+ 		if len(scopedTranscript) > 0 {
+diff --git a/cmd/entire/cli/summarize/summarize.go b/cmd/entire/cli/summarize/summarize.go
+index b494b24a..71c79e05 100644
+--- a/cmd/entire/cli/summarize/summarize.go
++++ b/cmd/entire/cli/summarize/summarize.go
+@@ -119,8 +119,8 @@ func BuildCondensedTranscriptFromBytes(content []byte, agentType agent.AgentType
+ 		return buildCondensedTranscriptFromGemini(content)
+ 	case agent.AgentTypeOpenCode:
+ 		return buildCondensedTranscriptFromOpenCode(content)
+-	case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeUnknown:
+-		// Claude/cursor format - fall through to shared logic below
++	case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeKiro, agent.AgentTypeUnknown:
++		// Claude/Cursor/Kiro format - fall through to shared logic below
+ 	}
+ 	// Claude format (JSONL) - handles Claude Code, Unknown, and any future agent types
+ 	lines, err := transcript.ParseFromBytes(content)
+diff --git a/e2e/tests/main_test.go b/e2e/tests/main_test.go
+index 6f884270..7e2a2b54 100644
+--- a/e2e/tests/main_test.go
++++ b/e2e/tests/main_test.go
+@@ -28,6 +28,8 @@ func TestMain(m *testing.M) {
+ 	// Resolve the entire binary (builds from source if E2E_ENTIRE_BIN is unset).
+ 	entireBin := entire.BinPath()
+ 
++	os.Setenv("PATH", filepath.Dir(entireBin)+string(os.PathListSeparator)+os.Getenv("PATH"))
++
+ 	// Preflight: verify required dependencies before running any tests.
+ 	var missing []string
+ 	for _, bin := range []string{"git", "tmux"} {
+diff --git a/mise.toml b/mise.toml
+index 49ae474f..3d30c71d 100644
+--- a/mise.toml
++++ b/mise.toml
+@@ -162,6 +162,20 @@ go run ./e2e/cmd/testreport -color -o "$E2E_ARTIFACT_DIR/report.txt" "$E2E_ARTIF
+ exit ${rc:-0}
+ """
+ 
++[tasks."test:e2e:kiro"]
++description = "Run E2E tests with Kiro"
++usage = 'arg "[filter]" help="Test name filter (regex)" default=""'
++quiet = true
++run = """
++E2E_ARTIFACT_DIR="$PWD/e2e/artifacts/$(date +%Y-%m-%dT%H-%M-%S)"
++export E2E_ARTIFACT_DIR
++mkdir -p "$E2E_ARTIFACT_DIR"
++echo "artifacts: $E2E_ARTIFACT_DIR"
++E2E_AGENT=kiro gotestsum --format dots --jsonfile "$E2E_ARTIFACT_DIR/test-events.json" -- -tags=e2e -count=1 -timeout=30m ${usage_filter:+-run "$usage_filter"} ./e2e/tests/... || rc=$?
++go run ./e2e/cmd/testreport -color -o "$E2E_ARTIFACT_DIR/report.txt" "$E2E_ARTIFACT_DIR/test-events.json"
++exit ${rc:-0}
++"""
++
+ [tasks."test:e2e:opencode"]
+ description = "Run E2E tests with OpenCode"
+ usage = 'arg "[filter]" help="Test name filter (regex)" default=""'
+- Current branch: alisha/kiro-agent
+- Recent commits: 38f02325 Merge pull request #498 from entireio/alisha/agent-integration-skill
+8056f428 Merge pull request #512 from entireio/20260226-paul-fix-explain-contexts
+e4b5b0c6 Merge pull request #528 from entireio/dependabot/github_actions/actions/upload-artifact-6
+a5b97bbc chore(deps): bump actions/upload-artifact from 4 to 6
+91f9ab4f Merge pull request #525 from entireio/rwr/fix-cursor-docs-2
+1d9b2f09 cursor: fix resume command test
+ecdd3c4e cursor: fix docs for cli
+53a8ae8e better errorhandling
+6e872270 make getAllChangedFilesBetweenTrees handle the error case more explicit
+cf88b92d Merge pull request #513 from entireio/worktree-agile-marinating-sonnet
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

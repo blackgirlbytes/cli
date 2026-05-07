@@ -1,0 +1,80 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "d0d138a8b16d",
+  "session_id": "46b6f0ad-8975-4306-94a6-56bf49f213dd",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-27T02:05:11.624683Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "956c6761aa18",
+  "token_usage": {
+    "input_tokens": 6500,
+    "cache_creation_tokens": 472983,
+    "cache_read_tokens": 24847736,
+    "output_tokens": 93741,
+    "api_call_count": 165
+  },
+  "session_metrics": {
+    "turn_count": 20
+  },
+  "summary": {
+    "intent": "Build a full interactive TUI dashboard for the memory-loop subsystem using Charmbracelet/bubbletea libraries, allowing users to browse, manage, and configure memories from a single interface.",
+    "outcome": "A 4-tab bubbletea TUI was implemented in a new `memorylooptui` package with Memories, Injection, History, and Settings tabs. Settings key handling was debugged and fixed, accent color changed to orange, borders/spacing improved iteratively, but the settings tab visual design still doesn't match the mockup at session end.",
+    "learnings": {
+      "repo": [
+        "The CLI uses a `termstyle` package for ANSI 256-color styling; color `8` (dark gray) is invisible on dark terminals — use `245` (light gray) for visible borders.",
+        "The project uses a `memoryloop` package under `cmd/entire/cli/memoryloop/` with functions like `TransitionRecordLifecycle`, `SelectRelevant`, `AddManualRecord`, `PruneRecords`, `SaveState`.",
+        "The `docs/superpowers/` directory is gitignored, so spec/plan docs written there are not committed to the repo.",
+        "ACCESSIBLE=1 env var is already used by the CLI to simplify huh forms; the TUI falls back to plain-text show when this is set.",
+        "The project uses `go.mod` with charmbracelet libraries already available as dependencies."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memorylooptui/root.go",
+          "line": 88,
+          "end_line": 126,
+          "finding": "In the root model's Update method, the tea.KeyMsg case processes global keys then falls through — delegation to tab models at line ~175 uses the outer msg parameter (tea.Msg), not the typed tea.KeyMsg. Tab models must do their own type assertion. This is correct Go behavior but was a source of debugging confusion."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_settings.go",
+          "finding": "Settings key handling was broken when using pointer fields in settingsChangedMsg closures. Fix was to refactor to capture the full struct value rather than pointer fields, making changes synchronous."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_memories.go",
+          "finding": "Detail pane was hidden by default (showDetail: false). Changed to showDetail: true so it shows immediately without requiring Enter press."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_injection.go",
+          "finding": "Log table height must be capped (h - reservedLines) to prevent content overflow pushing the tab bar off-screen. Used h-10 initially but needed more aggressive reservation."
+        }
+      ],
+      "workflow": [
+        "Visual companion (local HTTP server with HTML mockups) is valuable for design approval before implementation — prevents misalignment between spec and reality.",
+        "Subagent-driven development dispatched Tasks 1-3 together as one agent since they were tightly coupled foundational work; this was more efficient than one agent per task.",
+        "Debug logging to a temp file (/tmp/tui-debug.log) was the correct approach to trace bubbletea message routing issues since the TUI captures stdin/stdout.",
+        "lipgloss border color must be explicitly set to a visible color (245) — the default or color 8 renders as invisible on dark terminals.",
+        "The brainstorm visual companion server shuts down between sessions and must be restarted; content written to the brainstorm directory persists across restarts."
+      ]
+    },
+    "friction": [
+      "Multiple iteration cycles needed for border visibility — lipgloss color `8` (dark gray) was used initially and was invisible on dark terminals, requiring re-discovery in multiple files.",
+      "Settings key handling required extensive debugging including adding file-based debug logging to trace bubbletea message routing.",
+      "maxWidth cap of 80 was too narrow for the user's terminal, causing layout issues that required removal.",
+      "Injection tab content overflowed terminal height and pushed the tab bar off-screen, requiring height capping fixes.",
+      "The brainstorm server stopped between user questions about 'how to use' and 'open visual companion again', requiring a restart.",
+      "Fix agents committed changes mid-session making it unclear which files had uncommitted changes in the main session."
+    ],
+    "open_items": [
+      "Settings tab visual design still doesn't match the mockup — user noted 'its not as nice as this one' at session end; the mockup uses a single-panel row layout rather than bordered cards.",
+      "History tab `R` refresh trigger is a placeholder — async refresh via tea.Cmd is not yet wired to the actual memoryloop.Refresh function.",
+      "Injection tab prompt tester scoring — the match results display was implemented but the actual SelectRelevant integration needs verification.",
+      "No unit tests for the TUI package — the plan noted 'manual verification focus' and tests were explicitly deferred.",
+      "Async spinner state for refresh in History tab was noted in the design but marked as a future enhancement.",
+      "The `prune` action keybinding (`x` for archive vs prune distinction) was added in spec self-review but needs UX validation.",
+      "The spec and implementation plan files were written to `docs/superpowers/` which is gitignored — they exist only locally."
+    ]
+  }
+}
