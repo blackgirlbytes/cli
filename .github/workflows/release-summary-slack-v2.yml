@@ -149,6 +149,7 @@ jobs:
     needs: prepare
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
@@ -188,6 +189,19 @@ jobs:
             exit 1
           fi
 
+          TOKEN_LENGTH=$(printf '%s' "${ENTIRE_AUTH_TOKEN}" | wc -c | tr -d ' ')
+          TOKEN_SHA256_PREFIX=$(printf '%s' "${ENTIRE_AUTH_TOKEN}" | sha256sum | awk '{print substr($1, 1, 12)}')
+          if [[ "${ENTIRE_AUTH_TOKEN}" == ent_* ]]; then
+            TOKEN_PREFIX_OK=true
+          else
+            TOKEN_PREFIX_OK=false
+          fi
+          echo "::notice::ENTIRE_AUTH_TOKEN length=${TOKEN_LENGTH} starts_with_ent=${TOKEN_PREFIX_OK} sha256_prefix=${TOKEN_SHA256_PREFIX}"
+          if [ "${TOKEN_PREFIX_OK}" != "true" ]; then
+            echo "::error::ENTIRE_AUTH_TOKEN must be a raw Entire API token starting with ent_."
+            exit 1
+          fi
+
           echo "ENTIRE_API_BASE_URL=${ENTIRE_API_BASE_URL:-<default>}"
           entire auth status | tee /tmp/entire-auth-status.txt
           if grep -q "Not logged in" /tmp/entire-auth-status.txt; then
@@ -201,7 +215,20 @@ jobs:
           entire auth list --json > /tmp/entire-auth-list.json
 
           cd /tmp/repo
-          entire dispatch --repos "$REPO" --since "$SINCE" --voice neutral > /tmp/entire-dispatch.md
+          for attempt in 1 2 3; do
+            if entire dispatch --repos "$REPO" --since "$SINCE" --voice neutral > /tmp/entire-dispatch.md 2> /tmp/entire-dispatch.err; then
+              break
+            fi
+
+            if grep -q "429\\|Rate limit exceeded" /tmp/entire-dispatch.err && [ "$attempt" -lt 3 ]; then
+              echo "::warning::entire dispatch hit the dispatch rate limit for ${REPO}; waiting 70 seconds before retry ${attempt}/2."
+              sleep 70
+              continue
+            fi
+
+            cat /tmp/entire-dispatch.err >&2
+            exit 1
+          done
           cat /tmp/entire-dispatch.md
 
       - name: Collect GitHub release and PR data
