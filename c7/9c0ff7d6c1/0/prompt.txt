@@ -1,0 +1,228 @@
+can you review this branch and also give me an overview
+
+---
+
+<task-notification>
+<task-id>aebdb16b685d2eccb</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/49549d0b-166a-48f3-a7cd-2a93ea53dbe7/tasks/aebdb16b685d2eccb.output</output-file>
+<status>completed</status>
+<summary>Agent "Architecture review of auth split" completed</summary>
+<result>I have the full picture. Let me draft the architecture review.
+
+---
+
+## Architecture Review: `alex/cli-auth-consolidation`
+
+### 1. Architecture Overview
+
+The branch cleanly separates a reusable OAuth library (`auth/`) from an entire-specific shim (`cmd/entire/cli/auth/`). Library has 5 subpackages plus `internal/oauthhttp`; the shim adds provider tables, env-var reads, keyring service name, legacy bare-string fallback, and singleton wiring. Data-API call sites flow through `cli.NewAuthenticatedAPIClient` (`cmd/entire/cli/api_client.go:36`) or `auth.TokenForResource` (`cmd/entire/cli/auth/exchange.go:74`).
+
+### 2. Compliance Check
+
+**Library purity (good).** `grep` for env-var reads under `auth/` returns nothing. `auth/doc.go:13-16` and `auth/README.md:5,98-102` explicitly forbid globals/env vars/implicit URLs, and the code matches the stated contract. `tokenmanager.Config` (`auth/tokenmanager/tokenmanager.go:55-97`) takes every wire-affecting value as a field. `sts.Client` (`auth/sts/sts.go:76-80`) and `deviceflow.Client` are field-bag structs — no provider table inside the library.
+
+**Single entry-point invariant (mostly held).** Every data-API caller (`activity_cmd.go`, `dispatch_wizard.go`, `trail_cmd.go`, `recap.go`, `search_cmd.go:229`) goes through `NewAuthenticatedAPIClient`. The dispatch cloud path (`mode_cloud.go:35`) routes through `lookupResourceToken` → `auth.TokenForResource`, and search (`search_cmd.go:116`) does the same. `api/client.go:57` adds `errEmptyBearerToken` as a runtime tripwire if a caller bypasses construction. This is a strong invariant — well done.
+
+**Keyring isolation.** No direct `keyring.*` calls outside `auth/tokenstore/` and the shim's two backward-compat fallback reads (`store.go:80,121`).
+
+### 3. Findings (ranked)
+
+#### High — `api/auth_tokens.go` duplicates the provider env var, breaking the single-source-of-truth claim
+`cmd/entire/cli/api/auth_tokens.go:32-42` reads `ENTIRE_AUTH_PROVIDER_VERSION` directly to switch between `/api/v1/auth/tokens` and `/api/auth/tokens`, with a comment explaining the duplication is to avoid an `api → auth` import. The provider table in `cmd/entire/cli/auth/provider.go:35-47` already encodes per-version paths (`deviceCodePath`, `tokenPath`, `stsPath`); auth-tokens path belongs in the same struct. Fix: add `authTokensPath` to `providerConfig`, then either (a) inject it into the `api.Client` at construction, or (b) move `authTokensBasePath()` into the auth shim and call it via a small accessor. As written, two files independently parse the same env var — exactly the leak the comment is apologizing for.
+
+#### High — Provider switch is on `os.Getenv` at call time, not on construction
+`currentProvider()` (`provider.go:53-60`) reads `ENTIRE_AUTH_PROVIDER_VERSION` every time it's called. `defaultManager()` (`exchange.go:48-68`) freezes via `sync.Once`, but `NewClient` (`client.go:47-58`) does not — login can pick v2 while a later in-process call (e.g. via `auth.TokenForResource`) sees a v1 manager if env was changed. Real risk in long-running processes / tests. Also the comment at `exchange.go:46-47` admits "later env-var changes within the same process are ignored" — that's surprising-by-design. Fix: read env once at startup into a typed `Provider` value and pass it explicitly into `NewClient`/`defaultManager`.
+
+#### Medium — `LookupCurrentToken` is a public name that invites misuse
+`store.go:140-142` returns the auth-host bearer. CLAUDE.md (`cmd/entire/cli/cli_experiments/CLAUDE.md` auth section) warns against using it for data-API calls; the only remaining production caller is `dispatch/mode_local.go:30` retained as a test seam alias. Rename to `LookupAuthHostToken` (or move to an internal package) so its narrow purpose is obvious from the call site, removing the "is this safe?" cognitive load.
+
+#### Medium — Shim's backward-compat fallback is a load-bearing leaky abstraction
+`store.go:68-88,112-129` falls back to `keyring.Get` directly when `tokenstore.Keyring` returns `ErrMalformed`. This *is* the right place for it (entire-specific upgrade path), but the library's `ErrMalformed` exists only to support this one caller. Document that explicitly in `auth/tokenstore/tokenstore.go:18-23` (currently it says "used by callers that want to treat … as a legacy/upgrade path" without naming who) so a second CLI doesn't have to reverse-engineer the design.
+
+#### Medium — Test seams `Config.Exchange` / `Config.Now` are correctly scoped
+Production callers in this repo never set them; they're nil-checked and fall through to real impls (`tokenmanager.go:129-131,349-351`). Good. The `auth.SetManagerForTest` shape (taking `interface{ Helper() }`) avoids dragging `testing.T` into production imports. Keep as-is.
+
+#### Low — `secondsUntil` in shim re-derives `expires_in` only to satisfy the legacy `DeviceAuthPoll.ExpiresIn` field
+`client.go:155-162`. `ExpiresIn` is unused — `runLogin` (`login.go:82-92`) reads `start.ExpiresIn` for the deadline and `result.AccessToken` for the token; it never reads `result.ExpiresIn`. Drop the field and the helper, and remove the `nowFunc` package-level mutable.
+
+#### Low — `client_id` doubles as `UserAgent`
+`exchange.go:60` and `client.go:50-53` set `UserAgent: provider.clientID`. That's `"entire-cli"` with no version. The library lets you set anything; pass a real UA like `"entire-cli/" + version.Version()` so server-side logs can correlate by build.
+
+#### Low — `auth/doc.go` says "Entire CLI auth library" but README says "shareable across CLIs"
+`auth/doc.go:1` calls it "the umbrella for the Entire CLI auth library." README sells it as multi-tenant. Pick one framing — probably the README's, since the design has clearly been done for it.
+
+### 4. Forward-Compat Risks for a Second CLI
+
+1. **`tokenmanager.Manager` is a value-typed `Config` constructor — good.** A second CLI imports `auth/tokenmanager` and `auth/tokenstore` and is done.
+2. **No retry / refresh-token policy in the manager.** `TokenSet.RefreshToken` is captured (`tokens/tokens.go:26`) but `tokenmanager` never uses it. First CLI to need refresh will have to add it; design the hook now (a `Config.OnExpired` callback?) or document the omission.
+3. **`Provider` concept lives only in the shim.** A second CLI will rewrite an equivalent table. Consider promoting a tiny `auth/provider` helper struct (clientID + 4 paths) so embedders don't reinvent it — optional, but cheap.
+4. **Singleton in the shim (`managerOnce`)** is fine for one CLI but not pattern-worthy. Document in README that consumers can hold the `*Manager` themselves.
+
+### 5. Recommendations (in priority order)
+
+1. Eliminate the duplicated `ENTIRE_AUTH_PROVIDER_VERSION` read in `cmd/entire/cli/api/auth_tokens.go`.
+2. Read provider version once at startup; pass `Provider` explicitly to `NewClient` and `defaultManager`.
+3. Rename `LookupCurrentToken` → `LookupAuthHostToken` (or move to `internal/`).
+4. Tighten `auth/tokenstore` docs to name the upgrade-path use case for `ErrMalformed`.
+5. Drop `DeviceAuthPoll.ExpiresIn` + `secondsUntil` + `nowFunc` from the shim.
+6. Reconcile `auth/doc.go` framing with `README.md`.
+
+### Files Cited
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/tokenmanager/tokenmanager.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/tokenstore/tokenstore.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/sts/sts.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/tokens/tokens.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/doc.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/README.md`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/auth/provider.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/auth/exchange.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/auth/client.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/auth/store.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/auth_tokens.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/client.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api_client.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/dispatch/mode_local.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/dispatch/mode_cloud.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/login.go`</result>
+<usage><total_tokens>87536</total_tokens><tool_uses>27</tool_uses><duration_ms>119868</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a7b9c75eb85272981</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/49549d0b-166a-48f3-a7cd-2a93ea53dbe7/tasks/a7b9c75eb85272981.output</output-file>
+<status>completed</status>
+<summary>Agent "Security review of new auth library" completed</summary>
+<result>Note: `stsClient.BaseURL = m.cfg.Issuer` and `Path = m.cfg.STSPath`. The core token is sent only as the body's `subject_token` — not URL/headers. Good.
+
+But: the **core token is sent over HTTP** if `m.cfg.Issuer` is `http://`. Single-host setups guard via `requireSecureBaseURL` check at command entry. But the tokenmanager itself doesn't check scheme on `Issuer`. STS path goes wherever Issuer points. Worth noting — though in practice `NewAuthenticatedAPIClient` calls `api.RequireSecureURL(api.AuthBaseURL())` first. The library doesn't enforce HTTPS internally (consistent with "library is config-driven"). Fine.
+
+Now I'll deliver findings.
+
+---
+
+# Security Review: `alex/cli-auth-consolidation` auth library
+
+Scope: `auth/{deviceflow,sts,tokens,tokenstore,tokenmanager,internal/oauthhttp}`, `cmd/entire/cli/auth/`, `cmd/entire/cli/api/auth_tokens.go`, `cmd/entire/cli/{api_client,login,logout}.go`, `cmd/entire/cli/dispatch/`.
+
+Overall posture: solid. The cache key correctly binds `(core, resource, audience, requested_token_type, scope)`; `coreTokenAudienceIncludes` is the only consumer of `tokens.ParseClaims` and is used only for routing (matches README); `DeleteCoreToken` ordering matches spec (keyring first, cache only on success) and is pinned by `TestDeleteCoreToken_PreservesCacheOnStoreFailure`; tokens never appear in logs or URLs; no `Bearer ` mangling. No critical or high findings.
+
+## Findings
+
+### Medium
+
+1. **No core-token expiry check before reuse** — `auth/tokenmanager/tokenmanager.go:229-234` and `:336-363`. The same-host shortcut, the JWT-aud shortcut, and the STS exchange all use the stored core token verbatim with no `tokens.Claims.ExpiresAt` check. A long-expired core token will be sent on every call and rejected with 401 by the resource (or, worse, returned by STS as an opaque error and surfaced as a confusing `token exchange: status 400: invalid_grant`). On a server that accepts an expired-but-undetected token (clock skew), it could even be exchanged for a fresh resource token. The core token's `exp` is already accessible via `tokens.ParseClaims`; either preflight-check it or surface a `re-login required` error rather than a generic STS failure. Not a confidentiality issue, but a real correctness/availability cliff for users who leave the CLI logged in for weeks.
+
+2. **`SaveCoreToken` does not clear the exchange cache** — `auth/tokenmanager/tokenmanager.go:140-142`. `DeleteCoreToken` clears it; `SaveCoreToken` does not. In practice the cache key includes `CoreToken`, so a new core can't return a stale exchanged token, but the old entries linger until process exit. If a future refactor were to drop `CoreToken` from the cache key (e.g., to share exchanges across re-logins for the same user), this becomes exploitable: a re-login under a different user could hand back the prior user's exchanged tokens. Either clear the cache on save, or add a comment-and-test pinning the invariant that `CoreToken` is the load-bearing isolator.
+
+3. **STS response `issued_token_type` is decoded but never validated against the request** — `auth/sts/sts.go:128`. RFC 8693 §2.2.1 requires a server response to include `issued_token_type`; the library accepts whatever the server returns, then the manager caches the result keyed by `RequestedTokenType` regardless. If a misconfigured server downgrades (e.g., issues an opaque access token when JWT was requested) the CLI silently uses the wrong shape. Low likelihood; spec-required validation.
+
+### Low
+
+4. **String-equality `Resource` comparison without normalisation** — `auth/tokenmanager/tokenmanager.go:229,232` (`m.cfg.Issuer == req.Resource`, `slices.Contains(claims.Audience, target)`). Trailing slash, case in scheme/host, default-port differences cause the same-host and aud-shortcuts to miss and force an exchange. Not a confidentiality issue but predictable footgun: a user rotating `ENTIRE_AUTH_BASE_URL=https://entire.io/` (trailing slash) will burn an STS round-trip every call. Normalise both sides through `url.Parse` + canonical form, or document strict `==` matching.
+
+5. **Auth-tokens path picker reads the env var directly** — `cmd/entire/cli/api/auth_tokens.go:32-42`. `authTokensProviderVersionEnvVar` duplicates `auth.ProviderVersionEnvVar`; the comment justifies it as avoiding an import cycle, but it means a future provider rename/typo in one constant won't break the other. If `ENTIRE_AUTH_PROVIDER_VERSION` ever drifts (e.g., a `v3` only the auth package knows about), `ListTokens`/`RevokeToken` will route to the v1 path while login goes to v3. Low risk today, but worth a single-source-of-truth helper in a leaf package both can import.
+
+6. **`readAPIErrorResponse` (deviceflow) dumps up to 1MB of HTML on non-200 with HTML body** — `auth/deviceflow/deviceflow.go:248-264`. Only the success path (`ReadAndDecodeJSON`) detects HTML and surfaces `ErrNonJSONResponse`. A captive portal returning 502 with an HTML page falls through to `text := strings.TrimSpace(string(body))` and the entire HTML appears in the error message. UX issue, not security, but consistency would be good — share the HTML detector.
+
+7. **`StartDeviceAuth` uses `DisallowUnknownFields` (strict=true); `PollDeviceAuth` does not** — `auth/deviceflow/deviceflow.go:130,177`. Asymmetric. A compromised/buggy AS that adds a field to `Start` fails the response, but the same field on `Poll` is silently ignored. Not exploitable today; pin both to strict for defence-in-depth, or document why poll is permissive.
+
+8. **Login retries on transient errors *include* `ErrNonJSONResponse`** — `cmd/entire/cli/login.go:118-130` reaches the transient branch if `PollDeviceAuth` returns any error that doesn't pass `oauthErrorParts`. An HTML-returning captive portal causes 5 polls before giving up (~5–25s wasted, plus repeated bursts of error to the user). Minor.
+
+### Nit
+
+9. **`auth/sts/sts.go:200`** — the body read in `readAPIError` swallows the read error with `//nolint:errcheck`. Best-effort is fine; document so future readers don't assume the body is complete.
+
+10. **`auth/tokenstore/keyring.go:104`** — encoded TokenSet JSON includes empty `expires_at` only via `omitempty` on the wire struct; `t.Scope` and `t.TokenType` likewise. Looks fine; nothing to fix.
+
+## Test coverage gaps that would let real regressions through
+
+- No test that a malformed/tampered core token JWT (signature won't be checked, but malformed payload) does **not** silently match the audience shortcut. *`TestCoreTokenAudienceShortcut_FallsThroughOnMalformedJWT`* covers the unparseable case but not "well-formed JWT, attacker-supplied `aud` claim" — though that's acceptable since unverified JWT was the explicit design choice and the resource will reject the token.
+- No test pins that `Resource` ends up in the STS form when the same-host/aud shortcuts are bypassed by an explicit `Audience`. *`TestToken_ExplicitAudienceBypassesAudienceShortcut`* checks `Audience` but not `Resource` in that path.
+- No test that `SaveCoreToken` on a manager with a populated cache yields fresh exchanges (related to finding 2).
+- No integration test that the tokenmanager refuses to send the core over `http://` (it doesn't — see review note above; intentional, but worth pinning).
+
+Files referenced (absolute paths):
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/tokenmanager/tokenmanager.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/sts/sts.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/deviceflow/deviceflow.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/tokenstore/keyring.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/auth/internal/oauthhttp/jsonresp.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/api/auth_tokens.go`
+- `/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/login.go`</result>
+<usage><total_tokens>128355</total_tokens><tool_uses>42</tool_uses><duration_ms>218484</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0e37afb34d7dcb1e</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli-experiments/49549d0b-166a-48f3-a7cd-2a93ea53dbe7/tasks/a0e37afb34d7dcb1e.output</output-file>
+<status>completed</status>
+<summary>Agent "Critical correctness review" completed</summary>
+<result>There's no review folder for this branch, and the user asked for findings inline. The user also said "Do NOT Write report/summary/findings/analysis .md files. Return findings directly as your final assistant message."
+
+# Code Review — `alex/cli-auth-consolidation`
+
+## Critical
+None.
+
+## High
+
+- **`SetManagerForTest` racy package var** — `cmd/entire/cli/auth/exchange.go:30,38`. `managerForTest` is a plain package var accessed without a mutex; the comment at line 30 calls out "tests use SetManagerForTest" but every test that touches it (`exchange_test.go:60`, `provider_test.go`) must remain non-parallel forever or the race detector will fire. The current test in `exchange_test.go:44` correctly notes "Not parallel", but as written the foot-gun is invisible to future contributors. Either guard with a `sync.Mutex`/`atomic.Pointer`, or have `SetManagerForTest` panic if called from a test that has already opted into `t.Parallel()` (no clean way), or document in the function godoc that callers must not run in parallel. The doc-only fix is fine, but this is one wrong `t.Parallel()` away from a flaky CI.
+
+- **`defaultManager` singleton vs env-driven config** — `cmd/entire/cli/auth/exchange.go:48,52`. `sync.Once` permanently pins `Issuer/STSPath/clientID` to whatever the first caller saw. Any non-test code path that triggers `TokenForResource` during package init or before `t.Setenv("ENTIRE_API_BASE_URL", …)` runs in a test will cement the wrong issuer. The comment at exchange.go:46 acknowledges this but production has the same hazard during partial process upgrades (`exec.Command` chains, etc.). Consider exposing a `Reset()` for tests + a constructor that takes config explicitly. At minimum, log/panic if the second `defaultManager()` call observes a different `api.AuthBaseURL()` than the cached manager's `Issuer()`.
+
+- **Library `Issuer == Resource` comparison is byte-exact** — `auth/tokenmanager/tokenmanager.go:229`. If a third-party caller passes `https://entire.io` for `Issuer` and `https://entire.io/` for `Resource`, the same-host shortcut misses and STS fires unnecessarily — or worse, fails because `Config.STSPath` is empty (single-host expectation), surfacing `ErrNoSTSPath` instead of the core token. The cmd-side wraps this via `api.normalizeBaseURL`, but the library doc (`README.md`, `tokenmanager.go:208`) advertises this as a general-purpose library. Either normalize internally (parse + reconstruct origin) or document the contract loudly in the `Resource` field's godoc.
+
+- **Resource not echoed in cache key normalization** — `auth/tokenmanager/tokenmanager.go:301`. Same root cause as above: `cacheKey.Resource` stores the caller-supplied string, so `https://api.entire.io` and `https://api.entire.io/` cache as two entries. Not a correctness bug today but doubles the exchange count for sloppy callers.
+
+## Medium
+
+- **`tokenstore/keyring.go` decodes lenient JSON without trip-wire** — `auth/tokenstore/keyring.go:111-131`. Any well-formed JSON object (e.g. an unrelated CLI's blob the user happens to have keyed against the same `(service, profile)`) decodes to `keyringTokenSet{}` with a zero AccessToken, so it returns `tokens.TokenSet{}` with no error. The manager then sees a stored entry with empty access token and returns `ErrNotLoggedIn` rather than triggering the bare-string fallback. Add an explicit check after Unmarshal: if `wire.AccessToken == ""` AND no other recognised fields are set, surface `ErrMalformed` so the legacy fallback fires.
+
+- **`auth/tokens/tokens.go:121` `decodeAudience` masks underlying error** — when `aud` is a JSON object/number, both `Unmarshal` calls fail and the returned error reads `"decode JWT aud claim: not a string or array"` with no source-error context. Wrap one of the two attempt errors so `errors.Unwrap` still surfaces the cause.
+
+- **`auth/sts/sts.go:117` swallowed transport error** — `httpClient.Do` failure returns `fmt.Errorf("token exchange: %w", err)`, but the caller (`tokenmanager.runExchange`) further wraps via the calling shim. `cmd/entire/cli/auth/exchange.go:79` already returns the lib error verbatim, so a single 30s outage propagates as `"resolve API token: token exchange: Post …: dial tcp: i/o timeout"`. Caller cannot distinguish "logged out" (`ErrNotLoggedIn`) from "auth host unreachable". Consider exporting `ErrSTSUnreachable` for net errors, or at minimum classifying `*url.Error.Timeout()`/`net.OpError` so `api_client.go:38-42` can show a different message than "not logged in (run 'entire login' first)".
+
+- **`tokenmanager.LookupCoreToken` collapses non-`ErrNotFound` store errors into wrapped errors** — `auth/tokenmanager/tokenmanager.go:147-156`. The test at `tokenmanager_test.go:652` asserts the contract that real keyring failures must surface non-`ErrNotLoggedIn`, which is good. But the cmd-side `auth.Store.LoadTokens` (`store.go:112-129`) only triggers the bare-string fallback on `ErrMalformed`, not on permission-denied errors. If keyring lookup fails with anything other than `ErrNotFound`/`ErrMalformed`, the user sees `"resolve API token: load core token: get token from keyring: &lt;error&gt;"`. That's correct error propagation but no path-to-recover guidance ("run keyring unlock", "set ENTIRE_AUTH_BASE_URL", etc.). Minor UX fit-and-finish.
+
+- **`PollDeviceAuth` body is read into memory before being checked for HTML** — `auth/internal/oauthhttp/jsonresp.go:39-46`. The 1 MB cap protects against huge bodies, but a slow-loris HTML response that drips bytes within `MaxResponseBytes` will block the whole poll loop until the read completes. The HTTP client has no per-request `Timeout`. Set a sensible default `c.HTTP.Timeout` in `deviceflow.Client` / `sts.Client` constructors, or use a `context.WithTimeout` inside the Exchange/Poll method bodies.
+
+- **`exchange.go:35` interface accepts only `Helper()`** — fine for tests, but `t.Cleanup` would be more idiomatic and would let `SetManagerForTest` register its own cleanup so callers can't forget the `defer cleanup()`. Tests already do `t.Cleanup(cleanup)`; promoting the cleanup registration into `SetManagerForTest` removes a foot-gun.
+
+## Low
+
+- **`oauthErrorParts` substring parsing is fragile** — `cmd/entire/cli/auth/client.go:122-133`. Detection of "unknown OAuth code" relies on `strings.CutPrefix(err.Error(), "oauth error: ")`. Any future change in `deviceflow.errCodeToSentinel`'s format string silently breaks this (no compile-time link). Consider exporting an `ErrUnknownOAuthCode` sentinel or a typed error from `deviceflow` so the cmd-side matches via `errors.As`.
+
+- **Tests that rely on `t.Setenv` near package init** — `cmd/entire/cli/api/auth_tokens_test.go:13,74,145` and `provider_test.go`. If `auth_tokens.go` ever caches the env-var value (e.g. behind `sync.Once`), these tests would silently start sharing state. The env-driven path already has this hazard in `exchange.go`. Add a `// REGRESSION:` style comment if you're depending on the lazy read.
+
+- **`auth/sts/sts.go:200` body read on error path drops the read error** — `body, _ := io.ReadAll(...)`. If the response body errors mid-read, the error message becomes `"token exchange: status NNN"` with no body context. Probably fine, but a `body, readErr := …; if readErr != nil { return fmt.Errorf("…: read body: %w", readErr) }` would be a one-line improvement.
+
+- **No test for STS `slow_down` followed by transport error** — coverage gap. The polling loop's transient-counter reset (`login.go:132`) is tested, but the interaction of slow_down → transport error → slow_down isn't pinned. Low risk.
+
+- **Cache never bounded** — `auth/tokenmanager/tokenmanager.go:117`. CLI processes are short-lived so unbounded growth is fine, but if a long-running daemon ever embeds this library, the cache map grows monotonically (entries only deleted on expiry-miss). Note in godoc that the manager is intended for short-lived processes, or add a TTL-based reaper.
+
+## Praise
+
+- The split into `deviceflow`/`sts`/`tokens`/`tokenstore`/`tokenmanager` is clean and the no-globals discipline (every URL/path injected via `Config`) reads well. The `README.md` design-principles section is unusually grown-up for an internal lib.
+- The struct-keyed cache (`cacheKey`) is the right call over delimiter-joined strings; the comment at `tokenmanager.go:285` documents *why*, which prevents the inevitable "let's just use `fmt.Sprintf`" regression.
+- Tests around delete-then-relogin (`TestDeleteCoreToken_ClearsExchangeCache`, `TestDeleteCoreToken_PreservesCacheOnStoreFailure`) are excellent — they pin the contract that's easy to break in a refactor.
+- `TestCoreTokenAudienceShortcut_FallsThroughOnMalformedJWT` correctly identifies and tests the security-sensitive fallthrough; the test's comment is the kind of thing future readers will thank you for.
+- The shadow `ErrNonJSONResponse` path with a captive-portal-friendly message is genuinely helpful UX.
+- The legacy bare-string fallback is well-tested and the comment in `store.go:103-111` clearly states the upgrade path. The `ErrMalformed` sentinel boundary is the right design choice.
+- The PR-review-fix commits (parallel-safe clock pin, struct cache key, PollDeviceAuth retry, etc.) show responsive iteration with clear commit messages.
+
+## Summary
+
+**Verdict: APPROVE WITH MINOR FOLLOW-UPS.** No correctness blockers; the split-host STS and resource-routing fixes look sound and the test coverage is good. The primary risks (`SetManagerForTest` racy var, singleton cementing config, byte-exact URL compare) are foot-guns rather than bugs in current call sites — they should be cleaned up before another CLI adopts the `auth/` library, but they don't block this consolidation. Estimated effort: ~half a day to address High items, another half-day for Medium.</result>
+<usage><total_tokens>182793</total_tokens><tool_uses>57</tool_uses><duration_ms>318974</duration_ms></usage>
+</task-notification>
+
+---
+
+ok, let's do a PR on top of this one and fix 1-6
