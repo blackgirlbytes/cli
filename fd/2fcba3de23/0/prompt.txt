@@ -1,0 +1,128 @@
+Implement the following plan:
+
+# Plan: Commit Hook Performance Test
+
+## Context
+
+A user with ~95 sessions (88 ended, 6 idle, 1 active) and ~100 checkpoints experienced **25.5s** commit time vs **0.335s** without Entire (v0.4.7). We need a reproducible test that:
+1. Recreates this exact scenario locally (no remote/GitHub needed)
+2. Measures PrepareCommitMsg + PostCommit separately
+3. Tests scaling across different session counts (10, 50, 100, 200)
+
+## New File
+
+**`cmd/entire/cli/strategy/commit_hook_perf_test.go`** — build tag `hookperf`
+
+Run: `go test -v -run TestCommitHookPerformance -tags hookperf -timeout 10m ./cmd/entire/cli/strategy/`
+
+## Approach
+
+Follows the same pattern as the existing `postcommit_bench_test.go` (`benchSetupPostCommitRepo`) but:
+- Uses a `hookperf` build tag (like `pushperf` in checkpoint package) so it doesn't run in CI
+- Seeds many more sessions (10-200) with realistic phase distribution
+- Times both PrepareCommitMsg AND PostCommit (the bench only does PostCommit with 1-3 sessions)
+- Uses `ENTIRE_TEST_TTY=1` to simulate the human terminal path (which is the expensive path — calls `filterSessionsWithNewContent`)
+- Uses `commit_linking: "always"` in settings to avoid hanging on the TTY prompt
+
+### Seeding Strategy
+
+| Phase | Count (100-session scenario) | Shadow Branch? | LastCheckpointID? | Notes |
+|-------|-----|----------------|-------------------|-------|
+| ENDED | 88 | No | Yes (set to dummy ID) | Already condensed; triggers `repo.Reference()` lookup that fails |
+| IDLE | 11 | Yes (via `SaveStep`) | No | Have uncommitted checkpoint data on shadow branch |
+| ACTIVE | 1 | Yes (via `SaveStep`) | No | Has live transcript file + shadow branch |
+
+All sessions share the same `WorktreePath` and `BaseCommit` (matching real scenario).
+
+### Test Flow Per Scenario
+
+1. `initHookPerfRepo` — git init + initial commit (reuses pattern from `benchSetupPostCommitRepo`)
+2. `createHookPerfSettings` — write `.entire/settings.json` with `commit_linking: "always"`
+3. `seedHookPerfSessions` — create session state files + shadow branches:
+   - ENDED: write state JSON files with `LastCheckpointID` set
+   - IDLE: use `SaveStep` to create shadow branch checkpoint + state (reuses `benchSetupPostCommitRepo` pattern)
+   - ACTIVE: use `SaveStep` + create live transcript file
+4. Stage a file change
+5. **Time PrepareCommitMsg** — write temp commit message file, call `s.PrepareCommitMsg(ctx, file, "message")`
+6. Create actual commit with the trailer (so PostCommit finds it)
+7. **Time PostCommit** — call `s.PostCommit(ctx)`
+8. Log results + summary table
+
+### Key Design Decisions
+
+- **No `t.Parallel()`** — required because we use `t.Chdir()` / `t.Setenv()` (same as existing strategy tests)
+- **Fresh `ManualCommitStrategy{}` for each hook** — matches production where each hook is a separate process
+- **Clear `paths.ClearWorktreeRootCache()` + `session.ClearGitCommonDirCache()`** before timing — captures full cost including cache misses
+
+### Reused Existing Code
+
+- `benchSetupPostCommitRepo` pattern from `postcommit_bench_test.go:70` — repo init, git config, SaveStep flow
+- `session.NewStateStoreWithDir()` from `session/state.go:247` — direct state file creation
+- `id.MustCheckpointID()` from `checkpoint/id/id.go:44` — create dummy checkpoint IDs for ended sessions
+- `ManualCommitStrategy.SaveStep()` — creates shadow branches properly
+
+### Expected Output
+
+```
+=== 100sessions ===
+  Sessions:         100 (ended=88, idle=11, active=1)
+  Setup:            1.2s
+  PrepareCommitMsg: 8.5s
+  PostCommit:       15.2s
+  TOTAL HOOKS:      23.7s
+
+========== COMMIT HOOK PERFORMANCE SUMMARY ==========
+Scenario             | Sessions | Prepare      | PostCommit   | TOTAL
+---------------------------------------------------------------------------
+10sessions           |       10 |       200ms  |       800ms  |      1000ms
+50sessions           |       50 |      3500ms  |      8000ms  |     11500ms
+100sessions          |      100 |      8500ms  |     15200ms  |     23700ms
+200sessions          |      200 |     17000ms  |     30000ms  |     47000ms
+```
+
+## Verification
+
+```bash
+go test -v -run TestCommitHookPerformance -tags hookperf -timeout 10m ./cmd/entire/cli/strategy/
+```
+
+The test should show linear scaling with session count, confirming the O(N) bottleneck in `listAllSessionStates` (reads all session files + checks shadow branch refs) and `filterSessionsWithNewContent`/`postCommitProcessSession` (per-session git operations).
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/a3cb9ec6-2024-40a0-92ff-a2032eff60f5.jsonl
+
+---
+
+so how is it possible that someone then who had 100 sessions in their .git/entire-sessions folder took 16s for a commit?
+
+---
+
+why don't we just use an existing repo like the entire/cli repo for this? update the test to clone the entireio/cli repo and use that to benchmark this test
+
+---
+
+we need to update the test. Here's what it should do. 
+
+we shoud clone down a repo (idealy with full history or enough to simulate a realistic repo)
+ensure that we have a reasonable amount of refs for that repo size
+ensure that we have several hundred real sessions (these can be pulled form the entire repo and used to simulate it
+then time this process:
+- disable entire
+- make some minor code changes
+- create a commit
+
+that'll give us a control
+
+then enable entire cli in the repo
+- make some code changes
+create a commit
+
+that'll give us our current performance
+
+then we should output the times for both across the prepare and postcommit process
+
+wrap all of these into a script that cleans everything up at the end of the test after collecting data
+
+---
+
+[Request interrupted by user for tool use]

@@ -1,0 +1,499 @@
+/pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>ab38d224e941c8459</task-id>
+<tool-use-id>toolu_01UNs33kswaTSMjM7FbbKUwy</tool-use-id>
+<status>completed</status>
+<summary>Agent "Test coverage analysis" completed</summary>
+<result>The `lifecycle.go` change is only a comment update -- no behavioral change. Good.
+
+Now I have a complete picture. Let me compile my analysis.
+
+---
+
+## Test Coverage Analysis: Copilot CLI Agent PR
+
+### 1. Summary
+
+The test coverage for this PR is **strong overall**. The four new files in the `copilotcli` package have comprehensive test suites that cover happy paths, error paths, edge cases, and important behavioral contracts. The tests follow DAMP principles with clear naming and meaningful assertions. The test-to-implementation ratio is healthy, and the tests focus on behavior rather than implementation details.
+
+### 2. Critical Gaps
+
+None identified at criticality 8-10. The core functionality is well-covered.
+
+### 3. Important Improvements
+
+**3a. `hasTTY()` -- COPILOT_CLI env var bypass (Criticality: 6/10)**
+
+The change at `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/strategy/manual_commit_hooks.go` (lines 58-63) adds `COPILOT_CLI` env var detection to `hasTTY()`. There are no dedicated unit tests for `hasTTY()` at all -- neither for the existing `GEMINI_CLI_SPAWNED` check nor the new `COPILOT_CLI` check. The function is only indirectly tested through benchmark tests.
+
+This is a **pre-existing gap** not introduced by this PR, but the PR extends it. If `hasTTY()` incorrectly returns `true` when Copilot CLI is running hooks, the prepare-commit-msg hook could attempt interactive prompts that hang the hook subprocess, causing timeouts. However, since this follows an established pattern (GEMINI_CLI_SPAWNED), the risk is low.
+
+**Regression it prevents:** Hook subprocess hangs when prepare-commit-msg tries interactive TTY input during Copilot CLI sessions.
+
+**3b. `ExtractModifiedFilesFromOffset` -- nonexistent file behavior (Criticality: 5/10)**
+
+`ExtractModifiedFilesFromOffset` in `transcript.go` does not handle the case where the file doesn't exist (unlike `GetTranscriptPosition` which returns 0 for nonexistent files). It would return an `os.Open` error. There is a test for empty path but not for a path to a nonexistent file. This inconsistency with `GetTranscriptPosition` could matter at runtime since transcript files may not exist yet when a hook fires early.
+
+**Regression it prevents:** Unclear error propagation when transcript file hasn't been created yet during early hook calls.
+
+**3c. `ExtractPrompts` and `ExtractSummary` -- missing file error tests (Criticality: 4/10)**
+
+Both `ExtractPrompts` and `ExtractSummary` in `transcript.go` use `os.ReadFile` and will return errors for missing files. There are no tests verifying error behavior for nonexistent files. The existing tests only cover valid file paths.
+
+**3d. `registry.go` registration -- no test for new agent (Criticality: 3/10)**
+
+The changes to `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/registry.go` add `AgentNameCopilotCLI` and `AgentTypeCopilotCLI` constants, but there is no test verifying the agent registers correctly via `init()` and can be retrieved from the registry. Other agents likely have integration tests for this, but a smoke test confirming `agent.Get("copilot-cli")` returns a `CopilotCLIAgent` would catch wiring issues.
+
+### 4. Test Quality Issues
+
+**No significant issues found.** The tests are well-structured:
+
+- Tests use `t.Parallel()` consistently (with appropriate exceptions for `t.Chdir` tests)
+- Assertions check concrete values, not just "no error"
+- Edge cases like malformed JSON, empty inputs, missing files, and round-trip fidelity are tested
+- The `TestInstallHooks_PreservesUnknownFields` and `TestUninstallHooks_PreservesUnknownFields` tests are particularly good -- they verify that the raw JSON round-trip approach works correctly, which is critical for not corrupting user config files
+
+### 5. Positive Observations
+
+- **Hook install/uninstall round-trip safety**: Excellent testing of JSON preservation (unknown fields, unknown hook types, entry-level fields like `cwd`, `timeoutSec`, `env`). This is exactly the kind of test that prevents real user-facing bugs.
+
+- **Model extraction priority chain**: The transcript tests (`TestExtractModelFromTranscript_ModelChangeTakesPrecedence`, `TestExtractModelFromEvents`) thoroughly validate the fallback logic from `session.model_change` to `tool.execution_complete`, including edge cases like empty model strings.
+
+- **Transcript offset semantics**: Tests for `GetTranscriptPosition`, `ExtractModifiedFilesFromOffset`, and `ExtractPrompts` all verify the offset/position contract, which is critical for incremental transcript reading.
+
+- **Idempotency testing**: `TestInstallHooks_Idempotent` verifies that double-install doesn't duplicate hooks -- a common real-world scenario.
+
+- **Force reinstall flow**: `TestInstallHooks_ForceReinstall` verifies the force flag removes old hooks before adding new ones without creating duplicates.
+
+- **Compile-time interface checks**: Both `var _ agent.HookSupport = (*CopilotCLIAgent)(nil)` and `var _ agent.TranscriptAnalyzer = (*CopilotCLIAgent)(nil)` ensure the agent satisfies required interfaces, catching missing method implementations at compile time.
+
+- **Malformed input resilience**: `TestParseEventsFromBytes_MalformedLines`, `TestInstallHooks_MalformedExistingFile`, and `TestExtractModifiedFilesFromEvents_EmptyAndMalformedFilePaths` all verify graceful handling of corrupt data.
+
+### Relevant Files
+
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/copilotcli.go` and `copilotcli_test.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/hooks.go` and `hooks_test.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/lifecycle.go` and `lifecycle_test.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/transcript.go` and `transcript_test.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/types.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/strategy/manual_commit_hooks.go` (hasTTY change, no dedicated tests)
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/lifecycle.go` (comment-only change)
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/registry.go` (constant additions)</result>
+<usage><total_tokens>74215</total_tokens><tool_uses>20</tool_uses><duration_ms>102866</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-1/tasks/ab38d224e941c8459.output
+
+---
+
+<task-notification>
+<task-id>ad8c219c4a9f01dc5</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Type design analysis" completed</summary>
+<result>I now have a comprehensive picture. Let me compile the analysis.
+
+---
+
+## Type Design Analysis: Copilot CLI Agent (PR: `peyton/copilot-model-tracking`)
+
+### Files Analyzed
+
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/types.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/copilotcli.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/transcript.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/hooks.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/lifecycle.go`
+
+Compared against the Claude Code agent at:
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/claudecode/`
+
+---
+
+## Type: CopilotCLIAgent
+
+### Invariants Identified
+- Stateless struct (zero fields) -- the sole invariant is that it exists and satisfies `agent.Agent`, `agent.HookSupport`, and `agent.TranscriptAnalyzer`
+- Name always returns `AgentNameCopilotCLI`, Type always returns `AgentTypeCopilotCLI`
+- IsPreview always returns `true`
+- Session reads require a non-empty `SessionRef`; session writes require non-nil session, matching agent name, non-empty `SessionRef`, and non-empty `NativeData`
+
+### Ratings
+- **Encapsulation**: 8/10
+  The struct is stateless (zero fields), which is the strongest form of encapsulation for a behavior-only type. All state flows through method parameters. This mirrors the Claude Code agent exactly and is the correct design -- agents are lightweight factories for behavior, not state containers.
+
+- **Invariant Expression**: 7/10
+  The compile-time interface checks (`var _ agent.HookSupport = (*CopilotCLIAgent)(nil)` and `var _ agent.TranscriptAnalyzer = (*CopilotCLIAgent)(nil)`) are good. However, the `HookSupport` check is in `lifecycle.go` while the `TranscriptAnalyzer` check is in `transcript.go`. Claude Code follows the same pattern, so this is consistent but slightly scattered. The interface contract is clearly expressed at compile time.
+
+- **Invariant Usefulness**: 8/10
+  The validation in `WriteSession` (nil check, agent name mismatch, empty ref, empty data) prevents real bugs -- especially the agent name cross-check which prevents accidentally writing a Claude session via the Copilot agent. The pattern of returning `(nil, nil)` for pass-through hooks is documented with nolint comments and follows the established convention.
+
+- **Invariant Enforcement**: 7/10
+  Construction-time enforcement is trivially satisfied (no state to validate). Runtime enforcement in `WriteSession` is thorough. `ReadSession` validates `SessionRef` but not `SessionID` (consistent with Claude Code). The `ExtractModelFromTranscript` function silently returns empty string on all errors, which is the correct design for a best-effort extraction.
+
+### Strengths
+
+1. **Strong consistency with existing agents.** The implementation follows the Claude Code agent pattern almost exactly: stateless struct, same method signatures, same validation logic in `ReadSession`/`WriteSession`, same chunking/reassembly delegation to shared helpers.
+
+2. **Compile-time interface compliance.** Both `HookSupport` and `TranscriptAnalyzer` are verified at compile time via nil-pointer assertions. The architecture test in `architecture_test.go` additionally enforces self-registration and import boundaries.
+
+3. **Robust hook file management.** The `InstallHooks`/`UninstallHooks` implementation uses raw `map[string]json.RawMessage` for round-tripping, which correctly preserves unknown fields and unknown hook types. This is a forward-compatible design that won't break when Copilot CLI adds new hook types.
+
+4. **Thorough test coverage.** Tests cover identity, session CRUD, transcript analysis, hook lifecycle, round-trip preservation, malformed input, idempotency, and force reinstall. The test quality is high.
+
+5. **Good separation of concerns.** Internal transcript parsing types (`copilotEvent`, `userMessageData`, `modelChangeData`, etc.) are unexported. The public API surface is minimal.
+
+### Concerns
+
+1. **`GetSupportedHooks` is dead code.** This method is defined on `CopilotCLIAgent` (hooks.go:267) but is not part of any interface and has zero callers in production code. It exists on OpenCode and Cursor agents too. It appears to be documentation-by-code, but it is not tested and will silently drift out of sync with `ParseHookEvent`. This is a codebase-wide issue, not specific to this PR.
+
+2. **`CopilotHooksFile.Version` has no validation.** The `InstallHooks` method defaults to `version: 1` on new files and preserves whatever exists on existing files, but there is no check that the version is actually 1. If Copilot CLI ships a v2 hooks format with breaking changes, this code will silently corrupt it.
+
+3. **`CopilotHookEntry.Type` is unconstrained.** The struct accepts any string for `Type`, but the install code always writes `"command"`. There is no validation that existing entries have a recognized type. This is fine for round-trip preservation but means the struct does not express its "always command" invariant.
+
+4. **Duplicate line-counting logic.** `GetTranscriptPosition` (lines 254-286 of transcript.go) and `ExtractModifiedFilesFromOffset` (lines 295-333) both implement JSONL line reading with `bufio.Reader`. This is identical to the Claude Code implementation. Both agents copy-paste the same `ReadBytes('\n')` loop with EOF handling. The CLAUDE.md explicitly says to check for duplication.
+
+5. **`parseEventsFromOffset` loads everything into memory.** For `ExtractPrompts` and `ExtractSummary`, the entire transcript is read via `os.ReadFile` into memory, then all events are parsed into a `[]copilotEvent` slice. This is fine for current transcript sizes but is inconsistent with the streaming `bufio.Reader` approach used in `ExtractModifiedFilesFromOffset`.
+
+6. **`ReadSession` does not populate `ModifiedFiles`.** The Claude Code `ReadSession` parses the transcript and populates `session.ModifiedFiles`. The Copilot CLI `ReadSession` does not -- it returns `NativeData` but leaves `ModifiedFiles` empty. If any framework code relies on `ModifiedFiles` being populated after `ReadSession`, this will silently produce incomplete data. The Claude Code version calls `ExtractModifiedFiles(lines)` at line 133 of `claude.go`.
+
+### Recommended Improvements
+
+1. **Populate `ModifiedFiles` in `ReadSession`.** After reading the transcript bytes, parse events and extract modified files, mirroring what Claude Code does. This ensures the `AgentSession` contract is consistently fulfilled:
+
+   ```go
+   events, _ := parseEventsFromBytes(data)
+   return &agent.AgentSession{
+       ...
+       ModifiedFiles: extractModifiedFilesFromEvents(events),
+   }, nil
+   ```
+
+2. **Add a version check in `InstallHooks`.** Before modifying an existing hooks file, verify that `version` is 1. If it is not, return a clear error rather than potentially corrupting a v2 format. This is a low-cost guard.
+
+3. **Consider extracting the JSONL line-counting logic.** Both Claude Code and Copilot CLI implement identical `GetTranscriptPosition` and `ExtractModifiedFilesFromOffset` loop structures. A shared helper in the `agent` package (e.g., `CountJSONLLines(path string) (int, error)`) would reduce the duplication. This is not urgent -- the existing duplication is small and well-tested -- but worth noting for the next agent that needs JSONL support.
+
+4. **Remove or test `GetSupportedHooks`.** Since it is not part of any interface and has no callers, it is dead code that will drift. Either promote it to an interface method (if there is a use case) or remove it. This applies to the codebase broadly, not just this PR.
+
+5. **Add a test that verifies `HookNames()` and `ParseHookEvent` are aligned.** The lifecycle_test.go has `TestParseHookEvent_AllHookTypes` which is close, but does not verify that every hook name from `HookNames()` appears in the test table. A data-driven test that iterates `HookNames()` and asserts each name is handled by `ParseHookEvent` would catch drift.</result>
+<usage><total_tokens>95996</total_tokens><tool_uses>27</tool_uses><duration_ms>104605</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-1/tasks/ad8c219c4a9f01dc5.output
+
+---
+
+<task-notification>
+<task-id>aa8c5be60b45e0dc5</task-id>
+<tool-use-id>toolu_01K3uEvkFtyjMkyLMUUqyPef</tool-use-id>
+<status>completed</status>
+<summary>Agent "Code review for guidelines" completed</summary>
+<result>Good -- the lifecycle.go change is just a documentation comment improvement, no logic change.
+
+Now I have a comprehensive view of the PR. Let me compile my review.
+
+---
+
+## Code Review: Copilot CLI Agent Integration (peyton/copilot-model-tracking)
+
+### Files Reviewed
+
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/copilotcli.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/hooks.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/lifecycle.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/transcript.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/types.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/AGENT.md`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/*_test.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/registry.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/hooks_cmd.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/lifecycle.go`
+- `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/strategy/manual_commit_hooks.go`
+- `/Users/alex/workspace/cli/.worktrees/1/e2e/agents/copilot-cli.go`
+- `/Users/alex/workspace/cli/.worktrees/1/e2e/agents/tmux.go`
+- `/Users/alex/workspace/cli/.worktrees/1/.github/workflows/e2e-isolated.yml`
+- `/Users/alex/workspace/cli/.worktrees/1/.github/workflows/e2e.yml`
+- `/Users/alex/workspace/cli/.worktrees/1/scripts/test-copilot-cli-agent-integration.sh`
+
+### Summary
+
+This is a well-structured PR that follows existing agent patterns closely. The code compiles, tests pass, and the implementation is consistent with the established agent framework (Claude Code, Cursor, Gemini CLI, etc.). The round-trip preservation of unknown JSON fields in hook install/uninstall is a nice defensive choice. Test coverage is thorough with good edge case handling.
+
+**No issues with confidence >= 80 were found.**
+
+### Positive Observations
+
+1. **Pattern adherence**: The implementation closely follows the existing agent patterns (Cursor, Claude Code). Registration via `init()`, `HookSupport` interface, `TranscriptAnalyzer` interface -- all consistent.
+
+2. **Error handling**: All errors are explicitly handled and wrapped with context per Go idioms. The `gosec` nolint annotations on `os.ReadFile` calls with constructed paths are justified and documented.
+
+3. **Logging vs user output**: Uses `logging.Warn/Debug` for operational messages, no `fmt.Print*` for internal messages. Follows CLAUDE.md logging guidelines.
+
+4. **Git operations**: Uses `paths.WorktreeRoot()` (not `os.Getwd()`) in hooks.go for path construction, matching the CLAUDE.md guidance on repo root vs CWD.
+
+5. **JSON round-trip safety**: Hook install/uninstall uses `map[string]json.RawMessage` to preserve unknown fields, which is the right approach for a third-party config file.
+
+6. **Test quality**: Tests use `t.Parallel()` where appropriate, use `t.TempDir()` for isolation, avoid `t.Parallel()` when `t.Chdir()` is needed (documented with comments). The `initGitRepo` helper creates a minimal fake `.git/` directory -- same pattern as the Cursor agent tests.
+
+7. **TTY detection**: The `hasTTY()` addition in `manual_commit_hooks.go` for `COPILOT_CLI` env var follows the exact same pattern used for Gemini CLI.
+
+8. **Documentation**: AGENT.md is comprehensive and well-structured, documenting the hook mechanism, payload formats, limitations, and gaps.
+
+### Minor Observations (below threshold, noted for awareness)
+
+- The `initGitRepo` test helper is duplicated between copilotcli and cursor packages. This is a pre-existing pattern -- not introduced by this PR -- and the duplication is intentional (test helper scoped to package).
+
+- The probe script (`scripts/test-copilot-cli-agent-integration.sh`) uses `eval "$RUN_CMD"` which could be a concern in untrusted environments, but this is a developer-facing test utility, not production code.
+
+- `ExtractModelFromTranscript` at `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/transcript.go:231` reads the entire transcript file to extract the model. For very large transcripts this could be slow, but this matches the pattern used by other agents and is called at most once per turn end.</result>
+<usage><total_tokens>101500</total_tokens><tool_uses>35</tool_uses><duration_ms>118417</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-1/tasks/aa8c5be60b45e0dc5.output
+
+---
+
+<task-notification>
+<task-id>a2bb228e6b1f36626</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Silent failure analysis" completed</summary>
+<result>I have all the information needed. Here is my comprehensive audit.
+
+---
+
+## Error Handling Audit: Copilot CLI Agent PR (`peyton/copilot-model-tracking`)
+
+### Issue 1: `ExtractModelFromTranscript` silently swallows all errors
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/transcript.go`, lines 231-247
+
+**Severity:** HIGH
+
+**Issue Description:** This function swallows errors from both `os.ReadFile` (line 237) and `parseEventsFromBytes` (line 242), returning an empty string with zero logging. The caller in `parseAgentStop` (lifecycle.go:104) also does not log when model extraction fails. The result is that model tracking -- the stated purpose of this PR -- will silently produce no data when the transcript file is missing, unreadable, or corrupted, with no indication of why.
+
+Compare with the factoryaidroid agent's `ExtractModelFromTranscript` at `factoryaidroid/transcript.go:308`, which at least logs on corrupt JSON with `slog.Warn`. This new code is strictly worse.
+
+**Hidden Errors:**
+- Permission denied reading transcript file
+- Transcript file is corrupt/truncated mid-write
+- Filesystem errors (disk full, NFS timeout, etc.)
+- JSONL parsing errors from `parseEventsFromBytes`
+
+**User Impact:** The entire point of this PR is model tracking for Copilot CLI. If the transcript is unreadable for any reason, the model field silently becomes empty. Nobody will know model tracking is broken until they notice missing data in metrics, potentially weeks later.
+
+**Recommendation:** This function lacks a `context.Context` parameter, which prevents use of the project's `logging` package. Either:
+1. Add a `ctx` parameter and log at `logging.Debug` level on failure (consistent with "best-effort extraction" semantics).
+2. Or change the signature to return `(string, error)` and let the caller decide.
+
+At minimum, the caller in `parseAgentStop` (lifecycle.go:104) should log when the returned model is empty and a `TranscriptPath` was provided:
+
+```go
+model = ExtractModelFromTranscript(raw.TranscriptPath)
+if model == "" {
+    logging.Debug(ctx, "copilot-cli: could not extract model from transcript",
+        "transcriptPath", raw.TranscriptPath)
+}
+```
+
+Note: `parseAgentStop` does not currently receive a `ctx` parameter either, which is a design gap that prevents any logging in this code path.
+
+---
+
+### Issue 2: `resolveTranscriptRef` returns empty string on error, propagating a broken state
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/lifecycle.go`, lines 143-152
+
+**Severity:** HIGH
+
+**Issue Description:** When `GetSessionDir` fails, this function logs a warning and returns `""`. The caller `parseUserPromptSubmitted` (line 72) sets this empty string as `event.SessionRef`. Downstream in `lifecycle.go:278-280`, the TurnEnd handler checks for empty `SessionRef` and returns a hard error: `errors.New("transcript file not specified")`. This means a failure to resolve the home directory during TurnStart will silently produce a broken session state, which then causes an unrelated-looking error at TurnEnd.
+
+The warning log at line 148 says "failed to resolve transcript path" but does not include the `sessionID`, making it harder to correlate with the later TurnEnd failure.
+
+**Hidden Errors:**
+- `os.UserHomeDir()` failure (containerized environments, missing HOME)
+- `ENTIRE_TEST_COPILOT_SESSION_DIR` set to an invalid path
+
+**User Impact:** Users in environments where `$HOME` is not set (containers, some CI systems) will see a confusing "transcript file not specified" error at turn end, with no clear connection to the actual root cause (home directory resolution failure at turn start).
+
+**Recommendation:** Either return an error from `resolveTranscriptRef` (changing the return type), or include the `sessionID` in the warning log so the failure can be correlated:
+
+```go
+logging.Warn(ctx, "copilot-cli: failed to resolve transcript path",
+    "sessionID", sessionID, "err", err)
+```
+
+This is the same pattern as the cursor agent (cursor/lifecycle.go:69-70), so I acknowledge this is a pre-existing design choice, but the Copilot agent has a chance to do better.
+
+---
+
+### Issue 3: `parseEventsFromBytes` / `parseEventsFromOffset` silently skip malformed JSONL lines
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/transcript.go`, lines 97-98, and similar at line 315 in `ExtractModifiedFilesFromOffset`
+
+**Severity:** MEDIUM
+
+**Issue Description:** Malformed JSONL lines are silently skipped with `continue` and no logging. The doc comment says "Malformed lines are silently skipped" -- at least this is documented -- but it means that if Copilot CLI changes its JSONL format or if a file is corrupted, the code will silently produce incomplete results. Modified files will be missed, prompts will be lost, and model extraction will fail, all without any indication.
+
+This pattern repeats in:
+- `parseEventsFromOffset` (line 97-98)
+- `extractModifiedFilesFromEvents` (line 118 and 128)
+- `extractPromptsFromEvents` (line 146)
+- `extractSummaryFromEvents` (line 161)
+- `extractModelFromEvents` (lines 198, 215)
+- `ExtractModifiedFilesFromOffset` (line 315)
+
+**Hidden Errors:**
+- Copilot CLI format changes that break our type definitions
+- Partially written JSON (race condition with active session)
+- Encoding issues
+
+**User Impact:** Silent data loss. Checkpoints may be missing files, prompts, or model information. The user has no way to know their data is incomplete.
+
+**Recommendation:** This is a design tradeoff (resilience vs. strictness for a streaming JSONL file), and skipping malformed lines is defensible for a file that may be actively written to. However, at minimum, consider counting skipped lines and logging a single summary warning if any were skipped:
+
+```go
+skipped := 0
+// ... in the loop:
+if err := json.Unmarshal(line, &ev); err != nil {
+    skipped++
+    continue
+}
+// ... after the loop:
+if skipped > 0 {
+    // Return a warning count alongside events, or log if ctx is available
+}
+```
+
+---
+
+### Issue 4: `InstallHooks` and `UninstallHooks` silently fall back to `"."` when worktree root resolution fails
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/hooks.go`, lines 49 and 168
+
+**Severity:** MEDIUM
+
+**Issue Description:** When `paths.WorktreeRoot(ctx)` fails, these functions fall back to `worktreeRoot = "."` without logging. If the CWD is not the repo root (e.g., the user is in a subdirectory, or in a container with a weird CWD), hooks will be installed to the wrong location -- `.github/hooks/entire.json` relative to the current directory instead of the repo root.
+
+I note this is the same pattern as the cursor agent (`cursor/hooks.go:62`), so this is a pre-existing issue being replicated. `AreHooksInstalled` at line 234 also does the same.
+
+**Hidden Errors:**
+- Not inside a git repository
+- Git directory resolution failure
+- Running from a subdirectory of the repo
+
+**User Impact:** Hooks silently installed in wrong directory. User thinks hooks are installed but they never fire. Debugging this would be extremely frustrating.
+
+**Recommendation:** At minimum, log a warning when falling back:
+
+```go
+worktreeRoot, err := paths.WorktreeRoot(ctx)
+if err != nil {
+    logging.Warn(ctx, "copilot-cli: could not resolve worktree root, falling back to cwd", "err", err)
+    worktreeRoot = "."
+}
+```
+
+---
+
+### Issue 5: `ExtractModelFromTranscript` has no `context.Context` -- preventing all logging
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/transcript.go`, line 231; also `lifecycle.go` lines 95-113 (`parseAgentStop`)
+
+**Severity:** MEDIUM
+
+**Issue Description:** `ExtractModelFromTranscript` is a package-level function with no `context.Context` parameter. The project's logging infrastructure (`logging.Debug/Warn/Error`) requires a context. This means the function structurally cannot use the project's logging system, which explains why errors are silently swallowed.
+
+Similarly, `parseAgentStop` (lifecycle.go:95) does not receive a `ctx` parameter, unlike `parseUserPromptSubmitted` which does. This prevents logging in the model extraction path.
+
+**User Impact:** Architectural gap that prevents proper observability for the core feature of this PR (model tracking).
+
+**Recommendation:** Add `ctx context.Context` as a parameter to `parseAgentStop` and pass it through to model extraction. Either make `ExtractModelFromTranscript` accept a context, or have the caller do the logging.
+
+---
+
+### Issue 6: `GetTranscriptPosition` returns 0 for empty path without error
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/transcript.go`, lines 254-256
+
+**Severity:** MEDIUM
+
+**Issue Description:** When `path` is empty, `GetTranscriptPosition` returns `(0, nil)` -- success with zero lines. This is the same return value as "file exists but is empty." An empty path is likely a bug upstream (e.g., from the `resolveTranscriptRef` failure in Issue 2), and returning success here masks it. The caller `CapturePrePromptState` in `lifecycle.go` will store position=0, and everything downstream will proceed as if the transcript is empty.
+
+**Hidden Errors:** Propagated from Issue 2 -- an empty `SessionRef` from a failed transcript resolution flows through here undetected.
+
+**User Impact:** Pre-prompt state captures a position of 0 when it should have failed. Modified file detection will then process the entire transcript on every turn instead of just the delta, causing duplicate file entries in checkpoints.
+
+**Recommendation:** Return an error for empty path, or at minimum document that `(0, nil)` for empty path is intentional and expected (and why).
+
+---
+
+### Issue 7: `ExtractModifiedFilesFromOffset` returns nil for empty path without error
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/transcript.go`, lines 296-298
+
+**Severity:** MEDIUM
+
+**Issue Description:** Same pattern as Issue 6. Returns `(nil, 0, nil)` for empty path, which the caller interprets as "no files modified, position 0" -- indistinguishable from legitimate "nothing happened."
+
+---
+
+### Issue 8: E2E `StartSession` discards `s.SendKeys` errors
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/1/e2e/agents/copilot-cli.go`, line 129
+
+**Severity:** MEDIUM
+
+**Issue Description:** `_ = s.SendKeys("Enter")` discards the error from sending keystrokes to the tmux session. If the tmux session has crashed or become unresponsive, this error is thrown away. The loop will continue trying to dismiss dialogs that no longer exist, eventually timing out on the next `WaitFor` with a confusing timeout error rather than the actual problem (tmux session gone).
+
+**Hidden Errors:**
+- Tmux session crashed
+- Tmux pane no longer exists
+- Tmux server connection lost
+
+**User Impact:** E2E test failures will show "waiting for startup prompt: timeout" instead of the real error (tmux session died). This is in test infrastructure, but CLAUDE.md says "tests should not be fixed by disabling them" -- and bad error handling in test infra makes debugging flaky tests much harder.
+
+**Recommendation:**
+```go
+if err := s.SendKeys("Enter"); err != nil {
+    _ = s.Close()
+    return nil, fmt.Errorf("failed to send Enter key to dismiss dialog: %w", err)
+}
+```
+
+---
+
+### Issue 9: `ReadSession` uses `time.Now()` as `StartTime` instead of actual session start
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/1/cmd/entire/cli/agent/copilotcli/copilotcli.go`, line 101
+
+**Severity:** LOW (not strictly error handling, but data quality)
+
+**Issue Description:** `ReadSession` sets `StartTime: time.Now()` regardless of when the session actually started. Since the transcript JSONL contains timestamped events, the actual start time is available but not used. This is not an error handling issue per se, but it means session metadata will have incorrect timing data.
+
+---
+
+### Summary of Findings
+
+| # | Severity | File | Issue |
+|---|----------|------|-------|
+| 1 | HIGH | transcript.go:231-247 | `ExtractModelFromTranscript` silently swallows all errors with no logging |
+| 2 | HIGH | lifecycle.go:143-152 | `resolveTranscriptRef` returns empty string, causing confusing downstream error |
+| 3 | MEDIUM | transcript.go:97-98 (+ 5 more) | Malformed JSONL lines silently skipped everywhere |
+| 4 | MEDIUM | hooks.go:49, 168, 234 | Worktree root fallback to `"."` without logging |
+| 5 | MEDIUM | transcript.go:231, lifecycle.go:95 | Missing `context.Context` prevents all logging in model extraction |
+| 6 | MEDIUM | transcript.go:254-256 | `GetTranscriptPosition` returns success for empty path |
+| 7 | MEDIUM | transcript.go:296-298 | `ExtractModifiedFilesFromOffset` returns success for empty path |
+| 8 | MEDIUM | copilot-cli.go:129 | E2E `SendKeys` error discarded |
+| 9 | LOW | copilotcli.go:101 | `ReadSession` uses fabricated `StartTime` |
+
+**The most concerning pattern** is the chain from Issues 1, 2, 5, 6, and 7: a failure to resolve the home directory (Issue 2) produces an empty `SessionRef` that silently flows through `GetTranscriptPosition` (Issue 6) and `ExtractModifiedFilesFromOffset` (Issue 7) as "zero/nothing" instead of an error, while model extraction (Issue 1) also silently returns empty. The net effect is that a single environment issue ($HOME missing) causes the entire session to produce degraded checkpoints with no model data and potentially incorrect file tracking, with only a single `logging.Warn` breadcrumb in a sea of "successful" operations.
+
+Issues 3 and 4 are pre-existing patterns shared with the cursor agent, so they represent inherited technical debt rather than new regressions. Still worth calling out since this is a chance to set a higher bar for the new agent.</result>
+<usage><total_tokens>45426</total_tokens><tool_uses>26</tool_uses><duration_ms>161744</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-1/tasks/a2bb228e6b1f36626.output
+
+---
+
+fix 1-3

@@ -1,0 +1,57 @@
+Implement the following plan:
+
+# Fix PR #607 Review Comments
+
+## Context
+PR #607 (stabilize Droid interactive E2E tests for CI) received 3 inline review comments from Copilot. All are valid improvements to robustness.
+
+## Fixes
+
+### 1. `e2e/testutil/repo.go:167` — Use `json.Marshal` for model ID string
+**Problem:** Building JSON via string concatenation (`"\"" + value + "\""`) can produce invalid JSON if the value contains special characters.
+**Fix:** Use `json.Marshal()` to properly encode the string. Note: Copilot suggested `agents.DroidCustomModelBaseID()` which doesn't exist — the actual exported function is `agents.DefaultDroidModel()` which returns `"custom:<baseID>"`. That's the value we want in the `model` setting, so we marshal that.
+
+**File:** `e2e/testutil/repo.go:167`
+```go
+// Before:
+repoSettings["model"] = json.RawMessage(`"` + agents.DefaultDroidModel() + `"`)
+
+// After:
+modelJSON, err := json.Marshal(agents.DefaultDroidModel())
+if err != nil {
+    return fmt.Errorf("marshal model setting: %w", err)
+}
+repoSettings["model"] = json.RawMessage(modelJSON)
+```
+
+### 2. `e2e/agents/tmux.go:162-169` — Treat tmux errors as dead pane
+**Problem:** `IsPaneDead()` returns `false` on tmux errors (e.g., session not found), causing `WaitFor` to poll the full timeout on a nonexistent pane.
+**Fix:** When tmux command fails, check if the error output indicates the session/pane no longer exists and treat that as dead.
+
+**File:** `e2e/agents/tmux.go:162-169`
+
+### 3. `e2e/agents/droid.go:202` — Make sleep context-aware
+**Problem:** `time.Sleep(2 * time.Second)` ignores context cancellation/deadlines.
+**Fix:** Replace with timer + select on `ctx.Done()`.
+
+**File:** `e2e/agents/droid.go:200-203`
+
+## Verification
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-droid-e2e-ci/3cb5d6d0-6d2d-4833-9d72-4a4f3087e3bf.jsonl
+
+---
+
+is IsPaneDead necessary / valuable?
+
+---
+
+commit and push
+
+---
+
+[Request interrupted by user for tool use]

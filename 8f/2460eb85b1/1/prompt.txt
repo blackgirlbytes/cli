@@ -1,0 +1,523 @@
+I had to clean up changes in this repo. Can you apply the last step again?
+
+---
+
+Continue
+
+---
+
+Continue
+
+---
+
+Should we rename V2Store to V2GitStore to be consistent with the naming of the original store. V2Store could mean anything, really.
+
+---
+
+I found that writeMainSessionEntries isn't a great name considering that it's supposed to mirror writeStandardCheckpointEntries. Can we do better here? I feel like the function name should at least state that it's related to checkpoints.
+
+---
+
+writeMainCheckpointEntries sounds good.
+
+---
+
+The comments for writeMainSessionToSubdirectory state that it writes to a numbered subdirectory. What about this subdirectory is numbered?
+
+---
+
+I think the name is fine but we should update the comments to indicate what numbered means.
+
+---
+
+Continue
+
+---
+
+writeCommittedFull could be named writeCommittedFullTranscript. What do you think?
+
+---
+
+Should we rename writeTranscriptOnly to writeTranscriptOnlyBlobs or something similar? I'm open to suggestions.
+
+---
+
+Yes, I like it
+
+---
+
+Just to clarify: What would the file structure stored via writeCommittedFullTranscript look like on disk? Can you give me an example?
+
+---
+
+What happens to the `/full/current` ref when a new checkpoint is added. Please explain with examples.
+
+---
+
+This behavior is wrong! Based on the document in ~/entire/company-knowledge/rfds/rfd-009-transcript-compaction.md, we should only store the transcript of the latest checkpoint under this ref. We'll implement a mechanism to rotate the `/full/*` transcripts later but the `/full/current` ref shouldn't continue to grow and should only ever contain the transcripts for the latest checkpoint.
+
+---
+
+Thanks
+
+---
+
+Yes
+
+---
+
+I just noticed that the `content_hash.txt` file is stored in the `/main` ref and not together with the `full.jsonl` file the hash is referencing. Since it seems to be mostly used by tess, I think it would make sense to store it together with the hashed content so we won't end in a situation where we're storing hashes for files we can't resolve anymore.
+
+---
+
+continue
+
+---
+
+continue
+
+---
+
+Can you ensure that we also have integration test coverage for the changes in this branch?
+
+---
+
+Okay, is there anything else to do now?
+
+---
+
+/requesting-code-review Thoroughly review the changes in this branch against origin/main.
+
+---
+
+Yes
+
+---
+
+/requesting-code-review Thoroughly review the changes in this branch against origin/main.
+
+---
+
+Yes
+
+---
+
+Can you open a pull request for me?
+
+---
+
+Wait. Why did you mark all attributes in SessionFilePaths as optional and not just Transrtipd and ContentHash?
+
+---
+
+Can you fetch the PR comments and see which ones need to be addressed?
+
+---
+
+About validateWriteOpts: I've reverted its use in the V1 store and you should take that into account. I want the changes to ungated production code here to be minimal.
+
+---
+
+About validateWriteOpts: I've reverted its use in the V1 store and you should take that into account. I want the changes to ungated production code here to
+be minimal.
+
+---
+
+Here's another comment: When the session ID is not found, this falls back to the latest session index but does not log anything. The v1 UpdateCommitted path logs a debug message for this fallback; adding similar logging here would make session-ID mismatches diagnosable in production.
+
+---
+
+There were a few more comments on the PR. Can you check the ones that are unresolved and see if we need to address them?
+
+---
+
+Can you address the settings reload issue. I'll address the other ones myself.
+
+---
+
+I just realized that based on the RFD linked above, the plan is to have the `/full/current` ref accummulate multiple checkpoints before the ref is being rotated. I think I told you do do the opposite. Can you double check against ~/entire/company-knowledge/rfds/rfd-009-transcript-compaction.md and ensure that storing the full transcript works as intended.
+
+---
+
+Can you update the PR description to match the changes in the code?
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a06e6e62354ca7b25</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-refs/317bd5c0-3100-469e-b083-e42918bc4693/tasks/a06e6e62354ca7b25.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>I have now reviewed all the relevant code. Here is my analysis.
+
+---
+
+## Efficiency Review: V2 Dual-Write Diff
+
+### Finding 1 (High): Double redaction of transcripts in the finalize path
+
+**Location:** `manual_commit_hooks.go:2252` + `v2_committed.go:439`
+
+In `finalizeAllTurnCheckpoints`, the transcript is redacted once at line 2252 via `redact.JSONLBytes(fullTranscript)`. The already-redacted bytes are then passed as `updateOpts.Transcript` to `v2Store.UpdateCommitted`, which calls `updateCommittedFullTranscript` -> `writeTranscriptBlobs`, which calls `redact.JSONLBytes(transcript)` again on the same data (line 439). The v1 `UpdateCommitted` also re-redacts (line 1179), described as a "safety net," so the v2 path applies redaction a third time total (once in the hook, once in v1, once in v2). `redact.JSONLBytes` parses and processes every line of potentially large JSONL data, so this is non-trivial work.
+
+Similarly in `CondenseSession`, the v1 `WriteCommitted` redacts the raw transcript internally (`committed.go:562`), and the same `writeOpts` (with the same raw transcript bytes) are passed to v2, which also redacts. This means redaction happens twice per checkpoint in the condense path. However, the double-redaction in the condense path is arguably intentional since the v1 and v2 stores both need to independently ensure redaction. The finalize path is worse because the caller *also* redacts before either store sees it (triple redaction).
+
+**Severity:** Moderate. Transcripts can be large (hundreds of KB to MBs). Redundant parsing and regex scanning is wasteful.
+
+### Finding 2 (High): `writeCommittedV2IfEnabled` re-reads settings from disk
+
+**Location:** `manual_commit_condensation.go:921`
+
+`writeCommittedV2IfEnabled` calls `settings.IsCheckpointsV2Enabled(ctx)` which calls `settings.Load(ctx)`, which reads and parses `settings.json` and `settings.local.json` from disk every time. In `CondenseSession`, the v2 flag was not already evaluated, so this is an extra pair of file reads. By contrast, in `finalizeAllTurnCheckpoints`, the code correctly evaluates the flag once before the loop (line 2269). If `CondenseSession` were called multiple times in a session (e.g., interleaved commits), each call would re-read settings from disk via `writeCommittedV2IfEnabled`. This is low-frequency enough that it's minor, but inconsistent with the pattern used in `finalizeAllTurnCheckpoints`.
+
+**Severity:** Low. `CondenseSession` is typically called once per commit, not in a tight loop. But the inconsistency is worth noting.
+
+### Finding 3 (Medium): Repeated `GetGitAuthorFromRepo` calls within a single operation
+
+**Location:** `v2_committed.go:138`, `v2_committed.go:192`
+
+Both `updateCommittedMain` (line 138) and `updateCommittedFullTranscript` (line 192) independently call `GetGitAuthorFromRepo(s.repo)`, which reads the git config (potentially both local and global config files). This happens within a single `UpdateCommitted` call. The same pattern exists in `WriteCommitted` where `writeCommittedMain` uses `opts.AuthorName/AuthorEmail` (passed from the caller), but `writeCommittedFullTranscript` also uses `opts.AuthorName/AuthorEmail`. So `WriteCommitted` is fine -- but `UpdateCommitted` redundantly resolves the author twice because `UpdateCommittedOptions` doesn't carry author info and both sub-methods resolve it independently.
+
+**Severity:** Low. Git config reads are fast but this is still unnecessary duplicate work.
+
+### Finding 4 (Medium): Redundant `ensureRef` + `getRefState` call sequence
+
+**Location:** `v2_committed.go:151-158` (`updateCommittedFullTranscript`) and `v2_committed.go:207-214` (`writeCommittedMain`)
+
+Both `writeCommittedMain` and `writeCommittedFullTranscript` call `ensureRef(refName)` followed by `getRefState(refName)`. The `ensureRef` method calls `s.repo.Reference(refName, true)` to check existence, and then `getRefState` calls `s.repo.Reference(refName, true)` again to get the hash. This is a redundant ref lookup that could be combined into a single "ensure and return state" method.
+
+**Severity:** Low. These are in-memory lookups via go-git's storer interface, so they're fast. But the pattern is repeated 4+ times across the new code (twice for WriteCommitted, twice for UpdateCommitted).
+
+### Finding 5 (Medium): Sequential writes to /main and /full/current when they could be parallelized
+
+**Location:** `v2_committed.go:34-44` (`WriteCommitted`) and `v2_committed.go:54-71` (`UpdateCommitted`)
+
+`WriteCommitted` writes to `/main` first, then `/full/current` sequentially. These two refs are independent -- they don't share state, and the only dependency is `sessionIndex` computed from `/main`. Once the session index is known, the actual git tree building and commit creation for `/full/current` could in principle be done concurrently with the `/main` write. However, since there's a data dependency (sessionIndex), and these are local git operations (not network), the benefit would be marginal. Noting for completeness.
+
+**Severity:** Low. Both operations are local git I/O, not network calls.
+
+### Finding 6 (Low): `validateWriteOpts` called redundantly in `writeCommittedFullTranscript`
+
+**Location:** `v2_committed.go:392` vs `v2_committed.go:202`
+
+When `WriteCommitted` is called, `writeCommittedMain` calls `validateWriteOpts(opts)` at line 202. Then `writeCommittedFullTranscript` calls `validateWriteOpts(opts)` again at line 392 with the same options. The validation does string checks on checkpoint ID, session ID, tool use ID, and agent ID -- this is cheap, but redundant since the same options are validated twice in the same `WriteCommitted` call.
+
+**Severity:** Negligible. String validation is very cheap.
+
+### Finding 7 (Informational): `NewV2GitStore` allocates a new `GitStore` wrapper on every call
+
+**Location:** `manual_commit_condensation.go:925`, `manual_commit_hooks.go:2270`
+
+Both call sites allocate `cpkg.NewV2GitStore(repo)` which internally allocates a new `GitStore{repo: repo}`. In the finalize loop, this happens once before the loop (correct). In `writeCommittedV2IfEnabled`, a new store is created per `CondenseSession` call. These are small allocations so this is not a real issue, but if there's ever a need for caching (e.g., memoizing `ensureRef` calls), the ephemeral nature of these store instances would prevent it.
+
+**Severity:** Negligible.
+
+### Finding 8 (Informational): `os.ReadFile` for transcript fallback could read unbounded data
+
+**Location:** `v2_committed.go:389`
+
+`writeCommittedFullTranscript` falls back to `os.ReadFile(opts.TranscriptPath)` if `opts.Transcript` is empty. This reads the entire file into memory with no size limit. The v1 code has the same pattern (`committed.go:550`), so this is not a regression, but it's worth noting that for very large transcripts this could spike memory usage.
+
+**Severity:** Pre-existing. Not introduced by this diff.
+
+---
+
+### Summary
+
+The most actionable finding is **Finding 1 (double/triple redaction)**. In the `finalizeAllTurnCheckpoints` path, the transcript is redacted by the caller, then redacted again by v1's `UpdateCommitted`, and redacted a third time by v2's `writeTranscriptBlobs`. Each pass scans and parses the full JSONL transcript. For the finalize path, since the caller already redacts at line 2252 and also redacts prompts at line 2261-2263, both stores are doing redundant safety-net redaction. This is tripled work on what can be the largest data structure in the system.
+
+The remaining findings are low-severity or negligible. The code correctly evaluates the v2 flag once before the finalize loop (avoiding per-iteration settings reads), and the sequential nature of the /main + /full/current writes is appropriate given the session-index dependency.</result>
+<usage><total_tokens>81208</total_tokens><tool_uses>35</tool_uses><duration_ms>167144</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-refs/317bd5c0-3100-469e-b083-e42918bc4693/tasks/a06e6e62354ca7b25.output
+
+---
+
+<task-notification>
+<task-id>afa2c20bbcf861f7c</task-id>
+<tool-use-id>toolu_01CuTRJAMgPTizX9WC8rXLXx</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-refs/317bd5c0-3100-469e-b083-e42918bc4693/tasks/afa2c20bbcf861f7c.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>I now have a complete picture. Here is my review.
+
+---
+
+## Code Review: V2 Dual-Write Diff
+
+### 1. Copy-Paste with Slight Variation (Major)
+
+**`v2_committed.go` vs `committed.go` -- pervasive near-duplication**
+
+The core finding is that `v2_committed.go` is substantially a copy-paste of `committed.go` with minor variations (different ref name, transcript split out). Several blocks are nearly identical:
+
+- **Prompt writing** (`redact.String(strings.Join(opts.Prompts, "\n\n---\n\n"))` + `CreateBlobFromContent` + entry insertion): Appears in 4 locations across both files (`committed.go:353`, `committed.go:1190`, `v2_committed.go:121`, `v2_committed.go:301`). This should be a shared helper like `writePromptBlob(repo, prompts, sessionPath, entries)`.
+
+- **Session metadata construction** (`v2_committed.go:321-342` vs `committed.go:367-388`): The `CommittedMetadata` literal is copy-pasted verbatim between `writeMainSessionToSubdirectory` and `writeSessionToSubdirectory`. Same field ordering, same backward-compat dual-write of `TranscriptLinesAtStart`. If a field is added to `CommittedMetadata`, it must be updated in both places.
+
+- **Content hash writing** (`v2_committed.go:363-375` vs `committed.go:587-598`): The `sha256:%x` formatting + blob creation + entry insertion is duplicated. The v2 code extracted `writeContentHash` but only uses it internally. This helper could be shared with v1's `writeTranscript` and `replaceTranscript`.
+
+- **Transcript writing with redaction + chunking** (`v2_committed.go:443-468` vs `committed.go:545-599` and `committed.go:1224-1269`): The v2 `writeTranscriptBlobs` method is essentially the same logic as the chunk-writing portion of v1's `writeTranscript` and `replaceTranscript`, but reimplemented on `V2GitStore`. The redact-then-chunk-then-write pattern is now in three places.
+
+- **Session index finding with fallback** (`v2_committed.go:106-115` vs `committed.go:1152-1172`): The v2 `updateCommittedMain` reimplements the "find session index, fall back to latest" logic from v1's `UpdateCommitted`. The v1 version does an inline loop with `sessionIndex = -1` while v2 calls `findSessionIndex` then checks `>= len`. Different implementations of the same fallback behavior.
+
+- **"Clear entries at session path" loop** (`v2_committed.go:171-175` and `v2_committed.go:299-303`): The `for key := range entries { if strings.HasPrefix(key, sessionPath) { delete(entries, key) } }` pattern appears twice in the new code and also exists in v1 (`committed.go:338-342`).
+
+### 2. Redundant State / Derivable Values
+
+**`basePath` and `checkpointPath`** (`v2_committed.go:82-83`, `v2_committed.go:160-161`, `v2_committed.go:216-217`, `v2_committed.go:406-407`): Every method computes both `basePath = opts.CheckpointID.Path() + "/"` and `checkpointPath = opts.CheckpointID.Path()`. These are the same value with/without a trailing slash. The `basePath` is just `checkpointPath + "/"`. This is repeated in every function. A small struct or single local could eliminate the duplication and the risk of using the wrong one.
+
+### 3. Inconsistent Dual-Write Wiring Patterns (Leaky Abstraction)
+
+The `CondenseSession` path uses a free function `writeCommittedV2IfEnabled` that encapsulates the feature-flag check internally. The `finalizeAllTurnCheckpoints` path uses an inline `if v2Store != nil` check with a pre-allocated store outside the loop. These are two different patterns for the same concern (conditional v2 dual-write).
+
+The `writeCommittedV2IfEnabled` function creates a new `V2GitStore` on every call, while the finalize path pre-allocates one store and reuses it across the loop. The condensation path could benefit from the same optimization (though it's called once, not in a loop, so the cost difference is negligible). More importantly, the inconsistency means a future maintainer must know both patterns.
+
+A unified helper (or a thin wrapper struct that holds both stores) would reduce this to one pattern.
+
+### 4. Unnecessary Comments
+
+Several comments narrate what the code does rather than explaining non-obvious intent:
+
+- `v2_committed.go:32-38` (the `WriteCommitted` doc comment): "This is the public entry point for v2 dual-writes. The session index is determined from the /main ref and passed to the /full/current write to keep both refs consistent." -- This is already apparent from reading the two method calls.
+
+- `v2_committed.go:250-251`: `// writeMainCheckpointEntries orchestrates writing session data to the /main ref. It mirrors GitStore.writeStandardCheckpointEntries but excludes raw transcript blobs.` -- "mirrors ... but excludes" is a description of the copy-paste relationship, not a design constraint. If the duplication were eliminated, this comment would be unnecessary.
+
+- `v2_committed.go:119`: `// Replace prompts` -- Self-evident from the code that follows.
+
+- `v2_committed.go:96`: `// Read root summary to find session index` -- The variable name `rootMetadataPath` and `findSessionIndex` call make this clear.
+
+- `v2_committed.go:416-417`: `// Read existing entries at this checkpoint's shard path (accumulate, don't replace)` -- "accumulate, don't replace" is the non-obvious WHY and is worth keeping; the rest is noise.
+
+- `v2_committed.go:431`: `// Splice into existing root tree (preserves other checkpoints' transcripts)` -- The parenthetical is useful; the leading text is what the function name says.
+
+- `manual_commit_condensation.go:652-653`: `// Dual-write to v2 refs when enabled` -- Comment just restates the function name.
+
+- `manual_commit_hooks.go:2267`: `// Evaluate v2 flag once before the loop to avoid re-reading settings per checkpoint` -- This one is good; it explains a performance-motivated design choice.
+
+### 5. Validation Asymmetry (Potential Bug / Leaky Abstraction)
+
+`validateWriteOpts` in `v2_committed.go` is called in `writeCommittedMain` and `writeCommittedFullTranscript`, but **not** in the public `WriteCommitted` entry point. The v1 `GitStore.WriteCommitted` validates inline at the top of the method. The v2 approach validates in each sub-method, meaning the `writeCommittedFullTranscript` validates *after* `writeCommittedMain` has already committed to the `/main` ref. If validation fails in the full-transcript step, `/main` has been updated but `/full/current` has not, leaving the refs inconsistent. Validation should happen once, upfront, in the public `WriteCommitted` method.
+
+Similarly, `UpdateCommitted` validates `CheckpointID.IsEmpty()` but does not call `validateWriteOpts` (which also checks `SessionID`, `ToolUseID`, and `AgentID`). The v2 `UpdateCommittedOptions` does carry `SessionID` and `Agent`, but `ToolUseID`/`AgentID` aren't on that struct, so the asymmetry may be intentional. However, `SessionID` validation is silently skipped for updates.
+
+### 6. `V2GitStore` Wraps `GitStore` but Exposes Internal Structure
+
+`V2GitStore` holds a `*GitStore` as `gs` and calls unexported methods on it (`gs.flattenCheckpointEntries`, `gs.findSessionIndex`, `gs.spliceCheckpointSubtree`, `gs.writeCheckpointSummary`). This works because they're in the same package, but it creates a tight coupling where `V2GitStore` depends on `GitStore`'s internal method signatures. If `GitStore` methods change (e.g., adding a new parameter), `V2GitStore` breaks silently. This coupling is acknowledged in the `V2GitStore` doc comment but it still represents a leaky abstraction -- the v2 store is not really "separate" from v1 despite the stated goal of "keep concerns isolated and simplify future v1 removal."
+
+### 7. `ensureRef` in `updateCommittedFullTranscript` (Subtle Behavioral Difference)
+
+In `updateCommittedFullTranscript` (line 151), `ensureRef` is called before `getRefState`. This means an update to `/full/current` will *create* the ref if it doesn't exist, then proceed to write to it. This is fine for writes, but for updates, if `/full/current` doesn't have the checkpoint yet (because the initial write had no transcript), the update will succeed in creating the ref and writing the transcript -- which is arguably correct. But `updateCommittedMain` does *not* call `ensureRef` and instead returns `ErrCheckpointNotFound` if the ref doesn't exist. The asymmetry between the two update methods is subtle and could mask bugs.
+
+### Summary of Key Findings
+
+| # | Category | Severity | Location |
+|---|----------|----------|----------|
+| 1 | Copy-paste with slight variation | High | `v2_committed.go` entire file vs `committed.go` (prompt writing, metadata construction, content hash, transcript writing, session clearing) |
+| 2 | Redundant state | Low | `basePath`/`checkpointPath` computed redundantly in every method |
+| 3 | Inconsistent patterns | Medium | `writeCommittedV2IfEnabled` free function vs inline `if v2Store != nil` in `manual_commit_hooks.go` |
+| 4 | Unnecessary comments | Low | Multiple WHAT comments throughout new code |
+| 5 | Validation ordering | Medium | Validation happens in sub-methods after partial writes, not at entry point |
+| 6 | Leaky abstraction | Medium | `V2GitStore.gs` directly calls unexported `GitStore` methods |
+| 7 | Behavioral asymmetry | Low | `ensureRef` called in update-full but not update-main |</result>
+<usage><total_tokens>92795</total_tokens><tool_uses>48</tool_uses><duration_ms>257222</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-refs/317bd5c0-3100-469e-b083-e42918bc4693/tasks/afa2c20bbcf861f7c.output
+
+---
+
+<task-notification>
+<task-id>a92fede576b71e6ec</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-refs/317bd5c0-3100-469e-b083-e42918bc4693/tasks/a92fede576b71e6ec.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>Now I have a thorough understanding of the codebase. Let me compile my findings.
+
+---
+
+Here is my analysis of code reuse opportunities in the v2 dual-write diff, organized by file.
+
+## 1. `v2_committed.go` -- Duplicated patterns from `committed.go`
+
+### Finding 1: `validateWriteOpts` duplicates inline validation in `GitStore.WriteCommitted`
+
+**New code** (`v2_committed.go:472-486`): `validateWriteOpts(opts WriteCommittedOptions)` validates `CheckpointID`, `SessionID`, `ToolUseID`, and `AgentID`.
+
+**Existing code** (`committed.go:47-59`): The v1 `GitStore.WriteCommitted` has identical inline validation logic:
+```go
+if opts.CheckpointID.IsEmpty() { ... }
+if err := validation.ValidateSessionID(opts.SessionID); err != nil { ... }
+if err := validation.ValidateToolUseID(opts.ToolUseID); err != nil { ... }
+if err := validation.ValidateAgentID(opts.AgentID); err != nil { ... }
+```
+
+**Suggestion:** Extract `validateWriteOpts` as a package-level helper and have *both* v1 `WriteCommitted` and v2 `WriteCommitted` call it, eliminating the inline duplication in v1.
+
+### Finding 2: `CommittedMetadata` struct literal duplicated verbatim
+
+**New code** (`v2_committed.go`, `writeMainSessionToSubdirectory`, diff lines 321-342): Builds a `CommittedMetadata` with ~20 fields copied from `WriteCommittedOptions`.
+
+**Existing code** (`committed.go:367-388`, `writeSessionToSubdirectory`): Identical struct literal, same field-for-field mapping.
+
+**Suggestion:** Extract a `buildSessionMetadata(opts WriteCommittedOptions) CommittedMetadata` helper. Both v1 and v2 can call it. If they diverge later, the v2 version can override specific fields.
+
+### Finding 3: Prompt joining + redaction pattern repeated 4 times
+
+The expression `redact.String(strings.Join(opts.Prompts, "\n\n---\n\n"))` appears at:
+- `committed.go:353` (v1 `writeSessionToSubdirectory`)
+- `committed.go:1190` (v1 `UpdateCommitted`)
+- `v2_committed.go:121` (v2 `updateCommittedMain`)
+- `v2_committed.go:301` (v2 `writeMainSessionToSubdirectory`)
+
+**Suggestion:** Extract `func redactAndJoinPrompts(prompts []string) string` and use it in all four locations.
+
+### Finding 4: Content hash computation repeated 3 times
+
+The pattern `fmt.Sprintf("sha256:%x", sha256.Sum256(...))` appears at:
+- `committed.go:588` (v1 `writeTranscript`)
+- `committed.go:1256` (v1 `replaceTranscript`)
+- `v2_committed.go:358` (v2 `writeContentHash`)
+
+**Suggestion:** Extract `func computeContentHash(data []byte) string`. The v2 code already factors this into `writeContentHash`, but the computation itself could be shared with v1.
+
+### Finding 5: `writeTranscriptBlobs` largely duplicates v1's transcript writing logic
+
+**New code** (`v2_committed.go:443-468`): `writeTranscriptBlobs` redacts, chunks, and writes transcript blobs to entries.
+
+**Existing code** (`committed.go:547-598`): `writeTranscript` does the same thing plus reads from file and writes content hash. `replaceTranscript` (`committed.go:1224-1269`) also has the same chunk-write loop.
+
+The core logic -- redact, chunk, write blobs in a loop -- is identical. The differences are: (a) v1 also reads from file, (b) v1 also writes the content hash inline, (c) v2 returns the redacted bytes. These are composable.
+
+**Suggestion:** Extract a shared helper like `func writeChunkedTranscriptBlobs(repo, redactedTranscript, agentType, basePath, entries)` that just does the chunk-and-write loop. Both v1 and v2 can compose around it.
+
+### Finding 6: "Clear existing entries at session path" loop repeated 4 times
+
+The pattern `for key := range entries { if strings.HasPrefix(key, sessionPath) { delete(entries, key) } }` appears at:
+- `committed.go:339` (v1 `writeSessionToSubdirectory`)
+- `committed.go:1229-1233` (v1 `replaceTranscript`, clearing transcript-specific entries)
+- `v2_committed.go:173` (v2 `updateCommittedFullTranscript`)
+- `v2_committed.go:295` (v2 `writeMainSessionToSubdirectory`)
+
+**Suggestion:** Extract `func clearEntriesWithPrefix(entries map[string]object.TreeEntry, prefix string)`.
+
+## 2. `v2_store.go` -- Duplicated patterns from `committed.go` / `parse_tree.go`
+
+### Finding 7: `ensureRef` duplicates `ensureSessionsBranch`
+
+**New code** (`v2_store.go:35-58`): `V2GitStore.ensureRef` creates an orphan commit with an empty tree if the ref doesn't exist.
+
+**Existing code** (`committed.go:1272-1296`): `GitStore.ensureSessionsBranch` does the same thing, just hardcoded to the v1 branch ref name.
+
+The logic is identical: check if ref exists, build empty tree, create orphan commit, set reference. The only difference is the ref name and commit message.
+
+**Suggestion:** Extract a package-level `func ensureOrphanRef(repo *git.Repository, refName plumbing.ReferenceName, message string) error` that both v1 and v2 can call.
+
+### Finding 8: `getRefState` duplicates `getSessionsBranchRef`
+
+**New code** (`v2_store.go:61-73`): `V2GitStore.getRefState` gets parent hash and tree hash for a ref.
+
+**Existing code** (`parse_tree.go:296-309`): `GitStore.getSessionsBranchRef` does the same thing, hardcoded to v1 branch.
+
+**Suggestion:** Extract a package-level `func getRefState(repo *git.Repository, refName plumbing.ReferenceName) (plumbing.Hash, plumbing.Hash, error)`.
+
+### Finding 9: `updateRef` duplicates the commit-and-set-reference pattern in v1
+
+**New code** (`v2_store.go:76-88`): Creates a commit and updates a ref.
+
+**Existing code** (`committed.go:104-114`): The v1 `WriteCommitted` does `createCommit` + `SetReference` inline.
+
+**Suggestion:** `updateRef` is a reasonable abstraction. v1 could be refactored to use it too, but this is lower priority since it's only a few lines.
+
+## 3. `v2_store_test.go` -- Test helper duplication
+
+### Finding 10: `initTestRepo` duplicates `setupRepoForUpdate` (partial) and inline test setup
+
+**New code** (`v2_store_test.go:23-42`): `initTestRepo` creates a temp dir, inits a repo, writes a README, adds/commits.
+
+**Existing code** (`committed_update_test.go:20-46`): `setupRepoForUpdate` does the same init + initial commit, then also writes a checkpoint. The first ~20 lines are identical.
+
+Many other test files in the `checkpoint` package (`checkpoint_test.go`, `backwards_compat_test.go`, etc.) repeat this exact pattern inline (PlainInit, write file, add, commit with test author). There are 20+ instances.
+
+**Suggestion:** Extract `initTestRepo` (or a variant) to a test helper file shared across the `checkpoint` package tests. `setupRepoForUpdate` can call `initTestRepo` instead of duplicating the init logic.
+
+### Finding 11: `v2MainTree` / `v2FullTree` / `v2ReadFile` -- generic test helpers
+
+**New code** (`v2_store_test.go:178-197`): `v2MainTree`, `v2FullTree`, `v2ReadFile` read trees and files from refs.
+
+These are thin wrappers around `repo.Reference` + `CommitObject` + `Tree` + `tree.File` + `file.Contents`. The pattern is identical to what `ReadFileFromRef` does in `testenv.go`. While they serve different test contexts (unit vs integration), the duplication is worth noting.
+
+## 4. `testenv.go` (integration test) -- Refactoring opportunity
+
+### Finding 12: `ReadFileFromRef` almost entirely duplicates `ReadFileFromBranch`
+
+**New code** (`testenv.go:861-895`): `ReadFileFromRef` takes a full ref name.
+
+**Existing code** (`testenv.go:812-855`): `ReadFileFromBranch` takes a branch name, prepends `refs/heads/`.
+
+The bodies are identical except for the ref-resolution step. `ReadFileFromBranch` could be implemented as `ReadFileFromRef("refs/heads/" + branchName)` (adjusting for the fallback logic).
+
+**Suggestion:** Implement `ReadFileFromBranch` in terms of `ReadFileFromRef` to eliminate the duplicated commit/tree/file reading logic.
+
+### Finding 13: `RefExists` duplicates `BranchExists` logic
+
+**New code** (`testenv.go:897-907`): `RefExists` checks if a ref exists.
+
+**Existing code** (`testenv.go:744-754`): `BranchExists` does the same thing with `plumbing.NewBranchReferenceName`.
+
+**Suggestion:** `BranchExists` could be `return env.RefExists("refs/heads/" + branchName)` (noting `NewBranchReferenceName` prepends `refs/heads/`).
+
+## 5. Strategy files -- minor observations
+
+### Finding 14: `writeCommittedV2IfEnabled` is clean but could benefit from being alongside the update path
+
+The `writeCommittedV2IfEnabled` helper (condensation.go:921-935) encapsulates the v2 dual-write for `WriteCommitted`. However, for `UpdateCommitted` in `manual_commit_hooks.go:2300-2309`, the equivalent v2 logic is inlined rather than using a similar helper.
+
+**Suggestion:** Consider extracting `updateCommittedV2IfEnabled(ctx, v2Store, opts)` to parallel `writeCommittedV2IfEnabled`, keeping the pattern consistent.
+
+---
+
+## Summary (ranked by impact)
+
+| # | Severity | Description | Files involved |
+|---|----------|-------------|----------------|
+| 2 | High | `CommittedMetadata` struct literal duplicated verbatim | `v2_committed.go`, `committed.go` |
+| 5 | High | Transcript write logic (redact + chunk + blob loop) duplicated across 3 methods | `v2_committed.go`, `committed.go` |
+| 7 | Medium | `ensureRef` duplicates `ensureSessionsBranch` | `v2_store.go`, `committed.go` |
+| 8 | Medium | `getRefState` duplicates `getSessionsBranchRef` | `v2_store.go`, `parse_tree.go` |
+| 1 | Medium | `validateWriteOpts` duplicates inline validation in v1 | `v2_committed.go`, `committed.go` |
+| 3 | Medium | Prompt join+redact pattern repeated 4 times | `v2_committed.go`, `committed.go` |
+| 6 | Low | "Clear entries with prefix" loop repeated 4 times | `v2_committed.go`, `committed.go` |
+| 4 | Low | Content hash computation repeated 3 times | `v2_committed.go`, `committed.go` |
+| 12 | Low | `ReadFileFromRef` duplicates `ReadFileFromBranch` | `testenv.go` |
+| 13 | Low | `RefExists` duplicates `BranchExists` | `testenv.go` |
+| 10 | Low | `initTestRepo` duplicates test setup across many test files | `v2_store_test.go`, `committed_update_test.go`, etc. |
+| 14 | Low | Inline v2 update logic could use a helper like `writeCommittedV2IfEnabled` | `manual_commit_hooks.go` |</result>
+<usage><total_tokens>101136</total_tokens><tool_uses>58</tool_uses><duration_ms>290999</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-checkpoints-v2-refs/317bd5c0-3100-469e-b083-e42918bc4693/tasks/a92fede576b71e6ec.output
+
+---
+
+Can you check the project plan in ~/entire/cli/docs/superpowers/specs/2026-03-19-checkpoints-v2-design.md and double check if anything needs to be updated based on the changes in this branch?
+
+---
+
+Yes
+
+---
+
+It might make sense to move the external agent compaction protocol back until we have a formal spec of the compacted format that we can expect from external agents. What do you think?
+
+---
+
+Yes
+
+---
+
+Wait. I think this should still be done, just later than before. Keep it in the current scope, though.

@@ -1,0 +1,188 @@
+Implement the following plan:
+
+# Review: Kiro-Specific Changes in Agent-Agnostic Files
+
+## Context
+
+The `alisha/kiro-oneshot` branch adds Kiro agent support. The Kiro-specific logic is properly isolated in `cmd/entire/cli/agent/kiro/`, but several agent-agnostic files were also modified. This review assesses whether those shared-file changes are necessary and whether any can be moved into the Kiro package.
+
+---
+
+## File-by-File Analysis
+
+### 1. `cmd/entire/cli/agent/event.go` — stdin timeout + `ErrEmptyHookInput`
+
+**Changes:** Replaced synchronous `io.ReadAll(stdin)` with a goroutine + 500ms `select` timeout. Added exported `ErrEmptyHookInput` sentinel error.
+
+**Why it's here:** Kiro IDE keeps stdin pipes open without sending EOF, causing `io.ReadAll` to block forever. The timeout prevents hanging.
+
+**Verdict: KEEP in shared code, but with concerns.**
+
+- The sentinel error (`ErrEmptyHookInput`) is cleanly designed — Kiro's `readHookInputOrEmpty()` checks for it with `errors.Is()`, which is the right pattern.
+- However, the **goroutine + timeout approach has a goroutine leak**: when the timeout fires, the goroutine calling `io.ReadAll` is abandoned but never terminates (it blocks forever on the open stdin pipe). This is a resource leak that persists for the lifetime of the process.
+
+**Recommendation:**
+- **Cannot move to Kiro package** — `ReadAndParseHookInput` is the shared helper all agents call; the fix must live here.
+- **Fix the goroutine leak**: The leaking goroutine is low-severity (hook processes are short-lived), but it's still worth documenting with a comment, or better, accepting `context.Context` so callers can bound the goroutine's lifetime. At minimum, add a comment acknowledging the leak.
+- Consider whether the old behavior (returning error on empty stdin) should remain the default, with Kiro wrapping it. Currently `ErrEmptyHookInput` is returned to ALL agents on empty stdin — previously it was an anonymous `errors.New("empty hook input")` that agents couldn't match with `errors.Is`. This is a **behavioral change**: agents that previously got an opaque error now get a matchable sentinel. This is fine but worth noting.
+
+---
+
+### 2. `cmd/entire/cli/strategy/manual_commit_hooks.go` — `agentUsesTerminal()`
+
+**Changes:** Added `agentUsesTerminal()` predicate that returns true only for `AgentTypeKiro`. Modified the PrepareCommitMsg fast path from `if !hasTTY()` to `if !hasTTY() || agentUsesTerminal(state.AgentType)`.
+
+**Why it's here:** Kiro runs in tmux, so `hasTTY()` returns true even when the *agent* is committing (not the user). Without this, the hook would prompt the user during an agent-driven commit.
+
+**Verdict: MUST stay in shared code (strategy layer), but the hardcoded agent check is concerning.**
+
+The strategy layer necessarily handles all agents — `PrepareCommitMsg` runs as a git hook and must decide per-agent. However:
+
+- **`agentUsesTerminal()` hardcodes `agent.AgentTypeKiro`** — this is a Kiro-specific check leaking into strategy code.
+- **Better pattern: Use an optional interface.** The codebase already has 8 optional interfaces (`TranscriptPreparer`, `HookResponseWriter`, etc.). A `TerminalAgent` interface (or a method on `HookSupport` like `UsesTerminal() bool`) would let the agent declare this trait, and the strategy would do a type assertion instead of checking agent names.
+
+**Recommendation:**
+- Add a small optional interface (e.g., `TerminalAgent`) to `agent/agent.go`, have Kiro implement it, and replace the hardcoded check in `manual_commit_hooks.go` with a type assertion. This removes the Kiro import from the strategy package entirely.
+- Alternatively, if adding an interface feels heavy for a single boolean, add a `UsesTerminal` field to the session state (set by the agent at session start). The strategy already reads session state — no new interface needed.
+
+---
+
+### 3. `cmd/entire/cli/strategy/manual_commit_condensation.go` — Empty TranscriptPath handling
+
+**Changes:** When `state.TranscriptPath == ""` and no shadow branch exists, instead of erroring, creates an empty `ExtractedSessionData{}`.
+
+**Why it's here:** Kiro's transcript isn't available during mid-turn commits (SQLite not populated yet). Without this, condensation fails when a commit happens before the transcript exists.
+
+**Verdict: KEEP — genuinely generic.**
+
+- The logic is agent-agnostic: "if no transcript is available, create a minimal checkpoint anyway". Any future agent with deferred transcript persistence benefits.
+- The code doesn't reference Kiro at all (just a comment saying "e.g., Kiro's deferred SQLite persistence").
+- The alternative path still errors on `extractSessionDataFromLiveTranscript` failure, so this only changes behavior for the specific case of empty TranscriptPath.
+
+**No changes recommended.** This is well-placed shared logic.
+
+---
+
+### 4. `cmd/entire/cli/strategy/manual_commit_git.go` — TranscriptPath backfill in SaveStep
+
+**Changes:** Added 4 lines: if `state.TranscriptPath == ""` and `step.TranscriptPath != ""`, backfill it.
+
+**Verdict: KEEP — genuinely generic.**
+
+- Same pattern as condensation: handles deferred transcript availability.
+- The guard (`if state.TranscriptPath == ""`) makes it a no-op for all existing agents (they set TranscriptPath at session start).
+- Clean, minimal, and doesn't reference Kiro.
+
+**No changes recommended.**
+
+---
+
+### 5. `cmd/entire/cli/lifecycle.go` — Two changes
+
+#### 5a. Empty repository: `NewSilentError(...)` → `return nil`
+
+**Verdict: KEEP — generic bugfix.**
+
+This is not Kiro-specific. Returning `SilentError` caused unnecessary error logging for a benign condition (new repo with no commits). Returning `nil` is the right behavior for all agents.
+
+#### 5b. TranscriptPath backfill in `transitionSessionTurnEnd`
+
+**Changes:** Added 4 lines to backfill `turnState.TranscriptPath` from `event.SessionRef` if empty.
+
+**Verdict: KEEP — genuinely generic.**
+
+Same pattern as the SaveStep backfill. Ensures the transcript path is available in session state before the state machine transition. Agent-agnostic, no-op for existing agents.
+
+**No changes recommended.**
+
+---
+
+### 6. `cmd/entire/cli/strategy/manual_commit_rewind.go` — Clear TranscriptPath on rewind
+
+**Changes:** After resetting the shadow branch to a checkpoint, clears `state.TranscriptPath` so subsequent condensation reads from the shadow branch (not the stale live transcript file).
+
+**Verdict: KEEP — genuinely generic.**
+
+- This is a rewind correctness fix. After rewinding, the live transcript file may contain data beyond the rewind point. Reading from it would create incorrect checkpoints.
+- Applies to any agent with a persistent transcript file.
+- Graceful error handling (warns, doesn't fail).
+
+**No changes recommended.**
+
+---
+
+### 7. `cmd/entire/cli/hooks_cmd.go` — Kiro import
+
+**Changes:** Added `_ "github.com/entireio/cli/cmd/entire/cli/agent/kiro"` import.
+
+**Verdict: KEEP — required.**
+
+This is the standard agent registration pattern. Every agent has a blank import here for `init()` self-registration. This is expected and correct.
+
+---
+
+### 8. `cmd/entire/cli/strategy/manual_commit_hooks.go` — Minor cleanup of `sessionsWithContent` nil check
+
+**Changes:** Removed the `if len(sessionsWithContent) > 0` guard around agent type extraction, since the code already returns early if `sessionsWithContent` is empty (line ~400).
+
+**Verdict: KEEP — correct cleanup.**
+
+The guard was dead code — `sessionsWithContent` is guaranteed non-empty at that point. Removing it improves readability.
+
+---
+
+## Summary
+
+| File | Change | Kiro-specific? | Can move to Kiro? | Recommendation |
+|------|--------|:-:|:-:|----------------|
+| `agent/event.go` | stdin timeout + sentinel error | Motivated by Kiro, generic fix | **No** | Keep; document goroutine leak |
+| `strategy/manual_commit_hooks.go` | `agentUsesTerminal()` | **Yes** (hardcodes Kiro) | **Partially** | Replace hardcode with optional interface or session state flag |
+| `strategy/manual_commit_condensation.go` | Empty TranscriptPath fallback | No | No | Keep as-is |
+| `strategy/manual_commit_git.go` | TranscriptPath backfill | No | No | Keep as-is |
+| `lifecycle.go` | Empty repo fix + TranscriptPath backfill | No | No | Keep as-is |
+| `strategy/manual_commit_rewind.go` | Clear TranscriptPath on rewind | No | No | Keep as-is |
+| `hooks_cmd.go` | Agent registration import | Standard pattern | No | Keep as-is |
+
+## Recommended Changes
+
+### 1. Remove Kiro hardcode from `agentUsesTerminal()` (medium priority)
+
+**Option A — Optional interface (preferred, follows existing patterns):**
+
+```go
+// In agent/agent.go:
+// TerminalAgent is implemented by agents that run inside a terminal emulator
+// (e.g., Kiro in tmux). These agents have hasTTY()=true even when the agent
+// is committing, requiring special handling in git hooks.
+type TerminalAgent interface {
+    Agent
+    UsesTerminal() bool
+}
+```
+
+Then in `manual_commit_hooks.go`, replace:
+```go
+func agentUsesTerminal(agentType types.AgentType) bool {
+    return agentType == agent.AgentTypeKiro
+}
+```
+with a lookup that checks the agent registry for the `TerminalAgent` interface.
+
+**Option B — Session state flag (simpler):**
+Add `UsesTerminal bool` to `SessionState`. Set it at session start from agent metadata. Strategy reads it from state without knowing agent types.
+
+### 2. Document goroutine leak in `ReadAndParseHookInput` (low priority)
+
+Add a comment noting that on timeout, the `io.ReadAll` goroutine is abandoned. Since hook processes are short-lived, this is acceptable but should be documented.
+
+## Verification
+
+- Run `mise run fmt && mise run lint && mise run test:ci` after any changes
+- The `agentUsesTerminal` refactor should be covered by existing `manual_commit_hooks_test.go` tests
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/3e28b093-94b1-45ab-9761-47571d24013d.jsonl
+
+---
+
+commit and push

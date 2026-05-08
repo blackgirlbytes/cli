@@ -1,0 +1,113 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "a5d50321aaee",
+  "session_id": "94e9b5d5-deae-47b7-8ee1-b3c7da08a5b2",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-07T22:25:05.915706Z",
+  "branch": "update-attach-no-tty-case",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "cmd/entire/cli/attach.go",
+    "cmd/entire/cli/integration_test/attach_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "ecfbf0439f14",
+  "token_usage": {
+    "input_tokens": 37,
+    "cache_creation_tokens": 79537,
+    "cache_read_tokens": 1462641,
+    "output_tokens": 8892,
+    "api_call_count": 28
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "summary": {
+    "intent": "Investigate and fix extremely slow integration tests in the CLI repo, starting with a general performance analysis and then focusing on a specific test (TestAttach_AlreadyTracked_NoCheckpoint) that timed out at 9m15s for a coworker.",
+    "outcome": "Identified and fixed a bug where `promptAmendCommit` in `attach.go` called `huh.NewConfirm()` without checking `canPromptInteractively()`, causing the subprocess to hang indefinitely waiting for TTY input. The specific test dropped from 9m15s to 7s.",
+    "learnings": {
+      "repo": [
+        "The integration test suite builds the CLI binary once in TestMain (setup_test.go:25-26) before any tests run — this is a known serial bottleneck of ~30-60s.",
+        "Tests use ENTIRE_TEST_TTY=0 env var to signal non-interactive mode, but this only works if the command code explicitly checks canPromptInteractively() before showing huh forms.",
+        "The established pattern for guarding interactive prompts is canPromptInteractively() — used correctly in setup.go and login.go but was missing in attach.go.",
+        "RunCLIWithError has no timeout; a hanging subprocess will run until the test framework's global timeout (default 10m) kills it.",
+        "217 tests exist, ~208 of which use t.Parallel(); the non-parallel ones are a secondary bottleneck worth investigating."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/attach.go",
+          "line": 385,
+          "end_line": 396,
+          "finding": "promptAmendCommit called huh.NewConfirm() unconditionally without checking canPromptInteractively(), causing indefinite hangs in non-interactive (test) environments. Fixed by adding canPromptInteractively() guard that falls back to printing the copy-paste trailer."
+        },
+        {
+          "path": "cmd/entire/cli/integration_test/testenv.go",
+          "finding": "RunCLI/RunCLIWithError helpers spawn subprocesses with no timeout, making them vulnerable to indefinite hangs if the subprocess blocks on interactive input."
+        },
+        {
+          "path": "cmd/entire/cli/integration_test/interactive.go",
+          "line": 51,
+          "end_line": 73,
+          "finding": "Interactive PTY tests use 10-second time.After deadlines — these are safety nets, not the primary bottleneck."
+        },
+        {
+          "path": "cmd/entire/cli/integration_test/attach_test.go",
+          "line": 192,
+          "end_line": 192,
+          "finding": "Test called RunCLI('attach', ...) without -f flag, triggering the amend prompt path. Fixed by adding -f flag."
+        }
+      ],
+      "workflow": [
+        "When a test hangs near the framework timeout (9m15s of a 10m limit), the root cause is almost always an unbounded subprocess block, not slow logic.",
+        "Grepping for huh.New(Confirm|Select|Input) is an effective way to audit all interactive prompt sites for missing canPromptInteractively() guards.",
+        "Running a single previously-hanging test with an explicit short timeout (e.g., 60s) is a fast way to verify a fix without running the full suite."
+      ]
+    },
+    "friction": [
+      "The user interrupted the assistant mid-investigation (before non-parallel test analysis completed) to redirect toward the specific failing test — the initial broad investigation was partially wasted.",
+      "No timeout on RunCLIWithError means hanging subprocesses produce no actionable error; they silently consume the full test framework timeout before failing."
+    ],
+    "open_items": [
+      "Broader audit of other commands (beyond attach.go) for huh form calls missing canPromptInteractively() guards — grep showed multiple sites not yet reviewed.",
+      "The initial performance investigation (binary build bottleneck, 218 subprocess-spawning tests, non-parallel tests) was deferred once the hanging test was identified — overall suite time of 134s has not been addressed.",
+      "RunCLIWithError should have a configurable or default timeout to prevent future hanging-subprocess test failures from burning the full 10m.",
+      "Non-parallel tests (~9 identified) should be reviewed to see if they can be parallelized."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-07T22:25:05.683513Z",
+    "agent_lines": 6,
+    "agent_removed": 3,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 6,
+    "total_lines_changed": 9,
+    "agent_percentage": 100,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 1580,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".cursor/hooks.json": 40,
+        ".factory/settings.json": 93,
+        ".github/hooks/entire.json": 61,
+        ".opencode/package-lock.json": 115,
+        "cmd/compact-debug/main.go": 41,
+        "entire-checkpoints-playground.html": 698,
+        "full-example.jsonl": 129,
+        "metadata-example.json": 32,
+        "review-01.md": 95,
+        "review-02.md": 82,
+        "review-03.md": 77,
+        "transcript-output.jsonl": 117
+      }
+    }
+  ]
+}

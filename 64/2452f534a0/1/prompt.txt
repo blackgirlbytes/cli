@@ -1,0 +1,96 @@
+Implement the following plan:
+
+# Code Simplification: Kiro Agent Integration
+
+## Context
+
+The `alisha/kiro-oneshot` branch adds a full Amazon Kiro IDE agent integration (~5,700 lines across 28 files). Two DRY violations were found in the new Kiro agent code that increase maintenance surface without adding value:
+
+1. **4x repeated transcript read+parse pattern** in `kiro.go` — four public methods duplicate the same file read, error check, and parse logic
+2. **3x repeated command prefix computation** in `hooks.go` — three functions compute the identical `cmdPrefix` from a `localDev` bool
+
+All other code on this branch was reviewed and found to be clean — no further simplifications are warranted. (The `map[string]bool` for the `seen` set in `transcript.go` matches the project convention of 63 occurrences; `ChunkTranscript` error wrapping is required by `wrapcheck` linter.)
+
+## Changes
+
+### 1. Extract `readAndParseTranscript` helper (`kiro.go`)
+
+**File:** `cmd/entire/cli/agent/kiro/kiro.go`
+
+Add a private sentinel error and helper function before `GetTranscriptPosition` (~line 166):
+
+```go
+var errTranscriptEmpty = errors.New("transcript is empty or missing")
+
+func readAndParseTranscript(path string) (*kiroTranscript, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        if os.IsNotExist(err) {
+            return nil, errTranscriptEmpty
+        }
+        return nil, fmt.Errorf("reading transcript: %w", err)
+    }
+    if len(data) == 0 {
+        return nil, errTranscriptEmpty
+    }
+    t, err := parseTranscript(data)
+    if err != nil {
+        return nil, fmt.Errorf("parsing transcript: %w", err)
+    }
+    return t, nil
+}
+```
+
+Refactor these 4 methods to use it:
+- `GetTranscriptPosition` — check `errors.Is(err, errTranscriptEmpty)` → return `0, nil`
+- `ExtractModifiedFilesFromOffset` — check `errors.Is(err, errTranscriptEmpty)` → return `nil, 0, nil`
+- `ExtractPrompts` — propagate error directly (no special handling for empty)
+- `ExtractSummary` — propagate error directly
+
+**Net impact:** ~-20 lines, eliminates 4 copies of the read+parse boilerplate.
+
+### 2. Extract `hookCmdPrefix` helper (`hooks.go`)
+
+**File:** `cmd/entire/cli/agent/kiro/hooks.go`
+
+Add a private helper near the other unexported functions (~line 215, after `hasEntireHook`):
+
+```go
+func hookCmdPrefix(localDev bool) string {
+    if localDev {
+        return localDevCmdPrefix + "hooks kiro "
+    }
+    return prodHookCmdPrefix
+}
+```
+
+Replace the 5-line `if/else` block with a single line in:
+- `InstallHooks` (line 84)
+- `allHooksPresent` (line 192)
+- `allIDEHooksPresent` (line 271)
+
+**Net impact:** ~-7 lines, consolidates 3 copies of the same logic.
+
+## Files Modified
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/agent/kiro/kiro.go` | Add `errTranscriptEmpty` + `readAndParseTranscript`; refactor 4 methods |
+| `cmd/entire/cli/agent/kiro/hooks.go` | Add `hookCmdPrefix`; refactor 3 call sites |
+
+No test files need modification — all existing tests validate the same behavioral contracts.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+All existing tests for `GetTranscriptPosition`, `ExtractModifiedFilesFromOffset`, `ExtractPrompts`, `ExtractSummary`, `InstallHooks`, `allHooksPresent`, and `allIDEHooksPresent` must pass unchanged.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/c180cd4e-50b8-48fb-8ea6-bb97c9341d8f.jsonl
+
+---
+
+commit

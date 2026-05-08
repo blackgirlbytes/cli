@@ -1,0 +1,140 @@
+Implement the following plan:
+
+# Plan: Support Kiro IDE transcript format for session metadata
+
+## Context
+
+After fixing the stop hook exit code (returning nil for empty repos), the hooks run successfully in the Kiro IDE. However, `full.jsonl`, `prompt.txt`, and `summary.txt` are all empty because the transcript is just a `{}` placeholder.
+
+**Root cause**: `ensureCachedTranscript()` queries `~/Library/Application Support/kiro-cli/data.sqlite3` (the kiro-cli database), but the **Kiro IDE stores conversations in a completely different location and format**:
+
+- **Location**: `~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/<base64-encoded-cwd>/<session-uuid>.json`
+- **Index**: `sessions.json` in the same directory lists all sessions with `sessionId`, `title`, `dateCreated`, `workspaceDirectory`
+- **Format**: Sequential `{role, content}` messages (like Anthropic API format), NOT the paired `{user, assistant}` entries the kiro-cli uses
+
+### Format comparison
+
+**kiro-cli (SQLite, current parser)**:
+```json
+{
+  "conversation_id": "...",
+  "history": [
+    { "user": { "content": {"Prompt": {"prompt": "..."}} }, "assistant": {"Response": {"content": "..."}} }
+  ]
+}
+```
+
+**Kiro IDE (JSON files, what we need to support)**:
+```json
+{
+  "history": [
+    { "message": { "role": "user", "content": [{"type": "text", "text": "..."}] } },
+    { "message": { "role": "assistant", "content": "On it." }, "promptLogs": [...] }
+  ]
+}
+```
+
+## Approach
+
+Two changes needed: (1) find the transcript from the IDE storage, (2) parse the IDE format.
+
+### 1. IDE transcript discovery (`kiro.go`)
+
+Add `ensureIDETranscript()` that:
+1. Computes `ideWorkspaceSessionsDir()` → `~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/<base64(cwd)>/`
+2. Reads `sessions.json` index, sorts by `dateCreated` descending to find most recent session
+3. Reads the session JSON file and copies it to `.entire/tmp/<sessionID>.json`
+
+Call this from `parseStop()` — after `ensureCachedTranscript()` fails and before `createPlaceholderTranscript()`:
+
+```go
+// lifecycle.go parseStop(), lines 154-163
+sessionRef, _ := k.ensureCachedTranscript(ctx, cwd, sessionID)
+if sessionRef == "" {
+    sessionRef, _ = k.ensureIDETranscript(ctx, cwd, sessionID)  // NEW
+}
+if sessionRef == "" {
+    sessionRef = k.createPlaceholderTranscript(ctx, cwd, sessionID)
+}
+```
+
+### 2. Dual-format transcript parsing (`transcript.go`)
+
+Update `parseTranscript()` to detect the format and normalize both into `kiroTranscript`:
+
+- **Detection**: If the raw JSON has `history[0].message.role`, it's IDE format. If it has `history[0].user`, it's CLI format.
+- **Conversion**: Convert IDE sequential messages into paired `kiroHistoryEntry` entries so all downstream code (ExtractPrompts, ExtractSummary, ExtractModifiedFilesFromOffset) works unchanged.
+
+Add IDE-specific types to `types.go`:
+```go
+type kiroIDEHistoryEntry struct {
+    Message struct {
+        Role    string          `json:"role"`
+        Content json.RawMessage `json:"content"`
+    } `json:"message"`
+}
+```
+
+Update `parseTranscript()`:
+```go
+func parseTranscript(data []byte) (*kiroTranscript, error) {
+    // Try CLI format first
+    var t kiroTranscript
+    if err := json.Unmarshal(data, &t); err != nil { ... }
+    if len(t.History) > 0 { return &t, nil }
+
+    // Try IDE format
+    var ide kiroIDETranscript
+    if err := json.Unmarshal(data, &ide); err != nil { ... }
+    if len(ide.History) > 0 { return convertIDETranscript(ide), nil }
+
+    return &kiroTranscript{}, nil
+}
+```
+
+Update extraction functions to handle IDE content format:
+- `extractUserPrompt()`: Also handle `[{"type": "text", "text": "..."}]` array format (in addition to `{"Prompt": {"prompt": "..."}}`)
+- `extractLastAssistantResponse()`: Also handle plain string content (in addition to `{"Response": {...}}`)
+
+### 3. IDE workspace path helper (`kiro.go`)
+
+```go
+func ideWorkspaceSessionsDir(cwd string) (string, error) {
+    home, err := os.UserHomeDir()
+    // macOS: ~/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/workspace-sessions/<base64(cwd)>/
+    // linux: TBD (Kiro IDE isn't on Linux yet, but use XDG if needed)
+    encoded := base64.StdEncoding.EncodeToString([]byte(cwd))
+    return filepath.Join(home, "Library", "Application Support", "Kiro", "User", "globalStorage", "kiro.kiroagent", "workspace-sessions", encoded), nil
+}
+```
+
+Note: The base64 encoding uses standard encoding (not URL-safe) with no padding trimming — verified by decoding the actual directory name `REDACTED`.
+
+## Files to modify
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/agent/kiro/types.go` | Add IDE transcript types (`kiroIDETranscript`, `kiroIDEHistoryEntry`) |
+| `cmd/entire/cli/agent/kiro/transcript.go` | Update `parseTranscript()` for dual-format detection; update `extractUserPrompt()` and `extractLastAssistantResponse()` to handle IDE content formats |
+| `cmd/entire/cli/agent/kiro/kiro.go` | Add `ensureIDETranscript()`, `ideWorkspaceSessionsDir()`, IDE sessions.json types |
+| `cmd/entire/cli/agent/kiro/lifecycle.go` | Call `ensureIDETranscript()` in `parseStop()` fallback chain |
+| `cmd/entire/cli/agent/kiro/transcript_test.go` | Add tests for IDE format parsing, prompt extraction, summary extraction |
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Then test in the Kiro IDE with the test repo at `/Users/alisha/Projects/test-repos/kiro-ide`:
+1. Start a new Kiro session with a prompt like "create hello world in python"
+2. After it completes, check that `full.jsonl` has real transcript content (not `{}`)
+3. Check that `prompt.txt` contains the user prompt
+4. Check that `summary.txt` contains the assistant response
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/75dc86c1-99d8-40a8-ba1e-018fbe0b4e9c.jsonl
+
+---
+
+commit

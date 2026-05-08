@@ -1,0 +1,54 @@
+is this still an issue:   2. Double settings load per push — resolveCheckpointRemote() calls settings.Load(), and
+  then pushSessionsBranchCommon() likely loads settings again to check push_sessions. Minor
+   but wasteful.
+
+---
+
+3. Stale doc comment on ensureBranchFromRemote — Claims it "updates the tracking" for
+  existing branches, but the code only handles the case where the branch doesn't exist
+  locally. The local-already-exists path is a silent no-op.
+
+---
+
+this is fixed, right:   4. push_sessions: false + checkpoint_remote interaction — When push is disabled,
+  resolveCheckpointRemote() still does all the work (ensure remote, reachability check,
+  fetch branches) before push is ultimately skipped. The check order should be reversed, or
+   documented.
+
+---
+
+5. No URL validation — The checkpoint_remote value is passed directly to git remote add.
+  While git itself validates, a malformed URL will produce confusing errors. Consider basic
+   validation (non-empty, no spaces/shell metacharacters).
+
+---
+
+can you explain this: 
+
+  6. Inconsistent GIT_TERMINAL_PROMPT=0 — Set in isRemoteReachable and
+  ensureBranchFromRemote, but not in ensureGitRemote. If the remote requires auth, git
+  remote get-url won't prompt, but consistency matters.
+
+---
+
+7. Missing t.Parallel() — Several tests (TestEnsureGitRemote_*,
+  TestResolveCheckpointRemote_*, TestEnsureBranchFromRemote_*) use t.Chdir() which prevents
+   parallel execution, but the project convention says to add a comment explaining why when
+   omitting t.Parallel().
+
+---
+
+8. Duplicated settings-application logic — The CheckpointRemote settings block is
+  copy-pasted between runEnableInteractive and setupAgentHooksNonInteractive in setup.go.
+  Consider extracting to a helper.
+
+---
+
+10. Direct os.Stderr writes — ensureBranchFromRemote uses fmt.Fprintf(os.Stderr, ...)
+  instead of the logging package, which the project conventions prefer for operational
+  messages.
+
+---
+
+thoughts on:   - os.Environ() in isRemoteReachable copies the full env; consider whether the parent
+  context already handles this

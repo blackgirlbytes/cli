@@ -1,0 +1,430 @@
+Implement the following plan:
+
+# Plan: External Agent Plugin Protocol + Cursor Extraction
+
+## Context
+
+The CLI currently has all agent implementations compiled in (Claude Code, Cursor, Gemini CLI, OpenCode, Factory AI Droid). To make the CLI extensible — allowing third-party agents without modifying the main repo — we need a protocol for external agent binaries that the CLI discovers via PATH and communicates with over stdin/stdout.
+
+**Starting point:** Extract the Cursor agent into a separate repo (`entire-agent-cursor`) as the first external agent. The built-in Cursor code will be removed from this repo.
+
+## Step 1: Define the Protocol Specification
+
+Create `docs/architecture/external-agent-protocol.md` documenting the full protocol.
+
+**Protocol summary:**
+- **Discovery:** CLI scans PATH for `entire-agent-<name>` binaries
+- **Communication:** Subcommand-based, JSON over stdin/stdout, raw bytes for transcripts
+- **Stateless:** Each invocation is independent
+- **Environment:** `ENTIRE_REPO_ROOT` and `ENTIRE_PROTOCOL_VERSION=1` are always set; working directory is repo root
+
+**Subcommands** (each maps to an Agent interface method):
+
+| Subcommand | Required | Maps to | I/O |
+|---|---|---|---|
+| `info` | Always | Name/Type/Description/IsPreview/ProtectedDirs/HookNames + capabilities | stdout: JSON |
+| `detect` | Always | DetectPresence | stdout: `{"present": bool}` |
+| `parse-hook --hook <name>` | If hooks capable | ParseHookEvent | stdin: raw agent payload → stdout: JSON Event or `null` |
+| `read-transcript --session-ref <path>` | Always | ReadTranscript | stdout: raw bytes |
+| `chunk-transcript --max-size <n>` | Always | ChunkTranscript | stdin: raw → stdout: JSON `{"chunks": ["base64..."]}` |
+| `reassemble-transcript` | Always | ReassembleTranscript | stdin: JSON chunks → stdout: raw |
+| `get-session-id` | Always | GetSessionID | stdin: JSON HookInput → stdout: `{"session_id": "..."}` |
+| `get-session-dir --repo-path <p>` | Always | GetSessionDir | stdout: `{"session_dir": "..."}` |
+| `resolve-session-file --session-dir <d> --session-id <id>` | Always | ResolveSessionFile | stdout: `{"session_file": "..."}` |
+| `read-session` | Always | ReadSession | stdin: JSON HookInput → stdout: JSON AgentSession |
+| `write-session` | Always | WriteSession | stdin: JSON AgentSession → exit 0 |
+| `format-resume-command --session-id <id>` | Always | FormatResumeCommand | stdout: `{"command": "..."}` |
+| `install-hooks [--local-dev] [--force]` | If hooks | InstallHooks | stdout: `{"hooks_installed": N}` |
+| `uninstall-hooks` | If hooks | UninstallHooks | exit 0 |
+| `are-hooks-installed` | If hooks | AreHooksInstalled | stdout: `{"installed": bool}` |
+| `get-transcript-position --path <p>` | If transcript_analyzer | GetTranscriptPosition | stdout: `{"position": N}` |
+| `extract-modified-files --path <p> --offset <n>` | If transcript_analyzer | ExtractModifiedFilesFromOffset | stdout: JSON |
+| `extract-prompts --session-ref <p> --offset <n>` | If transcript_analyzer | ExtractPrompts | stdout: JSON |
+| `extract-summary --session-ref <p>` | If transcript_analyzer | ExtractSummary | stdout: JSON |
+| `prepare-transcript --session-ref <p>` | If transcript_preparer | PrepareTranscript | exit 0 |
+| `calculate-tokens --offset <n>` | If token_calculator | CalculateTokenUsage | stdin: raw → stdout: JSON |
+| `generate-text --model <m>` | If text_generator | GenerateText | stdin: prompt → stdout: JSON |
+| `write-hook-response --message <m>` | If hook_response_writer | WriteHookResponse | stdout: agent-native format |
+| `extract-all-modified-files --offset <n> --subagents-dir <d>` | If subagent_aware | ExtractAllModifiedFiles | stdin: raw → stdout: JSON |
+| `calculate-total-tokens --offset <n> --subagents-dir <d>` | If subagent_aware | CalculateTotalTokenUsage | stdin: raw → stdout: JSON |
+
+**`info` response** declares capabilities:
+```json
+{
+  "protocol_version": 1,
+  "name": "cursor",
+  "type": "Cursor",
+  "description": "Cursor - AI-powered code editor",
+  "is_preview": true,
+  "protected_dirs": [".cursor"],
+  "hook_names": ["session-start", "session-end", "stop", ...],
+  "capabilities": {
+    "hooks": true,
+    "transcript_analyzer": true,
+    "transcript_preparer": false,
+    "token_calculator": false,
+    "text_generator": false,
+    "hook_response_writer": false,
+    "subagent_aware_extractor": false
+  }
+}
+```
+
+**Error handling:** exit 0 = success, non-zero = error with message on stderr.
+
+## Step 2: Create ExternalAgent Adapter
+
+Create `cmd/entire/cli/agent/external/` package with:
+
+### `external.go` — Core adapter
+
+```go
+type ExternalAgent struct {
+    binaryPath string
+    info       *InfoResponse  // cached from `info`
+}
+```
+
+- Implements `agent.Agent` (all 14 methods) by shelling out to the binary
+- Each method: build args → exec binary → parse JSON response
+- Helper: `exec(ctx, subcommand, args, stdin) (stdout, error)`
+
+### `capabilities.go` — Optional interface wrappers
+
+Since Go interfaces are checked at compile time via type assertions, the adapter needs wrapper types for each optional interface:
+
+```go
+// ExternalAgentWithHooks wraps ExternalAgent and implements agent.HookSupport
+type ExternalAgentWithHooks struct{ *ExternalAgent }
+
+// ExternalAgentWithAnalyzer wraps ExternalAgent and implements agent.TranscriptAnalyzer
+type ExternalAgentWithAnalyzer struct{ *ExternalAgent }
+
+// ... etc for each optional interface
+```
+
+A `NewExternalAgent(binaryPath)` constructor calls `info`, caches the response, and returns the appropriate wrapper combining all declared capabilities. Uses Go embedding + interface composition.
+
+### `types.go` — Protocol JSON types
+
+JSON request/response structs for all subcommands (InfoResponse, EventResponse, SessionResponse, etc.).
+
+### `external_test.go` — Unit tests
+
+Test the adapter with a mock binary (shell script or test helper that implements the protocol).
+
+**Key files:**
+- `cmd/entire/cli/agent/external/external.go`
+- `cmd/entire/cli/agent/external/capabilities.go`
+- `cmd/entire/cli/agent/external/types.go`
+- `cmd/entire/cli/agent/external/external_test.go`
+
+## Step 3: Add PATH Discovery to Registry
+
+Modify `cmd/entire/cli/agent/registry.go`:
+
+- Add `DiscoverExternal()` function that:
+  1. Scans `$PATH` for executables matching `entire-agent-*`
+  2. For each found binary, calls `entire-agent-<name> info`
+  3. Creates an `ExternalAgent` adapter
+  4. Registers it via `Register(name, factory)`
+- Skip binaries whose name conflicts with already-registered (built-in) agents
+
+Modify `cmd/entire/cli/hooks_cmd.go`:
+
+- Call `DiscoverExternal()` before building the hooks command tree (alongside the blank imports)
+- Remove the `_ "github.com/entireio/cli/cmd/entire/cli/agent/cursor"` blank import
+
+## Step 4: Remove Built-in Cursor Agent
+
+Delete `cmd/entire/cli/agent/cursor/` directory entirely (9 files).
+
+**Keep in this repo** (not Cursor-specific):
+- `AgentNameCursor` / `AgentTypeCursor` constants in `registry.go` — used in switch statements in `explain.go`, `summarize.go`, `manual_commit_condensation.go`
+- `transcript` package — shared JSONL parsing (handles role→type normalization)
+- `textutil` package — IDE tag stripping (handles `` tags)
+
+**Update references:**
+- `hooks_cmd.go`: Remove cursor blank import
+- `strategy/manual_commit_condensation_test.go`: Remove cursor blank import, adjust test to use external agent or mock
+- `agent/architecture_test.go`: Update if it validates cursor package imports
+
+## Step 5: Tests
+
+### Unit tests for ExternalAgent adapter
+- Mock binary (test helper script) implementing the protocol
+- Test each method delegation
+- Test capability-based interface composition
+- Test error handling (binary not found, non-zero exit, malformed JSON)
+
+### Integration tests
+- Test PATH discovery finds and registers external agents
+- Test hook dispatch works end-to-end with external agent
+- Test that removing built-in Cursor doesn't break any existing tests (the constants remain)
+
+### Test commands
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+## Files to Create
+- `docs/architecture/external-agent-protocol.md` — Protocol specification
+- `cmd/entire/cli/agent/external/external.go` — Core adapter
+- `cmd/entire/cli/agent/external/capabilities.go` — Optional interface wrappers
+- `cmd/entire/cli/agent/external/types.go` — Protocol JSON types
+- `cmd/entire/cli/agent/external/external_test.go` — Tests
+
+## Files to Modify
+- `cmd/entire/cli/agent/registry.go` — Add `DiscoverExternal()`
+- `cmd/entire/cli/hooks_cmd.go` — Call discovery, remove cursor import
+- `cmd/entire/cli/strategy/manual_commit_condensation_test.go` — Remove cursor import
+- `cmd/entire/cli/agent/architecture_test.go` — Update import validation
+
+## Files to Delete
+- `cmd/entire/cli/agent/cursor/cursor.go`
+- `cmd/entire/cli/agent/cursor/cursor_test.go`
+- `cmd/entire/cli/agent/cursor/hooks.go`
+- `cmd/entire/cli/agent/cursor/hooks_test.go`
+- `cmd/entire/cli/agent/cursor/lifecycle.go`
+- `cmd/entire/cli/agent/cursor/lifecycle_test.go`
+- `cmd/entire/cli/agent/cursor/transcript.go`
+- `cmd/entire/cli/agent/cursor/transcript_test.go`
+- `cmd/entire/cli/agent/cursor/types.go`
+- `cmd/entire/cli/agent/cursor/AGENT.md`
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci` — All pass
+2. Create a test `entire-agent-test` shell script implementing `info` and `detect`, verify discovery works
+3. Verify `entire hooks` command tree still builds correctly
+4. Verify agent type switch statements (`explain.go`, `summarize.go`) still work via the constants
+
+## Out of Scope (Follow-up)
+- **`entire-agent-cursor` binary** — Built in a separate repo, implements the protocol using the extracted Cursor logic
+- **Migrating other agents** (Gemini, OpenCode, Factory AI Droid) to external binaries
+- **Batch subcommand** — Optimizing warm-path (turn-end) by combining multiple operations into one exec
+- **Long-running daemon mode** — Future protocol extension for latency-sensitive scenarios
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/nodo/.claude/projects/-Users-nodo-work-cli/183a740b-f39a-448f-8ec9-cff6045cdc6f.jsonl
+
+---
+
+Can you implement the cursor agent using the new external type? Keep it in this repo for now.
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user provided a detailed plan for implementing an External Agent Plugin Protocol and extracting the Cursor agent from the built-in codebase. This was a multi-step plan with specific files to create, modify, and delete.
+
+2. I explored the codebase using multiple agents to understand the agent architecture, registry, cursor implementation, hooks_cmd, architecture tests, and all references to cursor.
+
+3. I created the protocol specification document, the external agent adapter package (types.go, external.go, capabilities.go, discovery.go), modified hooks_cmd.go, removed the cursor directory, updated tests, and fixed various lint issues.
+
+4. All tests passed after fixing: paths.WorktreeRoot context argument, ExternalAgent stuttering name, gosec path traversal, musttag json tags, nilnil sentinel, blank-imports comments, wrapcheck errors, and the Go embedding issue where wrapper types exposed all interfaces.
+
+5. Then the user asked to implement the cursor agent using the new external type, keeping it in this repo. I entered plan mode and started recovering the deleted cursor code from git to understand what needs to be reimplemented as an external agent binary.
+
+Let me trace through all the specific details:
+
+**Phase 1: Plan Implementation (External Agent Protocol)**
+
+Files Created:
+- docs/architecture/external-agent-protocol.md
+- cmd/entire/cli/agent/external/types.go
+- cmd/entire/cli/agent/external/external.go
+- cmd/entire/cli/agent/external/capabilities.go
+- cmd/entire/cli/agent/external/discovery.go
+- cmd/entire/cli/agent/external/external_test.go
+
+Files Modified:
+- cmd/entire/cli/hooks_cmd.go - removed cursor import, added external discovery
+- cmd/entire/cli/strategy/manual_commit_condensation_test.go - removed cursor import and tests
+- cmd/entire/cli/agent/architecture_test.go - added "external" to skipDirs
+
+Files Deleted:
+- cmd/entire/cli/agent/cursor/ (all 10 files)
+
+**Phase 2: User asked to implement cursor agent using new external type**
+
+I entered plan mode and started recovering the deleted cursor code from git history. I recovered:
+- cursor.go
+- hooks.go
+- lifecycle.go
+- transcript.go
+- types.go
+
+I was in the middle of plan mode exploration when the summary was requested.
+
+Key errors and fixes:
+1. paths.WorktreeRoot needs context.Context argument - fixed by passing ctx
+2. ExternalAgent stutters as external.ExternalAgent - renamed to Agent, New
+3. gosec G703 path traversal on os.Stat - added nolint comment
+4. musttag: agent.Event has no json tags - created eventJSON proxy struct
+5. nilnil: parse-hook returns nil,nil - added nolint comment
+6. blank-imports: revive flagged blank imports without per-line comments - added inline comments
+7. wrapcheck: json.Marshal errors unwrapped - wrapped with fmt.Errorf
+8. Go embedding exposes ALL methods: wrapper types embedding *Agent satisfied TranscriptAnalyzer even when capability was false - redesigned to use delegation (non-embedded field) with explicit method forwarding per wrapper type
+
+Summary:
+1. Primary Request and Intent:
+   The user provided a comprehensive plan to implement an External Agent Plugin Protocol for the Entire CLI, allowing third-party agents to integrate via standalone binaries discovered on PATH. The plan had 5 steps:
+   - Step 1: Create protocol specification document
+   - Step 2: Create ExternalAgent adapter package
+   - Step 3: Add PATH discovery to registry
+   - Step 4: Remove built-in Cursor agent (extract to external)
+   - Step 5: Run fmt, lint, and tests
+   
+   After completing all 5 steps, the user then asked: "Can you implement the cursor agent using the new external type? Keep it in this repo for now." This is the current pending work.
+
+2. Key Technical Concepts:
+   - **External Agent Protocol**: Subcommand-based, JSON over stdin/stdout, raw bytes for transcripts. Binary naming: `entire-agent-<name>`. Environment vars: `ENTIRE_REPO_ROOT`, `ENTIRE_PROTOCOL_VERSION=1`.
+   - **Agent Interface**: 14 methods in `agent.Agent` (Identity: 5, Transcript Storage: 3, Legacy: 6). Optional interfaces: HookSupport, TranscriptAnalyzer, TranscriptPreparer, TokenCalculator, TextGenerator, HookResponseWriter, SubagentAwareExtractor.
+   - **Registry Pattern**: Agents self-register via `init()` calling `agent.Register(name, factory)`. Factory function returns `agent.Agent`.
+   - **Capability-based Interface Composition**: Cannot use Go embedding because `*Agent` implements ALL optional interface methods. Must use delegation with explicit method forwarding per wrapper type to selectively expose interfaces.
+   - **Discovery**: `DiscoverAndRegister()` scans `$PATH` for `entire-agent-*` executables, calls `info`, validates protocol version, wraps with capabilities, registers.
+   - **Cursor Agent Specifics**: JSONL transcript format, `role` field (not `type`), `` tags, no tool_use blocks (relies on git status), session dir at `~/.cursor/projects/<sanitized-path>/agent-transcripts`, nested vs flat layout for session files.
+
+3. Files and Code Sections:
+
+   - **`docs/architecture/external-agent-protocol.md`** (CREATED)
+     - Full protocol specification documenting all subcommands, capabilities, error handling, versioning
+     - Documents discovery mechanism, environment variables, communication model
+
+   - **`cmd/entire/cli/agent/external/types.go`** (CREATED)
+     - All JSON request/response structs for the protocol
+     - Includes `eventJSON` proxy type with JSON tags (because `agent.Event` lacks them) with `toEvent()` converter
+     - Key types: InfoResponse, Capabilities, DetectResponse, SessionIDResponse, ChunkResponse, AgentSessionJSON, HookInputJSON, eventJSON
+     ```go
+     type eventJSON struct {
+         Type              int               `json:"type"`
+         SessionID         string            `json:"session_id"`
+         // ... all fields with json tags
+     }
+     func (ej *eventJSON) toEvent() (*agent.Event, error) { ... }
+     ```
+
+   - **`cmd/entire/cli/agent/external/external.go`** (CREATED)
+     - Core adapter: `type Agent struct { binaryPath string; info *InfoResponse }`
+     - `New(binaryPath)` constructor calls `info`, validates protocol version
+     - All agent.Agent methods implemented by shelling out via `run(ctx, stdin, args...)`
+     - All optional interface methods (HookSupport, TranscriptAnalyzer, etc.) also implemented on `*Agent`
+     - `run()` method handles exec, environment setup, stdin piping, stderr capture
+     - Helper functions: `marshalHookInput`, `marshalAgentSession`, `unmarshalAgentSession`, `convertTokenUsage`
+     ```go
+     func (e *Agent) run(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
+         cmd := exec.CommandContext(ctx, e.binaryPath, args...)
+         cmd.Env = append(cmd.Environ(), "ENTIRE_PROTOCOL_VERSION="+strconv.Itoa(ProtocolVersion))
+         if repoRoot, err := paths.WorktreeRoot(ctx); err == nil {
+             cmd.Env = append(cmd.Env, "ENTIRE_REPO_ROOT="+repoRoot)
+             cmd.Dir = repoRoot
+         }
+         // ... stdin, stdout, stderr handling
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/external/capabilities.go`** (CREATED)
+     - `Wrap(ea *Agent) agent.Agent` — returns wrapper with correct interface set
+     - Uses delegation (NOT embedding) to avoid exposing all methods
+     - `baseAgent` has `ea *Agent` field (non-embedded) and forwards all 14 agent.Agent methods
+     - `hooksAgent`, `analyzerAgent`, `hooksAnalyzerAgent`, `fullAgent` embed `baseAgent` and add specific interface methods
+     ```go
+     type baseAgent struct{ ea *Agent }
+     type hooksAgent struct{ baseAgent }
+     type hooksAnalyzerAgent struct{ baseAgent }
+     // Each explicitly forwards only the interfaces it should expose
+     ```
+
+   - **`cmd/entire/cli/agent/external/discovery.go`** (CREATED)
+     - `DiscoverAndRegister(ctx)` scans PATH for `entire-agent-*` binaries
+     - Skips names conflicting with built-in agents
+     - Deduplicates across PATH dirs, checks executable bit
+     ```go
+     func DiscoverAndRegister(ctx context.Context) {
+         // scan PATH, skip conflicts, call New(), Wrap(), agent.Register()
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/external/external_test.go`** (CREATED)
+     - Mock binary using shell scripts implementing the protocol
+     - Tests: New valid/invalid/wrong-version, Identity, DetectPresence, GetSessionDir, TranscriptAnalyzer methods, HookSupport methods, error on stderr
+     - Wrap tests: HooksAndAnalyzer, NoCapabilities, HooksOnly — verify correct interface exposure
+
+   - **`cmd/entire/cli/hooks_cmd.go`** (MODIFIED)
+     - Removed `_ "github.com/entireio/cli/cmd/entire/cli/agent/cursor"` import
+     - Added `"github.com/entireio/cli/cmd/entire/cli/agent/external"` import and `"context"` import
+     - Added `external.DiscoverAndRegister(context.Background())` call before agent iteration
+     - Added per-line `// register agent` comments on blank imports
+     ```go
+     _ "github.com/entireio/cli/cmd/entire/cli/agent/claudecode" // register agent
+     "github.com/entireio/cli/cmd/entire/cli/agent/external"
+     _ "github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid" // register agent
+     ```
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation_test.go`** (MODIFIED)
+     - Removed `_ "github.com/entireio/cli/cmd/entire/cli/agent/cursor"` blank import
+     - Removed `cursorSampleTranscript` variable and 6 cursor-specific tests: TestCalculateTokenUsage_CursorReturnsNil, TestCountTranscriptItems_Cursor, TestCountTranscriptItems_CursorEmpty, TestExtractUserPrompts_Cursor, TestExtractUserPrompts_CursorEmpty, TestCalculateTokenUsage_CursorRealTranscript, TestCalculateTokenUsage_CursorWithOffset
+
+   - **`cmd/entire/cli/agent/architecture_test.go`** (MODIFIED)
+     - Added `"external": true` to `skipDirs` map (external is adapter package, not self-registering agent)
+
+   - **`cmd/entire/cli/agent/cursor/`** (DELETED - all 10 files)
+     - cursor.go, cursor_test.go, hooks.go, hooks_test.go, lifecycle.go, lifecycle_test.go, transcript.go, transcript_test.go, types.go, AGENT.md
+
+   - **Key existing files read for understanding:**
+     - `cmd/entire/cli/agent/agent.go` — Agent interface + all optional interfaces
+     - `cmd/entire/cli/agent/registry.go` — Register, Get, List, DetectAll, constants (AgentNameCursor, AgentTypeCursor kept)
+     - `cmd/entire/cli/agent/event.go` — EventType constants, Event struct, ReadAndParseHookInput helper
+     - `cmd/entire/cli/agent/session.go` — AgentSession struct
+     - `cmd/entire/cli/agent/types.go` — HookInput, TokenUsage structs
+     - `cmd/entire/cli/agent/types/agent.go` — AgentName, AgentType type definitions
+
+4. Errors and Fixes:
+   - **`paths.WorktreeRoot()` missing context**: Called with no args but signature requires `context.Context`. Fixed: `paths.WorktreeRoot(ctx)`.
+   - **`external.ExternalAgent` name stutters (revive)**: Renamed type to `Agent`, constructor to `New()`.
+   - **gosec G703 path traversal on `os.Stat(binPath)`**: PATH dirs are trusted. Fixed: `//nolint:gosec // PATH entries are trusted` on the `os.Stat` line.
+   - **musttag: `agent.Event` lacks json tags**: Cannot unmarshal `agent.Event` directly. Fixed: Created `eventJSON` proxy struct with JSON tags and `toEvent()` converter method.
+   - **nilnil: `parse-hook` returns `nil, nil`**: Protocol contract is null = no event. Fixed: `//nolint:nilnil // protocol contract: null = no event`.
+   - **blank-imports revive lint**: Removing cursor import shifted comment association. Fixed: Added per-line `// register agent` comments on each blank import.
+   - **wrapcheck: `json.Marshal` errors unwrapped**: Fixed: Wrapped with `fmt.Errorf("marshal hook input: %w", err)` and similar.
+   - **Go embedding exposes all interfaces (CRITICAL)**: Wrapper types (hooksAgent, analyzerAgent) embedding `*Agent` satisfied ALL optional interfaces because `*Agent` has all methods. Tests failed: `Wrap()` returned TokenCalculator even when capability was false. Fixed: Redesigned capabilities.go to use delegation pattern — `baseAgent{ea: *Agent}` with non-embedded field and explicit method forwarding. Each wrapper type only forwards the interfaces it should expose.
+
+5. Problem Solving:
+   - Solved the import cycle problem: `DiscoverExternal()` can't live in `registry.go` (agent package) because it would import `agent/external` which imports `agent`. Solution: `DiscoverAndRegister()` lives in the `external` package and calls `agent.Register()`.
+   - Solved selective interface exposure in Go: Go embedding is structural — embedding a type exposes ALL its methods. Solution: Use composition with a private non-embedded field and explicit delegation of only the desired methods per wrapper type.
+   - Kept `AgentNameCursor`/`AgentTypeCursor` constants in registry.go even though cursor agent is removed — they're used in switch statements in explain.go, summarize.go, manual_commit_condensation.go for reading existing checkpoints.
+
+6. All User Messages:
+   - First message: Detailed implementation plan with 5 steps for External Agent Plugin Protocol + Cursor Extraction. Includes protocol specification, subcommand table, info response format, file lists to create/modify/delete, test commands, verification steps.
+   - Second message: "Can you implement the cursor agent using the new external type? Keep it in this repo for now."
+
+7. Pending Tasks:
+   - Implement the cursor agent as an external agent binary (`entire-agent-cursor`) using the external agent protocol, keeping it in this repo.
+
+8. Current Work:
+   I entered plan mode for the second user request and began exploring. I recovered all deleted cursor agent source code from git history:
+   - `cursor.go` — CursorAgent struct, identity methods, session management, path sanitization, JSONL chunking
+   - `hooks.go` — Hook installation/uninstallation in `.cursor/hooks.json`, 7 hook names, JSON round-trip preservation
+   - `lifecycle.go` — ParseHookEvent dispatcher, 7 hook parsers, resolveTranscriptRef for CLI mode
+   - `transcript.go` — TranscriptAnalyzer: GetTranscriptPosition (line counting), ExtractPrompts (JSONL + user_query stripping), ExtractSummary, ExtractModifiedFilesFromOffset (returns nil)
+   - `types.go` — CursorHooksFile, CursorHooks, CursorHookEntry, 7 raw hook input types (sessionStartRaw, stopHookInputRaw, etc.)
+   
+   I also read the external agent protocol types to understand the JSON contract. I was in the middle of Phase 1 (exploration) of plan mode when the summary was requested.
+
+9. Optional Next Step:
+   Continue planning the cursor agent binary implementation. The user said: "Can you implement the cursor agent using the new external type? Keep it in this repo for now." I was in plan mode exploration, having recovered all the deleted cursor code from git. The next step is to:
+   1. Design the binary structure (likely at `cmd/entire-agent-cursor/main.go`) 
+   2. Map each protocol subcommand to the recovered cursor logic
+   3. Write the plan file and exit plan mode for approval
+   4. Then implement: create the binary that handles all subcommands (info, detect, parse-hook, read-transcript, chunk-transcript, reassemble-transcript, get-session-id, get-session-dir, resolve-session-file, read-session, write-session, format-resume-command, install-hooks, uninstall-hooks, are-hooks-installed, get-transcript-position, extract-modified-files, extract-prompts, extract-summary) using the recovered cursor agent logic
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/nodo/.claude/projects/-Users-nodo-work-cli/b12319af-9a0a-4691-b084-e5fc5ae7e446.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+[Request interrupted by user for tool use]

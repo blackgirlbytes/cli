@@ -1,0 +1,260 @@
+can you take a look at this review for the current branch: 
+
+# Review 01
+
+> Status: pending-dev
+> Date: 2026-04-22
+> Reviewer: Code Review Agent
+> Verdict: REQUEST CHANGES
+
+## Scope
+
+Reviewed branch `feat/entire-review` against `main`. The feature introduces a new
+`entire review` command that runs configured review skills inside a single
+agent session, with the session/checkpoint metadata recording that a review
+occurred.
+
+- 17 commits, ~1,750 lines across 30 files (code + tests + CLAUDE.md).
+- Key files: `cmd/entire/cli/review.go` (+685), `cmd/entire/cli/review_test.go`
+  (+395), `cmd/entire/cli/lifecycle.go` + test (+186), plus additions to
+  `session.State`, `settings.EntireSettings.Review`, `checkpoint` types (`Kind`,
+  `ReviewSkills`, `HasReview`), `trailers`, and three agent `Launcher` impls.
+- `mise run test` — all packages pass.
+- `mise run lint` — 0 issues.
+
+Previous PR-level reviewer feedback (commit `47eb589` "Address PR review
+feedback") has been addressed. No prior `review-NN.md` files exist in this
+repo; this is the first file-based review.
+
+## High (Must Fix)
+
+1. **High: the unsupported-launcher fallback clears the pending marker it
+   just told the user to rely on.** In
+   [review.go](/Users/soph/Work/entire/devenv/cli_worktree1/cmd/entire/cli/review.go:414),
+   the cleanup `defer` is installed before the `LauncherFor` check, and the
+   fallback path at
+   [review.go](/Users/soph/Work/entire/devenv/cli_worktree1/cmd/entire/cli/review.go:425)
+   returns `nil`. That means configs for non-launchable agents print
+   "falling back to --track-only", but the marker is removed on return, so
+   the manually started review session will not be tagged or condensed as a
+   review.
+
+   Fix: either skip the defer-driven cleanup on this branch (e.g. move the
+   "fallback to track-only" return *above* the defer, analogous to how the
+   `trackOnly` branch at line 400-406 already does), or short-circuit the
+   cleanup with a local flag (`markerHandedOff := false; defer ... if !markerHandedOff ...`).
+   Add a test that registers a non-Launcher agent and asserts the marker
+   survives when `LauncherFor` returns `ok=false`.
+
+## Important (Should Fix)
+
+2. **Medium: `entire review` never verifies that hooks are installed for
+   the configured agent before launching it.** The command selects an
+   agent from settings in
+   [review.go](/Users/soph/Work/entire/devenv/cli_worktree1/cmd/entire/cli/review.go:353)
+   and immediately writes the marker / launches, but there is no
+   `AreHooksInstalled` gate even though the feature depends on
+   `UserPromptSubmit` adoption and the repo already has
+   [GetAgentsWithHooksInstalled](/Users/soph/Work/entire/devenv/cli_worktree1/cmd/entire/cli/config.go:85).
+   A manually edited config such as `"claude-code": [...]` in a repo
+   without `entire enable` will appear to run successfully, but no review
+   metadata will ever be recorded because no hook fires.
+
+   Focused tests passed: `go test ./cmd/entire/cli/... -run 'Review|AdoptPendingReviewMarker|DetectBaseBranch|DetectReviewScope'`
+   and `go test ./cmd/entire/cli/agent/... -run 'LaunchCmd|LauncherFor'`.
+   Those scenarios are not currently covered by tests.
+
+- **[cmd/entire/cli/review.go:451-468] Multi-agent review config silently
+  prefers the alphabetically-first agent, with no override.**
+  `selectReviewAgent` picks `sort.Strings(names)[0]`, so a user with
+  `{"claude-code": [...], "codex": [...]}` configured can never reach the
+  codex agent without removing `claude-code` from settings. The doc comment
+  admits "v1: single agent" but there's no flag to select an agent, and the
+  first-run picker happily writes multiple entries. Either (a) gate the
+  picker to one agent at a time, (b) add `--agent <name>`, or (c) prompt
+  the user when the map has multiple keys. Today the UX is "I configured
+  codex and nothing happens," which will produce confused bug reports.
+
+- **[cmd/entire/cli/review.go:425 → .github/hooks, etc.] Stale config can
+  point to an uninstalled agent.**
+  `runReviewConfigPicker` correctly gates to `GetAgentsWithHooksInstalled`,
+  but once saved, `runReview` reads `s.Review` directly with no re-check.
+  If the user later runs `entire disable` for an agent, its entry stays in
+  the settings map, `selectReviewAgent` will pick it, and the marker will be
+  written for an agent whose hook will never adopt it — same silent failure
+  as the Critical above. Suggest intersecting `s.Review` keys with
+  `GetAgentsWithHooksInstalled(ctx)` inside `runReview` and skipping/warning
+  on missing entries.
+
+- **[cmd/entire/cli/review.go:196-201] Empty-installed-agents error message
+  assumes the fix is `entire enable`.**
+  The error says: `"no agents installed; run 'entire enable' first"`. In
+  practice a user who disabled a specific agent via `entire configure
+  --remove` may already have `entire enable`d the repo — they just don't
+  have hooks for any agent. Consider `"no agents with hooks installed; run
+  'entire configure --agent <name>' to install hooks."`.
+
+- **[cmd/entire/cli/checkpoint/committed.go:440-449] `HasReview` is not
+  derived from session metadata — stale summaries can never lose it, but
+  also never gain it on rewrite.**
+  `writeCheckpointSummary` carries `HasReview` forward from the existing
+  summary OR sets it from `opts.HasReview`. `reaggregateFromEntries`
+  recomputes `CheckpointsCount`/`FilesTouched`/`TokenUsage` by reading each
+  session's `CommittedMetadata` from the tree, but **does not** look at the
+  per-session `Kind` field. That means:
+  1. If the summary is ever rebuilt without `opts.HasReview=true` (e.g.
+     someone re-runs `CondenseSession` for a non-review session after a
+     review session was previously condensed), the flag *is* preserved via
+     the "existing summary" read — good.
+  2. But if the root `metadata.json` blob is missing or unreadable while
+     the session subfolder with `Kind=agent_review` survives, `HasReview`
+     silently resets to false.
+  This is unlikely in practice (the summary and session are written in the
+  same commit), but the truth-of-record should be the per-session
+  `CommittedMetadata.Kind`. Consider making `reaggregateFromEntries`
+  OR `writeCheckpointSummary` iterate the per-session metadata and
+  OR-in `Kind.IsReview()` equivalent. (Since `checkpoint` can't import
+  `session`, this would mean either hardcoding `"agent_review"` in the
+  checkpoint package or adding a small `IsReviewKind(string) bool` helper
+  exported from `session` that's safe for `checkpoint` to consume.)
+
+- **README.md + CHANGELOG.md — feature is undocumented for end users.**
+  CLAUDE.md has extensive documentation, but `README.md` lists every other
+  `entire` command in the Commands Reference table and doesn't mention
+  `entire review`. `CHANGELOG.md` has no entry for this feature. If the
+  command is intentionally preview/hidden, mark the cobra command
+  `Hidden: true` and add a changelog "preview" note. Otherwise, add a
+  README section and a CHANGELOG entry before release.
+
+## Suggestions (Consider)
+
+- **[cmd/entire/cli/review.go:54-60] `pendingMarkerPath` discards
+  `session.SessionStateDirName` collision risk.**
+  The marker lives next to per-session `<session-id>.json` files under
+  `.git/entire-sessions/`. The filename is a constant (`review-pending.json`)
+  that could collide with a real session ID. Validation prevents
+  path-traversal, but defense-in-depth: pick a reserved prefix (e.g.
+  `.review-pending.json`) that session-ID validation would reject anyway.
+  Very low risk — session IDs are `YYYY-MM-DD-<UUID>` — but a future refactor
+  that loosens validation could expose this.
+
+- **[cmd/entire/cli/review.go:126-139] `curatedReviewSkills` is a hardcoded
+  map with no update path.**
+  Only `claude-code` and `codex` have curated skills. New agents (or new
+  skills for existing ones) require a code change. Consider loading from an
+  embed-ed JSON or from agent-specific files so community skills can ship
+  without a CLI release.
+
+- **[cmd/entire/cli/review.go:481-491] `currentHeadSHA` duplicates git logic
+  already available via `go-git`.**
+  The rest of the codebase uses `git.PlainOpen(...).Head()`. Shelling out
+  is not wrong here (consistency with `detectReviewScope`), but the helper
+  could be a one-liner `repo.Head().Hash().String()` without spawning a
+  subprocess. Minor.
+
+- **[cmd/entire/cli/review.go:195-292] `runReviewConfigPicker` does not test
+  coverage for accessible mode.**
+  `NewAccessibleForm` is used, but no test exercises the `ACCESSIBLE=1`
+  path, so regressions in accessible rendering would slip through. A
+  lightweight test that sets `ACCESSIBLE=1` and verifies the form doesn't
+  panic would be worth adding.
+
+- **[cmd/entire/cli/lifecycle.go:271-289] Non-atomic read-modify-write on
+  session state during marker adoption.**
+  Load → mutate → Save with no lock around the file. If two concurrent
+  `UserPromptSubmit` hooks adopt simultaneously, both could win because the
+  first save is clobbered by the second. Concurrent hooks for the same
+  session ID are unlikely in practice (agents serialize hooks per turn),
+  but adding a quick `fcntl`-style advisory lock would be cheap insurance.
+  Same shape of issue exists elsewhere in the codebase, so not a blocker.
+
+- **[cmd/entire/cli/review.go:451-468] `selectReviewAgent` returns
+  `([]string(nil), errors.New("..."))` twice with the same error text.**
+  Collapse the two branches into a single "filter to valid entries, then
+  sort" step to avoid the duplicated error string.
+
+- **[cmd/entire/cli/review.go:302-318] Flag documentation drift risk.**
+  The command `Long` text mentions `--edit` but not `--track-only`. Easy
+  fix: mention `--track-only` in the long description, or trust the flag
+  registration to speak for itself.
+
+## Praise
+
+- **Excellent defensive commentary throughout `review.go`.** Almost every
+  non-trivial decision is justified in a comment — the worktree-scoped
+  marker rationale (lines 141-147, 173-179), the settings-wipe data-loss
+  guard (lines 330-341, 667-684), the defer-cleanup lifecycle (lines
+  408-422). This raises the bar for future maintainers. Exactly the "teach
+  via code" pattern the reviewer guide asks for.
+
+- **Worktree-scoped marker is a real correctness win.**
+  `TestAdoptPendingReviewMarker_OtherWorktreeLeavesMarker` documents a race
+  that's hard to see until you hit it. The fix is minimal and the test
+  pins it — textbook.
+
+- **HasReview-via-Kind derivation.**
+  `session.Kind.IsReview()` + `opts.HasReview: state.Kind.IsReview()` is
+  the right seam. Pins the invariant that new review kinds won't need
+  three string-literal updates across packages. `TestKindIsReview` makes
+  it load-bearing.
+
+- **Settings-malformed → surface error instead of clobbering.**
+  `TestSaveReviewConfig_ReturnsErrorOnMalformedSettings` is exactly the
+  regression shape you want pinned: the test asserts the file is byte-for-
+  byte identical before and after a failed save. That's the difference
+  between a close call and a data-loss bug.
+
+- **`detectBaseBranch` fallback order matches its doc comment, and is
+  tested.** Two regression tests
+  (`TestDetectBaseBranch_UsesOriginMainWhenNoLocalMain`,
+  `TestDetectBaseBranch_PrefersAllRemotesOverLocals`) pin the order so a
+  future refactor can't quietly flip it. The
+  `masterBaseBranch`/`defaultBaseBranch` constants are used consistently
+  across `git_operations.go`, `resume.go`, `review.go`.
+
+- **`Launcher` abstraction is cleanly scoped.** Three agent impls; a
+  single-line Launcher interface; `LauncherFor` is the exact ergonomic
+  helper callers need; `TestLauncher_AtLeastOneImplementor` ensures the
+  build can't regress into a state where no agent can be spawned.
+
+## Summary
+
+The feature is well-engineered, thoroughly tested (394 lines of tests for
+the review package alone, plus integration via `TestAdoptPendingReviewMarker*`
+in `lifecycle_test.go`), and the design choices (pending-marker + hook
+adoption, worktree scoping, HasReview umbrella flag, settings-malformed
+guard) reflect careful thinking. CLAUDE.md is updated correctly; lint +
+unit tests are green.
+
+The High item — marker erasure on the `LauncherFor` `!ok` branch — is a
+real bug that will silently break the fallback code path the commit
+messages explicitly promise. It's a one-line fix plus a test. The Medium
+item — no `AreHooksInstalled` gate — is the same silent-failure shape on
+a different input path (manually edited config in a repo without
+`entire enable`).
+
+The other "Important" items are quality-of-release issues (multi-agent
+selection UX, stale config, README/CHANGELOG). None block merge in the
+strict sense, but the README/CHANGELOG gap will produce a version shipping
+an undocumented command.
+
+Estimated effort to address feedback: 2-3 hours (Critical fix + test + one
+Important + docs).
+
+### Previous Review Status
+
+No prior `review-NN.md` files. Upstream PR-review feedback ("data-loss,
+cleanup, context, HasReview derivation," commit `47eb589`) appears fully
+addressed based on the current code and the dedicated regression tests:
+
+- [x] Settings-load errors no longer wipe user config (tested).
+- [x] Pending marker cleaned up on every spawn-path failure (via defer) —
+      *except* the `LauncherFor !ok` branch. See Critical above.
+- [x] `detectBaseBranch` prefers all remotes before any local (tested).
+- [x] `HasReview` derived from `session.Kind.IsReview()` (tested).
+- [x] Context threaded through marker I/O.
+- [x] `headHasReviewCheckpoint` logs at Debug on each failure step.
+
+---
+
+can you do the fixes

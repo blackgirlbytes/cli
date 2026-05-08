@@ -1,0 +1,69 @@
+Implement the following plan:
+
+# Preflight dependency checks for E2E tests
+
+## Context
+
+When E2E tests encounter missing dependencies (tmux, agent binaries, entire CLI), they fail deep inside test execution with unhelpful errors and no artifact reports. The artifact capture is registered as a `t.Cleanup` inside `SetupRepo`, so if something fails before or during setup, there's no diagnostic output.
+
+## Approach
+
+Add preflight checks in `TestMain` (e2e/tests/main_test.go) that verify all required dependencies exist before any tests run. Fail early with a clear error message.
+
+### Checks to add (after artifact dir setup, before `m.Run()`):
+
+1. **`git`** — required for all repo operations
+2. **`tmux`** — required for all interactive session tests
+3. **`entire`** — already partially checked (version command), but should be a hard failure
+4. **Agent binaries** — check that each registered agent's binary exists via `exec.LookPath`
+
+### Implementation
+
+**File: `e2e/agents/agent.go`**
+- Add a `Binary() string` method to the `Agent` interface that returns the CLI binary name (e.g. `"claude"`, `"gemini"`, `"opencode"`)
+
+**Files: `e2e/agents/claude.go`, `e2e/agents/gemini.go`, `e2e/agents/opencode.go`**
+- Implement `Binary()` on each agent
+
+**File: `e2e/tests/main_test.go`**
+- After artifact dir setup, before `m.Run()`:
+  - Check `tmux` via `exec.LookPath("tmux")`
+  - Check `entire` via `exec.LookPath("entire")`
+  - Iterate `agents.All()` and check `exec.LookPath(agent.Binary())` for each
+  - On any missing dependency, print a clear error to stderr and `os.Exit(1)`
+
+### Verification
+
+- `go build ./e2e/...` compiles
+- Run with a missing binary (e.g. rename tmux temporarily) to verify early failure
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-entire-cli-e2e-tests/1cb7ed5c-2524-4ba4-97d6-a1359143d74a.jsonl
+
+---
+
+aren't we doubling up on what should be one definition?
+
+---
+
+are there lint issues?
+
+---
+
+commit this, then let's fix the lint
+
+---
+
+any other lint failures?
+
+---
+
+can we clean that up please
+
+---
+
+oh wait where are we? we should be working in the cli repo :|
+
+---
+
+yes, reset the e2e-tests repo and commit in cli

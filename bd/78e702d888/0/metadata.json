@@ -1,0 +1,102 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "bd78e702d888",
+  "session_id": "505074f6-04f8-47f5-ba59-9d9444474e9c",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T02:17:11.296905Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 9,
+  "files_touched": [
+    "cmd/entire/cli/memoryloop/generator.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "393c01fb5534",
+  "token_usage": {
+    "input_tokens": 2938,
+    "cache_creation_tokens": 314067,
+    "cache_read_tokens": 10698632,
+    "output_tokens": 49460,
+    "api_call_count": 116
+  },
+  "session_metrics": {
+    "turn_count": 9
+  },
+  "summary": {
+    "intent": "Improve memory quality in the checkpoint repo's memory loop by adding a hard evidence gate that rejects one-off or unverifiable memories, replacing the existing prompt-instruction-only approach.",
+    "outcome": "Implemented a two-layer evidence gate (provenance + session validation) in generator.go, replacing passesReviewDerivedGate with a generalized passesEvidenceGate. All tests pass and CI is green. Also fixed a JSON parse error caused by LLM returning trailing text after the JSON object.",
+    "learnings": {
+      "repo": [
+        "AffectedSessions in PatternAnalysis uses CheckpointID, but the generation prompt was exposing SessionID — these must be aligned to the same identifier type for the evidence gate to work.",
+        "passesReviewDrivedGate at generator.go:360 was the only kind-specific evidence enforcement; all other memory kinds (repo_rule, workflow_rule, agent_instruction) had no multi-session requirement.",
+        "repo_learning and workflow_learning in PatternAnalysis have no Count or AffectedSessions fields, making them ineligible for the evidence gate — they must be marked context-only in the prompt.",
+        "Personal-scope records auto-activate without a TUI promotion step (memoryloop.go:623), so UI-only quality controls are insufficient.",
+        "llmcli.ExtractJSONFromMarkdown at llmcli.go:122 handles markdown-fenced JSON but not trailing plain text after a bare JSON object — raw unmarshal fails with 'invalid character n after top-level value'.",
+        "logicalRuleSimilarity is defined in memoryloop.go and used there too, not only in the review gate helpers — must not be removed when removing passesReviewDerivedGate.",
+        "GenerationStats is consumed in both memoryloop.go (RefreshHistory) and memory_loop_cmd.go (display) — new fields must be propagated to both."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 319,
+          "end_line": 319,
+          "finding": "Prompt instruction 'Avoid duplicates and avoid one-off incidents without repeated evidence' is a suggestion to the LLM, not a hard code gate."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 155,
+          "end_line": 161,
+          "finding": "Post-filter catches low confidence and low strength, but a one-off memory with confidence:high and strength:4 passes through."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 173,
+          "end_line": 173,
+          "finding": "SourceSessionIDs was captured but never validated for length — a record backed by 1 session was treated identically to one backed by 5."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 360,
+          "end_line": 375,
+          "finding": "passesReviewDerivedGate enforced count>=2 || strong only for review-derived rules, not for other kinds. Replaced by generalized passesEvidenceGate."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "line": 623,
+          "end_line": 623,
+          "finding": "Personal-scope records become active immediately under auto-activation policy, bypassing TUI review entirely."
+        }
+      ],
+      "workflow": [
+        "When an LLM fills structured fields (like source_session_ids), those fields can be hallucinated — gate on upstream analyzer aggregations (RecurringSignal.Count, AffectedSessions) rather than trusting LLM-populated fields alone.",
+        "Iterative design review with Codex caught: (1) missing provenance link making cross-reference fuzzy, (2) allow-on-no-match fallback nullifying the gate, (3) auto-activation bypassing TUI controls.",
+        "Write analysis doc to shared file for async review by other agents before implementing.",
+        "Run mise lint after implementation to confirm no new lint issues introduced in changed files."
+      ]
+    },
+    "friction": [
+      "Identifier mismatch between AffectedSessions (CheckpointID) and prompt sessions (SessionID) required a prerequisite fix before the evidence gate could be deterministic.",
+      "LLM returned trailing natural language text after JSON object despite 'Return ONLY JSON' instruction, causing json.Unmarshal to fail with 'invalid character n after top-level value' — required adding extractJSONObject helper.",
+      "Twelve existing tests had to be updated to include SourceSignal provenance fields plus matching analysis signals, since the new gate rejects records without valid provenance.",
+      "passesReviewDerivedGate and its helpers (bestMatchingReviewDerivedRule, generatedMatchesReviewEvidence) had to be carefully decomposed — the literal review evidence rejection needed to be preserved as a standalone isLiteralReviewEvidence check."
+    ],
+    "open_items": [
+      "improve/generator.go and facets/facets.go may have the same LLM trailing-text JSON parse issue — not fixed in this session.",
+      "Existing low-quality memories already in memory-loop.json are not affected by the new gate — no backfill or re-evaluation pass was implemented.",
+      "Option 4 (show evidence count in TUI before promotion) is still useful for transparency alongside the evidence gate but was not implemented.",
+      "repo_learning and workflow_learning could be given Count/AffectedSessions fields upstream in the analyzer to make them eligible for the evidence gate in the future.",
+      "The substring-fallback in findRecurringSignal/findSkillSignal/findReviewRuleSignal may produce false positives if LLM paraphrases keys — exact match behavior and false-negative rate should be monitored."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-03T02:16:15.080759Z",
+    "agent_lines": 183,
+    "agent_removed": 0,
+    "human_added": 834,
+    "human_modified": 21,
+    "human_removed": 0,
+    "total_committed": 1038,
+    "total_lines_changed": 0,
+    "agent_percentage": 17.63005780346821
+  }
+}

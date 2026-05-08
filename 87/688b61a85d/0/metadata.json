@@ -1,0 +1,111 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "87688b61a85d",
+  "session_id": "505074f6-04f8-47f5-ba59-9d9444474e9c",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T16:32:15.455516Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 2,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "0ef980002506",
+  "token_usage": {
+    "input_tokens": 3166,
+    "cache_creation_tokens": 560941,
+    "cache_read_tokens": 49198405,
+    "output_tokens": 89801,
+    "api_call_count": 312
+  },
+  "session_metrics": {
+    "turn_count": 5
+  },
+  "summary": {
+    "intent": "Improve memory quality in the memory-loop system by enforcing evidence-based gating on generated memory records, and fix several UX issues in the summary command (slow startup, missing facets, broken repo filter).",
+    "outcome": "Implemented a two-layer evidence gate replacing the weak prompt-based filtering; fixed JSON parsing failures causing silent facet extraction errors; removed auto-backfill from summary command startup; corrected the repo branch filter to use git-reachability from default branch.",
+    "learnings": {
+      "repo": [
+        "memoryloop generator uses prompt instructions (not code) to enforce memory quality — a model suggestion, not a hard gate",
+        "passesReviewDerivedGate was the only per-kind evidence check; all other memory kinds had no multi-session enforcement",
+        "SourceSessionIDs is LLM-populated and unvalidated — cannot be trusted without cross-referencing against PatternAnalysis.AffectedSessions",
+        "improve/analyzer.go filtered out skill opportunities with count < 2 before the generator, making the singleton exception in the evidence gate unreachable",
+        "AffectedSessions uses checkpoint IDs while the prompt exposed session IDs — identifier mismatch would cause false rejections in Layer 2",
+        "summary_cmd.go ran backfill unconditionally on every invocation, causing 20+ sequential LLM calls with no progress output on first load",
+        "Personal-scope records become active immediately under auto-activation policy, bypassing TUI promotion entirely",
+        "The repo filter in summarytui used GetDefaultBranch (returning 'main') but sessions were on feature branches — always empty",
+        "Repo scope in memory-loop means checkpoints reachable from default branch HEAD via git history, not just branch name matching",
+        "LLM responses include trailing text after JSON (e.g. 'note:...') causing json.Unmarshal to fail with 'invalid character n after top-level value' — affected memoryloop generator, facets extractor, and improve generator"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 319,
+          "end_line": 319,
+          "finding": "Prompt instruction 'Avoid one-off incidents without repeated evidence' is a suggestion to the LLM, not enforced in code"
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 155,
+          "end_line": 161,
+          "finding": "Post-filter only catches low confidence/strength and generic advice; high-confidence singleton records pass through"
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 173,
+          "end_line": 173,
+          "finding": "SourceSessionIDs captured but never validated for length or accuracy"
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 360,
+          "end_line": 375,
+          "finding": "passesReviewDerivedGate enforced count>=2 only for review-derived rules, not other kinds — replaced by passesEvidenceGate"
+        },
+        {
+          "path": "cmd/entire/cli/improve/analyzer.go",
+          "line": 319,
+          "end_line": 319,
+          "finding": "Skill opportunities with count < 2 dropped before generator sees them, making singleton exception unreachable — threshold lowered to 1"
+        },
+        {
+          "path": "cmd/entire/cli/summary_cmd.go",
+          "line": 195,
+          "end_line": 196,
+          "finding": "Both summaryBackfillSummaries and summaryBackfillFacets called unconditionally on every launch, writing to io.Discard with no progress"
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "line": 81,
+          "end_line": 81,
+          "finding": "Detail pane checks row.HasFacets; after removing auto-backfill, this was always false until user pressed 'g'"
+        },
+        {
+          "path": "cmd/entire/cli/jsonutil/json.go",
+          "finding": "ExtractJSONObject added as shared utility; previously each package would need its own copy"
+        }
+      ],
+      "workflow": [
+        "When the LLM returns JSON with trailing natural-language text, json.Unmarshal fails silently — errors were logged at DEBUG level only, not surfaced to users",
+        "Moving shared utilities (like ExtractJSONObject) to jsonutil prevents duplication across facets, memoryloop, and improve packages",
+        "Evidence gate design: Layer 1 checks provenance via source_signal.key against PatternAnalysis signals; Layer 2 validates SourceSessionIDs against both input.Sessions and signal.AffectedSessions",
+        "Singleton exceptions should be scoped by both signal kind AND record kind to prevent exception leakage across types"
+      ]
+    },
+    "friction": [
+      "passesReviewDerivedGate was the only existing enforcement pattern but only covered one record kind — had to generalize the pattern to all kinds",
+      "Identifier mismatch between AffectedSessions (checkpoint IDs) and prompt-exposed session IDs required switching the prompt to use checkpoint IDs",
+      "LLM trailing text after JSON caused silent failures in three separate packages; required adding ExtractJSONObject fallback everywhere",
+      "Multiple test files needed updating after removing defaultBranch parameter from newRootModel and RunWithCurrentBranch signatures",
+      "replace_all missed some newRootModel call sites because they had different parameter patterns (e.g. with generateFn argument)",
+      "After removing the repo filter, user clarified 'repo' means merged-to-main (git-reachable), not just 'all branches' — required a second implementation pass",
+      "The matchedSignal type, AllowsSingleton logic, and AffectedSessionSet method were load-bearing but undefined in the doc sketch — had to design them during implementation"
+    ],
+    "open_items": [
+      "MEMORY_QUALITY_ANALYSIS.md notes that repo_learning and workflow_learning should be removed from the generator prompt or marked context-only to avoid wasted LLM tokens on ineligible signal types",
+      "findSignal lookup strategy uses normalized exact match with substring fallback — false negative rate if LLM paraphrases the signal key is not yet measured",
+      "Existing low-quality memories already in memory-loop.json are not retroactively filtered; natural decay or a backfill/re-evaluation pass may be needed",
+      "GenerationStats now has FilteredNoEvidenceCount but no separate counter to distinguish 'no source_signal field' from 'signal found but count too low'",
+      "The improve/generator.go JSON fix was applied but not explicitly tested for the trailing-text case"
+    ]
+  }
+}

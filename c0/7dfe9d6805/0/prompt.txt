@@ -1,0 +1,226 @@
+if i run ./entire search then I see this error  Error: parsing response: invalid character '<' looking for beginning of value but if I run ENTIRE_API_BASE_URL=http://localhost:8787 ENTIRE_SEARCH_URL=http://localhost:8686 ./entire search then no errors. whats going on
+
+---
+
+<task-notification>
+<task-id>b4o1ct6vo</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha-Projects-devenv-wt-cli-search/b6c6831e-6dc6-4319-8fe2-73d92462e890/tasks/b4o1ct6vo.output</output-file>
+<status>completed</status>
+<summary>Background command "Run full CI test suite" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+this message is kind of weird ENTIRE_SEARCH_URL is only set in dev mode. what does the html error say. thats what should be displayed
+
+---
+
+but the user needs to know error even if its html or json
+
+---
+
+not better.  SEARCH
+
+ › a
+
+ Error: unexpected response from search service: <!doctype html>
+<html lang="en" class="scroll-smooth">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=d... why is it returning html anyways?
+
+---
+
+I'm pretty sure the service is deployed. maybe the url for prod is wrong
+
+---
+
+for now can you just have it print out full html or json. have it be flexible
+
+---
+
+make sure to handle case where checkpoint detail has a lot of info. right now it gets cut off [Image #1]
+
+---
+
+in tui pressing / should always scroll and focus on the search input. also large detail card is still causing cut off issue. give some different options for fixing it
+
+---
+
+couple things to fix. 1. search input still getting cut off. so card detail cutoff needs to be better. 2. in the detail page the prompt is cut off. it should wrap and show everything. 3. search input focus is one line short. all I see if the filter instructions
+
+---
+
+continue
+
+---
+
+can you make the screen scroll? right now when I try to scroll it scrolls through table. I ask because the checkpoint detail overflow is still an issue. its cutting off top. nothing should cut off top
+
+---
+
+scroll is perfect but still have a resonable truncation for the checkpoint detail card. keep the scroll
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a713a3ed95bd03d5a</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha-Projects-devenv-wt-cli-search/b6c6831e-6dc6-4319-8fe2-73d92462e890/tasks/a713a3ed95bd03d5a.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>No existing reviews or requirements directory. Now I have all the information needed from reading the file. Let me analyze each of the 6 efficiency concerns.
+
+Here are my findings on the 6 efficiency questions you raised:
+
+---
+
+**1. `refreshBrowseContent()` called on every cursor move (j/k) -- lines 286-294**
+
+Yes, every j/k press triggers a full rebuild via `refreshBrowseContent()` which calls `renderBrowseContent()`. This rebuilds the header, table (with `viewTable()`), and detail card (with `viewDetailCard()`) -- all string allocations from scratch. For a page of 25 results, this means re-rendering all 25 rows plus the detail card just to move a highlight.
+
+**However, this is not a real performance concern.** Bubbletea TUIs routinely rebuild their entire view string on every keypress -- the `View()` method is designed to be called on every frame. With 25 rows of simple text formatting, you are looking at microseconds of work. The viewport's `SetContent` does a string assignment internally. Terminal rendering (the actual I/O) is the bottleneck, not string building. This is idiomatic Bubbletea.
+
+**2. `renderBrowseContent()` rebuilds the entire content including table on every call -- line 409**
+
+Same assessment as above. The table rendering in `viewTable()` (line 462) does `computeColumns` + format 25 rows + string concatenation. This is cheap. `computeColumns` is pure arithmetic (line 716). The `viewRow` calls do `fmt.Sprintf` and `TruncateRunes` -- all small, non-allocating-heavy operations. Not a concern for a TUI with at most 25 visible rows.
+
+**3. `viewDetailCard` calls `renderDetailContent` then splits for truncation -- lines 580-598**
+
+`viewDetailCard` renders full detail content (line 582), then splits it into lines and truncates to `maxCardContentLines=15` (lines 584-589). This means it word-wraps the entire detail text only to throw away lines beyond 15. The "waste" is minimal -- a checkpoint detail has maybe 20-30 lines of text total. The alternative (a width-aware line-counting wrapper that stops early) would add complexity for negligible savings.
+
+One minor note: `renderDetailContent` is called again when the user presses Enter to see the full detail (line 319), so the work is done twice for the same result. But since it only happens on a cursor-move redraw (not a tight loop), this is fine.
+
+**4. `wrapText` allocates a new `strings.Builder` per paragraph -- lines 665-677**
+
+Looking more carefully, `wrapText` does NOT allocate a Builder per paragraph. It allocates one `strings.Builder` (line 669) and passes it to `wrapParagraph` which writes into it (line 679: `func wrapParagraph(b *strings.Builder, ...)`). Each paragraph call reuses the same builder. This is already efficient -- no concern here.
+
+**5. `default` case in `updateBrowseMode` forwards all unhandled keys to the viewport -- lines 328-332**
+
+This forwards every unmatched keypress to the viewport's Update method. The viewport will process pgup/pgdn/ctrl+u/ctrl+d and ignore everything else. This is standard Bubbletea delegation and is not an efficiency issue -- viewport.Update for an unrecognized key just returns the model unchanged with `nil` cmd.
+
+The real question is about **unexpected behavior**, not efficiency. The viewport handles keys like `g` (go to top), `G` (go to bottom), half-page scrolls, etc. Some of these overlap with keys users might expect to do nothing. For instance, if a user presses `g` expecting it to be unhandled, the viewport will jump to top. This is arguably a feature (more scroll bindings), but it could surprise users. The comment on line 329 says "Forward pgup/pgdn/ctrl+u/ctrl+d" but the default case forwards everything, not just those keys. If the intent is to only forward specific scroll keys, an explicit allowlist would be more predictable.
+
+**Verdict: Not an efficiency issue, but a minor correctness/UX concern.** The comment is misleading about what actually gets forwarded.
+
+**6. `viewport.New()` with height=1, then immediately has content set -- line 156-158**
+
+```go
+browseVP:  viewport.New(ss.width, 1), // height set on first WindowSizeMsg
+```
+
+Then `refreshBrowseContent()` is called on line 158 which calls `SetContent`. The viewport is created with height=1 as a placeholder because the real terminal dimensions arrive via the first `WindowSizeMsg`. This is completely standard Bubbletea practice -- you cannot know the terminal size until the program starts and receives that message. The viewport.New constructor is trivial (allocates a struct with dimensions). Setting content immediately is fine; it will be re-set when WindowSizeMsg arrives. No waste.
+
+---
+
+**Summary:** None of the 6 items represent meaningful efficiency problems. The architecture follows standard Bubbletea patterns where full-view rebuilds on every update are expected and cheap. The only actionable finding is item 5 -- the `default` case comment is misleading (claims to forward only specific scroll keys but actually forwards all unhandled keys), and the broad forwarding could cause minor UX surprises from viewport-handled keys the user does not expect.</result>
+<usage><total_tokens>33856</total_tokens><tool_uses>6</tool_uses><duration_ms>50718</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a0479ff333ecf9908</task-id>
+<tool-use-id>toolu_01SEBRTtuEjSjPpJwzUJua2b</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha-Projects-devenv-wt-cli-search/b6c6831e-6dc6-4319-8fe2-73d92462e890/tasks/a0479ff333ecf9908.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>I have all the findings now. Here is my report.
+
+---
+
+## Code Reuse Findings
+
+### 1. `wrapText` / `wrapParagraph` (search_tui.go:665-701)
+
+**Finding: No existing utility in the codebase. A transitive dependency exists but is not a clean fit.**
+
+- `cmd/entire/cli/stringutil/stringutil.go` has `CollapseWhitespace` and `TruncateRunes` but nothing for word wrapping.
+- `github.com/charmbracelet/x/exp/strings` is already in `go.mod` as an indirect dependency (pulled in by other charmbracelet packages). This package is known to export a `WordWrap` function. However, it is an `exp` (experimental) package at a pinned commit from July 2024, and importing it directly would promote it from indirect to direct -- a conscious decision rather than a free win.
+- `github.com/muesli/reflow` (the classic charmbracelet word-wrap library) is NOT in the dependency tree at all.
+- lipgloss `Style.Width()` does padding/truncation, not word wrapping. It would not replace `wrapText`.
+
+**Verdict:** The hand-rolled `wrapText` is a reasonable choice given the current dependency set. The only alternative is `charmbracelet/x/exp/strings.WordWrap`, which is experimental and would add a direct import of a pinned experimental module. No existing in-repo utility covers this.
+
+### 2. `indentLines` (search_tui.go:654-661)
+
+**Finding: No existing utility anywhere in the codebase or current dependency tree.**
+
+- The only other `indent`-related functions in the codebase are `printChildren`/`printNode` in `help.go` (tree-drawing, not general indent) and `jsonutil.MarshalIndentWithNewline` (JSON marshaling).
+- lipgloss does NOT have an `Indent` function. It has `Padding` on styles, but that pads a rendered block, not individual lines of a string.
+- `charmbracelet/x/exp/strings` may have `Indent`, but same caveats as above apply -- experimental, indirect only.
+
+**Verdict:** No reuse opportunity exists in the current codebase or direct dependencies.
+
+### 3. `refreshBrowseContent` pattern (search_tui.go:457-460)
+
+**Finding: This is a standard bubbletea viewport pattern, not a code reuse concern.**
+
+The function is called 14 times across the `Update` method -- after every state mutation that changes what the viewport should display. This is the idiomatic way to use `charmbracelet/bubbles/viewport`: mutate model state, then call `viewport.SetContent()` with the re-rendered string. There is no higher-level bubbletea abstraction that eliminates this pattern; it is the intended usage of the viewport component.
+
+**Verdict:** No alternative pattern exists. The repeated calls are inherent to the bubbletea architecture.
+
+### 4. Test setup pattern: `m.height = 60; m.browseVP.Height = 59; m = m.refreshBrowseContent()` (search_tui_test.go lines 69-71, 268-270, 742-746)
+
+**Finding: Repeated 3 times. One instance (`testModel()` at line 65) already encapsulates it, but two other test sites duplicate the triple-line setup instead of using or extending `testModel()`.**
+
+- Line 65-73: `testModel()` helper -- sets height/browseVP.Height/refreshBrowseContent correctly.
+- Line 263-270: `TestSearchModel_ViewNoResults` -- creates its own model with `nil` results and `width: 80`, then duplicates the 3-line setup.
+- Line 735-746: `TestSearchModel_ViewFetchingMore` -- creates its own model with 25 empty results and `width: 100`, then duplicates the 3-line setup.
+
+The two non-`testModel()` sites use different constructor arguments (different results, width, total), so they cannot simply call `testModel()`. However, the 3-line height/viewport/refresh sequence could be extracted into a small helper like `initViewport(m *searchModel)` to avoid the repetition.
+
+**Verdict:** Minor duplication. A helper would reduce the 3-line pattern to 1 line in each test, but it is a low-impact improvement (3 occurrences of 3 lines).
+
+---
+
+### Summary
+
+| Item | Reuse opportunity? | Severity |
+|---|---|---|
+| `wrapText`/`wrapParagraph` | No -- nothing in codebase; experimental indirect dep is only alternative | None |
+| `indentLines` | No -- nothing in codebase or direct deps | None |
+| `refreshBrowseContent` pattern | No -- idiomatic bubbletea viewport usage | None |
+| Test height/viewport setup | Minor -- could extract a 3-line helper | Low |
+
+The newly written code does not duplicate any existing utilities in the codebase. The charmbracelet ecosystem does have experimental equivalents (`charmbracelet/x/exp/strings`) but they are not direct dependencies today, and adopting them would be a deliberate dependency decision rather than fixing an oversight.</result>
+<usage><total_tokens>40218</total_tokens><tool_uses>36</tool_uses><duration_ms>123709</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3637bcc1de15fe1a</task-id>
+<tool-use-id>toolu_011rxgS8nYuqRe2kY21tP1xS</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-alisha-Projects-devenv-wt-cli-search/b6c6831e-6dc6-4319-8fe2-73d92462e890/tasks/a3637bcc1de15fe1a.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Here are the findings from the code quality review.
+
+**Review written to:** `/Users/alisha/Projects/devenv/wt/cli_search/docs/requirements/cli-search/review-01.md`
+
+**Summary of findings:**
+
+**Important (Should Fix):**
+
+1. **Stale doc comment** (search_tui.go:509-511) -- The comment on `renderDetailContent` says `wrapWidth controls word-wrapping` but there is no `wrapWidth` parameter. The wrapping width is computed internally from `m.width`. Actively misleading.
+
+2. **`writeWrappedField` duplicates label formatting from `writeField`** (search_tui.go:530-535) -- Both closures independently format the label with `fmt.Sprintf("%-*s", labelWidth, label+":")`. When wrapping IS needed, `writeWrappedField` re-implements the label formatting rather than reusing `writeField`. If the label format changes, two places need updating.
+
+3. **`viewSearchMode()` duplicates the SEARCH header from `renderBrowseContent()`** (search_tui.go:394-406 vs 409-416) -- Both render the identical `"\n" + pad + SEARCH title + "\n\n"` block. A `renderSearchHeader()` helper would deduplicate this.
+
+4. **`hasFilters` in search_cmd.go:57 duplicates `Config.HasFilters()`** -- The same boolean expression exists in two places because the check runs before the Config struct is constructed.
+
+**Suggestions (lower priority):**
+
+5. The two mouse event handler blocks (browse/detail) are structurally identical but only 3 lines each -- not worth extracting unless a third viewport is added.
+
+6. `refreshBrowseContent()` on every cursor up/down rebuilds the entire browse string. Fine for 25-item pages but worth noting as a scalability concern.</result>
+<usage><total_tokens>55321</total_tokens><tool_uses>11</tool_uses><duration_ms>132935</duration_ms></usage>
+</task-notification>

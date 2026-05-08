@@ -1,0 +1,98 @@
+Implement the following plan:
+
+# Plan: Fix prompt.txt missing in mid-turn commit checkpoints
+
+## Context
+
+Mid-turn commits (agent commits while still working) produce checkpoints without `prompt.txt` after the first one. All checkpoints in a turn share the same user prompt and should all have it.
+
+Root cause: `extractCheckpointPrompts()` scopes the transcript past where the prompt lives after the first condensation advances `CheckpointTranscriptStart`.
+
+## Approach
+
+Repurpose `FirstPrompt` on session state to track the **last prompt** instead. Update it on every `InitializeSession` call (each `UserPromptSubmit`). Use it in condensation instead of re-parsing the transcript.
+
+All consumers of `prompt.txt` already truncate (`ExtractFirstPrompt` → 60 chars), and `FirstPrompt` stores 100 runes, so the truncation is fine.
+
+## Changes
+
+### 1. Rename `FirstPrompt` → `LastPrompt` in session state
+
+**`cmd/entire/cli/session/state.go`** (line 142-143):
+- Rename field from `FirstPrompt` to `LastPrompt`
+- Keep JSON tag as `"first_prompt"` for backward compat with existing state files
+- Update comment
+
+### 2. Update `LastPrompt` on every turn, not just the first
+
+**`cmd/entire/cli/strategy/manual_commit_hooks.go`** — `InitializeSession()` (line 1681-1684):
+
+Change from only-backfill-if-empty:
+```go
+if state.FirstPrompt == "" && userPrompt != "" {
+    state.FirstPrompt = truncatePromptForStorage(userPrompt)
+}
+```
+To always-update:
+```go
+if userPrompt != "" {
+    state.LastPrompt = truncatePromptForStorage(userPrompt)
+}
+```
+
+Also update comment on line 1648 (`FirstPrompt` → `LastPrompt`).
+
+**`cmd/entire/cli/strategy/manual_commit_session.go`** — `initializeSession()` (line 241):
+- Rename `FirstPrompt:` → `LastPrompt:` in the initial state struct
+- Update comment on line 194 (`FirstPrompt` → `LastPrompt`)
+
+### 3. Use `LastPrompt` in condensation
+
+**`cmd/entire/cli/strategy/manual_commit_condensation.go`**:
+
+**`extractSessionData()`** (line 439): Add `turnPrompt string` parameter. At line 465:
+```go
+if turnPrompt != "" {
+    data.Prompts = []string{turnPrompt}
+} else {
+    data.Prompts = extractCheckpointPrompts(agentType, data.Transcript, checkpointTranscriptStart)
+}
+```
+
+**`CondenseSession()` caller** (line 129): Pass `state.LastPrompt` as the new `turnPrompt` argument.
+
+**`extractSessionDataFromLiveTranscript()`** (line 504): Already receives `state`, so:
+```go
+if state.LastPrompt != "" {
+    data.Prompts = []string{state.LastPrompt}
+} else {
+    data.Prompts = extractCheckpointPrompts(state.AgentType, data.Transcript, state.CheckpointTranscriptStart)
+}
+```
+
+### 4. Use `LastPrompt` in `finalizeAllTurnCheckpoints`
+
+**`cmd/entire/cli/strategy/manual_commit_hooks.go`** (line 2017):
+```go
+var prompts []string
+if state.LastPrompt != "" {
+    prompts = []string{state.LastPrompt}
+} else {
+    prompts = extractUserPrompts(state.AgentType, string(fullTranscript))
+}
+```
+
+### 5. Update references
+
+Rename `FirstPrompt` → `LastPrompt` in:
+- `cmd/entire/cli/status.go` (line 311-312) — display code
+- `cmd/entire/cli/strategy/manual_commit_types.go` (lines 17-24) — constant name `maxFirstPromptRunes` → `maxLastPromptRunes`, comments
+- `cmd/entire/cli/status_test.go` — test fixtures (3 occurrences of `FirstPrompt:`, 1 comment)
+
+## Verification
+
+1. `mise run fmt && mise run test:ci`
+2. Integration tests pass (no context.md assertions to worry about on this branch)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-cli/15fd6ab2-14d2-491c-a545-979c64b074e7.jsonl
