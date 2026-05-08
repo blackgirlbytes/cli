@@ -1,0 +1,11 @@
+cmd/entire/cli/clean.go
+1. The help text says "Checkpoint metadata is never deleted", but the cleanup strategy supports listing and deleting orphaned checkpoints (see strategy.DeleteAllCleanupItems/DeleteOrphanedCheckpoints). This is misleading for users running clean --all; please update the description to reflect actual behavior (e.g., clarify that the entire/checkpoints/v1 branch is preserved, but orphaned checkpoint entries may be cleaned).
+2. runCleanCurrentHead delegates to strat.Reset(ctx), but ManualCommitStrategy.Reset writes user-facing output directly to os.Stderr and uses "reset" wording (e.g., "Nothing to reset..."). This makes entire clean output inconsistent (wrong verb + bypasses cmd.OutOrStdout/ErrOrStderr). Consider moving the user messaging into clean.go (and having the strategy return structured results), or updating Reset to accept writers / use the command’s streams with "clean" wording.
+
+cmd/entire/cli/reset.go
+1. Like clean, reset initializes logging before verifying it's in a git repository. Because logging.Init falls back to repoRoot = ".", entire reset run outside a repo can create .entire/logs in the current directory before returning "not a git repository". Please reorder to check paths.WorktreeRoot first, then initialize logging once the repo context is confirmed.
+2. For backward compatibility, entire reset --session <id> currently delegates to runCleanSession, which uses "clean" wording in prompts/output (e.g., "Clean session…" / "has been cleaned"). Even though reset is deprecated, this can confuse users following older docs/scripts. Consider parameterizing runCleanSession with the action verb (reset/clean) or keeping a small reset-specific wrapper for messaging.
+
+---
+
+commit this

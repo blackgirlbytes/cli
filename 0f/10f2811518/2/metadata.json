@@ -1,0 +1,86 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "0f10f2811518",
+  "session_id": "90f3ff3b-83c8-4125-bbc4-c02734981f54",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T17:51:10.628452Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "cmd/entire/cli/summary_cmd.go",
+    "cmd/entire/cli/summary_cmd_test.go",
+    "cmd/entire/cli/summarytui/root.go",
+    "cmd/entire/cli/summarytui/root_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "7a1c6ce295e6",
+  "checkpoint_transcript_start": 170,
+  "token_usage": {
+    "input_tokens": 99,
+    "cache_creation_tokens": 51640,
+    "cache_read_tokens": 17174941,
+    "output_tokens": 22275,
+    "api_call_count": 91
+  },
+  "session_metrics": {
+    "turn_count": 16
+  },
+  "summary": {
+    "intent": "Fix the repo filter in the summary TUI showing nothing when 'memory loop refresh scope repo' had been run, so that sessions reachable from main are visible when the repo filter is active.",
+    "outcome": "Identified root cause (200 most-recent session cap excluded all merged sessions when on a feature branch), introduced a dedicated DB query for repo-scoped sessions, stored branch and repo rows as separate slices in the TUI model, updated all tests, and committed the fix.",
+    "learnings": {
+      "repo": [
+        "loadSummarySessions caps results at 200 most-recent sessions; when on a feature branch, none of those 200 may be reachable from main, making the repo filter appear empty.",
+        "The repo filter and branch filter are separate views in the TUI (toggled with the '2' key), not a merged dataset — each should draw from its own independently-loaded row slice.",
+        "Checkpoint IDs in the DB match the format returned by trailers.ParseAllCheckpoints on main commits.",
+        "1403 reachable checkpoint IDs existed on main; 2633 sessions in DB; 1308 overlap — data was present but unreachable due to the 200-row cap."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/summary_cmd.go",
+          "finding": "runSummaryTUI is a package-level var pointing to summarytui.RunWithCurrentBranch; its signature was updated to accept repoRows []insightsdb.SessionRow alongside branchRows."
+        },
+        {
+          "path": "cmd/entire/cli/insightsdb/queries.go",
+          "finding": "A new QueryByCheckpointIDs (or equivalent) method was added to load sessions filtered to a set of reachable checkpoint IDs, enabling repo-scoped queries without the recency cap."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "finding": "m.rows was replaced with m.branchRows and m.repoRows; applyFilter selects the appropriate source slice based on the active branchFilter value."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root_test.go",
+          "finding": "Tests that set filterRepo must pass the same sample rows as both branchRows and repoRows arguments to newRootModel; passing nil for repoRows with filterRepo active yields zero visible rows."
+        },
+        {
+          "path": "cmd/entire/cli/summary_cmd_test.go",
+          "line": 172,
+          "end_line": 197,
+          "finding": "Mock runSummaryTUI function signatures must be updated when the real function signature changes (map[string]struct{} → []insightsdb.SessionRow)."
+        }
+      ],
+      "workflow": [
+        "When a filter produces no results, verify whether the data population step (query limit) and the filter step operate on the same scope — a cap before filtering can silently exclude all matching rows.",
+        "Counting overlap between two sets (reachable IDs vs DB sessions) is a reliable diagnostic step to confirm data exists before investigating filter logic."
+      ]
+    },
+    "friction": [
+      "Multiple rounds of investigation were needed before identifying the 200-row cap as the root cause rather than a code logic bug.",
+      "An initial plan proposed merging branch and repo rows into one slice, which the user immediately corrected — the two views are independent and should not be merged.",
+      "Many test call sites for newRootModel needed individual inspection to determine which ones set filterRepo and therefore required non-nil repoRows."
+    ],
+    "open_items": []
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-03T17:50:41.223156Z",
+    "agent_lines": 106,
+    "agent_removed": 0,
+    "human_added": 18,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 124,
+    "total_lines_changed": 0,
+    "agent_percentage": 85.48387096774194
+  }
+}

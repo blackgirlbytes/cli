@@ -1,0 +1,105 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "2f7df8655dad",
+  "session_id": "90f3ff3b-83c8-4125-bbc4-c02734981f54",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T22:26:18.895612Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "cmd/entire/cli/memoryloop/memoryloop.go"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "8c01623ecad5",
+  "token_usage": {
+    "input_tokens": 450,
+    "cache_creation_tokens": 1315692,
+    "cache_read_tokens": 60541685,
+    "output_tokens": 101905,
+    "api_call_count": 346
+  },
+  "session_metrics": {
+    "turn_count": 7
+  },
+  "summary": {
+    "intent": "Enhance the summary TUI detail pane to show all available session data (scores, stats, files, tools, facets with evidence), fix the repo filter showing nothing, and add text selection/copy support.",
+    "outcome": "Implemented 4-box grouped layout (SUMMARY, CODE, LEARNINGS, SIGNALS) with all missing data; fixed repo filter by loading separate row sets per filter view; enabled highlight-copy via keyboard-only scrolling; fixed memory-loop outcome tracking logic which was incorrectly marking injected memories as ineffective; wired up the edit wizard intent in memory-loop TUI.",
+    "learnings": {
+      "repo": [
+        "The insights.db has 15 populated tables including sessions, tool_calls, files_touched, learnings, friction, failure_loops, repeated_user_instructions, missing_context_signals, skill_signals, review_rule_signals, codebase_patterns, implementation_rationale, tradeoffs.",
+        "Facet backfilling: sessions are initially stored with has_facets=0; memory-loop/improve/insights commands send condensed transcripts to an LLM to extract structured signals, then set has_facets=1.",
+        "The summary TUI loadSummarySessions loads only the 200 most recent sessions; when on a feature branch, none of these overlap with main-reachable checkpoint IDs, causing the repo filter to show nothing.",
+        "DeriveOutcomes outcome logic was inverted: injected memories appearing in post-injection negative evidence should be ineffective, but evidence from pre-injection sessions was incorrectly influencing the outcome; fix requires temporal split on LastInjectedAt.",
+        "The WizardIntentEdit case was missing from the memory_loop_cmd.go wizard handler switch; the interactive edit mode was stubbed with 'not yet implemented'.",
+        "tea.WithMouseCellMotion() captures all mouse events preventing terminal text selection; removing it restores highlight-copy while pgup/pgdn/ctrl+u/ctrl+d provide keyboard-only detail pane scrolling."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/summarytui/detail_page.go",
+          "line": 1,
+          "end_line": 999,
+          "finding": "Rewrote renderDetailContent to use 4 grouped boxes: SUMMARY (scores/stats), CODE (files/tools/rationale/tradeoffs/patterns), LEARNINGS, SIGNALS (all facet types with evidence). Added renderSubSection helper with blank-line spacing between sub-sections, renderSignalsBox, renderCodeBox, formatDuration."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "line": 1,
+          "end_line": 999,
+          "finding": "Replaced single m.rows with m.branchRows and m.repoRows; applyFilter selects the correct source slice based on active filter. Removed tea.WithMouseCellMotion() to allow text selection; detail pane scrolls via pgup/pgdn/ctrl+u/ctrl+d."
+        },
+        {
+          "path": "cmd/entire/cli/summary_cmd.go",
+          "line": 1,
+          "end_line": 999,
+          "finding": "Added loadRepoSessions helper that calls QueryByCheckpointIDs with reachable checkpoint IDs; passes repoRows separately to RunWithCurrentBranch alongside branchRows."
+        },
+        {
+          "path": "cmd/entire/cli/insightsdb/queries.go",
+          "line": 1,
+          "end_line": 999,
+          "finding": "Added QueryByCheckpointIDs method to load sessions matching a set of checkpoint IDs, used for the repo filter view."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "line": 1108,
+          "end_line": 1135,
+          "finding": "Fixed DeriveOutcomes: for injected records, split sessions into pre/post LastInjectedAt; only post-injection friction overlap signals ineffective; no post-injection friction overlap signals reinforced; zero post-injection sessions signals neutral."
+        },
+        {
+          "path": "cmd/entire/cli/memory_loop_cmd.go",
+          "line": 770,
+          "end_line": 820,
+          "finding": "Added WizardIntentEdit case in wizard handler; added editMemoryLoopWizardRequest function that opens a huh form pre-populated with record's title, body, and keywords, then calls EditRecord on submit."
+        }
+      ],
+      "workflow": [
+        "Codex adversarial review companion hits ENOBUFS on large repos because its internal git diff buffer overflows; not usable on large monorepos.",
+        "When removing mouse capture from bubbletea TUI, verify all scroll paths still work via keyboard before committing.",
+        "For outcome/signal correctness bugs, write temporal test cases with explicit CreatedAt and LastInjectedAt values to avoid zero-value ambiguity."
+      ]
+    },
+    "friction": [
+      "Codex adversarial review companion failed with ENOBUFS on both foreground and background runs due to repo size; review was skipped.",
+      "replace_all corrupted function call sites when used on short parameter tokens — required manual repair of renderSubSection call signatures.",
+      "First mouse-removal commit broke scroll entirely before the keyboard-only fallback was validated, requiring a follow-up fix.",
+      "Visual companion server startup required multiple attempts and was left running as a background process.",
+      "The brainstorming skill spawned many tracking tasks and had overhead before producing the actual design output."
+    ],
+    "open_items": [
+      "The 'y copy' clipboard feature (copy entire detail pane) was added then removed in favor of highlight-copy; could be re-added as an opt-in if users want it.",
+      "DeriveOutcomesFromEvidence (the evidence-only variant used in some tests) now returns neutral for all cases since it has no temporal data; a separate evidence-based reinforcement signal path may be worth adding.",
+      "The memory-loop 'reinforced' outcome now requires post-injection sessions with no friction overlap; memories injected recently with few post-injection sessions will stay neutral indefinitely."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-03T22:25:27.916577Z",
+    "agent_lines": 68,
+    "agent_removed": 0,
+    "human_added": 35,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 103,
+    "total_lines_changed": 0,
+    "agent_percentage": 66.01941747572816
+  }
+}

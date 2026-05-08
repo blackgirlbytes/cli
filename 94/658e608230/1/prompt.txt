@@ -1,0 +1,239 @@
+Implement the following plan:
+
+# Implement `GetSessionDir` for Factory AI Droid
+
+## Context
+
+When running `entire rewind` with a Droid session, code files restore correctly but the session transcript fails to restore:
+
+```
+Warning: failed to restore session transcript: failed to get agent session directory: not implemented
+```
+
+All transcript restore paths (rewind, resume, debug) call `resolveTranscriptPath()` → `agent.GetSessionDir()`, which returns "not implemented" for Droid. This blocks transcript restoration for rewind, resume, and debug commands.
+
+**Goal**: Implement `GetSessionDir` with Droid's real storage location so transcripts are restored where Droid can find them for `droid --session-id` resume.
+
+## Droid's Storage Pattern
+
+Confirmed from the user's filesystem:
+
+```
+~/.factory/sessions/<sanitized-repo-path>/<session-id>.jsonl
+```
+
+Where `sanitized-repo-path` replaces all non-alphanumeric chars with `-` (same algorithm as Claude Code's `SanitizePathForClaude` using `[^a-zA-Z0-9]` → `-`).
+
+Example: `/Users/alisha/Projects/test-repos/factoryai-droid` → `-Users-alisha-Projects-test-repos-factoryai-droid`
+
+## Changes
+
+### 1. `cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go`
+
+**Add** `sanitizeRepoPath` helper (same regex pattern as `claudecode.SanitizePathForClaude` — duplicated to avoid cross-package dependency):
+
+```go
+var nonAlphanumericRegex = regexp.MustCompile(`[^a-zA-Z0-9]`)
+
+func sanitizeRepoPath(path string) string {
+    return nonAlphanumericRegex.ReplaceAllString(path, "-")
+}
+```
+
+**Replace** `GetSessionDir` implementation:
+
+```go
+func (f *FactoryAIDroidAgent) GetSessionDir(repoPath string) (string, error) {
+    if override := os.Getenv("ENTIRE_TEST_DROID_PROJECT_DIR"); override != "" {
+        return override, nil
+    }
+    homeDir, err := os.UserHomeDir()
+    if err != nil {
+        return "", fmt.Errorf("failed to get home directory: %w", err)
+    }
+    projectDir := sanitizeRepoPath(repoPath)
+    return filepath.Join(homeDir, ".factory", "sessions", projectDir), nil
+}
+```
+
+New imports needed: `"regexp"`.
+
+### 2. `cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go`
+
+**Replace** existing `TestGetSessionDir` (which asserts "not implemented" error) with:
+- `TestGetSessionDir` — verifies returns `~/.factory/sessions/<sanitized>/`
+- `TestGetSessionDir_EnvOverride` — verifies `ENTIRE_TEST_DROID_PROJECT_DIR` env override (cannot use `t.Parallel()` due to `t.Setenv`)
+
+### 3. `cmd/entire/cli/integration_test/agent_test.go` (~line 1157)
+
+**Replace** `"GetSessionDir returns not-implemented error"` test with one that validates the new path pattern.
+
+## What This Unblocks
+
+All 8 call sites that use `GetSessionDir` will automatically work:
+- `resolveTranscriptPath()` → rewind (3 callers), resume (1), debug (1)
+- Direct calls in resume.go:395, manual_commit_rewind.go:652, manual_commit_rewind.go:791
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Manually test with a Droid repo:
+1. Run `entire rewind` — should restore transcript without warning
+2. Verify the transcript was written to `~/.factory/sessions/<sanitized-path>/<session-id>.jsonl`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.REDACTED.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+	modified:   cmd/entire/cli/integration_test/agent_test.go
+
+no changes added to commit (use "git add" and/or "git commit -a")
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+index 0339542d..4162a204 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+@@ -7,11 +7,20 @@ import (
+ 	"io"
+ 	"os"
+ 	"path/filepath"
++	"regexp"
+ 
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
+ 	"github.com/entireio/cli/cmd/entire/cli/paths"
+ )
+ 
++// nonAlphanumericRegex matches any non-alphanumeric character for path sanitization.
++// Same pattern as claudecode.SanitizePathForClaude — duplicated to avoid cross-package dependency.
++var nonAlphanumericRegex = regexp.MustCompile(`[^a-zA-Z0-9]`)
++
++func sanitizeRepoPath(path string) string {
++	return nonAlphanumericRegex.ReplaceAllString(path, "-")
++}
++
+ //nolint:gochecknoinits // Agent self-registration is the intended pattern
+ func init() {
+ 	agent.Register(agent.AgentNameFactoryAIDroid, NewFactoryAIDroidAgent)
+@@ -100,9 +109,18 @@ func (f *FactoryAIDroidAgent) ParseHookInput(_ agent.HookType, r io.Reader) (*ag
+ // GetSessionID extracts the session ID from hook input.
+ func (f *FactoryAIDroidAgent) GetSessionID(input *agent.HookInput) string { return input.SessionID }
+ 
+-// GetSessionDir is not implemented for Factory AI Droid.
+-func (f *FactoryAIDroidAgent) GetSessionDir(_ string) (string, error) {
+-	return "", errors.New("not implemented")
++// GetSessionDir returns the directory where Factory AI Droid stores session transcripts.
++// Path: ~/.factory/sessions/<sanitized-repo-path>/
++func (f *FactoryAIDroidAgent) GetSessionDir(repoPath string) (string, error) {
++	if override := os.Getenv("ENTIRE_TEST_DROID_PROJECT_DIR"); override != "" {
++		return override, nil
++	}
++	homeDir, err := os.UserHomeDir()
++	if err != nil {
++		return "", fmt.Errorf("failed to get home directory: %w", err)
++	}
++	projectDir := sanitizeRepoPath(repoPath)
++	return filepath.Join(homeDir, ".factory", "sessions", projectDir), nil
+ }
+ 
+ // ResolveSessionFile returns the path to a Factory AI Droid session file.
+diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+index 539f605a..2f15b9bb 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+@@ -295,9 +295,35 @@ func TestGetSessionID(t *testing.T) {
+ func TestGetSessionDir(t *testing.T) {
+ 	t.Parallel()
+ 	ag := &FactoryAIDroidAgent{}
+-	_, err := ag.GetSessionDir("/some/repo")
+-	if err == nil {
+-		t.Error("GetSessionDir() should return error (not implemented)")
++
++	dir, err := ag.GetSessionDir("/Users/alisha/Projects/test-repos/factoryai-droid")
++	if err != nil {
++		t.Fatalf("GetSessionDir() error = %v", err)
++	}
++
++	homeDir, err := os.UserHomeDir()
++	if err != nil {
++		t.Fatalf("failed to get home dir: %v", err)
++	}
++
++	expected := filepath.Join(homeDir, ".factory", "sessions", "-Users-alisha-Projects-test-repos-factoryai-droid")
++	if dir != expected {
++		t.Errorf("GetSessionDir() = %q, want %q", dir, expected)
++	}
++}
++
++// TestGetSessionDir_EnvOverride cannot use t.Parallel() due to t.Setenv.
++func TestGetSessionDir_EnvOverride(t *testing.T) {
++	ag := &FactoryAIDroidAgent{}
++	override := "/tmp/test-droid-sessions"
++	t.Setenv("ENTIRE_TEST_DROID_PROJECT_DIR", override)
++
++	dir, err := ag.GetSessionDir("/any/repo/path")
++	if err != nil {
++		t.Fatalf("GetSessionDir() error = %v", err)
++	}
++	if dir != override {
++		t.Errorf("GetSessionDir() = %q, want %q (env override)", dir, override)
+ 	}
+ }
+ 
+diff --git a/cmd/entire/cli/integration_test/agent_test.go b/cmd/entire/cli/integration_test/agent_test.go
+index b9d39918..0f14d814 100644
+--- a/cmd/entire/cli/integration_test/agent_test.go
++++ b/cmd/entire/cli/integration_test/agent_test.go
+@@ -1154,16 +1154,19 @@ func TestFactoryAIDroidSessionStubs(t *testing.T) {
+ 		}
+ 	})
+ 
+-	t.Run("GetSessionDir returns not-implemented error", func(t *testing.T) {
++	t.Run("GetSessionDir returns factory sessions path", func(t *testing.T) {
+ 		t.Parallel()
+ 
+ 		ag, _ := agent.Get("factoryai-droid")
+-		_, err := ag.GetSessionDir("/tmp/repo")
+-		if err == nil {
+-			t.Error("GetSessionDir() should return an error for Factory AI Droid")
++		dir, err := ag.GetSessionDir("/Users/test/my-project")
++		if err != nil {
++			t.Fatalf("GetSessionDir() error = %v", err)
+ 		}
+-		if !strings.Contains(err.Error(), "not implemented") {
+-			t.Errorf("GetSessionDir() error = %q, want to contain 'not implemented'", err.Error())
++		if !strings.Contains(dir, filepath.Join(".factory", "sessions")) {
++			t.Errorf("GetSessionDir() = %q, want to contain .factory/sessions", dir)
++		}
++		if !strings.HasSuffix(dir, "-Users-test-my-project") {
++			t.Errorf("GetSessionDir() = %q, want to end with sanitized path", dir)
+ 		}
+ 	})
+ }
+- Current branch: alisha/factoryai-agent
+- Recent commits: ac7c4438 Add Factory AI Droid E2E test runner
+12d2099e Fix Droid "(no prompt)" after commit by adding agent-specific transcript parsing
+cd0220e3 Merge branch 'main' into alisha/factoryai-agent
+c83248a7 Add Factory AI Droid integration tests
+da2c18a7 Simplify Droid transcript parsing code
+bdf4c1af Fix Factory AI Droid transcript parsing and session lifecycle issues
+3c37cf55 Add Factory AI Droid agent integration
+9e0d4603 Merge pull request #426 from entireio/soph/do-not-track-git-ignored-files-in-session
+16313647 Merge pull request #425 from entireio/rwr/refactor-agent-remove-GetHookConfigPath
+3524400d don't track gitignored files (for example node_modules) in our session metadata as untracked_files_at_start
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

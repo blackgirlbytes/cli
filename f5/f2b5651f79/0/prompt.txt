@@ -1,0 +1,161 @@
+Implement the following plan:
+
+# Plan: Refocus Research Phase, Add Implementation One-Pager
+
+## Context
+
+The 3-phase agent integration pipeline (research → write-tests → implement) has overlap: research reads the same internal Entire docs that the implementer re-reads, and both phases may search external agent docs independently. The fix: **research focuses purely on external discovery** and produces a structured "implementation one-pager" that both test-writer and implementer reference instead of re-searching external docs.
+
+## Files to Modify
+
+1. **`.claude/skills/agent-integration/researcher.md`** — Refocus on external-only discovery, remove internal Entire doc reading, output a one-pager
+2. **`.claude/skills/agent-integration/test-writer.md`** — Reference the one-pager for agent-specific info
+3. **`.claude/skills/agent-integration/implementer.md`** — Reference the one-pager for agent-specific info, keep internal doc reading
+4. **`.claude/skills/agent-integration/SKILL.md`** — Update phase descriptions to reflect the one-pager handoff
+
+## Changes
+
+### 1. `researcher.md` — External-Only, Produces One-Pager
+
+**Remove:** Phase 1 (Architecture Inspection) reads too many internal files (`agent.go`, `event.go`, `hook_registry.go`, `lifecycle.go`, checklist, reference implementations). Most of that is the implementer's job.
+
+**Keep from Phase 1:** Read `docs/architecture/agent-guide.md` — the researcher needs this to understand what Entire expects from agents (EventType names, required interfaces, hook patterns) so it can create accurate mappings in the one-pager.
+
+**Keep:** Phase 2 (Static Capability Checks) — binary probing, help scanning, config dir discovery, web search for docs.
+
+**Keep:** Phase 3 (Test Script Creation) — the probe script for capturing real hook payloads.
+
+**Keep:** Phase 4 (Execution & Analysis) — running the script, analyzing captures.
+
+**Replace Phase 5 (Compatibility Report)** with a new output: an **implementation one-pager** written to `cmd/entire/cli/agent/$AGENT_SLUG/AGENT.md`.
+
+**One-pager template:**
+
+```markdown
+# $AGENT_NAME — Integration One-Pager
+
+## Verdict: COMPATIBLE / PARTIAL / INCOMPATIBLE
+
+## Binary
+- Name: `$AGENT_BIN`
+- Version: ...
+- Install: ... (how to install if not present)
+
+## Hook Mechanism
+- Config file: `~/.config/$AGENT_SLUG/settings.json` (exact path)
+- Config format: JSON / YAML / TOML
+- Hook registration: ... (how hooks are declared — JSON objects, env vars, etc.)
+- Hook names and when they fire:
+  | Native Hook Name | When It Fires | Entire EventType |
+  |-----------------|---------------|-----------------|
+  | `on_session_start` | Agent session begins | `SessionStart` |
+  | ... | ... | ... |
+- Hook input (stdin JSON): ... (exact fields with example payload)
+
+## Transcript
+- Location: `~/.config/$AGENT_SLUG/sessions/<id>/transcript.jsonl`
+- Format: JSONL / JSON array / other
+- Session ID extraction: ... (from hook payload field or directory name)
+- Example entry: `{"role": "user", "content": "..."}`
+
+## Config Preservation
+- Keys to preserve when modifying: ... (or "use read-modify-write on entire file")
+- Settings that affect hook behavior: ...
+
+## CLI Flags
+- Non-interactive prompt: `$AGENT_BIN --prompt "..." --no-confirm`
+- Interactive mode: `$AGENT_BIN` (or "not supported")
+- Relevant env vars: ...
+
+## Gaps & Limitations
+- ... (anything that doesn't map cleanly)
+
+## Captured Payloads
+- See `.entire/tmp/probe-$AGENT_SLUG-*/captures/` for raw JSON captures
+```
+
+**Key change:** The one-pager includes the **Entire EventType mapping** (which native hook → which EventType). Research can do this mapping because it's a simple table based on the hook names — it doesn't need to read Entire source code to know that "session start" maps to `SessionStart`. The implementer then uses this table directly when writing `lifecycle.go`.
+
+### 2. `test-writer.md` — Reference One-Pager
+
+**Update prerequisites:**
+```
+- The research command's one-pager at `cmd/entire/cli/agent/$AGENT_SLUG/AGENT.md`
+- If no one-pager exists, ask the user for: binary name, prompt CLI flags, interactive mode support
+```
+
+**Update Step 4 (Create Agent Implementation):**
+- Binary name → from one-pager "Binary" section
+- Prompt flags → from one-pager "CLI Flags" section
+- Interactive mode → from one-pager "CLI Flags" section
+- Transient error patterns → from one-pager "Gaps & Limitations" or use defaults
+- Bootstrap setup → from one-pager "Config Preservation" section
+
+**Add instruction:** "Check the one-pager first for all agent-specific information. If something is missing, you may search external docs — but update `AGENT.md` with anything new you discover."
+
+### 3. `implementer.md` — Reference One-Pager, Keep Internal Docs
+
+**Step 1 (Read Implementation Guide):** Unchanged — reads internal Entire docs (`agent-guide.md`, checklist, `agent.go`, `event.go`). This is the only place these get read.
+
+**Step 2 (Read Reference Implementation):** Update to say: "Check the one-pager's 'Gaps & Limitations' section to pick the best reference — choose an agent with a similar hook mechanism."
+
+**Step 3 (Create Stubs):** Update each sub-item to reference the one-pager:
+- `types.go` JSON tags → from one-pager "Hook input (stdin JSON)"
+- `hooks.go` config file path → from one-pager "Config file" and "Hook registration"
+- `lifecycle.go` event mapping → from one-pager "Hook names" table
+- `transcript.go` format → from one-pager "Transcript" section
+
+**Steps 4-12 (E2E Tiers):** Add a standing instruction: "If you need agent-specific information (hook format, transcript location, config structure), check `AGENT.md` first. If AGENT.md doesn't cover what you need, you may search external docs — but always update AGENT.md with anything new you discover so future steps don't need to re-search."
+
+### 4. `SKILL.md` — Update Phase Descriptions
+
+**Phase 1 (Research):** Update description to emphasize external-only focus and one-pager output:
+```
+Discover the agent's hook mechanism, transcript format, and configuration
+through binary probing and documentation research. Produces an implementation
+one-pager at `cmd/entire/cli/agent/$AGENT_SLUG/AGENT.md` that the other
+phases use as their single source of agent-specific information.
+```
+
+**Phase 2 (Write Tests):** Update expected output to mention it uses the one-pager.
+
+**Phase 3 (Implement):** Already updated from previous commit. No further changes.
+
+**Gate:** Keep the INCOMPATIBLE gate after Phase 1.
+
+## What This Achieves
+
+| Before | After |
+|--------|-------|
+| Research reads all internal Entire docs | Research reads only `agent-guide.md`; implementer reads the rest |
+| Implementer re-reads internal docs | Same (but no duplication) |
+| Both phases may search external docs | Research does primary external search; other phases check one-pager first, fall back to external search, and update one-pager |
+| Research produces a report (consumed once) | Research produces a one-pager (consumed by both later phases) |
+| Test-writer asks user if no research | Test-writer reads one-pager directly |
+| Implementer has no record of external findings | One-pager persists as `AGENT.md` in the package |
+
+## AGENT.md Lifecycle
+
+- **Created** by research phase
+- **Read** by test-writer and implementer phases (their primary source of agent-specific info)
+- **Updated** during implementation if E2E failures reveal new information
+- **Committed** to the repo — serves as development documentation for future maintainers
+
+## Verification
+
+1. Read updated `researcher.md` — confirm no internal Entire doc reading, confirm one-pager output
+2. Read updated `test-writer.md` — confirm it references one-pager, confirm no external doc searching
+3. Read updated `implementer.md` — confirm it references one-pager for agent-specific info, confirm no external doc searching
+4. Read updated `SKILL.md` — confirm phase descriptions reflect the handoff
+5. Mentally trace through a hypothetical agent integration to verify no phase needs to re-search external docs
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/b6cafcb4-19c4-45c6-9e59-cc361ef5d6b9.jsonl
+
+---
+
+audit it and suggest other improvements
+
+---
+
+[Request interrupted by user for tool use]

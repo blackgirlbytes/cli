@@ -1,0 +1,84 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "1b62f97ce468",
+  "session_id": "46b6f0ad-8975-4306-94a6-56bf49f213dd",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-26T22:53:10.552199Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "4d60f884688c",
+  "token_usage": {
+    "input_tokens": 6427,
+    "cache_creation_tokens": 184659,
+    "cache_read_tokens": 12474629,
+    "output_tokens": 71404,
+    "api_call_count": 108
+  },
+  "session_metrics": {
+    "turn_count": 16
+  },
+  "summary": {
+    "intent": "Build a full interactive TUI dashboard for the memory-loop subsystem using Charmbracelet bubbletea libraries, replacing plain-text output with a tab-based management interface.",
+    "outcome": "A working 4-tab bubbletea TUI was built and committed in the `memorylooptui` package with Memories, Injection, History, and Settings tabs. Multiple visual polish iterations were applied (orange accent color, tab visibility, detail pane defaults), but functional issues with settings key handling, injection prompt tester, and missing borders/spacing were still being addressed at session end.",
+    "learnings": {
+      "repo": [
+        "The project uses a `termstyle` package for ANSI 256-color theming that respects NO_COLOR; new TUI components should use its palette for consistency.",
+        "ACCESSIBLE=1 env var is the established pattern for screen-reader fallback; the TUI skips to plain-text show/status output when set.",
+        "The memory-loop state lives in `.entire/memory-loop.json`; `entire memory-loop refresh` must be run before the TUI has data to display.",
+        "The `docs/superpowers/` directory is gitignored, so brainstorming specs and plans written there are not tracked in version control.",
+        "Key lifecycle functions are: TransitionRecordLifecycle, SelectRelevant, AddManualRecord, PruneRecords, SaveState in the memoryloop package."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memorylooptui/styles.go",
+          "finding": "Accent color changed from cyan (color 6) to orange (color 214); inactive tabs use color 245 (light gray) not 8 (dark gray) to remain visible on dark terminals."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_memories.go",
+          "finding": "Detail pane defaults to shown (showDetail=true); hardcoded Color(\"6\") for selected table row must be replaced with the shared accent style variable."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/root.go",
+          "line": 90,
+          "end_line": 128,
+          "finding": "Key routing: tea.KeyMsg case does NOT early-return after unmatched global keys, allowing delegation to active tab — but value receiver vs pointer receiver on settingsTab.update() was suspected as a state propagation bug preventing settings from saving."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_settings.go",
+          "finding": "Settings tab key handling (m/p/+/-) suspected broken due to state propagation issue; settingsChangedMsg handler may use value receivers that don't persist mutations."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_injection.go",
+          "finding": "Prompt tester input and injection log detail card were visually incomplete; prompt injection scoring not functioning at end of session."
+        }
+      ],
+      "workflow": [
+        "The brainstorming skill + visual companion (localhost HTML server) workflow is effective for iterative UI design — HTML mockups in browser let the user approve layout before writing code.",
+        "Subagent-driven development (dispatching implementer agents per task group, then a reviewer agent) scales well for multi-file feature builds but requires careful attention to uncommitted changes between agents.",
+        "Dispatching Tasks 1-3 together as a single implementer worked well because they were tightly coupled foundational scaffolding; independent tabs (5-7) were batched separately.",
+        "The code reviewer agent surfaced real bugs (rune-aware truncate, lipgloss.Width, empty state messages, search mode key handling) that warranted a dedicated fix agent pass.",
+        "Color code 8 (dark gray) is effectively invisible on dark terminals — always use 245+ for secondary text that must remain readable."
+      ]
+    },
+    "friction": [
+      "The brainstorm visual companion server shut down between user sessions, requiring a restart and re-rendering of all HTML mockups.",
+      "maxWidth=80 cap in the root model made the TUI too narrow for the user's terminal — hardcoded width limits should be avoided in terminal UIs.",
+      "Multiple hardcoded Color(\"6\") cyan references were scattered across tab files instead of using a shared style constant, requiring grep and multi-file edits.",
+      "The docs/superpowers/ directory being gitignored meant spec and plan artifacts couldn't be committed alongside the code.",
+      "The visual companion mockups and the actual TUI rendered differently enough that the user noticed immediately — mockup fidelity to real terminal rendering is hard to guarantee."
+    ],
+    "open_items": [
+      "Settings tab key handling (m/p/+/-) is broken — suspected value receiver issue in settingsChangedMsg handler; fix was in progress at session end.",
+      "Injection prompt tester is non-functional — SelectRelevant call or result display not wired up correctly.",
+      "Injection tab missing bottom detail card for viewing recent injection log entries.",
+      "Missing borders and spacing on Memories detail pane and other panels — lipgloss border styling not yet applied.",
+      "History tab 'R' refresh trigger is a placeholder — async refresh with spinner/progress not wired to actual memoryloop.Refresh().",
+      "No unit tests for the memorylooptui package — design spec called for manual verification only; test coverage deferred.",
+      "Prune action (x keybinding on Memories tab) was added to keybinding map but full integration with PruneRecords was not verified.",
+      "Add-memory form (n key) was implemented but not fully verified against the real AddManualRecord API."
+    ]
+  }
+}

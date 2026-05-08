@@ -1,0 +1,1659 @@
+# AGENTS.md instructions for /Users/pfleidi/entire/cli/.worktrees/feat/entire-why
+
+<INSTRUCTIONS>
+## Workflow — Plan First, Implement Incrementally
+
+NEVER jump to coding before understanding the problem. For any non-trivial change:
+
+1. **Plan first:** Enter plan mode. Read relevant source files, trace execution paths, and write a step-by-step implementation plan. Exit plan mode and wait for approval before writing any code.
+2. **Implement one step at a time:** After the plan is approved, implement ONE logical step (e.g., one new file, one function, one test group). Then STOP.
+3. **Present changes for review:** After each step, show what changed (files modified, key decisions made) and wait for explicit approval before proceeding to the next step.
+4. **Never auto-commit:** NEVER create git commits unless the user explicitly asks. Present the completed work and let the user decide when to commit.
+
+When asked to explore or analyze code, ALWAYS read the actual source files. NEVER delegate to a Task agent or give surface-level answers without thorough codebase exploration.
+
+**"Yes" means "yes to the approach" — NOT "implement everything at once."** Approval of a plan or analysis is permission to start the first step, not to run through all steps uninterrupted.
+
+## Search
+
+When searching files, try to use faster tools like `ripgrep` rather than `grep`.
+
+## Scope Control
+
+NEVER modify files or code beyond what the task requires:
+- No refactoring adjacent code, adding wrapper structs, or extracting abstractions unless explicitly requested
+- No renaming, reorganizing, or "improving" code outside the task scope
+- If you see improvement opportunities, list them separately at the end — NEVER bundle them into the change
+
+When multiple items need attention (e.g., multiple failing agents, multiple commits), address ALL of them — not just the first one found. Confirm the full scope before starting work.
+
+**Stop and ask before:** adding any dependency, changing function signatures in shared interfaces, or modifying code outside files directly related to the task.
+
+## Code Review
+
+When reviewing branches, ALWAYS diff against the correct base branch (e.g., `git diff main...HEAD` or `git merge-base`). NEVER review changes outside the requested branch scope.
+
+When fixing code review issues, fix them one at a time — NEVER batch multiple fixes into a single change.
+
+## Go Development
+
+After editing Go files, ALWAYS run `go build ./...` and `go vet ./...` before considering the task done. Fix any unused variables or compilation errors before presenting results.
+
+Always ensure that the code will lint without any issues.
+
+## Git Workflow
+
+### Git Operations
+
+When reverting changes, use surgical git operations (e.g., `git checkout main -- <file>` or `git revert`) — NEVER hard-reset entire branches.
+
+NEVER force push without my consent. Try to avoid amending commits. If there's a need for amending a commit, double check if the commit was already pushed to a remote. If it was, don't amend and create a new commit instead.
+
+### Commit Messages
+
+When writing commit messages, describe ONLY the net change between this commit and the previous one — the actual diff. NEVER describe:
+
+- The process of arriving at the change (debugging steps, failed attempts, iterations)
+- Conversations, decisions, or back-and-forth that happened during development
+- Work that was done and then undone before committing
+- Intermediate states that no longer exist in the final diff
+
+The commit message must read as if a human wrote the code in one pass. A reader seeing only `git log` and `git diff` should find the message perfectly
+sufficient — no hidden context needed.
+
+Write the message by reading a diff (`git diff` or `git diff --cached`), not by recalling the session history. NEVER add `Co-Authored-By:` trailers. Write a semantically correct commit message only.
+
+## "Commit and Continue" Protocol
+
+When I say "commit and continue" (or any variation like "commit & continue", "commit, continue"):
+
+1. **Commit** — Stage and commit ONLY the current uncommitted changes. Use a clear, semantically correct commit message. Do NOT amend previous commits. Do
+NOT push.
+2. **Advance** — Move to the next task or step in the current plan. Mark the completed step as done.
+3. **STOP** — Present what the next step involves and wait for my explicit approval before writing any code or making any changes.
+
+"Commit and continue" is NEVER permission to implement the next step. It means: save my work, tell me what's next, and wait.
+
+## Pull Requests
+
+Create complete but concise PR descriptions. Describe the problem solved and how it was implemented. Don't waste reviewer time. Do NOT add self-promotion to a pull request description. I don't want to see any "Generated with Claude Code" references in my pull requests ever.
+
+## Plans
+
+NEVER check in plan files unless explicitly asked. The `docs/plans` and `docs/superpowers` folders are git-ignored.
+
+--- project-doc ---
+
+# Entire - CLI
+
+This repo contains the CLI for Entire.
+
+## Architecture
+
+- CLI built with github.com/spf13/cobra and github.com/charmbracelet/huh
+
+## Key Directories
+
+### Commands (`cmd/`)
+
+- `entire/`: Main CLI entry point
+- `entire/cli`: CLI utilities and helpers
+- `entire/cli/commands`: actual command implementations
+- `entire/cli/agent`: agent implementations (Claude Code, Gemini CLI, OpenCode, Cursor, Factory AI Droid, Copilot CLI) - see [Agent Integration Checklist](docs/architecture/agent-integration-checklist.md) and [Agent Implementation Guide](docs/architecture/agent-guide.md)
+- `entire/cli/strategy`: strategy implementation (manual-commit) - see section below
+- `entire/cli/checkpoint`: checkpoint storage abstractions (temporary and committed)
+- `entire/cli/session`: session state management
+- `entire/cli/integration_test`: integration tests (simulated hooks)
+- `e2e/`: E2E tests with real agent calls (see [e2e/README.md](e2e/README.md))
+
+## Tech Stack
+
+- Language: Go 1.26.x
+- Build tool: mise, go modules
+- Linting: golangci-lint
+
+## Development
+
+### Running Tests
+
+```bash
+mise run test
+```
+
+### Running Integration Tests
+
+```bash
+mise run test:integration
+```
+
+### Running All Tests (CI)
+
+```bash
+mise run test:ci
+```
+
+This runs unit tests, integration tests, and the E2E canary (Vogon agent) in sequence. Integration tests use the `//go:build integration` build tag and are located in `cmd/entire/cli/integration_test/`.
+
+### Running E2E Canary Tests (Vogon Agent)
+
+The Vogon agent is a deterministic fake agent that exercises the full E2E test suite without making any API calls. Named after the Vogons from The Hitchhiker's Guide to the Galaxy — bureaucratic, procedural, and deterministic to a fault.
+
+```bash
+mise run test:e2e:canary           # Run all E2E tests with the Vogon agent
+mise run test:e2e:canary TestFoo   # Run a specific test
+```
+
+- **Runs as part of `test:ci`** — canary failures block merges
+- **No API calls, no cost** — safe to run freely, unlike real agent E2E tests
+- **If a canary test fails, the bug is in the CLI or test infrastructure**, not in an agent
+- Located in `e2e/vogon/` (binary) and `cmd/entire/cli/agent/vogon/` (Agent interface)
+- The binary parses prompts via regex, creates/modifies/deletes files, and fires lifecycle hooks
+- **IMPORTANT: When changing E2E test prompt wording**, the Vogon binary (`e2e/vogon/main.go`) parses prompts with hardcoded regexes. New phrasing may not match existing patterns — always run `mise run test:e2e:canary` after changing prompt text and fix Vogon's parsing if tests fail.
+
+### Running E2E Tests (Only When Explicitly Requested)
+
+**IMPORTANT: Do NOT run E2E tests proactively.** E2E tests make real API calls to agents, which consume tokens and cost money. Only run them when the user explicitly asks for E2E testing.
+
+```bash
+mise run test:e2e [filter]                          # All agents, filtered
+mise run test:e2e --agent claude-code [filter]       # Claude Code only
+mise run test:e2e --agent gemini-cli [filter]        # Gemini CLI only
+mise run test:e2e --agent opencode [filter]          # OpenCode only
+mise run test:e2e --agent cursor [filter]            # Cursor only
+mise run test:e2e --agent factoryai-droid [filter]   # Factory AI Droid only
+mise run test:e2e --agent copilot-cli [filter]       # Copilot CLI only
+```
+
+E2E tests:
+
+- Use the `//go:build e2e` build tag
+- Located in `e2e/tests/`
+- See [`e2e/README.md`](e2e/README.md) for full documentation (structure, debugging, adding agents)
+- Test real agent interactions (Claude Code, Gemini CLI, OpenCode, Cursor, Factory AI Droid, Copilot CLI, or Vogon creating files, committing, etc.)
+- Validate checkpoint scenarios documented in `docs/architecture/checkpoint-scenarios.md`
+- Support multiple agents via `E2E_AGENT` env var (`claude-code`, `gemini`, `opencode`, `cursor`, `factoryai-droid`, `copilot-cli`, `vogon`)
+
+**Environment variables:**
+
+- `E2E_AGENT` - Agent to test with (default: `claude-code`)
+- `E2E_CLAUDE_MODEL` - Claude model to use (default: `haiku` for cost efficiency)
+- `E2E_TIMEOUT` - Timeout per prompt (default: `2m`)
+
+### Test Parallelization
+
+**Always use `t.Parallel()` in tests.** Every top-level test function and subtest should call `t.Parallel()` unless it modifies process-global state (e.g., `os.Chdir()`).
+
+```go
+func TestFeature_Foo(t *testing.T) {
+    t.Parallel()
+    // ...
+}
+
+// Integration tests with TestEnv
+func TestFeature_Bar(t *testing.T) {
+    t.Parallel()
+    env := NewFeatureBranchEnv(t)
+    // ...
+}
+```
+
+**Exception:** Tests that modify process-global state cannot be parallelized. This includes `os.Chdir()`/`t.Chdir()` and `os.Setenv()`/`t.Setenv()` — Go's test framework will panic if these are used after `t.Parallel()`.
+
+### Git in Tests
+
+**Tests that touch git state must use an isolated temp repo — never the real repo CWD.**
+
+Many handlers (lifecycle, strategy, hooks) resolve the git repo from CWD via `OpenRepository`, `GetGitCommonDir`, `DetectFileChanges`, etc. Without isolation, tests can create session state files, shadow branches, or other artifacts in the real `.git/` directory.
+
+Use the `testutil` helpers:
+
+```go
+tmpDir := t.TempDir()
+testutil.InitRepo(t, tmpDir)                    // git init + user config + disable GPG
+testutil.WriteFile(t, tmpDir, "f.txt", "init")  // create a file
+testutil.GitAdd(t, tmpDir, "f.txt")             // stage it
+testutil.GitCommit(t, tmpDir, "init")           // commit (needs at least one commit for HEAD)
+t.Chdir(tmpDir)                                 // redirect CWD-based git resolution
+```
+
+`testutil.InitRepo` configures `user.name`, `user.email`, and disables GPG signing — safe for CI environments without global git config.
+
+**Prefer `testutil.InitRepo()` over direct `git.PlainInit()` in tests.** When a test in this repo needs an initialized repository, use `testutil.InitRepo(t, dir)` unless the test specifically needs lower-level initialization behavior that the helper cannot provide. Do not call `git.PlainInit()` directly and then create commits or run CLI git operations without also reproducing the helper's repo-local config.
+
+**Do NOT** shell out to `git init`/`git commit` directly without setting user config and `--no-gpg-sign`, and **do NOT** run lifecycle/strategy handlers from the real repo CWD in tests.
+
+### Linting and Formatting
+
+```bash
+mise run fmt && mise run lint
+```
+
+`mise run fmt` can rewrite files. Treat `mise run fmt && mise run lint` as a single verification sequence: if formatting changes anything, run lint again on the formatted tree rather than assuming a previous lint result still applies.
+
+### Before Every Commit (REQUIRED)
+
+**CI will fail if you skip these steps:**
+
+```bash
+mise run check
+```
+
+Equivalent expanded form:
+
+```bash
+mise run fmt      # Format code (CI enforces gofmt)
+mise run lint     # Lint check (CI enforces golangci-lint)
+mise run test:ci  # Run all tests (unit + integration)
+```
+
+`mise run check` runs the three commands above.
+
+Safety note: do not treat a clean `mise run lint` result as final unless it was run after the most recent `mise run fmt` pass.
+
+**Common CI failures from skipping this:**
+
+- `gofmt` formatting differences → run `mise run fmt`
+- Lint errors → run `mise run lint` and fix issues
+- Test failures → run `mise run test` and fix
+
+### Code Duplication Prevention
+
+Before implementing Go code, use `/go:discover-related` to find existing utilities and patterns that might be reusable.
+
+**Check for duplication:**
+
+```bash
+mise run dup           # Comprehensive check (threshold 50) with summary
+mise run dup:staged    # Check only staged files
+mise run lint          # Normal lint includes dupl at threshold 75 (new issues only)
+mise run lint:full     # All issues at threshold 75
+```
+
+**Tiered thresholds:**
+
+- **75 tokens** (lint/CI) - Blocks on serious duplication (~20+ lines)
+- **50 tokens** (dup) - Advisory, catches smaller patterns (~10+ lines)
+
+When duplication is found:
+
+1. Check if a helper already exists in `common.go` or nearby utility files
+2. If not, consider extracting the duplicated logic to a shared helper
+3. If duplication is intentional (e.g., test setup), add a `//nolint:dupl` comment with explanation
+
+## Code Patterns
+
+### Error Handling
+
+The CLI uses a specific pattern for error output to avoid duplication between Cobra and main.go.
+
+**How it works:**
+
+- `root.go` sets `SilenceErrors: true` globally - Cobra never prints errors
+- `main.go` prints errors to stderr, unless the error is a `SilentError`
+- Commands return `NewSilentError(err)` when they've already printed a custom message
+
+**When to use `SilentError`:**
+Use `NewSilentError()` when you want to print a custom, user-friendly error message instead of the raw error:
+
+```go
+// In a command's RunE function:
+if _, err := paths.WorktreeRoot(); err != nil {
+    cmd.SilenceUsage = true  // Don't show usage for prerequisite errors
+    fmt.Fprintln(cmd.ErrOrStderr(), "Not a git repository. Please run 'entire enable' from within a git repository.")
+    return NewSilentError(errors.New("not a git repository"))
+}
+```
+
+**When NOT to use `SilentError`:**
+For normal errors where the default error message is sufficient, just return the error directly. main.go will print it:
+
+```go
+// Normal error - main.go will print "unknown strategy: foo"
+return fmt.Errorf("unknown strategy: %s", name)
+```
+
+**Key files:**
+
+- `errors.go` - Defines `SilentError` type and `NewSilentError()` constructor
+- `root.go` - Sets `SilenceErrors: true` on root command
+- `main.go` - Checks for `SilentError` before printing
+
+### Settings
+
+All settings access should go through the `settings` package (`cmd/entire/cli/settings/`).
+
+**Why a separate package:**
+The `settings` package exists to avoid import cycles. The `cli` package imports `strategy`, so `strategy` cannot import `cli`. The `settings` package provides shared settings loading that both can use.
+
+**Usage:**
+
+```go
+import "github.com/entireio/cli/cmd/entire/cli/settings"
+
+// Load full settings object
+s, err := settings.Load()
+if err != nil {
+    // handle error
+}
+if s.Enabled {
+    // ...
+}
+
+// Or use convenience functions
+if settings.IsSummarizeEnabled() {
+    // ...
+}
+```
+
+**Do NOT:**
+
+- Read `.entire/settings.json` or `.entire/settings.local.json` directly with `os.ReadFile`
+- Duplicate settings parsing logic in other packages
+- Create new settings helpers without adding them to the `settings` package
+
+**Key files:**
+
+- `settings/settings.go` - `EntireSettings` struct, `Load()`, and helper methods
+- `config.go` - Higher-level config functions that use settings (for `cli` package consumers)
+
+### Logging vs User Output
+
+- **Internal/debug logging**: Use `logging.Debug/Info/Warn/Error(ctx, msg, attrs...)` from `cmd/entire/cli/logging/`. Writes to `.entire/logs/`.
+- **Enabling debug/perf logs locally**: Prefer adding `"log_level": "DEBUG"` to `.entire/settings.local.json` when you need detailed hook/perf logs. This file is gitignored, so it is a low-risk local-only change. `ENTIRE_LOG_LEVEL=debug` also works and takes precedence.
+- **User-facing output**: Use `fmt.Fprint*(cmd.OutOrStdout(), ...)` or `cmd.ErrOrStderr()`.
+
+Don't use `fmt.Print*` for operational messages (checkpoint saves, hook invocations, strategy decisions) - those should use the `logging` package.
+
+**Privacy**: Don't log user content (prompts, file contents, commit messages). Log only operational metadata (IDs, counts, paths, durations).
+
+### Git Operations
+
+We use github.com/go-git/go-git for most git operations, but with important exceptions:
+
+#### go-git v5 Bugs - Use CLI Instead
+
+**Do NOT use go-git v5 for `checkout` or `reset --hard` operations.**
+
+go-git v5 has a bug where `worktree.Reset()` with `git.HardReset` and `worktree.Checkout()` incorrectly delete untracked directories even when they're listed in `.gitignore`. This would destroy `.entire/` and `.worktrees/` directories.
+
+Use the git CLI instead:
+
+```go
+// WRONG - go-git deletes ignored directories
+worktree.Reset(&git.ResetOptions{
+    Commit: hash,
+    Mode:   git.HardReset,
+})
+
+// CORRECT - use git CLI
+cmd := exec.CommandContext(ctx, "git", "reset", "--hard", hash.String())
+```
+
+See `HardResetWithProtection()` in `common.go` and `CheckoutBranch()` in `git_operations.go` for examples.
+
+Regression tests in `hard_reset_test.go` verify this behavior - if go-git v6 fixes this issue, those tests can be used to validate switching back.
+
+#### Repo Root vs Current Working Directory
+
+**Always use repo root (not `os.Getwd()`) when working with git-relative paths.**
+
+Git commands like `git status` and `worktree.Status()` return paths relative to the **repository root**, not the current working directory. When an agent runs from a subdirectory (e.g., `/repo/frontend`), using `os.Getwd()` to construct absolute paths will produce incorrect results for files in sibling directories.
+
+```go
+// WRONG - breaks when running from subdirectory
+cwd, _ := os.Getwd()  // e.g., /repo/frontend
+absPath := filepath.Join(cwd, file)  // file="api/src/types.ts" → /repo/frontend/api/src/types.ts (WRONG)
+
+// CORRECT - use repo root
+repoRoot, _ := paths.WorktreeRoot()
+absPath := filepath.Join(repoRoot, file)  // → /repo/api/src/types.ts (CORRECT)
+```
+
+This also affects path filtering. The `paths.ToRelativePath()` function rejects paths starting with `..`, so computing relative paths from cwd instead of repo root will filter out files in sibling directories:
+
+```go
+// WRONG - filters out sibling directory files
+cwd, _ := os.Getwd()  // /repo/frontend
+relPath := paths.ToRelativePath("/repo/api/file.ts", cwd)  // returns "" (filtered out as "../api/file.ts")
+
+// CORRECT - keeps all repo files
+repoRoot, _ := paths.WorktreeRoot()
+relPath := paths.ToRelativePath("/repo/api/file.ts", repoRoot)  // returns "api/file.ts"
+```
+
+**When to use `os.Getwd()`:** Only when you actually need the current directory (e.g., finding agent session directories that are cwd-relative).
+
+**When to use repo root:** Any time you're working with paths from git status, git diff, or any git-relative file list.
+
+Test case in `state_test.go`: `TestFilterAndNormalizePaths_SiblingDirectories` documents this bug pattern.
+
+### Session Strategy (`cmd/entire/cli/strategy/`)
+
+The CLI uses a manual-commit strategy for managing session data and checkpoints. The strategy implements the `Strategy` interface defined in `strategy.go`.
+
+#### Strategy Interface
+
+The `Strategy` interface provides:
+
+- `SaveStep()` - Save session step checkpoint (code + metadata)
+- `SaveTaskStep()` - Save subagent task step checkpoint
+- `GetRewindPoints()` / `Rewind()` - List and restore to checkpoints
+- `GetSessionLog()` / `GetSessionInfo()` - Retrieve session data
+- `ListSessions()` / `GetSession()` - Session discovery
+
+#### How It Works
+
+The manual-commit strategy (`manual_commit*.go`) does not modify the active branch - no commits are created on the working branch. Instead it:
+
+- Creates shadow branch `entire/<HEAD-commit-hash[:7]>-<worktreeHash[:6]>` per base commit + worktree
+- **Worktree-specific branches** - each git worktree gets its own shadow branch namespace, preventing conflicts
+- **Supports multiple concurrent sessions** - checkpoints from different sessions in the same directory interleave on the same shadow branch
+- Condenses session logs to permanent `entire/checkpoints/v1` branch on user commits
+- Uses the `post-rewrite` Git hook to keep local session linkage aligned after amend/rebase rewrites
+- Builds git trees in-memory using go-git plumbing APIs
+- Rewind restores files from shadow branch commit tree (does not use `git reset`)
+- **Location-independent transcript resolution** - transcript paths are always computed dynamically from the current repo location (via `agent.GetSessionDir` + `agent.ResolveSessionFile`), never stored in checkpoint metadata. This ensures restore/rewind works after repo relocation or across machines.
+- **Copilot token scoping** - Copilot CLI `session.shutdown` contains session-wide token aggregates. Checkpoint metadata must stay scoped to `CheckpointTranscriptStart`; condensation may separately backfill full-session Copilot totals into session state for `entire status`.
+- Tracks session state in `.git/entire-sessions/` (shared across worktrees)
+- **Shadow branch migration** - if user does stash/pull/rebase (HEAD changes without commit), shadow branch is automatically moved to new base commit
+- **Orphaned branch cleanup** - if a shadow branch exists without a corresponding session state file, it is automatically reset when a new session starts
+- PrePush hook can push `entire/checkpoints/v1` branch alongside user pushes
+- Safe to use on main/master since it never modifies commit history
+
+#### Key Files
+
+- `strategy.go` - Interface definition and context structs (`StepContext`, `TaskStepContext`, `RewindPoint`, etc.)
+- `common.go` - Helpers for metadata extraction, tree building, rewind validation, `ListCheckpoints()`
+- `session.go` - Session/checkpoint data structures
+- `push_common.go` - PrePush logic for pushing `entire/checkpoints/v1` branch
+- `manual_commit.go` - Manual-commit strategy main implementation
+- `manual_commit_types.go` - Type definitions: `SessionState`, `CheckpointInfo`, `CondenseResult`
+- `manual_commit_session.go` - Session state management (load/save/list session states)
+- `manual_commit_condensation.go` - Condense logic for copying logs to `entire/checkpoints/v1`
+- `manual_commit_rewind.go` - Rewind implementation: file restoration from checkpoint trees
+- `manual_commit_git.go` - Git operations: checkpoint commits, tree building
+- `manual_commit_logs.go` - Session log retrieval and session listing
+- `manual_commit_hooks.go` - Git hook handlers (prepare-commit-msg, post-commit, post-rewrite, pre-push)
+- `manual_commit_reset.go` - Shadow branch reset/cleanup functionality
+- `session_state.go` - Package-level session state functions (`LoadSessionState`, `SaveSessionState`, `ListSessionStates`, `FindMostRecentSession`)
+- `hooks.go` - Git hook installation
+
+#### Checkpoint Package (`cmd/entire/cli/checkpoint/`)
+
+- `checkpoint.go` - Data types (`Checkpoint`, `TemporaryCheckpoint`, `CommittedCheckpoint`)
+- `store.go` - `GitStore` struct wrapping git repository
+- `temporary.go` - Shadow branch operations (`WriteTemporary`, `ReadTemporary`, `ListTemporary`)
+- `committed.go` - Metadata branch operations (`WriteCommitted`, `ReadCommitted`, `ListCommitted`)
+
+#### Session Package (`cmd/entire/cli/session/`)
+
+- `session.go` - Session data types and interfaces
+- `state.go` - `StateStore` for managing `.git/entire-sessions/` files
+- `phase.go` - Session phase state machine (phases, events, transitions, actions)
+
+#### Session Phase State Machine
+
+Sessions track their lifecycle through phases managed by a state machine in `session/phase.go`:
+
+**Phases:** `ACTIVE`, `IDLE`, `ENDED`
+
+**Events:**
+
+- `TurnStart` - Agent begins a turn (UserPromptSubmit hook)
+- `TurnEnd` - Agent finishes a turn (Stop hook)
+- `GitCommit` - A git commit was made (PostCommit hook)
+- `SessionStart` - New session started
+- `SessionStop` - Session explicitly stopped
+
+**Key transitions:**
+
+- `IDLE + TurnStart → ACTIVE` - Agent starts working
+- `ACTIVE + TurnEnd → IDLE` - Agent finishes turn
+- `ACTIVE + GitCommit → ACTIVE` - User commits while agent is working (condense immediately)
+- `IDLE + GitCommit → IDLE` - User commits between turns (condense immediately)
+- `ENDED + GitCommit → ENDED` - Post-session commit (condense if files touched)
+
+The state machine emits **actions** (e.g., `ActionCondense`, `ActionUpdateLastInteraction`) that hook handlers dispatch to strategy-specific implementations.
+
+#### Metadata Structure
+
+**Shadow branches** (`entire/<commit-hash[:7]>-<worktreeHash[:6]>`):
+
+```
+.entire/metadata/<session-id>/
+├── full.jsonl               # Session transcript
+├── prompt.txt               # Checkpoint-scoped user prompts
+└── tasks/<tool-use-id>/     # Task checkpoints
+    ├── checkpoint.json      # UUID mapping for rewind
+    └── agent-<id>.jsonl     # Subagent transcript
+```
+
+**Metadata branch** (`entire/checkpoints/v1`) - sharded checkpoint format:
+
+```
+<checkpoint-id[:2]>/<checkpoint-id[2:]>/
+├── metadata.json            # CheckpointSummary (aggregated stats)
+├── 0/                       # First session (0-based indexing)
+│   ├── metadata.json        # Session-specific metadata
+│   ├── full.jsonl           # Session transcript
+│   ├── prompt.txt           # Checkpoint-scoped user prompts
+│   ├── content_hash.txt     # SHA256 of transcript
+│   └── tasks/<tool-use-id>/ # Task checkpoints (if applicable)
+│       ├── checkpoint.json  # UUID mapping
+│       └── agent-<id>.jsonl # Subagent transcript
+├── 1/                       # Second session (if multiple sessions)
+│   ├── metadata.json
+│   ├── full.jsonl
+│   └── ...
+└── ...
+```
+
+**Multi-session metadata.json format:**
+
+```json
+{
+  "checkpoint_id": "abc123def456",
+  "session_id": "2026-01-13-uuid", // Current/latest session
+  "session_ids": ["2026-01-13-uuid1", "2026-01-13-uuid2"], // All sessions
+  "session_count": 2, // Number of sessions in this checkpoint
+  "strategy": "manual-commit",
+  "created_at": "2026-01-13T12:00:00Z",
+  "files_touched": ["file1.txt", "file2.txt"] // Merged from all sessions
+}
+```
+
+When multiple sessions are condensed to the same checkpoint (same base commit):
+
+- Sessions are stored in numbered subfolders using 0-based indexing (`0/`, `1/`, `2/`, etc.)
+- Latest session is always in the highest-numbered folder
+- `session_ids` array tracks all sessions, `session_count` increments
+
+**Session State** (filesystem, `.git/entire-sessions/`):
+
+```
+<session-id>.json            # Active session state (base_commit, checkpoint_count, etc.)
+```
+
+#### Checkpoint ID Linking
+
+The strategy uses a **12-hex-char random checkpoint ID** (e.g., `a3b2c4d5e6f7`) as the stable identifier linking user commits to metadata.
+
+**How checkpoint IDs work:**
+
+1. **Generated once per checkpoint**: When condensing session metadata to the metadata branch
+
+2. **Added to user commits** via `Entire-Checkpoint` trailer:
+   - **Manual-commit**: Added via `prepare-commit-msg` hook (user can remove it before committing)
+
+3. **Used for directory sharding** on `entire/checkpoints/v1` branch:
+   - Path format: `<id[:2]>/<id[2:]>/`
+   - Example: `a3b2c4d5e6f7` → `a3/b2c4d5e6f7/`
+   - Creates 256 shards to avoid directory bloat
+
+4. **Appears in commit subject** on `entire/checkpoints/v1` commits:
+   - Format: `Checkpoint: a3b2c4d5e6f7`
+   - Makes `git log entire/checkpoints/v1` readable and searchable
+
+**Bidirectional linking:**
+
+```
+User commit → Metadata:
+  Extract "Entire-Checkpoint: a3b2c4d5e6f7" trailer
+  → Read a3/b2c4d5e6f7/ directory from entire/checkpoints/v1 tree at HEAD
+
+Metadata → User commits:
+  Given checkpoint ID a3b2c4d5e6f7
+  → Search user branch history for commits with "Entire-Checkpoint: a3b2c4d5e6f7" trailer
+```
+
+Note: Commit subjects on `entire/checkpoints/v1` (e.g., `Checkpoint: a3b2c4d5e6f7`) are
+for human readability in `git log` only. The CLI always reads from the tree at HEAD.
+
+**Example:**
+
+```
+User's commit (on main branch):
+  "Implement login feature
+
+  Entire-Checkpoint: a3b2c4d5e6f7"
+       ↓ ↑
+       Linked via checkpoint ID
+       ↓ ↑
+entire/checkpoints/v1 commit:
+  Subject: "Checkpoint: a3b2c4d5e6f7"
+
+  Tree: a3/b2c4d5e6f7/
+    ├── metadata.json (checkpoint_id: "a3b2c4d5e6f7")
+    ├── full.jsonl (session transcript)
+    └── prompt.txt
+```
+
+#### Commit Trailers
+
+**On user's active branch commits:**
+
+- `Entire-Checkpoint: <checkpoint-id>` - 12-hex-char ID linking to metadata on `entire/checkpoints/v1`
+  - Added via `prepare-commit-msg` hook; user can remove it before committing to skip linking
+
+**On shadow branch commits (`entire/<commit-hash[:7]>-<worktreeHash[:6]>`):**
+
+- `Entire-Session: <session-id>` - Session identifier
+- `Entire-Metadata: <path>` - Path to metadata directory within the tree
+- `Entire-Task-Metadata: <path>` - Path to task metadata directory (for task checkpoints)
+- `Entire-Strategy: manual-commit` - Strategy that created the commit
+
+**On metadata branch commits (`entire/checkpoints/v1`):**
+
+Commit subject: `Checkpoint: <checkpoint-id>` (or custom subject for task checkpoints)
+
+Trailers:
+
+- `Entire-Session: <session-id>` - Session identifier
+- `Entire-Strategy: <strategy>` - Strategy name (manual-commit)
+- `Entire-Agent: <agent-name>` - Agent name (optional, e.g., "Claude Code")
+- `Ephemeral-branch: <branch>` - Shadow branch name (optional)
+- `Entire-Metadata-Task: <path>` - Task metadata path (optional, for task checkpoints)
+
+**Note:** The strategy keeps active branch history clean - the only addition to user commits is the single `Entire-Checkpoint` trailer. It never creates commits on the active branch (the user creates them manually). All detailed session data (transcripts, prompts, context) is stored on the `entire/checkpoints/v1` orphan branch or shadow branches.
+
+#### Multi-Session Behavior
+
+**Concurrent Sessions:**
+
+- When a second session starts in the same directory while another has uncommitted checkpoints, a warning is shown
+- Both sessions can proceed - their checkpoints interleave on the same shadow branch
+- Each session's `RewindPoint` includes `SessionID` and `SessionPrompt` to help identify which checkpoint belongs to which session
+- On commit, all sessions are condensed together with archived sessions in numbered subfolders
+- Note: Different git worktrees have separate shadow branches (worktree-specific naming), so concurrent sessions in different worktrees do not conflict
+
+**Orphaned Shadow Branches:**
+
+- A shadow branch is "orphaned" if it exists but has no corresponding session state file
+- This can happen if the state file is manually deleted or lost
+- When a new session starts with an orphaned branch, the branch is automatically reset
+- If the existing session DOES have a state file (concurrent session in same directory), a `SessionIDConflictError` is returned
+
+**Shadow Branch Migration (Pull/Rebase):**
+
+- If user does stash → pull → apply (or rebase), HEAD changes but work isn't committed
+- The shadow branch would be orphaned at the old commit
+- Detection: base commit changed AND old shadow branch still exists (would be deleted if user committed)
+- Action: shadow branch is renamed from `entire/<old-hash>-<worktreeHash>` to `entire/<new-hash>-<worktreeHash>`
+- Session continues seamlessly with checkpoints preserved
+
+#### When Modifying the Strategy
+
+- The strategy must implement the full `Strategy` interface
+- Test with `mise run test` - strategy tests are in `*_test.go` files
+- **Update both CLAUDE.md and AGENTS.md** when modifying the strategy to keep documentation current
+
+# Important Notes
+
+- **Before committing:** Follow the "Before Every Commit (REQUIRED)" checklist above - CI will fail without it
+- Integration tests: run `mise run test:integration` when changing integration test code
+- When adding new features, ensure they are well-tested and documented.
+- Always check for code duplication and refactor as needed.
+
+## Go Code Style
+
+- Write lint-compliant Go code on the first attempt. Before outputting Go code, mentally verify it passes `golangci-lint` (or your specific linter).
+- Follow standard Go idioms: proper error handling, no unused variables/imports, correct formatting (gofmt), meaningful names.
+- Handle all errors explicitly—don't leave them unchecked.
+- Reference `.golangci.yml` for enabled linters before writing Go code.
+
+## Accessibility
+
+The CLI supports an accessibility mode for users who rely on screen readers. This mode uses simpler text prompts instead of interactive TUI elements.
+
+### Environment Variable
+
+- `ACCESSIBLE=1` (or any non-empty value) enables accessibility mode
+- Users can set this in their shell profile (`.bashrc`, `.zshrc`) for persistent use
+
+### Implementation Guidelines
+
+When adding new interactive forms or prompts using `huh`:
+
+**In the `cli` package:**
+Use `NewAccessibleForm()` instead of `huh.NewForm()`:
+
+```go
+// Good - respects ACCESSIBLE env var
+form := NewAccessibleForm(
+    huh.NewGroup(
+        huh.NewSelect[string]().
+            Title("Choose an option").
+            Options(...).
+            Value(&choice),
+    ),
+)
+
+// Bad - ignores accessibility setting
+form := huh.NewForm(...)
+```
+
+**In the `strategy` package:**
+Use the `isAccessibleMode()` helper. Note that `WithAccessible()` is only available on forms, not individual fields, so wrap confirmations in a form:
+
+```go
+form := huh.NewForm(
+    huh.NewGroup(
+        huh.NewConfirm().
+            Title("Confirm action?").
+            Value(&confirmed),
+    ),
+)
+if isAccessibleMode() {
+    form = form.WithAccessible(true)
+}
+if err := form.Run(); err != nil { ... }
+```
+
+### Key Points
+
+- Always use the accessibility helpers for any `huh` forms/prompts
+- Test new interactive features with `ACCESSIBLE=1` to ensure they work
+- The accessible mode is documented in `--help` output
+
+</INSTRUCTIONS>
+
+---
+
+<environment_context>
+  <cwd>/Users/pfleidi/entire/cli/.worktrees/feat/entire-why</cwd>
+  <shell>zsh</shell>
+  <current_date>2026-04-21</current_date>
+  <timezone>America/Los_Angeles</timezone>
+</environment_context>
+
+---
+
+Use the brainstorming skill
+
+I’d like to understand what it would take to introduce a new CLI command called `entire why`, `entire explore`, or `entire blame`. I’m imagining it to be somewhat of a cross between `git blame` and `entire explore`.  What I’d like it to be is a CLI/TUI that lets you interactively navigate through the commit history of a file. By default, I’m imagining it to show similar information to `git blame` like “last updated”, “author”, and “commit” hash. In addition, I’d like to have it also show the entire checkpoint ID, the AI agent used (if any), and a short summary of the agent session that produced the checkpoint (based on the data from `entire explain —generate`.  On my local machine, the source output of `git blame` is also syntax highlighted. I’m not sure if that’s git or the `delta` pager I’m running locally, but I’d love if the `entire` app would support some sort of syntax highlighting via a custom pager or by default, too.
+
+I’m also imagining an interactive TUI, if an interactive shell is available, that would allow to browse code blocks using arrow and the “j” and “k” keys like in vim. Hitting the space bar or enter will take you into a detailed view of the checkpoint that generated the selected lines of code.
+
+What I’d like the navigation hierarchy to be like: Commits in form of code fragments, like `git blame` -> Checkpoints -> Sessions. It would also be good if there was an option that would return a text only format of the first view when no interactive shell is available (similar to `git blame`).  As an extra future feature, I could also imagine a `—json` option to be used in scripts.
+
+I’ve attached a screenshot of what `git blame` looks like with my local pager.
+
+￼
+
+Can you help me research this topic and find missing open questions etc?
+
+---
+
+Yes
+
+---
+
+Yes, commit-first: 1
+
+---
+
+This is going to be a prototype so local only would be fine for the time being.
+
+---
+
+Yes, go with the recommendation.
+
+---
+
+Let's go with `entire why` for now.
+
+---
+
+Can you copy the current plan into my cliboard first?
+
+---
+
+<image name=[Image #1]>
+
+---
+
+</image>
+
+---
+
+[Image #1] 
+
+This is what the output of my `git blame` looks like. Otherwise: Continue.
+
+---
+
+I think checkpoint-first detail. If an AI summary generated by `entire explain --generate` exists, we should show that. If no checkpoint exists at all, we might only want to show some generic commit information with a file diff.
+
+---
+
+Yes, summary with a fallback.
+
+---
+
+Let's do HEAD only. We can decide to add other refs if we decided to implement this fully.
+
+---
+
+yes
+
+---
+
+One little amendment I'd like to main: The first few shouldn't be only a version of git blame. It should also be enriched with entire specific data, if available. It should show things like the agents used, the checkpoint ID, maybe a short AI summary if available. Can you add that?
+
+---
+
+Yes
+
+---
+
+Is there a way to use a custom pager to do syntax highlighting, like I do for git blame? That would make for a much more impressive demo.
+
+---
+
+Are there any libraries we could use to add syntax highlighting to the TUI output. There probably are a few that would fit the bill, no? I'd really like this feature to have syntax highlighting. You should update the plan accordingly.
+
+---
+
+Yes, please.
+
+---
+
+1
+
+---
+
+<subagent_notification>
+{"agent_path":"019db219-7b13-7d83-9df3-071dad41895b","status":{"completed":"Plan for Task 1:\n\n1. Add `cmd/entire/cli/why_test.go` with the exact preservation test shape you specified.\n2. Add `cmd/entire/cli/why_model.go` containing only the shared data model: `whyCommitInfo`, `whyEntireInfo`, `whyDetailKind`, `whyBlock`, `RangeText()`, and the tiny `itoa()` helper.\n3. Run `go test ./cmd/entire/cli -run TestWhyBlock_PreservesEntireMetadata` to verify the test fails first, then passes after the model is added.\n\nAlternatives I considered:\n- Keep the model exactly as a standalone file in `cli` as requested. This is the best fit.\n- Reuse the `trail` package types. I’m not recommending this because the `why` renderer needs commit-level blame metadata, not trail metadata.\n- Delay the model until renderer work. That would couple later tasks unnecessarily and makes the test-driven shape harder to validate.\n\nApprove this approach, and I’ll implement only Task 1."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db21a-9718-7a72-9f45-932deaf9a8da","status":{"completed":"❌ Issues found:\n\n- `cmd/entire/cli/why_test.go:14-30, 40-49` only asserts `Entire.CheckpointID` and `RangeText()`. It does not verify the other renderer-facing fields on `whyBlock` or the enrichment values they carry, such as `Commit` fields, `CodeLines`, `Detail`, or the remaining `whyEntireInfo` fields. That leaves Task 1’s required preservation check incomplete."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db21b-6fd0-7d13-917f-37dd76ec13fd","status":{"completed":"✅ Spec compliant"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db21b-fa2d-7dd3-b4a1-cf83161a83dc","status":{"completed":"**Strengths**\n- `cmd/entire/cli/why_model.go` is scoped cleanly: the shared model, enum, and range formatter are all in one place and easy for later renderer work to consume.\n- `cmd/entire/cli/why_test.go` is explicit and parallel-safe, which makes it a good regression guard for a package-level data shape.\n\n**Issues**\n- Important: `cmd/entire/cli/why_test.go:17-30,47-88` - The preservation test does not assert `whyCommitInfo.Email` or any non-empty `whyDetailKind`, so the shared model can lose renderer-facing fields without a failing test. That weakens the only safety net for this model. Suggested fix: populate and assert `Commit.Email`, and add an assertion for `Detail` using one of the defined enum values.\n- Minor: `cmd/entire/cli/why_model.go:37-45` - `RangeText()` uses a private `itoa()` wrapper around `strconv.Itoa`, which adds indirection without buying anything. Suggested fix: inline `strconv.Itoa` in `RangeText()` and drop `itoa()` unless you expect additional call sites immediately.\n\n**Assessment**\n- Needs changes"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db21d-1bc4-7440-ab5f-dc4f84ee16c9","status":{"completed":"**Strengths**\n- `cmd/entire/cli/why_model.go:5-46` keeps the data model tight and self-contained. The file responsibility is clear: shared renderer-facing types plus the small `RangeText()` helper, with the required local `itoa()` preserved.\n- `cmd/entire/cli/why_test.go:5-96` is a good shape-preservation test for the `whyBlock` contract. It now covers the newly added `Email` field and a concrete `Detail` enum value, which closes the gap from the earlier version.\n- The test is parallel-safe and uses explicit field assertions, which makes regressions easy to spot.\n\n**Issues**\n- Critical: none\n- Important: none\n- Minor: none\n\n**Assessment**\n- Approved"}}
+</subagent_notification>
+
+---
+
+commit and continue
+
+---
+
+Go
+
+---
+
+<subagent_notification>
+{"agent_path":"019db223-e07d-7af0-a25f-a51589580579","status":{"completed":"Using the writing-plans skill to lock the implementation sequence before touching code.\n\nPlan for Task 2:\n\n1. Add `cmd/entire/cli/why_blame_test.go` first with two tests:\n   - `TestParseWhyBlame_CollapsesContiguousBlocks` using the minimal porcelain sample you provided, asserting:\n     - two collapsed blocks are returned\n     - the first block spans lines 23-24\n     - `CodeLines` contains both source lines in order\n     - `Commit.Subject` comes from `summary`\n   - `TestLoadWhyBlocks_UsesBlameRunner` to stub the git wrapper seam and prove `loadWhyBlocks(ctx, path)` delegates through it.\n\n2. Run `go test ./cmd/entire/cli -run TestParseWhyBlame_CollapsesContiguousBlocks` before the parser exists so the new test fails for the expected reason.\n\n3. Add `cmd/entire/cli/why_blame.go` with only the blame-loading and parsing logic:\n   - `var runGitBlamePorcelain = func(ctx context.Context, path string) (string, error)` invoking `git blame --line-porcelain -- <path>`\n   - `func loadWhyBlocks(ctx context.Context, path string) ([]whyBlock, error)` that calls the seam and feeds the output to the parser\n   - `parseWhyBlamePorcelain(r io.Reader) ([]whyBlock, error)` that:\n     - reads each blame record\n     - parses the leading header for commit hash and final line number\n     - captures `author` and `summary` when present\n     - captures the code line from the tab-prefixed line\n     - collapses contiguous records with the same commit hash into one `whyBlock`\n     - appends source lines into `CodeLines`\n     - sets `Commit.Subject` from `summary`\n\n4. Run the targeted tests again:\n   - `go test ./cmd/entire/cli -run TestParseWhyBlame_CollapsesContiguousBlocks`\n   - `go test ./cmd/entire/cli -run 'Test(ParseWhyBlame_CollapsesContiguousBlocks|LoadWhyBlocks_UsesBlameRunner)'`\n   and confirm both pass.\n\nIf you approve this plan, I’ll implement step 1 only and stop for review before moving on."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db226-9ad1-7383-9012-f86e166124b3","status":{"completed":"✅ Spec compliant"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db227-781a-7112-a235-0c1ec7c8b500","status":{"completed":"**Strengths**\n- `why_blame.go` keeps the scope tight: one seam for invoking `git blame`, one parser, and one wrapper for later callers.\n- The parser does the main required job correctly by collapsing adjacent records from the same commit into a single block.\n- The tests exercise both the contiguous-block behavior and the seam override pattern without reaching into unrelated command wiring.\n\n**Issues**\n\n**Important**\n- `cmd/entire/cli/why_blame.go:30-31,77-127` `bufio.Scanner` is left at its default 64 KiB token limit, so a valid blame record with a very long source line can fail to parse. That makes the parser brittle on generated or dense files. Use `scanner.Buffer(...)` or switch to a `bufio.Reader`-based line reader.\n- `cmd/entire/cli/why_blame.go:13-19` `cmd.Output()` discards `git blame` stderr, so failures will usually bubble up as an opaque exit status instead of the actual git diagnostic. That will make later CLI error handling harder to debug. Capture stderr and wrap it into the returned error.\n\n**Minor**\n- `cmd/entire/cli/why_blame_test.go:61-78` The seam test only asserts that one block is returned; it does not verify that the stubbed output is what actually got parsed, or that the path argument is threaded through. A slightly stronger assertion would make the seam contract harder to regress.\n\n**Assessment**\nNeeds changes."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db22a-429e-7930-b023-2a4fe917c7e3","status":{"completed":"**Strengths**\n- The blame execution seam is narrow and easy to stub, which keeps the parser testable without pulling the rest of `why` into the test.\n- The parser does the one thing this task needs: collapse contiguous records from the same commit into a single block.\n- The latest fixes are the right kind of hardening: `git blame` stderr is surfaced, and the scanner limit was increased instead of silently truncating input.\n\n**Issues**\n**Important**\n- `cmd/entire/cli/why_blame.go:32-37, 135-138` - Parse failures are returned without path context, and a truncated blame record falls back to a bare `io.EOF`.\n  - What: `loadWhyBlocks` wraps only the `git blame` subprocess failure path; if parsing fails, callers get an error with no file name, and malformed/truncated input is not clearly distinguished from clean end-of-input.\n  - Why: When this fails later, debugging which file or record shape triggered it will be harder than it needs to be.\n  - Suggested fix: wrap parse errors in `loadWhyBlocks` with the file path, and return a descriptive parse error for truncated records instead of `io.EOF`.\n\n- `cmd/entire/cli/why_blame_test.go:61-76` - The seam test mutates a package-global function inside a parallel test.\n  - What: `runGitBlamePorcelain` is swapped globally while the test runs with `t.Parallel()`.\n  - Why: This is brittle as soon as another parallel test in the package touches the same seam, and it makes future test additions easier to race.\n  - Suggested fix: either remove `t.Parallel()` from this test or change the seam to be injected locally instead of via a mutable package variable.\n\n**Minor**\n- `cmd/entire/cli/why_blame.go:147-155` - `whyBlockFromHeader` is a thin wrapper that cannot fail, so the `error` return is dead weight.\n  - What: The helper just builds a struct literal and always returns `nil` error.\n  - Why: It adds another layer to read without buying any actual validation.\n  - Suggested fix: inline the struct construction or drop the error return.\n\n- `cmd/entire/cli/why_blame_test.go:12-23` - The parser fixture uses a shortened second header instead of a fully representative porcelain header.\n  - What: The collapse test proves the merge behavior, but not the exact header shape `git blame --line-porcelain` emits.\n  - Why: A regression in header parsing could slip through because the fixture is more permissive than the real output.\n  - Suggested fix: use a fully formed sample header for both records, or add a fixture that mirrors real porcelain output more closely.\n\n**Assessment**\nNeeds changes. The core approach is sound, but the parsing error reporting and the parallel/global seam pattern should be tightened before this is easy to maintain safely."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db22c-a481-7111-9410-c0dc0d1e0021","status":{"completed":"**Strengths**\n- `cmd/entire/cli/why_blame.go` keeps the blame-specific I/O and parsing isolated, which is a good fit for the current `why` model layer.\n- The `runGitBlamePorcelain` seam is practical and the non-parallel test correctly verifies path forwarding and parsed content.\n- The new parse error wrapping in `loadWhyBlocks` improves diagnostics without leaking parser internals.\n\n**Issues**\n\n**Critical**\n- `cmd/entire/cli/why_blame.go:52-58,138-140` treats `cur.LineText == \"\"` as a truncated record, which breaks valid blame output for blank source lines. `git blame --line-porcelain` can emit a tab-only content line for an empty line, so files with blank lines will currently fail to parse with a false truncation error. Suggested fix: track whether a content line was seen separately from the line text itself, and only report truncation when no content line arrived at all. Add a regression test with an empty source line.\n\n**Assessment**\n- Needs changes"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db22e-9022-7f20-b13e-0aef1c48611e","status":{"completed":"**Strengths**\nThe parser is tight and purpose-built: it separates blame record state from the source text value, which fixes the blank-line case without complicating the rest of the flow. The seam around `runGitBlamePorcelain` is simple and testable, and the tests cover the three important behaviors here: contiguous block collapsing, truncated-record failure, and blank-source-line acceptance.\n\n**Issues**\nCritical: None found.\n\nImportant: None found.\n\nMinor: None found.\n\n**Assessment**\nApproved."}}
+</subagent_notification>
+
+---
+
+commit and continue
+
+---
+
+Commit and continue
+
+---
+
+Commit and continue
+
+---
+
+Go
+
+---
+
+<subagent_notification>
+{"agent_path":"019db24b-7c1f-7963-8d7e-a82105b0f69a","status":{"completed":"`cmd/entire/cli/why.go` does not exist in this branch; the current blame parsing lives in `cmd/entire/cli/why_blame.go`.\n\nI can proceed in either of these ways:\n1. Add the enrichment helpers to `why_blame.go` and keep the new tests in `why_test.go`.\n2. Create a new `why.go` for the enrichment layer and leave parsing in `why_blame.go`.\n\nI need your preference before I write the plan and start the first step."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db24f-5f5f-71d2-88e3-6c452dcbb826","status":{"completed":"❌ Issues found:\n- `cmd/entire/cli/why.go:114-141` reads enrichment data through `ReadSessionContent`, which requires transcript availability. The spec called for local checkpoint/session metadata enrichment, and this path can fail even when the session metadata exists. `ReadSessionMetadata` would satisfy the requirement without the transcript dependency.\n- `cmd/entire/cli/why_test.go:101-171` does not match the requested test coverage. The enrichment test stubs only `resolveWhyCommitMetadata` rather than separate commit lookup and checkpoint lookup, and it verifies a fixed summary instead of the requested fallback behavior (`generated summary -> intent -> commit subject`).\n- `cmd/entire/cli/why_test.go:150-171` does not actually exercise the “no `Entire-Checkpoint` trailer” path. It stubs the resolver to return `nil` metadata instead of using a real commit without the trailer, so it does not prove the Git-only fallback behavior."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db252-4468-7722-8bcb-d72a720bc2fd","status":{"completed":"❌ Issues found:\n- `cmd/entire/cli/why_test.go:104-150` - The new enrichment test does not match Task 3’s required shape. It stubs `resolveWhyCommitMetadata` as one black box and only asserts that `Summary` is non-empty, so it never verifies separate commit lookup + checkpoint lookup behavior, nor the required checkpoint ID / agent / summary-fallback fields on the enriched block. This means regressions in trailer parsing or summary selection could still pass. Suggested fix: replace this with a test that stubs the commit lookup and checkpoint lookup layers independently and asserts `Entire.CheckpointID`, `Entire.Agent`, and the fallback summary value exactly.\n\n- `cmd/entire/cli/why.go:109-146` - `loadWhyEntireInfo` bypasses the existing checkpoint reader abstraction and manually reopens the metadata branch/tree to read `metadata.json`. That misses the requested “use existing checkpoint readers” path and duplicates storage-layout logic in the CLI layer. Suggested fix: read the session metadata through the checkpoint reader API you already resolved, rather than directly traversing repo refs/trees in `why.go`."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db256-2ed2-7421-9cc4-ae6308a0ca98","status":{"completed":"✅ Spec compliant"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db257-9e31-7ec0-9fcf-ea3c6ee21168","status":{"completed":"**Strengths**\n- The implementation stays narrow and cohesive: enrichment logic is isolated in `why.go`, and the summary fallback behavior is covered with a focused table-driven test.\n- `enrichWhyBlocks` deduplicates commit hashes before resolving them, which avoids repeated lookup work for duplicate blame entries.\n\n**Issues**\n\n**Important**\n- `cmd/entire/cli/why.go:101` and `cmd/entire/cli/why.go:129`: `ResolveCommittedReaderForCheckpoint` already returns the committed checkpoint summary, but `loadWhyEntireInfoImpl` ignores it and calls `reader.ReadCommitted` again. Why: this doubles checkpoint I/O on every enrichment and makes the code more fragile if the metadata branch changes between the two reads. Suggested fix: thread the returned `CheckpointSummary` through and use it directly instead of rereading the same checkpoint.\n- `cmd/entire/cli/why_test.go:14`: `TestWhyBlock_PreservesEntireMetadata` is mostly a fixture self-check, not a behavioral test. Why: it can still pass if the production code that produces `whyBlock` regresses, so it adds false confidence. Suggested fix: replace it with a test that exercises `parseWhyBlamePorcelain` or `enrichWhyBlocks`, or remove the literal field reassertions that don’t validate behavior.\n\n**Assessment**\nNeeds changes."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db25a-d3c2-77d2-8be9-b4cf558ea68d","status":{"completed":"**Strengths**\n\nThe implementation is structurally clean: commit resolution, checkpoint lookup, summary selection, and block enrichment are separated into small helpers, which makes the flow easy to trace. The new tests also cover the fallback-order behavior directly, and the enrichment path preserves the original blame block shape while layering on `Entire` metadata only when available.\n\n**Issues**\n\n**Important**\n- `cmd/entire/cli/why.go:149-154`  \n  `loadWhyEntireInfoImpl` dereferences `sessionMetadata` immediately after `readWhySessionMetadata` without guarding against a nil return. The built-in readers currently return a struct, but this helper already accepts a generic reader and the test-injection pattern can return nil, which would panic instead of falling back to the commit subject. Suggested fix: treat `nil` metadata as a fallback case before reading `Summary`.\n\n**Minor**\n- `cmd/entire/cli/why.go:116-130`  \n  `lookupWhyCheckpointInfo` opens the repository a second time even though `lookupWhyCommitInfo` already opened it for the same hash resolution path. That adds avoidable work per checkpointed block and makes the call chain harder to follow. Suggested fix: thread the repo through the lookup path so commit and checkpoint resolution share one repository handle.\n- `cmd/entire/cli/why_test.go:12-48`  \n  `TestWhyBlock_PreservesEntireMetadata` is now a direct struct-literal contract test, so it no longer exercises behavior and has limited regression value. Suggested fix: keep the reduced scope if desired, but pair it with an output-level assertion or drop it if the parser/enrichment tests already cover the real contract.\n\n**Assessment**\n\nNeeds changes. The main functional risk is the nil-dereference path in checkpoint metadata loading; the rest is mostly maintainability and test-signal quality."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db25e-5392-7390-8c00-ba59e789cfee","status":{"completed":"**Strengths**\n\n`why.go` keeps the flow reasonably linear: resolve the blamed commit, parse the checkpoint trailer, load checkpoint metadata, then select the best summary. `selectWhySummary` makes the fallback order explicit, and the added tests cover the main summary-precedence cases plus the git-only path.\n\n**Issues**\n\n**Important**\n- `cmd/entire/cli/why_test.go:63-85` does not actually prove the repo-threading fix. What: the stubbed `lookupWhyCommitInfo` returns `nil` for the repo, and the checkpoint stub ignores its repo argument, so the test only checks the final `whyEntireInfo` shape. Why: a regression that reopens the repo or stops passing the repo through would still pass this test. Suggested fix: return a sentinel `*git.Repository` from the commit stub and assert the same pointer is received by `lookupWhyCheckpointInfo`, or add a focused test around `resolveWhyCommitMetadata`.\n\n**Minor**\n- `cmd/entire/cli/why_model.go:37-46` adds an `itoa` helper that only wraps `strconv.Itoa`. What: this is extra indirection for a one-line conversion. Why: it makes the model file slightly harder to scan without giving you reuse or test value. Suggested fix: inline `strconv.Itoa` directly in `RangeText` and remove the helper.\n\n**Assessment**\n\nNeeds changes. The implementation looks close, but the repo-threading fix still lacks a test that would catch a regression, and there is one small unnecessary abstraction in the model file."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db261-0fe2-7911-82d1-f90cb688894f","status":{"completed":"**Strengths**\n- `why_blame.go` cleanly separates blame parsing from metadata enrichment, which keeps the `why` path easier to follow and test.\n- The new sentinel-repo regression test in `why_test.go` directly verifies that the repo pointer is threaded through the commit-lookup seam into checkpoint lookup, which is the right guard for the bug you fixed.\n- The parser tests cover the main edge cases that matter here: contiguous block collapse, truncated input, blank source lines, and the runner seam.\n\n**Issues**\n**Minor**\n- `cmd/entire/cli/why_test.go:14` - `TestWhyBlock_PreservesEntireMetadata` mostly asserts fields on a manually constructed struct, so it does not exercise behavior beyond `RangeText`. That makes it low-value coverage and a bit misleading as a regression test. Suggested fix: either fold the useful assertions into a behavior-focused test or trim this down to just the method under test.\n\n**Assessment**\nApproved."}}
+</subagent_notification>
+
+---
+
+Commit and continue
+
+---
+
+<environment_context>
+  <shell>zsh</shell>
+  <current_date>2026-04-22</current_date>
+  <timezone>America/Los_Angeles</timezone>
+</environment_context>
+
+---
+
+Go
+
+---
+
+<subagent_notification>
+{"agent_path":"019db64b-0fa0-7943-b84f-2c9e70a6628b","status":{"completed":"Using the brainstorming and planning workflow, I’ve traced the existing `why`/pager code and I’m ready to lock a narrow implementation plan.\n\nPlan:\n1. Add the renderer test first in `cmd/entire/cli/why_render_test.go`, using the exact `whyBlock` shape you provided, then run `go test ./cmd/entire/cli -run TestRenderWhyStatic_IncludesEntireFields` to confirm it fails before implementation.\n2. Add the command test in `cmd/entire/cli/why_test.go`, stubbing `loadWhyDisplayData` so `newWhyCmd()` can be exercised without git, then run the targeted command test to confirm it fails first.\n3. Implement `renderWhyStatic([]whyBlock) string` in `cmd/entire/cli/why_render.go` as a pure text renderer that prints line ranges, commit metadata, code lines, and the Entire fields already present on each block.\n4. Implement `newWhyCmd()` and `loadWhyDisplayData(ctx, path)` in `cmd/entire/cli/why.go`, with `loadWhyDisplayData` composing the existing blame/enrichment pipeline and `newWhyCmd()` always using the static renderer plus `outputExplainContent` for pager-aware output.\n5. Register `newWhyCmd()` in `cmd/entire/cli/root.go`, then run the two targeted tests again and verify they pass.\n\nIf that looks right, I’ll start with step 1 only and stop after that first logical change."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db64d-06ba-7343-966e-d212b787cd5c","status":{"completed":"❌ Issues found:\n- Important - `cmd/entire/cli/why.go:151-226`: this implements Git commit fallback behavior (`selectWhySummary`, `commitSubject`, and the `Summary: commitSubject` branches) even though the task explicitly said not to add the commit-fallback detail yet. This broadens the feature beyond Task 4 and changes `why` enrichment semantics before the spec calls for it. Suggested fix: remove the commit-subject fallback paths and leave only the static renderer/command plumbing for now.\n- Nits - `cmd/entire/cli/why_render_test.go:11-31`: the renderer test claims to verify “Entire fields” but only asserts checkpoint ID and agent, not the rendered summary. That leaves part of the new output untested. Suggested fix: add a summary assertion to the fixture/output check."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db64f-9247-7063-b5ba-861c8d3f9e8a","status":{"completed":"✅ Spec compliant"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db650-858c-7322-ad72-e3fbb42b4edf","status":{"completed":"**Strengths**\n- The new code keeps the static renderer isolated in `why_render.go`, which is the right shape for the narrow Task 4 scope.\n- `enrichWhyBlocks` deduplicates commit lookups by hash before resolving metadata, which avoids repeated work and keeps the enrichment path straightforward.\n- The tests cover the new summary-selection behavior and the repo-to-checkpoint handoff, so the new metadata path is not totally unguarded.\n\n**Issues**\n\n**Important**\n- `cmd/entire/cli/why.go:249` still routes output through `outputExplainContent(..., false)`, which can invoke the pager on a terminal. That makes `entire why` interactive in the common case and conflicts with the intended static/non-interactive command path. The command should write directly or pass the non-pager path explicitly.\n- `cmd/entire/cli/why_test.go:54-70`, `cmd/entire/cli/why_test.go:113-123`, `cmd/entire/cli/why_test.go:229-245` mutate package-level function variables while also calling `t.Parallel()`. These tests can race with each other or with future package tests, which makes the suite flaky. Tests that stub globals should not run in parallel.\n\n**Minor**\n- `cmd/entire/cli/why_render_test.go:8-32` only checks for substring presence, so it will miss formatting regressions in ordering, labels, or spacing. A stricter golden-style assertion would give better protection for the static renderer.\n\n**Assessment**\n- Needs changes."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db652-7e3d-7612-9a42-89576999c723","status":{"completed":"**Status**\n\nImplemented the two requested review fixes. No commit was created.\n\n**What changed**\n\n`cmd/entire/cli/why.go` now writes the static `why` rendering directly to `cmd.OutOrStdout()` instead of going through the pager-aware explain output path, so the default static command execution will not auto-invoke a pager.\n\n`cmd/entire/cli/why_test.go` no longer uses `t.Parallel()` in the tests that stub package-level function variables. That removes the race hazard around global test doubles.\n\n**What I tested**\n\n- `go test ./cmd/entire/cli -run 'TestEnrichWhyBlocks_AddsEntireMetadata|TestResolveWhyCommitMetadata_ThreadsRepoToCheckpointLookup|TestWhyCommand_StaticModeRendersBlocks|TestRenderWhyStatic_IncludesEntireFields'`\n- `go build ./...`\n- `go vet ./...`\n\nAll passed.\n\n**Files changed**\n\n- [cmd/entire/cli/why.go](cmd/entire/cli/why.go)\n- [cmd/entire/cli/why_test.go](cmd/entire/cli/why_test.go)\n\n**Self-review findings**\n\nNo additional issues found within the requested scope."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db653-6f4b-7ba3-9a7a-243e4000591c","status":{"completed":"**Strengths**\n- `cmd/entire/cli/why_render.go:8-51` is a clean separation point for the static formatter. It keeps the output logic self-contained and easier to evolve than having it buried in the command handler.\n- `cmd/entire/cli/why.go:49-227` keeps the enrichment pipeline explicit and testable, and the repo-to-checkpoint threading is covered by focused tests.\n- The package-level stub cleanup in `cmd/entire/cli/why_test.go:63-119, 225-252` is disciplined; removing `t.Parallel()` from the mutating tests avoids a real race hazard.\n\n**Issues**\n- **Important:** `cmd/entire/cli/why_test.go:225-252` does not actually protect the regression that was just fixed. It only asserts that some output contains `package main`, so it would still pass if `newWhyCmd()` accidentally routed back through the pager/explain path. That leaves the exact failure mode of the latest fix uncovered.\n- **Minor:** `cmd/entire/cli/why.go:237-255` now mixes command construction with the full lookup/enrichment pipeline in the same file. It works, but the file is starting to carry too many responsibilities, which will make future `why`-related changes harder to localize.\n\n**Assessment**\n- Needs changes"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db655-5ce8-7060-9fe7-8c30969608f3","status":{"completed":"**Strengths**\n- The blame parser has solid coverage for the important edge cases: contiguous block collapsing, truncated output, blank source lines, and the runner seam.\n- The static-output command test now checks both that the seam is used and that the emitted text is exactly what the renderer produces, which is the right level of protection for this change.\n- `go test ./cmd/entire/cli/...` passed.\n\n**Issues**\n\n**Important**\n- `cmd/entire/cli/why.go:105-107,254-255` `writeWhyStaticOutput` drops the `fmt.Fprint` error, so a short write or broken stdout pipe still returns success. That makes the command report success even when output delivery failed. Return the write error from the seam and propagate it from `RunE`.\n\n**Minor**\n- `cmd/entire/cli/why_model.go:21-35` `whyDetailKind`, `whyDetailCheckpoint`, and `whyBlock.Detail` are not consumed by the current renderer or command path. That adds state without behavior and makes the model harder to understand. Either remove it until there is a real consumer or wire it into the output logic.\n\n**Assessment**\n- Needs changes."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db658-6b7d-7522-b30d-a7a9096cf317","status":{"completed":"**Strengths**\n- The implementation is split cleanly across blame parsing, metadata enrichment, and static rendering, which keeps the new `why` flow understandable.\n- The static-output error propagation fix is tight and covered by a regression test for `io.ErrClosedPipe`, so the failure mode you just fixed is now exercised.\n- The checkpoint lookup path is centralized instead of being duplicated in the command layer, which should make later TUI work easier.\n\n**Issues**\n\n**Important**\n- `cmd/entire/cli/why_blame.go:14-15` and `cmd/entire/cli/why.go:243-256`  \n  The command passes the raw path straight to `git blame` without resolving it against the repo root or setting `cmd.Dir`. That makes `entire why` cwd-dependent, so it will misbehave from nested subdirectories and can also fail for repo-root-relative or absolute paths.  \n  Suggested fix: resolve the worktree root first and either set `cmd.Dir = repoRoot` or convert the user path to a repo-root-relative path before invoking `git blame`.\n\n**Minor**\n- `cmd/entire/cli/why_render_test.go:27-31` and `cmd/entire/cli/why_test.go:233-271`  \n  The tests are too coupled to the implementation. The renderer test only checks for substrings, and the command test builds its expected string by calling `renderWhyStatic` again, so a formatting regression can still slip through.  \n  Suggested fix: compare `renderWhyStatic` against a literal golden string, and make the command test assert the exact emitted output independently.\n\n**Assessment**\n- Needs changes."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db65d-d394-78e2-b57f-7dc0aa99b917","status":{"completed":"**Strengths**\n- The repo-root path fix is applied in the right place: `why` now normalizes the target path and runs `git blame` from the worktree root, and the regression test covers cwd-relative, repo-root-relative, and absolute inputs.\n- The static renderer/output seam keeps the command testable without entangling formatting with git I/O, which is a good boundary for this task.\n\n**Issues**\n\n**Important**\n- `cmd/entire/cli/why_test.go:55-86` and `cmd/entire/cli/why_test.go:112-140` mutate package-level seams (`lookupWhyCommitInfo`, `lookupWhyCheckpointInfo`) inside `t.Parallel()` tests. Those tests can overlap and race with each other, so this package is flaky under parallel test execution. Remove `t.Parallel()` from the tests that override globals, or serialize the overrides with a package-level mutex/helper.\n- `cmd/entire/cli/why.go:118-152` makes checkpoint enrichment all-or-nothing. If checkpoint metadata cannot be read, the whole command errors instead of falling back to plain blame output, which makes `why` brittle when the optional Entire checkpoint data is missing or temporarily unavailable. Preserve the commit-only output for checkpoint lookup failures such as `ErrCheckpointNotFound`, and only fail on the underlying git-blame/commit lookup error.\n\n**Assessment**\n- Needs changes. The implementation direction is sound, but the test concurrency issue is real, and the enrichment failure path is too brittle for a user-facing diagnostic command."}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db661-e36b-75c3-abb5-2fc6609fc1b7","status":{"completed":"**Strengths**\n- The static renderer is cleanly separated from command wiring, and the output tests exercise the intended shape without overfitting to implementation details.\n- The repo-root path normalization is covered with realistic cases, including cwd-relative, repo-root-relative, and absolute paths.\n- The global seam approach is pragmatic for this CLI codebase, and the tests correctly avoid parallelizing cases that mutate shared state.\n\n**Issues**\n- **Important**: [`cmd/entire/cli/why.go:116`](</Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why.go:116>) swallows every enrichment failure and returns the raw blame blocks as success. That is broader than the stated fallback, and it can hide real failures like context cancellation, repo-opening problems, or unexpected metadata-read errors. In those cases the command will still exit 0 with degraded output, which makes bugs harder to detect and diagnose.\n\n**Assessment**\n- Needs changes"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db664-e21d-7921-bd89-67edfc7a6194","status":{"completed":"**Strengths**\n- The implementation is well-factored for the task scope: blame/path resolution, optional checkpoint enrichment, and static rendering are separated cleanly.\n- The new tests cover the important seams: repo-root path normalization, static rendering, and the distinction between optional checkpoint metadata failures vs. hard enrichment failures.\n\n**Issues**\n- **Important** `cmd/entire/cli/why.go:53-124` The fallback is all-or-nothing, so one missing checkpoint metadata record discards enrichment for every block, including blocks that were already resolved successfully. `enrichWhyBlocks` stops on the first error, and `loadWhyDisplayDataImpl` then returns the original `blocks` slice instead of the partially enriched result. For mixed-history files, this makes the \"narrow\" fallback broader than it needs to be and loses valid `Entire` data unnecessarily.\n\n**Assessment**\n- Needs changes"}}
+</subagent_notification>
+
+---
+
+<subagent_notification>
+{"agent_path":"019db667-6564-7e21-9c66-5affbdfd8887","status":{"completed":"**Strengths**\n- The per-block fallback logic in `why.go` is scoped correctly: a missing checkpoint now degrades only the affected commit block instead of aborting the whole render.\n- The blame-path normalization in `why_blame.go` is repo-root aware, and the regression test covers cwd-relative, repo-root-relative, and absolute inputs.\n- The tests are well-targeted for this scope: renderer output, enrichment fallback, and non-optional error propagation are all covered.\n\n**Issues**\n- Critical: none.\n- Important: none.\n- Minor: none.\n\n**Assessment**\n- Approved."}}
+</subagent_notification>
+
+---
+
+Commit and continue
+
+---
+
+go
+
+---
+
+<subagent_notification>
+{"agent_path":"019db6ea-b6df-7dd2-ac33-b4437c7b8785","status":{"completed":"1. Files changed\n\n- [why_model.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_model.go)\n- [why_render.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_render.go)\n- [why_render_test.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_render_test.go)\n\n2. Key decisions\n\n- Added a minimal `whyCommitDetail` model: just `Commit whyCommitInfo` plus raw `Diff string`.\n- Added `renderWhyCommitDetail(detail whyCommitDetail) string` in [why_render.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_render.go).\n- The renderer prefers the full commit hash and falls back to `ShortHash` when `Hash` is empty.\n- The diff is rendered as a raw file-scoped text payload under a `Diff:` header, with newline normalization only to avoid truncating the last line.\n- No command wiring, no TUI changes, no new dependencies.\n\n3. Verification commands and result\n\n- `gofmt -w cmd/entire/cli/why_model.go cmd/entire/cli/why_render.go cmd/entire/cli/why_render_test.go`\n- `go test ./cmd/entire/cli -run 'TestRenderWhyStatic_IncludesEntireFields|TestRenderWhyCommitDetail_IncludesCommitMetadataAndDiff|TestRenderWhyCommitDetail_FallsBackToShortHash'`\n\nResult:\n- `ok github.com/entireio/cli/cmd/entire/cli 0.584s`\n\n4. Concerns\n\n- The fallback detail model is intentionally minimal. It does not yet carry path context, commit email, or richer diff metadata because Task 5 was scoped to renderer/model only.\n- I did not touch the unrelated `.opencode/package-lock.json` change."}}
+</subagent_notification>
+
+---
+
+commit and continue
+
+---
+
+Go
+
+---
+
+<subagent_notification>
+{"agent_path":"019db6ef-a2e8-7811-a03d-b4474a8b0980","status":{"completed":"1. Files changed\n\n- [why_model.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_model.go)\n- [why_render.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_render.go)\n- [why_render_test.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_render_test.go)\n\n2. Key decisions\n\n- Added a minimal `whyCheckpointDetail` model with `Commit whyCommitInfo` and `Entire whyEntireInfo`.\n- Added `renderWhyCheckpointDetail(detail whyCheckpointDetail) string` in [why_render.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_render.go).\n- The checkpoint detail renderer shows `Checkpoint`, `Agent`, and summary text prominently first.\n- Summary labeling uses the existing `IsFallback` flag:\n  - `Generated Summary: ...` when `IsFallback == false`\n  - `Fallback Summary: ...` when `IsFallback == true`\n- Kept the existing `renderWhyCommitDetail` path unchanged so commit-detail fallback still works.\n- No command wiring, no TUI work, no dependency changes.\n\n3. Verification command(s) and result\n\n- `gofmt -w cmd/entire/cli/why_model.go cmd/entire/cli/why_render.go cmd/entire/cli/why_render_test.go`\n- `go test ./cmd/entire/cli -run 'TestRenderWhyStatic_IncludesEntireFields|TestRenderWhyCommitDetail_IncludesCommitMetadataAndDiff|TestRenderWhyCommitDetail_FallsBackToShortHash|TestRenderWhyCheckpointDetail_IncludesCheckpointMetadataAndGeneratedSummary|TestRenderWhyCheckpointDetail_LabelsFallbackSummary'`\n\nResult:\n- `ok github.com/entireio/cli/cmd/entire/cli 0.404s`\n\n4. Concerns\n\n- The checkpoint detail model is intentionally narrow. It does not yet carry session lists or richer checkpoint/session metadata because this task was scoped to renderer/model work only.\n- The renderer includes commit context in checkpoint detail for orientation, but there is still no command/TUI integration yet."}}
+</subagent_notification>
+
+---
+
+Commit and continue. Start the next task after that
+
+---
+
+Go
+
+---
+
+<subagent_notification>
+{"agent_path":"019db6ff-406e-7c41-ac51-c8ccb5259490","status":{"completed":"Task 7 is complete.\n\n1. Files changed\n\n- [why.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why.go)\n- [why_tui.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_tui.go)\n- [why_tui_test.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_tui_test.go)\n- [go.mod](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/go.mod)\n- [go.sum](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/go.sum)\n\n2. Key decisions\n\n- Kept the existing static path as the default fallback. `entire why` now only enters the TUI when stdout is a terminal and `ACCESSIBLE` is not set.\n- Added a narrow `runWhyTUI` seam in [why.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why.go) so the command path is testable without coupling tests to Bubble Tea runtime behavior.\n- Added a first `why` Bubble Tea model in [why_tui.go](/Users/pfleidi/entire/cli/.worktrees/feat/entire-why/cmd/entire/cli/why_tui.go) with browse/detail modes, `j`/`k` and arrow navigation, `enter`/space to open detail, and `esc` to return.\n- Browse mode renders a metadata block list and a separate code pane for the selected blamed block.\n- Detail mode switches between the existing checkpoint renderer and commit fallback renderer based on the block detail kind, and commit fallback now loads a file-scoped diff with `git show`.\n- Added syntax highlighting for the code pane using `github.com/alecthomas/chroma/v2`, with plain-text fallback if lexer or formatter resolution fails.\n- `whyBlock.Detail` is now normalized during display-data loading so the TUI does not have to infer everything ad hoc.\n\n3. Verification command(s) and result\n\n- `go test ./cmd/entire/cli -run 'TestWhyModel_NavigationAndDetailMode|TestWhyModel_ViewIncludesCodePaneAndMetadata|TestWhyModel_RenderDetailContentUsesCheckpointRenderer|TestWhyModel_RenderDetailContentUsesCommitFallback|TestRenderWhyHighlightedCode_FallsBackToPlainText|TestWhyCommand_UsesTUIWhenInteractive|TestRenderWhyStatic_IncludesEntireFields|TestRenderWhyCommitDetail_IncludesCommitMetadataAndDiff|TestRenderWhyCheckpointDetail_IncludesCheckpointMetadataAndGeneratedSummary'`  \n  Result: PASS\n- `go build ./...`  \n  Result: PASS\n- `go vet ./...`  \n  Result: PASS\n\nDependency addition was needed:\n- `github.com/alecthomas/chroma/v2 v2.15.0`\n\n4. Concerns\n\n- The code pane is syntax-highlighted, but detail screens are still text-rendered from the existing checkpoint/commit renderers; I kept that boundary to stay inside Task 7 scope.\n- Commit fallback detail currently loads the diff synchronously when opening detail. That is acceptable for the prototype, but large diffs may feel slow enough that a later async load would be worth considering.\n- I did not touch the unrelated `.opencode/package-lock.json` change.\n\nApprove the next task when you want me to continue."}}
+</subagent_notification>
+
+---
+
+Commit and continue
+
+---
+
+I just tried out the interactive mode and it isn't what I had in mind: For both modes, I would like the whole code of the file to be visible. When running `git blame`, it shows this pretty well:
+
+❯ git blame cmd/entire/main.go | cat
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100  1) package main
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100  2)
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100  3) import (
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100  4)     "context"
+7f93a963e3 (Stefan Haubold            2026-01-07 14:25:55 +0100  5)     "errors"
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100  6)     "fmt"
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100  7)     "os"
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100  8)     "os/signal"
+b550507521 (Victor Gutierrez Calderon 2026-03-30 17:15:27 +0200  9)     "runtime"
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 10)     "strings"
+b550507521 (Victor Gutierrez Calderon 2026-03-30 17:15:27 +0200 11)     "syscall"
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 12)
+c0ab55eeed (paul                      2026-02-05 10:34:45 +0530 13)     "github.com/entireio/cli/cmd/entire/cli"
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 14)     "github.com/spf13/cobra"
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 15) )
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 16)
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 17) func main() {
+d3b83523ca (Paulo Gomes               2026-04-15 14:54:35 +0100 18)     cli.RegisterObjectSigner()
+a719b0ea17 (Paulo Gomes               2026-03-30 11:07:32 +0100 19)
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 20)     // Create context that cancels on interrupt
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 21)     ctx, cancel := context.WithCancel(context.Background())
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 22)
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 23)     // Handle interrupt signals
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 24)     sigChan := make(chan os.Signal, 1)
+b550507521 (Victor Gutierrez Calderon 2026-03-30 17:15:27 +0200 25)     signals := []os.Signal{os.Interrupt}
+b550507521 (Victor Gutierrez Calderon 2026-03-30 17:15:27 +0200 26)     if runtime.GOOS != "windows" {
+b550507521 (Victor Gutierrez Calderon 2026-03-30 17:15:27 +0200 27)             signals = append(signals, syscall.SIGTERM)
+b550507521 (Victor Gutierrez Calderon 2026-03-30 17:15:27 +0200 28)     }
+b550507521 (Victor Gutierrez Calderon 2026-03-30 17:15:27 +0200 29)     signal.Notify(sigChan, signals...)
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 30)     go func() {
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 31)             <-sigChan
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 32)             cancel()
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 33)     }()
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 34)
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 35)     // Create and execute root command
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 36)     rootCmd := cli.NewRootCmd()
+a38ff03c6f (Victor Gutierrez Calderon 2026-01-14 11:16:54 +1100 37)     err := rootCmd.ExecuteContext(ctx)
+a38ff03c6f (Victor Gutierrez Calderon 2026-01-14 11:16:54 +1100 38)     if err != nil {
+7f93a963e3 (Stefan Haubold            2026-01-07 14:25:55 +0100 39)             var silent *cli.SilentError
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 40)
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 41)             switch {
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 42)             case errors.As(err, &silent):
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 43)                     // Command already printed the error
+41aa312be9 (Victor Gutierrez Calderon 2026-01-29 15:30:58 +1100 44)             case strings.Contains(err.Error(), "unknown command") || strings.Contains(err.Error(), "unknown flag"):
+41aa312be9 (Victor Gutierrez Calderon 2026-01-29 15:30:58 +1100 45)                     showSuggestion(rootCmd, err)
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 46)             default:
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 47)                     fmt.Fprintln(rootCmd.OutOrStderr(), err)
+7f93a963e3 (Stefan Haubold            2026-01-07 14:25:55 +0100 48)             }
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 49)
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 50)             cancel()
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 51)             os.Exit(1)
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 52)     }
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 53)     cancel() // Cleanup on successful exit
+^e72157d04 (Stefan Haubold            2026-01-03 18:07:37 +0100 54) }
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 55)
+41aa312be9 (Victor Gutierrez Calderon 2026-01-29 15:30:58 +1100 56) func showSuggestion(cmd *cobra.Command, err error) {
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 57)     // Print usage first (brew style)
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 58)     fmt.Fprint(cmd.OutOrStderr(), cmd.UsageString())
+41aa312be9 (Victor Gutierrez Calderon 2026-01-29 15:30:58 +1100 59)     fmt.Fprintf(cmd.OutOrStderr(), "\nError: Invalid usage: %v\n", err)
+68cb1d914d (Victor Gutierrez Calderon 2026-01-29 13:08:15 +1100 60) }
+
+The idea is to view the file, be able to read the code in its entirety and be able to see which commits/checkpoints/sessions have produced it. This needs to be reworked.
+
+---
+
+Okay, do it.
+
+---
+
+This is a prototype and I currently don't care about iterative workflows and the ability to review code commit by commit. What I eventually want is something I can play with and demo and a well defined spec based on the experimentation done here. Is there a way to not do the iterative process in this session and just get the prototype implemented?
+
+---
+
+There's some additional changes I'd like to make:
+
+- Right now, the commit-pecific view is very sparse and doesn't show a lot of information. I'd expect it to show checkpoint information if available.
+- The initial view doesn't show a header to describe which column is showing what
+- The diff shown in the commit/checkpoint view isn't syntax highlighted. It should be, too.
+- I like the idea with the top bar showing commit/checkpoint information. I'm wondering if, in interactive mode only, we should be showing less information on the left side next to the code and more in the top bar. That would give the code more room without taking away a lot of information. Can we remove the checkpoint specific data from the left columns and expand the interactive top bar a bit more?
+
+---
+
+- The top bar is now very sparse and it's unclear which commit has checkpoints attached to it or not. I think part of my earlier thinking was wrong and we should at least add the checkpoint ID back into the table on the left.
+- The dynamic top bar section should have a more well defined layout: Can we make this a table or something similar with a clear indication to show which value is what?
+- While the diff itself in the commit view is syntax highlighted, I'm not sure that's very useful. A more useful way would be if the code itself was syntax highlighted and there was a green/red indicator on the left to show whether it's an addition or a removal.
+
+---
+
+Okay: The details view when hitting enter still doesn't show any checkpoint or session information. What I'd like to see is checkpoint details and a list of sessions that I can drill down into.
+
+---
+
+Loading the data seems to break:
+
+loading why data for cmd/entire/cli/attach.go: ambiguous commit prefix: "b8019fe55d9e6451909b717e89f0cea5bb6c1017" matches 2 commits: b8019fe55d9e6451909b717e89f0cea5bb6c1017, b8019fe55d9e6451909b717e89f0cea5bb6c1017
+Use a longer prefix or a full SHA
+
+---
+
+Okay. That works now. Can you now please focus on the details view showing commit/checkpoint information when hitting enter? That should at least show a bunch of checkpoint information, like agent, tokens used, etc. and an interactive list of sessions in addition to the file diff. I would like to drill down into the sessions to view a transcript, too.
+
+---
+
+<image name=[Image #1]>
+
+---
+
+</image>
+
+---
+
+Nothing about what I'm seeing is richer now[Image #1]
+
+---
+
+This doesn't show anything I asked for multiple times now
+
+---
+
+The screenshot isn't from the wrong binary. I used `go run cmd/entire/main.go why cmd/entire/cli/attach.go` to now end up with a stale binary in the first place. Try again.
+
+---
+
+<turn_aborted>
+The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.
+</turn_aborted>
+
+---
+
+The screenshot is also very specifically from the TUI and not the CLI mode. Maybe we should focus on that mode only for now. I have ideas for the non-interactive CLI output, too, but they need to wait.
+
+---
+
+Okay, I do see checkpoint information now. What I'd like to change:
+
+- I'd like there to be some visual separation between the checkpoint metadata and the diff
+- I'd like there to be an interactive list of sessions that I can drill down to (I have asked you for this about three times already)
+
+---
+
+Okay, that's much better! Instead of showing the raw transcript json, I'd like to show a rendered version similar to `entire explain --checkpoint`.
+
+---
+
+<turn_aborted>
+The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.
+</turn_aborted>
+
+---
+
+Continue
+
+---
+
+I'd also like "general pager shortcuts" like:
+
+- G: Jumps to the end of the view
+- gg: Jumps to the top of the view
+
+In all views
+
+---
+
+I think I got that wrong: g should jump to the top, not gg
+
+---
+
+Okay, I'd also like tool calls in the session view to be collapsed by default. Instead of something like this:
+
+[Tool] Read: /Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go
+
+[Tool] Read: /Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go
+
+[Tool] Read: /Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go
+
+[Tool] Read: /Users/ninawork/entire/devenv/cli/cmd/entire/cli/attach.go
+
+I'd like to see "4 tool calls" and be able to expand the section on demand.
+
+---
+
+I don't see tool calls collapsed right now
+
+---
+
+Okay, cool. We should talk about colors now. I'd like colors to be used to make the whole TUI easier to read. Can you take a look at these changes and use a similar color scheme in order to enhance the commit/checkpoints view and the session view? https://github.com/entireio/cli/pull/999
+
+---
+
+Now, I'd like to add another feature: When `entire why` is called without any arguments in an interactive shell, I'd like to be shown a file browser showing the current `pwd`. I'd like to interactively traverse the folder structure midnight-commander style and be shown the why view when I select a file. Do you have any more questions before you start?
+
+---
+
+The only change I'd make is that the browser shouldn't hide any files right now. That's something we can add later and is more confusing than anything else.
+
+---
+
+Go
+
+---
+
+Go
+
+---
+
+go
+
+---
+
+Can you update the project spec based on the changes we've made in this session? It would be good to persist that somehow for an actual implementation later.
+
+---
+
+Can you wrap up the file browser work now?
+
+---
+
+Esc should also navigate back to the previous folder when traversing the file system in the browser.
+
+---
+
+I noticed an issue in the commit details view: It's not possible to scroll diff view other than jumping all the way to the bottom. The navigation is taken up by the session selector. Are there any common TUI patterns to address an issue like this?
+
+---
+
+Do it
+
+---
+
+Could we add a colored border around the section that's currently selected via tab?
+
+---
+
+<turn_aborted>
+The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.
+</turn_aborted>
+
+---
+
+continue
+
+---
+
+Loading the initial `why/blame` overview is incredibly slow. Is there a way that can be sped up?
+
+---
+
+Yes
+
+---
+
+Make it so
+
+---
+
+Go
+
+---
+
+One other thing: i'd like to have a consistent navigation across the board: hjkl as well as the arrow keys and enter/esc should work everywhere. We don't need to show the vim keybindings in the help texts. They can just be there for the people who are used to them.
+
+---
+
+What I meant: don't show j/k for scrolling but show arrow keys instead. That's probably more accessible for most.
+
+---
+
+Also: the h key should act the same way as esc and the l-key should act the same as enter/space. Both don't need to be shown in the help texts.
+
+---
+
+Go
+
+---
+
+When expanding the tool calls using the e button, it's not exactly clear what's happening. Would it be possible to use a similar sections pattern where we can draw a gray border around the summarized tool calls and select by tabbing through them. When hittin e, we can only expand the currently selected call.
+
+---
+
+Do ti
+
+---
+
+Go
+
+---
+
+Can you implement shift+tab to go back in additon to tab?
+
+---
+
+Also: When tabbing to a TUI element, we should make sure to scroll to the place where it is so it's visible
+
+---
+
+Okay, cool! Now I'd like to add the checkpoint summary generated by `entire explain --generate` in the commit/checkpoint view above the diff section. I'd like to be able to tab into it and scroll it like the diff section.
+
+---
+
+go
+
+---
+
+Go
+
+---
+
+The generated summaries are very hard to read due to the minimal space given to them. Can you increase the size they're given?
+
+---
+
+Also, the summary I'm seeing in `entire why` doesn't match the summary shown in e.g. `entire explain --checkpoint 97c75100bbac`. What I'd like to show is the summary generated by `entire explain --generate`.
+
+---
+
+Go
+
+---
+
+Go
+
+---
+
+<environment_context>
+  <shell>zsh</shell>
+  <current_date>2026-04-23</current_date>
+  <timezone>America/Los_Angeles</timezone>
+</environment_context>
+
+---
+
+Can you check the conventions regarding interactive TUIs vs CLI commands in this repo. I'd like the `entire why` command to consistent with the existing conventions.
+
+---
+
+Do it
+
+---
+
+Go
+
+---
+
+Let's keep the command structure as is for now.
+
+---
+
+When running entire why it doesn't work:
+
+❯ ./entire why cmd/entire/cli/explain.go
+loading why data for cmd/entire/cli/explain.go: object not found
+
+---
+
+`git blame` on the same file works, though! We should at least fall back to regular git blame behavior and leave out checkpoint specific data rather than just show an error.
+
+---
+
+I see new errors but not the expected result:
+
+❯ ./entire why cmd/entire/cli/explain.go
+loading why data for cmd/entire/cli/explain.go: session 1 not found: tree 4a/4241ca5b3d/1: directory not found
+
+---
+
+Okay. Now, I'd like to have a `-L <line range>` or alternatively a `--lines` flag on the `entire why` command that allows to only run it on specific lines of code
+
+---
+
+Yes, numeric only. Maybe support ranges like --lines 23-42 rather than comma separated values.
+
+---
+
+Otherwise, I'd like the `entire why` output to be compatible with my locally installed `delta` pager to do syntax highlighting. Is there a way to do that?
+
+---
+
+Yes, let's do that to keep it compatible.
+
+---
+
+<turn_aborted>
+The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.
+</turn_aborted>
+
+---
+
+On the other side: If the default is to show the TUI and we don't if no interactive shell is detected, then pager support probably also won't help much. Maybe we should add a `-i` or `--interactive` flag or `--browse` to show the TUI. Are there some guidelines for tools like this?
+
+---
+
+Yes. Also, with an explicit -i flag, you can add the pager behavior like `entire explain`.
+
+---
+
+Go
+
+---
+
+Can you update the spec file again according to the changes to the prototype?
+
+---
+
+Is there a chance to replace the `git blame` cli call with go-git instead? This might help with performance as well. Does go-git offer a way to run blame?
+
+---
+
+<environment_context>
+  <shell>zsh</shell>
+  <current_date>2026-04-27</current_date>
+  <timezone>America/Los_Angeles</timezone>
+</environment_context>
+
+---
+
+Can you double check that the doc is fully up to date for this feature?
+
+---
+
+I have merged in main. Can you resolve the merge conflicts?
+
+---
+
+Do it
+
+---
+
+Can you remove the staged changes that originated in this branch only so we can commit them later?
+
+---
+
+Now that I've pulled in main: Can you double check how the look and keyboard mapping etc. of `entire why` differs from existing TUI commands like `entire activity` or `entire search`? It would be good to align the look and feel of the existing TUIs and ensure they're consistent from a UX perspective. Don't take anything away from the current `entire why` spec, though. I'd like to review this and see where we could e.g. add some targetted improvements to allow vim-like navigation in all TUIs.
+
+---
+
+Regarding key bindings: Don't forget `h` for going back and `l` for drilling down.
+
+---
+
+Can you check if there's any updates that need to be made to the `why` spec, for now?
+
+---
+
+Yes, do that!
+
+---
+
+Can you create a prompt to target specifically target `entire activity` specifically to align the navigation and help patterns with the standards outlined above? Only target the features that are actually available in this command. I don't think it supports a drill down navigation so let's skil that.
+
+---
+
+Don't mention `enire why` since I'll be working on this in a different branch that won't have `entire why` enabled. Only refer to `entire activity` or `entire search` there. Otherwise, we should probably support home/end by default and treat `g` and `G` like other vim-style key bindings.
+
+---
+
+can you copy this prompt to my clipboard?
+
+---
+
+You are modifying the `entire activity` TUI in this repository to align its navigation and help behavior with the existing TUI standards used by commands like `entire search`, while keeping `entire activity` scoped to the features it actually has today.
+
+Context:
+- The `entire activity` TUI is implemented in `cmd/entire/cli/activity_tui.go`.
+- It is currently a single-view dashboard plus scrollable commit/activity list.
+- It does not support drill-down/detail navigation, so do not invent or add one.
+- We want interaction consistency across TUIs, but we do NOT want to add features that `activity` does not already conceptually support.
+
+Task:
+Update `entire activity` so its keyboard behavior and visible help/footer follow the same general interaction vocabulary used by the newer interactive commands in this repo.
+
+Requirements:
+1. Keep the command as a single-screen TUI. Do not add detail modes, nested views, file pickers, search inputs, or any other new navigation model.
+2. Add hidden vim-style aliases:
+   - `j` = down / scroll down
+   - `k` = up / scroll up
+   - `h` should behave the same as `esc` if there is a meaningful back/exit action in this single-screen context
+   - `l` should behave the same as `enter` only if there is already a meaningful confirm/open action; otherwise do not invent a new action just to support `l`
+   - `g` = jump to top
+   - `G` = jump to bottom
+3. Support standard non-vim equivalents for top/bottom navigation:
+   - `home` = jump to top
+   - `end` = jump to bottom
+4. Keep the visible/documented controls accessibility-first:
+   - show arrow keys
+   - show `home/end`
+   - show `q`
+   - do NOT show `h/j/k/l`
+   - do NOT show `g/G`
+5. Preserve existing quit behavior:
+   - `q` quits
+   - `ctrl+c` quits
+   - `esc` should remain supported
+6. Make the help/footer wording and ordering feel closer to the repo’s interactive conventions:
+   - use compact, dot-separated hints
+   - prefer labels like `↑/↓ scroll`, `home/end top/bottom`, `q quit`
+   - do not mention unsupported actions like `detail`, `open`, or `back` if there is no real second screen
+7. Do not change the visual structure of the activity dashboard beyond what is needed for help/footer consistency.
+8. Do not refactor unrelated code or change any API/data-loading behavior.
+9. Add or update focused tests for the new key behavior.
+
+Implementation constraints:
+- Only make changes directly required for this alignment task.
+- Do not add dependencies.
+- Do not add a drill-down mode.
+- Do not change the underlying activity rendering logic unless required for footer/help updates.
+- Keep the code idiomatic and consistent with the existing Bubble Tea patterns in this repo.
+
+Definition of done:
+- `entire activity` supports arrow-key navigation plus hidden `j/k` aliases.
+- `home/end` jump to top/bottom.
+- Hidden `g/G` aliases also jump to top/bottom.
+- Footer/help text reflects only the intended visible controls.
+- No new UI mode or feature is introduced.
+- Tests cover the new keyboard behavior.
+- `go build ./...` and `go vet ./...` pass.
+
+Before making changes:
+- Read `cmd/entire/cli/activity_tui.go`
+- Compare the interaction/help patterns in `cmd/entire/cli/search_tui.go`
+- Keep scope strictly limited to `entire activity`

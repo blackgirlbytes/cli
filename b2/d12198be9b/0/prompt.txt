@@ -1,0 +1,82 @@
+## Critical (must fix)
+
+1. *Cloud HTTP client has no default timeout.* cmd/entire/cli/dispatch/cloud.go:36-42 — NewCloudClient only honors cfg.Timeout > 0; the production caller (mode_cloud.go:64) never supplies one. Commit 0413e570f ("Fix dispatch cloud scope and timeout") actively removed the previous 30s default, and TestNewCloudClient_DefaultHTTPClientHasNoTimeout (cloud_test.go:127) locks that in. Context cancellation via NewRequestWithContext works, but cobra commands have no deadline by default, so a hung/slow server hangs the CLI until the user interrupts. Restore a sensible default (30–60s) or wrap in context.WithTimeout.
+
+2. *Voice is sanitized in local mode only; cloud mode forwards it raw.* mode_cloud.go:72 sets Voice: opts.Voice from the unfiltered flag, while local runs sanitizeDispatchVoice (generate.go:114). Control chars / bidi / zero-width chars go straight to /api/v1/dispatch. If the stated intent is "untrusted input", sanitize at the edge regardless of mode.
+
+## Important (should fix)
+
+3. *sanitizeDispatchVoice collapses presets into one line.* generate.go:193-204 uses strings.Fields + Join(" "), stripping all newlines — so ResolveVoice("marvin") loses its bullet layout before reaching the model. Strip disallowed runes per-code-point, preserve \n.
+
+4. *Tag-smuggling protection is case-sensitive.* escapeDispatchPrompt (generate.go:184-191) only rewrites exact lowercase <dispatch_data / </dispatch_data (same for voice_preference). <DISPATCH_DATA> or newline-interrupted variants pass through. Use a case-insensitive regex.
+
+5. *Test coverage aimed at the wrong surface.* generate_test.go:49 only tests voice-field injection. No test covers a </dispatch_data> smuggled through a *checkpoint bullet* (outcome / commit subject) — the actual untrusted-input surface. Add one.
+
+6. *Unbounded goroutine fan-out in wizard repo discovery.* dispatch_wizard.go:557-568 spawns one git rev-parse per sibling directory containing .git/. In ~/src-style monorepos this is N concurrent git processes. Cap via errgroup.SetLimit or a semaphore.
+
+7. *Error body from non-2xx responses is printed verbatim.* cloud.go:140 interpolates the trimmed body into fmt.Errorf(...: %s, ...). Untrusted bytes can include control chars / ANSI and corrupt terminal output. Use strconv.Quote or escape.
+
+8. *Asymmetric time normalization.* runLocal (mode_local.go:46) normalizes since/until to minute boundaries; runServer (mode_cloud.go:37) does not. Pick one semantic.
+
+9. *Unknown server fields silently swallowed.* CreateDispatchResponse (cloud.go:61-67) doesn't model totals/warnings that tests reference. json.Decoder ignores unknown fields by default — schema drift is invisible. Consider DisallowUnknownFields() or a debug log.
+
+10. *Package split is inconsistent.* Root-level dispatch.go owns pure flag parsing (resolveDispatchOptions, normalizeDispatchScopeValues) with no TUI deps; this belongs in cmd/entire/cli/dispatch/ next to Options. Keep only the cobra shell + huh/bubbletea glue at root.
+
+## Nits
+
+11. CreateDispatchRequest.Branches any (cloud.go:56) mixes []string and the literal "all". Two explicit fields (AllBranches bool, Branches []string) would be clearer; also no test for the null branches case.
+12. Mode is an int iota with no String() — operational logs render 0/1.
+13. flagRepos = append([]string(nil), flagRepos...) in resolveDispatchOptions is a wasted copy; normalizeDispatchScopeValues already returns a fresh slice.
+14. formatOptionalDispatchTime returning *string (generate.go:243-249) is overkill — use omitempty with a plain string.
+15. PR description says /api/v1/dispatches; code and tests use /api/v1/dispatch. Confirm which the server implements.
+16. dispatchBranches (generate.go:215-234) rebuilds a dedup set each call; trivial to fold into marshalDispatchPromptPayload.
+
+## Overall
+
+REQUEST CHANGES. The two blockers are #1 (timeout regression in the most recent "fix timeout" commit) and #2 (voice sanitization only runs in one of two modes). Everything else is medium-effort cleanup. The sanitization design is also being verified on the wrong surface — voice strings rather than untrusted checkpoint content.
+
+---
+
+can you verify you fixed all the issues
+
+---
+
+for 1. fix the test. I want long time out of 120 s
+fix 10, 11, 14, 16. For 15 ignore the new route is /api/v1/dispatch/generate
+
+---
+
+okay verify everything is fixed
+
+---
+
+why am I getting [api] [wrangler:info] POST /api/v1/dispatch/generate 401 Unauthorized (3ms) when before it worked
+
+---
+
+why am I getting [api] [wrangler:info] POST /api/v1/dispatch/generate 401 Unauthorized (3ms) when before it worked
+
+---
+
+Change the CLI back to /api/v1/dispatches/generate
+
+---
+
+~/Projects/wt/cli/entire-dispatch-codex (entire-dispatch-codex) $ /tmp/entire dispatch
+decode response: json: unknown field "branches"
+
+---
+
+yes
+
+---
+
+decode response: json: unknown field "voice"
+
+---
+
+are there other things missing?
+
+---
+
+yes

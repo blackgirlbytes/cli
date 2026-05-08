@@ -1,0 +1,67 @@
+Implement the following plan:
+
+# Fix: Review feedback — logging, docs, and performance
+
+## Context
+Three improvements from code review: add debug logging for silenced errors, document intentional behavior for terminal agent auto-linking, and optimize `isFileModificationTool` with a map lookup.
+
+## Changes
+
+### 1. Add debug logging for best-effort transcript errors
+**File:** `cmd/entire/cli/agent/kiro/lifecycle.go` (lines 156, 160)
+
+- Replace `//nolint:errcheck` suppressed errors with `logging.Debug` calls
+- The `logging` package is already imported
+- Keep the fallthrough behavior — just add visibility
+
+```go
+// Line 156: ensureCachedTranscript
+sessionRef, err := k.ensureCachedTranscript(ctx, cwd, sessionID)
+if err != nil {
+    logging.Debug(ctx, "kiro: ensureCachedTranscript failed (best-effort)", slog.String("error", err.Error()))
+}
+
+// Line 160: ensureIDETranscript
+sessionRef, err = k.ensureIDETranscript(ctx, cwd, sessionID)
+if err != nil {
+    logging.Debug(ctx, "kiro: ensureIDETranscript failed (best-effort)", slog.String("error", err.Error()))
+}
+```
+
+Need to add `"log/slog"` to imports.
+
+### 2. Add inline comment documenting terminal agent auto-link behavior
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks.go` (lines 364-377)
+
+The existing comment block (lines 364-377) already documents the behavior well. Add one sentence clarifying that manual user commits while a terminal agent is active will also auto-link (non-destructive, trailer is removable via prepare-commit-msg).
+
+### 3. Optimize `isFileModificationTool` with map lookup
+**File:** `cmd/entire/cli/agent/kiro/transcript.go`
+
+- Convert `kiroFileModificationTools` from `[]string` to `map[string]struct{}`
+- Simplify `isFileModificationTool` to a single map lookup
+- Update `extractFilesFromAssistant` call site (no change needed — it calls `isFileModificationTool`)
+
+```go
+var kiroFileModificationTools = map[string]struct{}{
+    "fs_write": {},
+    "fs_edit":  {},
+}
+
+func isFileModificationTool(name string) bool {
+    _, ok := kiroFileModificationTools[name]
+    return ok
+}
+```
+
+## Verification
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/47224433-a8ae-410c-bd14-905f80f751ec.jsonl
+
+---
+
+commit

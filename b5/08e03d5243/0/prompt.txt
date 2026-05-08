@@ -1,0 +1,80 @@
+Implement the following plan:
+
+# Fix: OpenCode mid-turn commits don't create checkpoints
+
+## Context
+
+When OpenCode's agent runs `git commit` mid-turn (e.g., "add a script and commit"), the commit gets an `Entire-Checkpoint` trailer but no checkpoint data is written to `entire/checkpoints/v1`. The root cause: OpenCode's transcript file (`.entire/tmp/<sessionID>.json`) only gets created at turn-end via `opencode export`, but condensation tries to read it at commit time.
+
+Claude Code doesn't have this problem because it writes its transcript to disk continuously in real-time.
+
+## Approach
+
+Make OpenCode implement the existing `TranscriptPreparer` interface, then call `PrepareTranscript` before reading the live transcript in the condensation and hook paths. This ensures the transcript file is created on-demand by running `opencode export` when needed.
+
+## Changes
+
+### 1. `cmd/entire/cli/agent/opencode/lifecycle.go` — Add `PrepareTranscript`
+
+Add method to `OpenCodeAgent`:
+```go
+func (a *OpenCodeAgent) PrepareTranscript(sessionRef string) error {
+    // No-op if file exists; otherwise extract sessionID from path and call fetchAndCacheExport
+}
+```
+- If file at `sessionRef` already exists → return nil
+- Extract session ID from path basename (strip `.json`)
+- Delegate to existing `fetchAndCacheExport(sessionID)`
+- Add `"strings"` to imports
+
+### 2. `cmd/entire/cli/agent/opencode/transcript.go` — Add compile-time assertion
+
+Add `_ agent.TranscriptPreparer = (*OpenCodeAgent)(nil)` to the existing `var` block (line 14-17).
+
+### 3. `cmd/entire/cli/strategy/manual_commit_condensation.go` — Two call sites
+
+**Site A: `CondenseSession` (line ~134-143, no-shadow-branch path)**
+Before `extractSessionDataFromLiveTranscript(state)`, call `PrepareTranscript` via agent registry:
+```go
+if ag, agErr := agent.GetByAgentType(state.AgentType); agErr == nil {
+    if preparer, ok := ag.(agent.TranscriptPreparer); ok {
+        _ = preparer.PrepareTranscript(state.TranscriptPath)
+    }
+}
+```
+
+**Site B: `extractSessionData` (line ~411-414, live transcript preferred path)**
+Before `os.ReadFile(liveTranscriptPath)`, same pattern.
+
+### 4. `cmd/entire/cli/strategy/manual_commit_hooks.go` — Two call sites
+
+**Site C: `extractNewModifiedFilesFromLiveTranscript` (line ~1142-1150)**
+After `agent.GetByAgentType`, before `analyzer.GetTranscriptPosition`:
+```go
+if preparer, ok := ag.(agent.TranscriptPreparer); ok {
+    _ = preparer.PrepareTranscript(state.TranscriptPath)
+}
+```
+
+**Site D: `extractModifiedFilesFromLiveTranscript` (line ~1179-1182)**
+Same pattern — after agent lookup, before transcript read.
+
+### 5. Tests
+
+- **Unit test** in `agent/opencode/lifecycle_test.go`: Test `PrepareTranscript` no-op when file exists, error on bad path format
+- **Integration test** in `integration_test/`: OpenCode mid-turn commit creates checkpoint on `entire/checkpoints/v1`
+
+## Why this approach
+
+- Uses the existing `TranscriptPreparer` interface — no new abstractions
+- Pattern already established by Claude Code (`claudecode/lifecycle.go:124`)
+- All call sites are no-ops for Claude Code (file already exists) and Gemini (doesn't implement interface)
+- `fetchAndCacheExport` already handles test mocking via `ENTIRE_TEST_OPENCODE_MOCK_EXPORT`
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. Integration tests cover the full flow: turn-start → mid-turn commit → checkpoint on `entire/checkpoints/v1`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl

@@ -1,0 +1,165 @@
+Implement the following plan:
+
+# Plan: Implement Cursor Agent as External Binary
+
+## Context
+
+The external agent protocol and adapter are already implemented (Steps 1-4 from the previous plan are complete). The built-in `cmd/entire/cli/agent/cursor/` package has been deleted. Now we need to implement the cursor agent as an external binary (`entire-agent-cursor`) that implements the external agent protocol, keeping it in this repo for now.
+
+The binary will be at `cmd/entire-agent-cursor/main.go` — a standalone Go binary that can be discovered via `$PATH` by the CLI's `external.DiscoverAndRegister()`.
+
+## Step 1: Create the Binary Entry Point
+
+**File:** `cmd/entire-agent-cursor/main.go`
+
+A simple `main()` that dispatches subcommands. Since this is a protocol binary (not a user CLI), use a switch on `os.Args[1]` rather than cobra. Parse flags with `flag.NewFlagSet` per subcommand.
+
+Subcommands to implement (matching the protocol spec):
+- `info` — static JSON response
+- `detect` — check `.cursor/` exists
+- `get-session-id` — extract from stdin HookInput
+- `get-session-dir` — compute `~/.cursor/projects/<sanitized>/agent-transcripts`
+- `resolve-session-file` — handle nested vs flat layout
+- `read-session` — read JSONL from session ref
+- `write-session` — write native data to session ref
+- `format-resume-command` — static message
+- `read-transcript` — read raw bytes
+- `chunk-transcript` — JSONL line-based chunking (reuse `agent.ChunkJSONL`)
+- `reassemble-transcript` — JSONL reassembly (reuse `agent.ReassembleJSONL`)
+- `parse-hook` — dispatch to 7 hook parsers
+- `install-hooks` — write `.cursor/hooks.json`
+- `uninstall-hooks` — remove Entire hooks from `.cursor/hooks.json`
+- `are-hooks-installed` — check `.cursor/hooks.json`
+- `get-transcript-position` — count JSONL lines
+- `extract-modified-files` — always returns empty (cursor has no tool_use blocks)
+- `extract-prompts` — parse JSONL, filter user messages, strip IDE tags
+- `extract-summary` — find last assistant text block
+
+## Step 2: Package Structure
+
+Since the binary has significant logic, organize into a package rather than one giant main.go:
+
+```
+cmd/entire-agent-cursor/
+├── main.go              # Entry point, subcommand dispatch
+├── cursor.go            # Core logic: detect, session management, path helpers
+├── hooks.go             # Hook install/uninstall/are-installed logic
+├── lifecycle.go         # ParseHookEvent: 7 hook parsers
+├── transcript.go        # TranscriptAnalyzer: position, prompts, summary, modified files
+└── types.go             # Hook input types, hooks.json types
+```
+
+All files in `package main`.
+
+## Step 3: Reuse Shared Packages
+
+The binary can import shared packages from this repo since it's in the same module:
+- `github.com/entireio/cli/cmd/entire/cli/agent` — `ChunkJSONL`, `ReassembleJSONL`, `HookInput`, `Event`, `EventType`, `AgentSession`
+- `github.com/entireio/cli/cmd/entire/cli/transcript` — `ParseFromFileAtLine`, `ParseFromBytes`, `ExtractUserContent`, type constants
+- `github.com/entireio/cli/cmd/entire/cli/textutil` — `StripIDEContextTags`
+- `github.com/entireio/cli/cmd/entire/cli/jsonutil` — `MarshalIndentWithNewline`
+
+**Key difference from built-in agent:** The binary communicates via JSON stdout, not Go interfaces. Each subcommand reads args/stdin, does the work, and outputs JSON to stdout.
+
+## Step 4: Protocol Response Details
+
+### `info` response (static):
+```json
+{
+  "protocol_version": 1,
+  "name": "cursor",
+  "type": "Cursor",
+  "description": "Cursor - AI-powered code editor",
+  "is_preview": true,
+  "protected_dirs": [".cursor"],
+  "hook_names": ["session-start","session-end","before-submit-prompt","stop","pre-compact","subagent-start","subagent-stop"],
+  "capabilities": {
+    "hooks": true,
+    "transcript_analyzer": true,
+    "transcript_preparer": false,
+    "token_calculator": false,
+    "text_generator": false,
+    "hook_response_writer": false,
+    "subagent_aware_extractor": false
+  }
+}
+```
+
+### `parse-hook` response:
+Outputs the `eventJSON` struct (same format as `external/types.go:eventJSON`). For hooks with no lifecycle significance, outputs `null`.
+
+### Session/transcript methods:
+Read/write files using the same logic as the deleted `cursor.go` — session dir at `~/.cursor/projects/<sanitized-path>/agent-transcripts`, nested vs flat file layout detection.
+
+## Step 5: Key Logic to Port
+
+### From `cursor.go`:
+- `sanitizePathForCursor(path)` — strips leading `/`, replaces non-alphanumeric with `-`
+- `DetectPresence` — check `ENTIRE_REPO_ROOT` env + `.cursor/` dir exists
+- `GetSessionDir` — `~/.cursor/projects/<sanitized>/agent-transcripts`, with `ENTIRE_TEST_CURSOR_PROJECT_DIR` override
+- `ResolveSessionFile` — check nested (`dir/id/id.jsonl`) first, fall back to flat (`dir/id.jsonl`)
+- `ReadSession` — resolve session file, read raw JSONL bytes, return as AgentSession JSON
+- `WriteSession` — write native data to session ref path
+
+### From `hooks.go`:
+- `InstallHooks` — read/modify `.cursor/hooks.json` using `map[string]json.RawMessage` to preserve unknown fields
+- `UninstallHooks` — remove Entire hook entries from all 7 hook types
+- `AreHooksInstalled` — check for any Entire hook command prefix
+- Recognized prefixes: `"entire "` and `"go run ${CURSOR_PROJECT_DIR}/cmd/entire/main.go "`
+
+### From `lifecycle.go`:
+- `ParseHookEvent` — switch on hook name, dispatch to 7 parsers
+- Each parser reads stdin JSON, maps to protocol event JSON
+- `resolveTranscriptRef` — if transcript path is empty, dynamically compute it from env
+
+### From `transcript.go`:
+- `GetTranscriptPosition` — count lines with bufio.Reader
+- `ExtractPrompts` — use `transcript.ParseFromFileAtLine`, filter TypeUser, extract content, strip IDE tags
+- `ExtractSummary` — parse all, walk backward for last assistant text block
+- `ExtractModifiedFilesFromOffset` — always returns `{"files": null, "current_position": 0}`
+
+## Step 6: Tests
+
+**File:** `cmd/entire-agent-cursor/cursor_test.go` (and per-file tests)
+
+Test the binary end-to-end by:
+1. Building the binary with `go build`
+2. Running subcommands and checking JSON output
+3. Testing hook parsing with sample stdin payloads
+
+Also test individual functions unit-style:
+- `sanitizePathForCursor` — various path inputs
+- Hook JSON round-trip preservation
+- Transcript line counting
+
+## Files to Create
+- `cmd/entire-agent-cursor/main.go` — Entry point + subcommand dispatch
+- `cmd/entire-agent-cursor/cursor.go` — Core: detect, session, path helpers
+- `cmd/entire-agent-cursor/hooks.go` — Hook install/uninstall
+- `cmd/entire-agent-cursor/lifecycle.go` — ParseHookEvent dispatching
+- `cmd/entire-agent-cursor/transcript.go` — Transcript analysis
+- `cmd/entire-agent-cursor/types.go` — Type definitions
+- `cmd/entire-agent-cursor/cursor_test.go` — Tests
+
+## Files to Modify
+- None (the external adapter and discovery are already in place)
+
+## Verification
+
+1. `go build ./cmd/entire-agent-cursor/` — binary compiles
+2. `./entire-agent-cursor info` — outputs valid info JSON
+3. `./entire-agent-cursor detect` — checks `.cursor/` presence
+4. `mise run fmt && mise run lint && mise run test:ci` — all pass
+5. Place binary on PATH, verify `external.DiscoverAndRegister()` discovers it
+6. Verify `entire hooks cursor ...` subcommands work end-to-end
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/nodo/.claude/projects/-Users-nodo-work-cli/b12319af-9a0a-4691-b084-e5fc5ae7e446.jsonl
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+continue

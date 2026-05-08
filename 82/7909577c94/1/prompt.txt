@@ -1,0 +1,866 @@
+can you let a few agents review the current branch? Focus on things like correctness, performance, security, readability and such. Please do it in a way that requires as little interaction on my side as possible.
+
+---
+
+<task-notification>
+<task-id>a8b2b4ce5e9858507</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Review CLI commands/lifecycle" completed</summary>
+<result>I cannot create the review file in the standard location since bash is restricted. I will provide the full review directly in my response instead.
+
+Now I have a thorough understanding of the changes. Let me compile the review.
+
+---
+
+# Review of `improve-context-management` Branch -- CLI Commands and Lifecycle Files
+
+**Branch:** `improve-context-management`
+**Base:** `main` (00c8469a)
+**Scope:** CLI commands, lifecycle, state, and supporting files
+**Date:** 2026-02-24
+**Reviewer:** Code Review Agent
+
+---
+
+## Overview
+
+This changeset is a systematic refactoring to thread `context.Context` through the CLI command layer, lifecycle handlers, state management, git operations, and hook infrastructure. The intent is to replace `context.Background()` calls deep in the call stack with proper context propagation from Cobra command handlers, enabling future cancellation, tracing, and deadline support.
+
+The change touches approximately 80+ files across the codebase. This review covers the subset specified: lifecycle, setup, resume, rewind, status, explain, clean, reset, debug, doctor, root, state, transcript, and related tests and support files.
+
+---
+
+## Critical (Must Fix)
+
+### 1. Garbled test error messages in `resume_test.go` and `status_test.go`
+
+**Files:** `/Users/pfleidi/entire/cli/cmd/entire/cli/resume_test.go`, `/Users/pfleidi/entire/cli/cmd/entire/cli/status_test.go`
+
+**Severity:** Medium (will not cause test failures but degrades debuggability)
+
+When updating call sites in test files, the error message strings were mechanically modified to include `context.Background(),` within the function name -- producing nonsensical test output like:
+
+```go
+t.Fatalf("BranchExistsLocally(context.Background(),) error = %v", err)
+t.Error("CheckoutBranch(context.Background(),) expected error for nonexistent branch, got nil")
+t.Errorf("runStatus(context.Background(),) error = %v", err)
+t.Errorf("resolveWorktreeBranch(context.Background(),) = %q, want %q", branch, wantBranch)
+```
+
+There are **40+ instances** across `resume_test.go` and `status_test.go`. The original messages read like `"BranchExistsLocally() error = %v"` and should remain unchanged since the string is a human-readable description, not code.
+
+**Suggested fix:** Revert the error message strings to their original form (without `context.Background(),` in the function name). The call site change is correct, but the string literals should not have been modified.
+
+---
+
+## Important (Should Fix)
+
+### 2. Inconsistent use of `context.TODO()` vs proper context propagation
+
+**Files:** Multiple files including:
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/explain.go` (lines ~797, ~889, ~939, ~1035, ~1295)
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/state.go` (lines ~332, ~467, ~483)
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/transcript.go` (line ~264)
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/config.go` (lines ~32, ~58, ~70, ~78, ~94)
+
+**Severity:** Medium
+
+The primary goal of this change is to thread `context.Context` properly, but several functions still use `context.TODO()` instead of accepting a context parameter. While `context.TODO()` is an appropriate marker for "we should thread context here later," the inconsistency means the refactoring is incomplete and creates a split personality in the codebase.
+
+Specific cases worth highlighting:
+
+**a) `getCurrentWorktreeHash()` in `explain.go`:**
+```go
+func getCurrentWorktreeHash() string {
+    repoRoot, err := paths.RepoRoot(context.TODO())
+```
+This is called from `getReachableTemporaryCheckpoints` which is called from `getBranchCheckpoints` -- both of which also use `context.TODO()`. Since `runExplainBranchWithFilter` already has a `ctx` parameter, the context could be threaded down.
+
+**b) `prePromptStateFile()` and `preTaskStateFile()` and `FindActivePreTaskFile()` in `state.go`:**
+```go
+func prePromptStateFile(sessionID string) string {
+    tmpDirAbs, err := paths.AbsPath(context.TODO(), paths.EntireTmpDir)
+```
+These are simple path helpers called from functions that already have context available. Adding `ctx` as a parameter would complete the propagation.
+
+**c) `resolveTranscriptPath()` in `transcript.go`:**
+```go
+func resolveTranscriptPath(sessionID string, agent agentpkg.Agent) (string, error) {
+    repoRoot, err := paths.RepoRoot(context.TODO())
+```
+
+**d) `LoadEntireSettings()`, `IsEnabled()`, `GetStrategy()`, `GetLogLevel()` in `config.go`:**
+These use `context.TODO()` with nolint comments explaining why. The `GetStrategy()` and `GetLogLevel()` cases are understandable (called from many places without context), but `LoadEntireSettings()` is only used in a few places and could accept context.
+
+**Suggested fix:** For this iteration, the `context.TODO()` approach is acceptable with the nolint comments. However, I recommend documenting a follow-up issue to complete context threading in these leaf functions. At minimum, `getCurrentWorktreeHash` should accept `ctx` since its callers already have it.
+
+### 3. `getBranchCheckpoints` and helper functions still use `context.TODO()`
+
+**File:** `/Users/pfleidi/entire/cli/cmd/entire/cli/explain.go`
+
+**Severity:** Medium
+
+The function `getBranchCheckpoints` at approximately line 889 uses `context.TODO()` for `store.ListCommitted`, `store.ReadLatestSessionContent`, `store.ListTemporary`, and `store.ListCheckpointsForBranch`. This function is called from `runExplainBranchWithFilter` which already has a proper `ctx`. The context should be passed through.
+
+Similarly, `getReachableTemporaryCheckpoints` at approximately line 1019 uses `context.TODO()` in multiple places.
+
+**Suggested fix:** Add `ctx context.Context` as a parameter to `getBranchCheckpoints` and `getReachableTemporaryCheckpoints`, and pass it through from callers.
+
+### 4. Variable shadowing: `ctx` renamed to `stepCtx`/`taskStepCtx` creates inconsistency
+
+**File:** `/Users/pfleidi/entire/cli/cmd/entire/cli/lifecycle.go`
+
+**Severity:** Low
+
+The original code had a naming collision where `ctx` was used for both `context.Context` and `strategy.StepContext`. The refactoring resolves this by renaming the strategy contexts:
+
+```go
+// Before (line ~377 area):
+ctx := strategy.StepContext{...}
+if err := strat.SaveStep(ctx); err != nil {
+
+// After:
+stepCtx := strategy.StepContext{...}
+if err := strat.SaveStep(ctx, stepCtx); err != nil {
+```
+
+This is a good fix. However, in `hooks_claudecode_posttodo.go`, the same pattern is applied:
+
+```go
+taskStepCtx := strategy.TaskStepContext{...}
+if err := strat.SaveTaskStep(ctx, taskStepCtx); err != nil {
+```
+
+The rename is correct and the approach is consistent across both files.
+
+### 5. `outputWithPager` uses `context.TODO()` for exec
+
+**File:** `/Users/pfleidi/entire/cli/cmd/entire/cli/explain.go` (line ~1295)
+
+**Severity:** Low
+
+```go
+cmd := exec.CommandContext(context.TODO(), pager)
+```
+
+This spawns a pager subprocess without a proper context. If the caller's context has a deadline or cancellation, it won't propagate to the pager. This is a minor issue since pagers are interactive, but it breaks the pattern being established.
+
+**Suggested fix:** Thread the context from `outputExplainContent` and its callers.
+
+---
+
+## Suggestions (Consider)
+
+### 6. Consider using `t.Context()` in Go 1.24+ tests instead of `context.Background()`
+
+**Files:** All test files
+
+**Severity:** Low (enhancement)
+
+Since the project targets Go 1.25.x (per CLAUDE.md), tests could use `t.Context()` (available since Go 1.24) which automatically cancels when the test completes. This would be a better practice than `context.Background()` in tests, though it's not critical since test functions are short-lived.
+
+### 7. `runEnable` does not propagate context for `LoadEntireSettings()`
+
+**File:** `/Users/pfleidi/entire/cli/cmd/entire/cli/setup.go` (line ~390)
+
+```go
+func runEnable(ctx context.Context, w io.Writer) error {
+    settings, err := LoadEntireSettings() // <-- no ctx
+```
+
+While `LoadEntireSettings` uses `context.TODO()` internally, this is a case where the caller has a context available. If/when `LoadEntireSettings` is updated to accept context, this call site would need updating.
+
+### 8. Defensive nil-check pattern in `handleLifecycleSessionStart`
+
+**File:** `/Users/pfleidi/entire/cli/cmd/entire/cli/lifecycle.go`
+
+The pattern of loading session state, checking for nil, then transitioning is repeated in several lifecycle handlers. This is not introduced by this change, but the context threading makes the pattern more visible. Consider extracting a helper like `transitionSessionState(ctx, sessionID, event, handler)` to reduce repetition.
+
+---
+
+## Praise
+
+- **Consistent approach**: The refactoring follows a very consistent pattern -- adding `ctx context.Context` as the first parameter, extracting context from `cmd.Context()` at the Cobra boundary, and threading it through. The mechanical nature of the change reduces the risk of logical errors.
+
+- **Good variable renaming in lifecycle.go**: The rename of `ctx` (which was `strategy.StepContext`) to `stepCtx` and `taskStepCtx` resolves a naming collision cleanly and makes the code more readable.
+
+- **Proper context source at hook boundaries**: The hook commands now correctly extract context from `cmd.Context()` rather than creating fresh `context.Background()` contexts, enabling future cancellation support.
+
+- **Nolint comments with rationale**: The `config.go` changes include clear `//nolint:contextcheck` comments explaining why `context.TODO()` is used in convenience wrappers. This is good practice.
+
+- **No behavioral changes**: Despite the large number of files touched, the changes are purely mechanical context threading. There are no logic changes, no new features, and no modified algorithms. This significantly reduces review risk.
+
+- **Correct handling of `exec.CommandContext`**: Functions like `performGitResetHard`, `CheckoutBranch`, `HasUncommittedChanges`, etc., now use the passed context for spawned commands, meaning cancellation will actually work for subprocess calls.
+
+---
+
+## Summary
+
+**Overall assessment:** REQUEST CHANGES (minor)
+
+**Verdict:** The change is fundamentally sound -- it is a well-executed mechanical refactoring to thread `context.Context` through the CLI layer. The approach is correct, consistent, and introduces no behavioral changes. However, there are two categories of issues:
+
+1. **Must fix:** The garbled test error messages (40+ instances) where `context.Background(),` was erroneously inserted into string literals. This is a search-and-replace artifact that produces confusing test failure output.
+
+2. **Should consider:** The incomplete context propagation (10+ functions still using `context.TODO()`) means the refactoring benefits are partially unrealized. While `context.TODO()` is an acceptable marker, at least the cases where the caller already has a context (like `getBranchCheckpoints` called from `runExplainBranchWithFilter`) should be completed in this pass.
+
+**Estimated effort to address:** ~1 hour for the test string fixes (mechanical), ~2 hours to complete the remaining `context.TODO()` propagation in explain.go and state.go helpers.</result>
+<usage><total_tokens>122558</total_tokens><tool_uses>30</tool_uses><duration_ms>185001</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli/tasks/a8b2b4ce5e9858507.output
+
+---
+
+<task-notification>
+<task-id>a887c8ab0ce143ed7</task-id>
+<tool-use-id>toolu_019xcczEh5DA9rfJ7hAoN5Fi</tool-use-id>
+<status>completed</status>
+<summary>Agent "Review agent layer changes" completed</summary>
+<result>I don't have permission to write files in this session. I will present the full review inline instead.
+
+---
+
+# Review 01 -- Agent Layer Context Propagation
+
+> Status: pending-dev
+> Date: 2026-02-24
+> Reviewer: Code Review Agent
+> Verdict: APPROVE
+
+## Scope
+
+This review covers the agent layer portion of the `improve-context-management` branch:
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/agent/` (all files)
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/hook_registry.go`
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/hooks_claudecode_posttodo.go`
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/hooks_git_cmd.go`
+
+The change threads `context.Context` through interface methods and internal functions that previously used `context.Background()`, enabling proper context propagation for cancellation, timeouts, and logging enrichment.
+
+## Previous Review Status
+
+No previous reviews exist for this branch.
+
+## Build and Test Verification
+
+- `go build ./...` compiles cleanly with zero errors.
+- `go test ./cmd/entire/cli/...` passes all 25 packages (including strategy at 34.6s).
+- No remaining `context.Background()` in production code within the reviewed files.
+
+---
+
+## New Findings
+
+### Critical (Must Fix)
+
+None.
+
+### Important (Should Fix)
+
+**1. `/Users/pfleidi/entire/cli/cmd/entire/cli/agent/opencode/opencode.go:220` -- `context.TODO()` in `WriteSession` (medium severity)**
+
+The `WriteSession` method uses `context.TODO()` because the `Agent.WriteSession` interface does not accept `context.Context`:
+
+```go
+return a.importSessionIntoOpenCode(context.TODO(), session.SessionID, session.NativeData) //nolint:contextcheck // WriteSession interface doesn't have ctx yet
+```
+
+This is the only remaining `context.TODO()` in the agent layer. While the nolint comment and explanation are appropriate, and `WriteSession` is marked as a "Legacy" method in the interface documentation, this leaves one path where cancellation/timeout from the caller is not respected. The downstream functions `runOpenCodeSessionDelete` and `runOpenCodeImport` execute external commands (`opencode session delete`, `opencode import`) that should ideally honor parent cancellation.
+
+*Suggested fix:* Add `context.Context` to the `WriteSession` interface as part of this changeset, or create a follow-up tracking issue. Since this is a broad interface change with many callers, a follow-up is acceptable.
+
+**2. `/Users/pfleidi/entire/cli/cmd/entire/cli/hooks_claudecode_posttodo.go:25-26` -- `handleClaudeCodePostTodoFromReader` re-reads stdin from `os.Stdin` (low severity, pre-existing)**
+
+```go
+func handleClaudeCodePostTodo(ctx context.Context) error {
+    return handleClaudeCodePostTodoFromReader(ctx, os.Stdin)
+}
+```
+
+`handleClaudeCodePostTodo(ctx)` is called from `hook_registry.go:150`, which already parsed the hook event from `cmd.InOrStdin()`. The `handleClaudeCodePostTodo` function then re-reads `os.Stdin` directly. Since `ParseHookEvent` for PostTodo returns `(nil, nil)` (line 59 of `/Users/pfleidi/entire/cli/cmd/entire/cli/agent/claudecode/lifecycle.go`), the stdin stream has NOT been consumed by the event parser. However, this relies on the implicit ordering: first the nil check at line 145, then the PostTodo branch at line 148 in `/Users/pfleidi/entire/cli/cmd/entire/cli/hook_registry.go`. If future refactoring moves PostTodo into the lifecycle dispatcher, stdin would already be consumed.
+
+*Pre-existing design concern. No action needed for this PR but worth noting for future work.*
+
+### Suggestions (Consider)
+
+**1. `/Users/pfleidi/entire/cli/cmd/entire/cli/agent/agent.go` -- Consider adding `context.Context` to more legacy methods**
+
+Several Agent interface methods still lack context parameters:
+- `ReadTranscript(sessionRef string) ([]byte, error)`
+- `ReassembleTranscript(chunks [][]byte) ([]byte, error)`
+- `GetSessionID(input *HookInput) string`
+- `GetSessionDir(repoPath string) (string, error)`
+- `ReadSession(input *HookInput) (*AgentSession, error)`
+- `WriteSession(session *AgentSession) error`
+
+These are documented as "Legacy methods (will move to optional interfaces in Phase 4)." The current PR correctly focuses on the methods that need ctx (those that call `paths.RepoRoot`, execute external commands, or perform I/O). No action needed now, but this surfaces as a future consistency opportunity.
+
+**2. `/Users/pfleidi/entire/cli/cmd/entire/cli/agent/claudecode/lifecycle.go:237-258` -- `waitForTranscriptFlush` could use `ctx.Done()` for cancellation**
+
+The polling loop:
+```go
+deadline := time.Now().Add(maxWait)
+for time.Now().Before(deadline) {
+    if checkStopSentinel(transcriptPath, tailBytes, hookStartTime, maxSkew) {
+        return
+    }
+    time.Sleep(pollInterval)
+}
+```
+
+Now that ctx is threaded through, this loop could check `ctx.Done()` to allow early termination if the parent context is cancelled. Current behavior (3-second timeout with 50ms polls) is fine for correctness, but honoring cancellation would be a nice improvement:
+
+```go
+for time.Now().Before(deadline) {
+    select {
+    case <-ctx.Done():
+        return
+    default:
+    }
+    if checkStopSentinel(transcriptPath, tailBytes, hookStartTime, maxSkew) {
+        return
+    }
+    time.Sleep(pollInterval)
+}
+```
+
+**3. `/Users/pfleidi/entire/cli/cmd/entire/cli/hook_registry.go:101-104` -- `IsEnabled()` still uses `context.TODO()` internally**
+
+The hook verb command at line 102 calls:
+```go
+enabled, err := IsEnabled()
+```
+
+While `IsEnabled()` (defined in `/Users/pfleidi/entire/cli/cmd/entire/cli/config.go:57`) internally uses `context.TODO()` for `settings.Load()`, the cmd already has `cmd.Context()` available. Consider either passing ctx to an `IsEnabled(ctx)` variant, or accepting this as a separate follow-up since `IsEnabled` is called from many places.
+
+*Low priority -- consistent with the `GetStrategy()` call at line 113 which also uses `context.TODO()` internally. These are CLI-layer convenience functions that will likely be updated in a separate sweep.*
+
+**4. `/Users/pfleidi/entire/cli/cmd/entire/cli/agent/opencode/cli_commands.go:17-18` -- Context layering in `runOpenCodeExport`**
+
+```go
+func runOpenCodeExport(ctx context.Context, sessionID string) ([]byte, error) {
+    ctx, cancel := context.WithTimeout(ctx, openCodeCommandTimeout)
+```
+
+The function shadows `ctx` with the timeout-wrapped version. This is idiomatic Go and correct. The 30-second timeout is now layered on top of any deadline the caller's context already has. If the caller has a shorter deadline, the parent deadline wins. This is correct behavior -- noting that the timeout is now a maximum bound rather than a fixed bound. No change needed.
+
+### Praise
+
+- **Mechanical consistency across all three agent implementations.** The Claude Code, Gemini CLI, and OpenCode agents all receive identical treatment: `context.Context` is added as the first parameter to every interface method that needs it. The naming convention (`_ context.Context` when unused, `ctx context.Context` when used) is applied correctly throughout.
+
+- **Good judgment on where ctx is used vs unused.** Methods that genuinely use the context (e.g., `DetectPresence` calls `paths.RepoRoot(ctx)`, `InstallHooks` calls `paths.RepoRoot(ctx)`, `waitForTranscriptFlush` enriches the logging context) receive `ctx`. Methods that don't need it yet (e.g., `ParseHookEvent` in ClaudeCode and Gemini, which only parse stdin) correctly use `_ context.Context` as a placeholder for future use, while still satisfying the interface contract.
+
+- **Clean elimination of `context.Background()` from production code.** All `context.Background()` usages in the reviewed production files have been replaced with proper context propagation from `cmd.Context()`. The remaining `context.Background()` usages are exclusively in test files, which is the correct pattern.
+
+- **Proper handling of the variable name conflict in `hooks_claudecode_posttodo.go`.** The old code had `ctx := strategy.TaskStepContext{...}` which shadowed any potential `context.Context` variable. The rename to `taskStepCtx` (line 119) and `strat.SaveTaskStep(ctx, taskStepCtx)` (line 137) is clean and avoids confusion between the two `ctx` meanings.
+
+- **Thorough test updates.** Every test call site has been updated to pass `context.Background()` as the first argument, maintaining complete test coverage for the new signatures. The compile-time interface assertions (`var _ Agent = (*mockAgent)(nil)`) in test files ensure the mock implementations stay in sync.
+
+- **The `context.TODO()` annotation in `/Users/pfleidi/entire/cli/cmd/entire/cli/agent/opencode/opencode.go:220` is honest and well-documented.** Rather than silently passing `context.Background()`, the code uses `context.TODO()` with a clear nolint comment explaining why, signaling this is known technical debt.
+
+- **Context flows end-to-end from Cobra commands.** In `hook_registry.go` and `hooks_git_cmd.go`, context originates from `cmd.Context()` and flows through `logging.WithComponent()` and `logging.WithAgent()` enrichment before reaching agent methods. This establishes a clean pattern where all downstream logging and I/O operations can trace back to the command invocation.
+
+---
+
+## Summary
+
+**Overall assessment: APPROVE**
+
+This is a well-executed mechanical refactoring that threads `context.Context` through the agent layer interfaces and their call sites. The changes are:
+
+1. **Correct** -- the code compiles, all tests pass, and the context propagation is consistent from Cobra command handlers through agent interfaces to underlying system calls (`git rev-parse`, `opencode export`, etc.).
+
+2. **Complete within scope** -- every `context.Background()` in production code within the reviewed files has been replaced with proper context from `cmd.Context()`. The one remaining `context.TODO()` (in `WriteSession`) is explicitly annotated as known debt.
+
+3. **Non-breaking from a behavioral perspective** -- this is a pure refactoring. No business logic changes, no new features, no removed functionality. The change is entirely about improving the plumbing for cancellation, timeouts, and logging context.
+
+4. **Well-tested** -- 25 packages pass, including the 34.6-second strategy integration test suite.
+
+**Key concerns:** None that block merging.
+
+**Estimated effort to address feedback:** The `WriteSession` ctx gap (Important #1) is a ~30-minute interface change if tackled now, or can be tracked as follow-up. The `waitForTranscriptFlush` cancellation enhancement (Suggestion #2) is ~5 minutes. All other items are informational.
+
+---
+
+*Note: I attempted to write this review to `/Users/pfleidi/entire/cli/docs/requirements/improve-context-management/review-01.md` but file write permissions were not available. If you would like me to write it to a file, please grant Write permission.*</result>
+<usage><total_tokens>124707</total_tokens><tool_uses>72</tool_uses><duration_ms>340610</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli/tasks/a887c8ab0ce143ed7.output
+
+---
+
+<task-notification>
+<task-id>a945c341163af1418</task-id>
+<tool-use-id>toolu_01FpDUaD2DgY25Do795ZunyJ</tool-use-id>
+<status>completed</status>
+<summary>Agent "Review cross-cutting concerns" completed</summary>
+<result>I don't have permission to write files in this session. I will present the full review directly in my response.
+
+---
+
+# Review 01 -- Cross-Cutting Infrastructure & Context Threading
+
+**Status:** pending-dev  
+**Date:** 2026-02-24  
+**Reviewer:** Code Review Agent  
+**Verdict:** REQUEST CHANGES (minor)
+
+---
+
+## Previous Review Status
+
+No previous reviews.
+
+---
+
+## Cross-Cutting Analysis
+
+### Overall Pattern
+
+This branch threads `context.Context` through the entire call chain, replacing hardcoded `context.Background()` calls inside functions with a `ctx` parameter received from callers. The change touches ~108 files and ~4300 lines across:
+
+- **Foundation layer**: `paths.RepoRoot()`, `paths.AbsPath()` -- the most deeply called functions
+- **Settings layer**: `settings.Load()`, `settings.Save()`, `settings.IsSetUp()`, etc.
+- **Git operations**: `openRepository()`, `GetCurrentBranch()`, `HasUncommittedChanges()`, `CheckoutBranch()`, etc.
+- **Agent interfaces**: `Agent.DetectPresence()`, `HookSupport.InstallHooks()`, `HookSupport.AreHooksInstalled()`, etc.
+- **Strategy interfaces**: `Strategy.SaveStep()`, `Strategy.Rewind()`, `Strategy.PostCommit()`, and many more
+- **Logging**: `logging.Init()`
+- **Version check**: `CheckAndNotify()`, `fetchLatestVersion()`
+
+This is a sound architectural improvement. By accepting `ctx` from callers, every external process (`exec.CommandContext`), HTTP call (`http.NewRequestWithContext`), and cascading internal call can now be cancelled or timed out from the top-level CLI entry point. Previously, individual functions created their own `context.Background()`, making graceful shutdown impossible.
+
+### Consistency Assessment
+
+The change is applied consistently across all reviewed files. The pattern is:
+
+1. Add `ctx context.Context` as the first parameter (Go convention)
+2. Remove internal `ctx := context.Background()` lines
+3. Pass `ctx` to downstream calls
+4. In tests, use `context.Background()` as the test context
+
+Functions that cannot easily receive a context (e.g., `GetLogLevel()` which is used as a callback via `SetLogLevelGetter`) correctly use `context.TODO()` with `//nolint:contextcheck` annotations explaining why.
+
+### Is the Direction Sound?
+
+Yes. This is textbook Go context propagation. The `context.Context` parameter enables:
+- Cancellation on SIGINT/SIGTERM (graceful shutdown)
+- Timeout propagation for git CLI commands
+- Future observability (tracing spans, structured logging with request IDs)
+
+The use of `context.TODO()` in convenience wrappers that cannot yet receive a context is the correct interim approach -- it signals "this needs future work" without blocking the refactor.
+
+---
+
+## New Findings
+
+### Critical (Must Fix)
+
+None.
+
+### Important (Should Fix)
+
+**1. `/Users/pfleidi/entire/cli/cmd/entire/cli/git_operations_test.go` -- Stray trailing commas in test error messages**
+
+Severity: low
+
+Multiple test error messages contain formatting artifacts from the mechanical refactoring:
+
+```go
+t.Fatalf("GetMergeBase(context.Background(),) error = %v", err)       // ~line 187
+t.Errorf("GetMergeBase(context.Background(),) = %v, want %v", ...)    // ~line 190
+t.Error("GetMergeBase(context.Background(),) expected error ...")       // ~line 228
+t.Fatalf("BranchExistsOnRemote(context.Background(),) error = %v"...)  // ~line 625
+t.Error("BranchExistsOnRemote(context.Background(),) = false, ...")    // ~line 628
+t.Fatalf("BranchExistsOnRemote(context.Background(),) error = %v"...)  // ~line 635
+t.Error("BranchExistsOnRemote(context.Background(),) = true, ...")     // ~line 638
+```
+
+These have `context.Background(),)` with a stray comma before the closing paren. The original messages were like `GetMergeBase()` and the refactoring incorrectly substituted `GetMergeBase(context.Background(),)`.
+
+**Suggested fix**: Keep the original short function name in error messages (e.g., `GetMergeBase()`). Error messages do not need to reflect the actual call signature -- they just need to identify the function. Including `context.Background()` in every error string is verbose and adds no diagnostic value.
+
+---
+
+**2. `/Users/pfleidi/entire/cli/cmd/entire/cli/git_operations_test.go` -- Overly verbose test error messages throughout**
+
+Severity: low
+
+The refactoring replaced concise messages like `GetGitAuthor() error = %v` with `GetGitAuthor(context.Background()) error = %v`. This applies across dozens of assertions:
+
+```go
+t.Fatalf("GetCurrentBranch(context.Background()) error = %v", err)
+t.Errorf("GetCurrentBranch(context.Background()) = %v, want feature", branch)
+t.Fatalf("HasUncommittedChanges(context.Background()) error = %v", err)
+t.Error("HasUncommittedChanges(context.Background()) = true, want false for clean tree")
+// ... many more
+```
+
+**Suggested fix**: Revert error messages to the original short form (e.g., `GetGitAuthor() error = %v`). The `context.Background()` argument is test infrastructure, not part of the function's identity for diagnostic purposes.
+
+---
+
+**3. `/Users/pfleidi/entire/cli/cmd/entire/cli/config.go` -- `LoadEntireSettings()` and `IsEnabled()` use `context.TODO()` but could accept `ctx`**
+
+Severity: medium
+
+These functions are convenience wrappers that use `context.TODO()`:
+
+```go
+func LoadEntireSettings() (*settings.EntireSettings, error) {
+    s, err := settings.Load(context.TODO()) // line ~32
+```
+
+```go
+func IsEnabled() (bool, error) {
+    s, err := settings.Load(context.TODO()) // line ~58
+```
+
+The nolint comments explain these are "convenience wrappers," but `SaveEntireSettings` and `SaveEntireSettingsLocal` in the same file *were* updated to accept `ctx`. This is inconsistent -- readers will wonder why some wrappers got `ctx` and others did not.
+
+**Suggested fix**: Either update `LoadEntireSettings` and `IsEnabled` to accept `ctx context.Context` for consistency with their siblings, or add a brief comment block at the top of the file explaining the deliberate split (e.g., "Read-only functions use context.TODO() because they're called from many legacy paths; write functions accept ctx because they're called from fewer, more controlled paths"). The same applies to `GetStrategy()`.
+
+---
+
+**4. `/Users/pfleidi/entire/cli/cmd/entire/cli/config.go` -- `GetStrategy()` should accept ctx**
+
+Severity: medium
+
+`GetStrategy()` both loads settings AND logs errors via `logging.Info(context.TODO(), ...)`. If this function accepted `ctx`, it could properly propagate cancellation to both the settings load and the logging calls. The nolint comment says "future work to thread ctx" -- but this branch *is* that future work.
+
+**Suggested fix**: Add `ctx context.Context` parameter to `GetStrategy()` and update callers.
+
+---
+
+### Suggestions (Consider)
+
+**5. `/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/strategy.go` -- Doc comment artifact**
+
+Severity: low
+
+A line in the strategy interface diff reads:
+
+```go
+// GetSessionInfo(ctx context.Context) returns session information for linking commits.
+```
+
+The method signature in the comment should not include parameter types. The Go convention for godoc is simply:
+
+```go
+// GetSessionInfo returns session information for linking commits.
+```
+
+**Suggested fix**: Remove `(ctx context.Context)` from the doc comment.
+
+---
+
+**6. `/Users/pfleidi/entire/cli/cmd/entire/cli/versioncheck/versioncheck_test.go` -- Same verbose error messages**
+
+Severity: low
+
+Same pattern as `git_operations_test.go`:
+
+```go
+t.Fatalf("fetchLatestVersion(context.Background()) error = %v", err)
+t.Errorf("fetchLatestVersion(context.Background()) = %q, want v1.2.3", version)
+```
+
+**Suggested fix**: Revert to short function names in diagnostic strings.
+
+---
+
+**7. `/Users/pfleidi/entire/cli/cmd/entire/cli/paths/paths.go` -- Consider whether RepoRoot's cache should key on ctx**
+
+Severity: low (informational only)
+
+`RepoRoot(ctx)` caches by working directory but ignores the context. This is fine for now -- the cache is purely about avoiding repeated git commands. However, if a context with a very short deadline is passed, the cache miss path could fail and then a subsequent call with a longer deadline would succeed. Not a real problem today, just something to note as context usage evolves.
+
+---
+
+**8. `/Users/pfleidi/entire/cli/cmd/entire/cli/settings/settings_test.go` -- Tests using `t.Chdir()` correctly avoid `t.Parallel()`**
+
+Severity: low (confirmation)
+
+The tests use `t.Chdir(tmpDir)` which changes the process working directory. Per project conventions, these tests must NOT call `t.Parallel()`. From the diff, they correctly omit `t.Parallel()`.
+
+---
+
+### Praise
+
+- **Thorough and mechanical**: The refactoring is remarkably consistent across 108 files. The pattern is applied identically everywhere -- `ctx context.Context` as first parameter, removed `ctx := context.Background()` lines, propagated to downstream calls. This suggests good tooling or careful manual work.
+
+- **Correct `context.TODO()` usage**: Where context cannot be threaded (callback functions, legacy convenience wrappers), `context.TODO()` is used instead of `context.Background()`. This follows Go conventions -- `context.TODO()` signals "this should be fixed later" while `context.Background()` means "this is intentionally the top-level context."
+
+- **Nolint comments are explanatory**: Every `//nolint:contextcheck` annotation includes a reason explaining *why* context cannot be threaded, not just silencing the linter. This is exemplary.
+
+- **Strategy interface cleanup**: Renaming `ctx StepContext` to `step StepContext` while adding `ctx context.Context` eliminates a confusing naming collision. The old code had `ctx` meaning two different things in different method signatures.
+
+- **`FetchAndCheckoutRemoteBranch` context improvement**: The old code created a `context.WithTimeout(context.Background(), 2*time.Minute)` for the fetch timeout. The new code wraps the *caller's* context: `context.WithTimeout(ctx, 2*time.Minute)`. This means if the caller has a shorter deadline, the fetch will respect it -- properly layered timeouts.
+
+- **Integration tests updated consistently**: All four integration test files were updated to pass `context.Background()` where needed, with no missed call sites.
+
+---
+
+## Summary
+
+The change is architecturally sound and well-executed. The `context.Context` threading is a major improvement that enables graceful shutdown, timeout propagation, and future observability. The implementation is consistent across ~108 files.
+
+The requested changes are minor:
+
+1. **Fix stray trailing commas** in test error messages in `git_operations_test.go` (cosmetic but embarrassing in CI output)
+2. **Revert verbose `context.Background()`** from test diagnostic strings across `git_operations_test.go` and `versioncheck_test.go` (readability)
+3. **Thread `ctx` through remaining `config.go` convenience wrappers** (`LoadEntireSettings`, `IsEnabled`, `GetStrategy`) for consistency, or document why they are intentionally excluded
+4. **Fix the godoc comment artifact** in `strategy.go`
+
+**Estimated effort to address**: 30-60 minutes. Issues 1, 2, and 4 are straightforward find-and-replace. Issue 3 requires a design decision about whether to thread ctx through the remaining convenience wrappers or to document the intentional split.
+
+---
+
+**Note**: I was unable to write this review to `docs/requirements/improve-context-management/review-01.md` because the Write tool was denied. If you would like me to persist this review as a file, please grant write access and I will create the file.</result>
+<usage><total_tokens>91647</total_tokens><tool_uses>67</tool_uses><duration_ms>388408</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-pfleidi-entire-cli/tasks/a945c341163af1418.output
+
+---
+
+<task-notification>
+<task-id>af4878787b32c67fe</task-id>
+<tool-use-id>toolu_01N7H9qD5JdWfpWivkDvHv6i</tool-use-id>
+<status>completed</status>
+<summary>Agent "Review strategy layer changes" completed</summary>
+<result>Good. Now I have confirmed all the key findings. Here is the complete review.
+
+---
+
+# Code Review: `improve-context-management` Branch -- Strategy Layer
+
+## Scope
+
+Branch `improve-context-management` vs HEAD, filtered to:
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/` (all files)
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/checkpoint/` (committed.go, temporary.go)
+- `/Users/pfleidi/entire/cli/cmd/entire/cli/session/` (phase.go, state.go)
+
+42 files changed, ~1144 insertions, ~1127 deletions.
+
+## Overview
+
+This change threads `context.Context` through approximately 80+ function signatures across the strategy, checkpoint, and session packages. It replaces ad-hoc `context.Background()` calls with properly propagated contexts, enabling cancellation, deadlines, and tracing throughout the call stack. The refactoring also renames `ctx StepContext` parameters to `step StepContext` where the name would shadow the new `context.Context` parameter.
+
+---
+
+## Critical (Must Fix)
+
+### C1. sync.Once captures first caller's context for git subprocess execution
+
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/manual_commit.go:33-42`**
+
+`getStateStore(ctx)` passes the caller's `context.Context` into `sync.Once`. Inside the closure, `NewStateStore(ctx)` calls `getGitCommonDir(ctx)` which runs `exec.CommandContext(ctx, "git", "rev-parse", "--git-common-dir")`. If the first caller's context is already cancelled or is cancelled during the subprocess execution, the git command fails and the error is cached permanently by `sync.Once`. All subsequent callers will receive the cached error, even though they pass valid contexts.
+
+```go
+// manual_commit.go:33-42
+func (s *ManualCommitStrategy) getStateStore(ctx context.Context) (*session.StateStore, error) {
+    s.stateStoreOnce.Do(func() {
+        store, err := session.NewStateStore(ctx)  // ctx from first caller only
+        if err != nil {
+            s.stateStoreErr = fmt.Errorf("failed to create state store: %w", err)
+            return
+        }
+        s.stateStore = store
+    })
+    return s.stateStore, s.stateStoreErr
+}
+```
+
+Compare with `getCheckpointStore()` on line 47-57, which correctly uses `context.Background()` inside its `sync.Once`:
+
+```go
+// manual_commit.go:47-57
+func (s *ManualCommitStrategy) getCheckpointStore() (*checkpoint.GitStore, error) {
+    s.checkpointStoreOnce.Do(func() {
+        repo, err := OpenRepository(context.Background())  // Correct: background context
+        // ...
+    })
+    return s.checkpointStore, s.checkpointStoreErr
+}
+```
+
+**Suggested fix:** Use `context.Background()` inside the `sync.Once` closure, consistent with `getCheckpointStore()`:
+
+```go
+s.stateStoreOnce.Do(func() {
+    store, err := session.NewStateStore(context.Background())
+    // ...
+})
+```
+
+The context is only used for a one-time directory lookup (`git rev-parse --git-common-dir`). Using `context.Background()` here is safe and correct -- the initialization is a one-time setup operation that should not be tied to any particular request's lifecycle.
+
+---
+
+## Important (Should Fix)
+
+### I1. EnsureSetup is the only Strategy interface method without context.Context
+
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/strategy.go:375`**
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/manual_commit.go:100`**
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/auto_commit.go:462`**
+
+`EnsureSetup() error` is the sole method on the `Strategy` interface that does not accept a `context.Context`. Both implementations use `context.Background()` with `//nolint:contextcheck` annotations. Since this refactoring is specifically about eliminating unnecessary `context.Background()` calls, this is an incomplete migration.
+
+```go
+// strategy.go:375
+EnsureSetup() error  // No context parameter
+
+// manual_commit.go:101
+func (s *ManualCommitStrategy) EnsureSetup() error {
+    if err := EnsureEntireGitignore(context.Background()); err != nil { //nolint:contextcheck
+```
+
+**Suggested fix:** Update the interface to `EnsureSetup(ctx context.Context) error` and thread the context from callers. If this is intentionally deferred (e.g., too many callers to update in this PR), add a TODO comment at the interface definition explaining the plan.
+
+### I2. Dual context parameters in handleAmendCommitMsg
+
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/manual_commit_hooks.go:393`**
+
+This function accepts two `context.Context` parameters:
+
+```go
+func (s *ManualCommitStrategy) handleAmendCommitMsg(ctx context.Context, logCtx context.Context, commitMsgFile string) error {
+```
+
+Having two context parameters is confusing and error-prone. A maintainer must carefully choose between `ctx` and `logCtx` for each call. Compare with `TransitionAndLog` at `/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/session_state.go:162-165` which correctly derives `logCtx` from the main context:
+
+```go
+func TransitionAndLog(goCtx context.Context, ...) error {
+    logCtx := logging.WithComponent(goCtx, "session")  // Derived, not a separate parameter
+```
+
+**Suggested fix:** Accept a single `ctx context.Context` and derive the logging context inside the function:
+
+```go
+func (s *ManualCommitStrategy) handleAmendCommitMsg(ctx context.Context, commitMsgFile string) error {
+    logCtx := logging.WithComponent(ctx, "manual-commit")
+    // ...
+}
+```
+
+### I3. postCommitActionHandler stores two context fields
+
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/manual_commit_hooks.go:486-503`**
+
+The `postCommitActionHandler` struct stores both `ctx` and `logCtx` as fields:
+
+```go
+type postCommitActionHandler struct {
+    s                      *ManualCommitStrategy
+    ctx                    context.Context
+    logCtx                 context.Context
+    // ...
+}
+```
+
+Storing contexts in structs is discouraged by Go conventions (see `context` package documentation: "Do not store Contexts inside a struct type"). In this case both fields are used in handler methods, creating ambiguity about which to use for different operations. The `HandleCondense` method (line 505) passes `h.ctx` to `condenseAndUpdateState` but `h.logCtx` to `updateBaseCommitIfChanged`.
+
+**Suggested fix:** Store only `ctx` and derive `logCtx` at the point of use in each handler method. This removes the ambiguity and follows Go conventions more closely. Note: I acknowledge the struct-stored-context pattern may be pragmatic here since the handler has a short lifecycle (one PostCommit event), but the dual-context storage adds unnecessary confusion.
+
+### I4. Test error messages contain literal "context.Background()" text (cosmetic, find-and-replace artifact)
+
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/clean_test.go:113, 118, 128, 131, 134, 168, 172, 176, 435`**
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/session_test.go:202, 206, 223, 231, 235, 263, 272, 276, 298, 353, 367`**
+(and likely more across 16 test files with 488 total occurrences)
+
+Error messages in test assertions now contain the literal text `context.Background()`. This appears to be a find-and-replace artifact where `ctx` in format strings like `"ListShadowBranches(%v)"` was replaced with `context.Background()`:
+
+```go
+// clean_test.go:113
+t.Fatalf("ListShadowBranches(context.Background()) error = %v", err)
+
+// session_test.go:202
+t.Fatalf("ListSessions(context.Background()) error = %v, want nil", err)
+```
+
+These are functionally harmless -- they only appear in test failure messages -- but they look like accidental artifacts and make error messages less readable. The original intent was likely `"ListShadowBranches(ctx) error = %v"` or just `"ListShadowBranches error = %v"`.
+
+**Suggested fix:** Clean up error message strings in test files. A simple approach:
+- Replace `"ListShadowBranches(context.Background())` with `"ListShadowBranches(ctx)` or just remove the argument from the message entirely since it adds no diagnostic value.
+
+---
+
+## Suggestions (Consider)
+
+### S1. Consider adding context to ValidateRepository
+
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/manual_commit.go:85-97`**
+
+`ValidateRepository()` internally uses `context.Background()`. For completeness of the context propagation, this could also accept `context.Context`.
+
+### S2. TransitionAndLog parameter naming
+
+**`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/session_state.go:162`**
+
+The function uses `goCtx` for `context.Context` and `ctx` for `session.TransitionContext`:
+
+```go
+func TransitionAndLog(goCtx context.Context, state *SessionState, event session.Event, ctx session.TransitionContext, handler session.ActionHandler) error {
+```
+
+While the naming distinguishes the two, `goCtx` is non-standard Go. Consider renaming to `ctx` and `transCtx`:
+
+```go
+func TransitionAndLog(ctx context.Context, state *SessionState, event session.Event, transCtx session.TransitionContext, handler session.ActionHandler) error {
+```
+
+### S3. Document the context propagation convention
+
+Since this is a large cross-cutting change, consider adding a brief note in CLAUDE.md under "Code Patterns" explaining the convention: functions that perform I/O, git operations, or subprocess execution should accept `context.Context` as their first parameter. This helps future contributors maintain consistency.
+
+### S4. Verify context parameters are actually used
+
+For checkpoint methods in `/Users/pfleidi/entire/cli/cmd/entire/cli/checkpoint/committed.go` and `temporary.go`, verify that the newly added `context.Context` parameters are being passed through to cancellation-aware operations (e.g., `exec.CommandContext`, `select` with `ctx.Done()`). If they are threaded through purely for future use, that is fine but worth a brief `// ctx reserved for future cancellation support` comment to clarify intent.
+
+---
+
+## Praise
+
+- **Consistent mechanical refactoring**: The change is remarkably uniform across 42 files. Parameter renames (`ctx StepContext` to `step StepContext`) are applied consistently, eliminating the variable shadowing risk between domain context and Go context.
+
+- **Test coverage updated in lockstep**: All 16 test files are updated to pass `context.Background()` where needed. The test structure and count appear maintained.
+
+- **Logging context derivation pattern**: The use of `logging.WithComponent(ctx, "...")` for structured logging contexts (e.g., `session_state.go:165`) is a good pattern that pairs naturally with proper context propagation.
+
+- **Nolint annotations with intent**: Where `context.Background()` is intentionally used (e.g., `EnsureSetup`, hooks that must not fail), the `//nolint:contextcheck` comments explain the rationale.
+
+- **Atomic write pattern preserved**: `SaveSessionState` (`/Users/pfleidi/entire/cli/cmd/entire/cli/strategy/session_state.go:80-87`) correctly maintains the write-to-temp-then-rename pattern.
+
+---
+
+## Summary
+
+**Verdict: REQUEST CHANGES**
+
+The refactoring is well-structured and consistent. The core goal -- threading `context.Context` through the strategy layer -- is achieved across all 42 files with matching test updates. However, one critical issue must be addressed:
+
+1. **C1 (Critical):** `getStateStore()` passes a caller's potentially-cancelled context into `sync.Once`. If the first invocation occurs with a cancelled context, the git subprocess fails and the error is permanently cached. Fix: use `context.Background()` inside the closure, consistent with `getCheckpointStore()`. This is a one-line change.
+
+The important issues (I1-I4) are not blockers but should be addressed for code quality:
+- I1: `EnsureSetup` is the only interface method without context (incomplete migration)
+- I2-I3: Dual context parameters/fields create maintainability risk
+- I4: Test error messages have find-and-replace artifacts (cosmetic)
+
+**Estimated effort:** 1-2 hours total
+- C1: ~5 minutes (one-line fix)
+- I1: ~30-60 minutes (interface change + caller updates, or add TODO)
+- I2-I3: ~15-30 minutes (refactor two locations)
+- I4: ~15-30 minutes (audit and clean up test messages)
+
+---
+
+**Note:** I was unable to write this review to `/Users/pfleidi/entire/cli/docs/requirements/improve-context-management/review-01.md` due to permission restrictions on both the Bash and Write tools. If you would like me to persist this review to disk, please grant write permissions and I will save it.</result>
+<usage><total_tokens>52513</total_tokens><tool_uses>53</tool_uses><duration_ms>438747</duration_ms></usage>
+</task-notification>
+Full transcript available at: REDACTED.output
+
+---
+
+Please fix the critical and important cases

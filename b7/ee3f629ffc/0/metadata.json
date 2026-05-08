@@ -1,0 +1,86 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "b7ee3f629ffc",
+  "session_id": "505074f6-04f8-47f5-ba59-9d9444474e9c",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T16:03:48.637478Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 0,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "b8a9fcdf36fb",
+  "token_usage": {
+    "input_tokens": 3017,
+    "cache_creation_tokens": 497511,
+    "cache_read_tokens": 20184052,
+    "output_tokens": 63534,
+    "api_call_count": 175
+  },
+  "summary": {
+    "intent": "Improve memory quality in the memory-loop pipeline by enforcing hard evidence gates on generated records, and fix two unrelated issues: a JSON parse error on LLM trailing text and slow summary command startup due to unconditional backfill.",
+    "outcome": "Implemented a two-layer evidence gate (provenance + session ID validation) replacing the soft LLM-prompt-only approach, added `FilteredNoEvidenceCount` stat, fixed LLM JSON trailing-text parse failure with `extractJSONObject`, removed unconditional backfill from summary command startup, and fixed a double-filter bug that silently dropped all singleton skill patch opportunities.",
+    "learnings": {
+      "repo": [
+        "The memory-loop generator previously enforced memory quality only via LLM prompt instructions, not code—`passesReviewDerivedGate` only covered review-derived rules, leaving repo_rule/workflow_rule/agent_instruction kinds ungated.",
+        "`improve/analyzer.go` filtered out skill opportunities with count < 2 before the generator ever saw them, making the evidence gate's singleton exception for skill patches unreachable.",
+        "The prompt exposed `SessionID` but `PatternAnalysis.AffectedSessions` used `CheckpointID`—identifier mismatch would have caused all Layer 2 session validation to fail; fixed by switching prompt to emit `CheckpointID`.",
+        "`summary_cmd.go` ran `summaryBackfillSummaries` and `summaryBackfillFacets` unconditionally on every invocation, causing 50–170s of silent LLM calls on first load.",
+        "`llmcli.Runner.Execute` already calls `ExtractJSONFromMarkdown` (strips ```json blocks) but does not strip trailing text outside code blocks—LLM responses with trailing prose caused `invalid character 'n' after top-level value`.",
+        "Personal-scope memory records auto-activate without a TUI promotion step (memoryloop.go:623), so Option 4 (show evidence count before promotion) does not protect that path.",
+        "`logicalRuleSimilarity` is defined in `memoryloop.go` and used there independently of the review gate—safe to remove `passesReviewDerivedGate` without losing it."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 319,
+          "end_line": 319,
+          "finding": "Prompt instruction 'avoid one-off incidents without repeated evidence' was a suggestion to the LLM, not enforced—replaced by hard evidence gate."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 155,
+          "end_line": 161,
+          "finding": "Post-filter caught low confidence/strength but a high-confidence singleton sailed through; SourceSessionIDs length was never validated."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 360,
+          "end_line": 375,
+          "finding": "passesReviewDerivedGate enforced count>=2||strong only for review-derived rules; removed and replaced by passesEvidenceGate covering all signal types."
+        },
+        {
+          "path": "cmd/entire/cli/improve/analyzer.go",
+          "line": 319,
+          "end_line": 319,
+          "finding": "Skill opportunities with count < 2 were dropped before reaching the generator, making the singleton exception in the evidence gate unreachable; threshold lowered to count >= 1 for skills."
+        },
+        {
+          "path": "cmd/entire/cli/summary_cmd.go",
+          "line": 195,
+          "end_line": 196,
+          "finding": "Unconditional backfill calls on every invocation caused 50-170s silent freeze; removed entirely—backfill now only on explicit user request."
+        }
+      ],
+      "workflow": [
+        "When adding a hard gate that replaces an LLM-prompt-based soft filter, all existing tests for the affected function need provenance fields added or they will all fail the new gate.",
+        "Reject-by-default (return false when no signal found) is critical for evidence gates—an allow-if-unmatched fallback nullifies the gate for exactly the bad cases being targeted.",
+        "Identifier alignment (which ID type flows end-to-end) must be resolved as a prerequisite before implementing cross-reference validation, not as a nice-to-have."
+      ]
+    },
+    "friction": [
+      "LLM returned trailing text after JSON despite 'Return ONLY JSON' prompt instruction, causing parse failures; required adding extractJSONObject fallback.",
+      "The rebuilt binary was needed to apply the JSON fix—user hit the same error again before rebuilding.",
+      "Double-filter bug (analyzer pre-filtering + evidence gate singleton exception) was invisible until a user noticed skill patches stopped appearing after the evidence gate was deployed.",
+      "Existing tests had no provenance fields, requiring 12 test updates across multiple test functions to add SourceSignal + matching analysis signals + valid SourceSessionIDs.",
+      "Codex identified that the original cross-reference recommendation understated implementation risk (no provenance link in data model), requiring a full doc rewrite before implementation."
+    ],
+    "open_items": [
+      "repo_learning and workflow_learning signals have no count/affected-sessions fields; they are marked context-only in the prompt but could benefit from count tracking upstream if they are ever to be eligible for memory generation.",
+      "Existing low-quality memories already in memory-loop.json are not retroactively re-evaluated by the evidence gate; a backfill/re-evaluation pass or natural decay is needed.",
+      "The findSignal lookup uses normalized exact match with substring fallback—false-negative rate if the LLM significantly paraphrases the signal key is not yet measured.",
+      "Option 4 (show evidence count in TUI before promotion) was noted as still useful for transparency alongside the evidence gate but was not implemented.",
+      "The `matchedSignal.Kind` scoping (prevents skill_opportunity singleton exception from applying to non-skill_patch records) needs a dedicated test to prevent regression."
+    ]
+  }
+}

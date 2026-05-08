@@ -1,0 +1,13 @@
+IsPromisorRepo() caches the result via sync.Once, but the first call uses the provided ctx for git config. If that ctx is already canceled or times out, cmd.Output() will fail and the function will cache false for the rest of the process, even when later calls have a valid context. Consider running the detection with a non-cancelable context (or only caching when the command succeeds / ctx isn’t canceled), so transient context errors don’t permanently force the non-promisor path.
+
+---
+
+IsPromisorRepo() runs git config --get extensions.partialClone without --local, so a user/global gitconfig setting could incorrectly mark every repo as promisor. Using git config --local --get extensions.partialClone keeps detection scoped to the repository config and avoids false positives (and makes tests less environment-dependent).
+
+PartialCloneFilterArgsWithDepth()’s comment says it returns args for “tree-only fetches”, but for non-promisor repos it returns only --depth=1, which will fetch blobs for the tip commit. Please update the doc comment to reflect that non-promisor repos will do a shallow (not treeless) fetch, or adjust the implementation to match the comment.
+
+The doc comment for FetchMetadataBranch() says the fetch is treeless (--filter=blob:none), but this change now uses PartialCloneFilterArgs(), which will use --depth=1 (and no filter) for non-promisor repos. Please update the function comment to match the new behavior so readers don’t assume blobs are always filtered.
+
+FetchMetadataTreeOnly()’s comment currently states it fetches with --depth=1 --filter=blob:none, but PartialCloneFilterArgsWithDepth() omits the filter for non-promisor repos. Please update the comment (or rename the function) to avoid claiming the fetch is always treeless.
+
+FetchV2MainTreeOnly()’s comment says it fetches with --depth=1 --filter=blob:none, but strategy.PartialCloneFilterArgsWithDepth() omits --filter=blob:none for non-promisor repos. Please update the comment to reflect the conditional filtering/shallow behavior.

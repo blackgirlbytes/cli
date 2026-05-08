@@ -1,0 +1,73 @@
+Implement the following plan:
+
+# Plan: Add Copilot E2E Test Support
+
+## Context
+
+The copilot agent is implemented and can be enabled via `entire enable --agent github-copilot`, but the e2e test suite (`cmd/entire/cli/e2e_test/`) has no `CopilotRunner`. Running `E2E_AGENT=github-copilot` falls through to `unavailableRunner`. This plan adds copilot support so existing e2e scenarios work with `E2E_AGENT=github-copilot`.
+
+The Copilot CLI (`copilot` v0.0.411) is installed locally and supports non-interactive mode via `-p "prompt"` with `--model` and `--allow-all-tools` flags — very similar to Claude Code.
+
+## Changes
+
+### 1. Add `CopilotRunner` to `e2e_test/agent_runner.go`
+
+Add constant and runner:
+
+```go
+const AgentNameCopilot = "github-copilot"
+```
+
+**`CopilotRunner` struct**: `Model string`, `Timeout time.Duration`
+
+**`NewCopilotRunner(config)`**:
+- Model: `config.Model` || `E2E_COPILOT_MODEL` || `"claude-haiku-4.5"` (cheapest)
+- Timeout: `config.Timeout` || `E2E_TIMEOUT` || `2m`
+
+**`IsAvailable()`**:
+- `exec.LookPath("copilot")`
+- `copilot --version` with 10s timeout
+
+**`RunPromptWithTools(ctx, workDir, prompt, tools)`**:
+- Command: `copilot --model <model> -p "<prompt>" --allow-all-tools`
+- If `tools` provided: add `--available-tools <tools...>`
+- Same stdout/stderr/exitcode capture pattern as `ClaudeCodeRunner`
+
+**`RunPrompt()`**: delegates to `RunPromptWithTools` with `nil` tools
+
+**Register in `NewAgentRunner` switch**:
+```go
+case AgentNameCopilot:
+    return NewCopilotRunner(config)
+```
+
+### 2. Add copilot session dir env var to `e2e_test/testenv.go`
+
+The copilot agent's `GetSessionDir()` checks `ENTIRE_TEST_COPILOT_SESSION_DIR`. Without it, hooks try to read `~/.copilot/session-state/` which won't have test session data.
+
+In **3 methods** that set hook env vars — `GitCommitWithShadowHooks`, `GitCommitStagedWithShadowHooks`, `GitCommitWithTrailerRemoved` — add:
+
+```go
+"ENTIRE_TEST_COPILOT_SESSION_DIR=" + filepath.Join(env.RepoDir, ".copilot-sessions"),
+```
+
+This mirrors the existing `ENTIRE_TEST_CLAUDE_PROJECT_DIR` and `ENTIRE_TEST_GEMINI_PROJECT_DIR` patterns.
+
+## Files
+
+| File | Change |
+|---|---|
+| `cmd/entire/cli/e2e_test/agent_runner.go` | Add `AgentNameCopilot`, `CopilotRunner`, register in factory |
+| `cmd/entire/cli/e2e_test/testenv.go` | Add `ENTIRE_TEST_COPILOT_SESSION_DIR` to 3 hook env blocks |
+
+## Verification
+
+```bash
+# Build and run a single e2e test with copilot
+E2E_AGENT=github-copilot go test -tags=e2e -run TestE2E_BasicWorkflow ./cmd/entire/cli/e2e_test/...
+
+# If copilot not authenticated, tests should skip gracefully (exit 0)
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.REDACTED.jsonl

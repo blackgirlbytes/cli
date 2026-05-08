@@ -1,0 +1,181 @@
+Implement the following plan:
+
+# Stabilize Droid Interactive E2E Tests
+
+## Context
+
+Droid interactive E2E tests are **mildly flaky locally** and **fail 100% in CI**. All interactive tests using `StartSession` + tmux are affected:
+- `TestAttributionOnAgentCommit`
+- `TestAttributionMultiCommitSameSession`
+- `TestShadowBranchCleanedAfterAgentCommit`
+- `TestInteractiveMultiStep`
+- `TestInteractiveContentOverlapRevertNewFile`
+
+The CI artifact shows: Droid starts, auto-generates a greeting (API works), fires Stop hook, receives the user's prompt (echoed in pane), then **never responds**. Test times out at 90s.
+
+## Root Cause Analysis
+
+From the CI pane capture:
+```
+>  Powered by Entire: ...
+>  --model custom:claude-haiku-4-5-20251001 --skip-permissions-unsafe
+⛬  I see this is a fresh repo with an initial commit and an .entire/ directory...
+ HOOKS  Stop
+ └─ Script: entire hooks factoryai-droid stop
+ └─ Result : Exit code: 0
+>  create a file called hello.txt containing 'hello world', then commit it...
+```
+Droid responded to its auto-greeting (API works), but after the user prompt was sent, no response ever came.
+
+### Primary cause: `CI`/`GITHUB_ACTIONS` env vars not unset
+
+Gemini explicitly unsets these (`e2e/agents/gemini.go:126-128`):
+```go
+// Unset CI and GITHUB_ACTIONS so gemini doesn't force headless mode
+s, err := NewTmuxSession(name, dir, []string{"CI", "GITHUB_ACTIONS", "ENTIRE_TEST_TTY"}, ...)
+```
+
+Droid only unsets `ENTIRE_TEST_TTY` (`e2e/agents/droid.go:183`):
+```go
+s, err := NewTmuxSession(name, dir, []string{"ENTIRE_TEST_TTY"}, d.Binary(), ...)
+```
+
+If Droid detects `CI=true` and enters single-turn or restricted mode, it explains exactly the observed behavior: greeting works (first turn), then Droid exits or refuses further input.
+
+### Secondary cause: PromptPattern `>` is too ambiguous
+
+Compare prompt patterns across agents:
+| Agent | Pattern | Specificity |
+|-------|---------|------------|
+| Claude Code | `❯` | Unique unicode char |
+| Gemini | `Type your message` | Multi-word phrase |
+| OpenCode | `(Ask anything\|▣)` | Unique phrases |
+| **Droid** | **`>`** | **Matches everywhere** |
+
+`>` matches Droid informational lines, echoed prompts, and any output containing `>`. This causes false-positive WaitFor matches, especially during the auto-greeting phase.
+
+### Tertiary cause: No process liveness detection in WaitFor
+
+When Droid's process exits (single-turn CI mode, crash), `remain-on-exit` keeps the tmux pane alive. `WaitFor` (`e2e/agents/tmux.go:105-152`) polls for the full 90s against a dead pane that will never change. No early bail-out exists.
+
+### Contributing factors
+- **No dialog handling**: Claude has 5-iteration dialog dismissal, Gemini has 10-iteration. Droid has zero.
+- **No interactive session retry**: `errScenarioRestart` only covers `RunPrompt`, not `WaitFor` timeouts.
+- **Auto-greeting timing**: Droid generates greeting + fires Stop before user prompt. First WaitFor may match on greeting `>` before Droid is idle.
+
+---
+
+## Stabilization Approaches
+
+### Approach 1: Droid Agent Hardening (Recommended - implement)
+
+Fix Droid-specific issues mirroring patterns from other agents.
+
+**File: `e2e/agents/droid.go`**
+
+1. **Unset `CI` and `GITHUB_ACTIONS`** in `StartSession` (copy Gemini pattern):
+   ```go
+   s, err := NewTmuxSession(name, dir,
+       []string{"CI", "GITHUB_ACTIONS", "ENTIRE_TEST_TTY"},
+       d.Binary(), "--model", defaultDroidModel, "--skip-permissions-unsafe")
+   ```
+
+2. **Unset `CI` and `GITHUB_ACTIONS`** in `RunPrompt` too:
+   ```go
+   cmd.Env = filterEnv(os.Environ(), "ENTIRE_TEST_TTY", "CI", "GITHUB_ACTIONS")
+   ```
+
+3. **Add post-greeting stabilization** in `StartSession`. After initial WaitFor(`>`), wait for the Stop hook to fire (greeting turn to complete), then re-verify readiness:
+   ```go
+   // Wait for greeting turn to complete (Stop hook fires)
+   time.Sleep(2 * time.Second)
+   s.stableAtSend = ""
+   ```
+
+4. **Improve PromptPattern** if possible. Investigate Droid's actual prompt format to find a more specific regex. If the input prompt line has a distinctive format (e.g. starts at column 0 with `> ` followed by cursor), use that. Otherwise, keep `>` but rely on WaitFor's content-change detection.
+
+### Approach 2: WaitFor Process Liveness Detection (Recommended - implement)
+
+Add dead-process detection to `WaitFor` so ALL agents fail fast when process exits.
+
+**File: `e2e/agents/tmux.go`**
+
+1. **Add `IsPaneDead()` method**:
+   ```go
+   func (s *TmuxSession) IsPaneDead() bool {
+       cmd := exec.Command("tmux", "display-message", "-t", s.name, "-p", "#{pane_dead}")
+       out, err := cmd.Output()
+       if err != nil { return false }
+       return strings.TrimSpace(string(out)) == "1"
+   }
+   ```
+
+2. **Check liveness in WaitFor polling loop** - bail immediately when process is dead and pattern doesn't match:
+   ```go
+   if s.IsPaneDead() && !re.MatchString(content) {
+       return content, fmt.Errorf("process exited while waiting for %q\n--- pane content ---\n%s\n--- end pane content ---", pattern, content)
+   }
+   ```
+
+3. **Optionally expose via Session interface** for testutil logging:
+   Add `IsAlive() bool` to Session interface (default true for non-tmux).
+
+### Approach 3: Interactive Session Retry (Optional - defer)
+
+Extend `errScenarioRestart` to cover interactive WaitFor timeouts when process dies. This adds complexity and masks bugs. Defer unless Approaches 1+2 are insufficient.
+
+### Approach 4: PromptPattern Architecture (Optional - defer)
+
+Separate `StartupReadyPattern()` from `ResponseDonePattern()` in the Agent interface. Architecturally clean but a larger refactor. Defer until a second agent needs it.
+
+### Approach 5: CI/Timeout Tweaks (Complementary)
+
+- Bump `TimeoutMultiplier` from 1.5 to 2.0 as safety margin
+- Already have `E2E_CONCURRENT_TEST_LIMIT: 1` for Droid in CI
+
+---
+
+## Implementation Plan
+
+### Step 1: Fix `e2e/agents/droid.go` — `StartSession`
+- Unset `CI`, `GITHUB_ACTIONS` alongside `ENTIRE_TEST_TTY`
+- Add 2s post-greeting stabilization wait after initial WaitFor
+- Reset `stableAtSend` properly
+
+### Step 2: Fix `e2e/agents/droid.go` — `RunPrompt`
+- Unset `CI`, `GITHUB_ACTIONS` in the env filtering
+
+### Step 3: Add `IsPaneDead()` to `e2e/agents/tmux.go`
+- Implement using `tmux display-message -t <name> -p "#{pane_dead}"`
+
+### Step 4: Integrate liveness check into `WaitFor` in `e2e/agents/tmux.go`
+- Check `IsPaneDead()` each poll iteration
+- Return immediately with descriptive error if process dead and pattern not matched
+
+### Step 5: Optionally bump `TimeoutMultiplier` in `e2e/agents/droid.go`
+- Change from 1.5 to 2.0
+
+### Step 6: Update `e2e/agents/agent.go` Session interface (optional)
+- Add `IsAlive() bool` if we want process liveness accessible from testutil
+
+## Verification
+
+1. `mise run fmt && mise run lint` — ensure code compiles and passes linting
+2. `mise run test` — unit tests pass
+3. Local test: `mise run test:e2e --agent factoryai-droid TestAttributionOnAgentCommit` — verify the specific failing test passes
+4. Trigger CI workflow: push to branch and run e2e.yml with `factoryai-droid` matrix entry
+
+## Key Files
+- `e2e/agents/droid.go` — Primary: unset CI vars, stabilization wait
+- `e2e/agents/tmux.go` — Primary: IsPaneDead, WaitFor liveness check
+- `e2e/agents/gemini.go:126-128` — Reference for CI env handling
+- `e2e/agents/claude.go:202-219` — Reference for dialog handling pattern
+- `e2e/agents/agent.go` — Optional: Session interface extension
+- `e2e/testutil/repo.go` — Optional: logging improvements
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-droid-e2e-ci/a0b13cf5-a566-48f6-af3d-59dfb2944e27.jsonl
+
+---
+
+commit and push

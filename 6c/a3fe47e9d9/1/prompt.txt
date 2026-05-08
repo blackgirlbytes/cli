@@ -1,0 +1,234 @@
+Implement the following plan:
+
+# Add Factory AI Droid E2E Test Runner
+
+## Context
+
+The E2E test suite (`cmd/entire/cli/e2e_test/`) supports running real agent sessions to validate the full Entire CLI workflow. It currently has runners for Claude Code and Gemini CLI, but not for Factory AI Droid — even though Droid has full integration test coverage with simulated hooks. Adding a Droid E2E runner lets us validate the real droid CLI + Entire hooks end-to-end.
+
+The effort is small because the multi-agent `AgentRunner` interface and test infrastructure already exist. We just need to implement the runner.
+
+## Changes
+
+### 1. Add `FactoryAIDroidRunner` to `cmd/entire/cli/e2e_test/agent_runner.go`
+
+Add constant:
+```go
+const AgentNameFactoryAIDroid = "factoryai-droid"
+```
+
+Add struct + constructor + 4 interface methods:
+
+- **`NewFactoryAIDroidRunner(config)`** — parse config, defaults:
+  - Model: `E2E_DROID_MODEL` env var, fallback to empty (use droid default)
+  - Timeout: `E2E_TIMEOUT` env var, fallback to 2 minutes
+  - Auto level: `"medium"` (needed for file writes and git commits)
+
+- **`Name()`** → `"factoryai-droid"`
+
+- **`IsAvailable()`** — `exec.LookPath("droid")` + check `FACTORY_API_KEY` is set (droid requires API key auth, unlike Claude which uses OAuth)
+
+- **`RunPromptWithTools()`** — build and execute:
+  ```
+  droid exec --cwd <workDir> --auto medium -o text [--enabled-tools <tools>] [-m <model>] "<prompt>"
+  ```
+
+Register in `NewAgentRunner()` switch: `case AgentNameFactoryAIDroid:` → `NewFactoryAIDroidRunner(config)`
+
+### 2. Update `cmd/entire/cli/e2e_test/testenv.go`
+
+In `NewFeatureBranchEnv()` — the `ENTIRE_TEST_TTY` env vars are set in `GitCommitWithShadowHooks`. Check that droid hooks get appropriate env. The existing `RunEntireEnable` already passes `--agent defaultAgent` so it should work for droid out of the box.
+
+No changes expected here — just verify.
+
+### 3. Adjust agent-specific test skips (if any)
+
+Review existing scenarios for Claude-specific assumptions. `scenario_subagent_test.go` already skips for non-Claude agents. The JSONL validation in `ValidateCheckpoint` already has `isClaudeCode` conditional. Droid uses JSONL too, so validation should pass.
+
+No changes expected — just verify.
+
+## Files Modified
+
+- `cmd/entire/cli/e2e_test/agent_runner.go` — add `FactoryAIDroidRunner` (~80 lines)
+
+## Run E2E Tests
+
+```bash
+# Requires droid CLI installed and FACTORY_API_KEY set
+E2E_AGENT=factoryai-droid go test -tags=e2e -run TestE2E_BasicWorkflow ./cmd/entire/cli/e2e_test/...
+
+# With specific model
+E2E_AGENT=factoryai-droid E2E_DROID_MODEL=claude-sonnet-4-5-20250929 go test -tags=e2e ./cmd/entire/cli/e2e_test/...
+```
+
+## Verification
+
+1. `mise run fmt && mise run lint` — passes
+2. `mise run test:ci` — unit + integration tests still pass
+3. Manual: `E2E_AGENT=factoryai-droid go test -tags=e2e -run TestE2E_BasicWorkflow -v ./cmd/entire/cli/e2e_test/...` — basic workflow completes
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.REDACTED.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   cmd/entire/cli/e2e_test/agent_runner.go
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/e2e_test/agent_runner.go b/cmd/entire/cli/e2e_test/agent_runner.go
+index 89fd8c19..93ae0794 100644
+--- a/cmd/entire/cli/e2e_test/agent_runner.go
++++ b/cmd/entire/cli/e2e_test/agent_runner.go
+@@ -19,6 +19,9 @@ const AgentNameClaudeCode = "claude-code"
+ // AgentNameGemini is the name for Gemini CLI agent.
+ const AgentNameGemini = "gemini"
+ 
++// AgentNameFactoryAIDroid is the name for Factory AI Droid agent.
++const AgentNameFactoryAIDroid = "factoryai-droid"
++
+ // AgentRunner abstracts invoking a coding agent for e2e tests.
+ // This follows the multi-agent pattern from cmd/entire/cli/agent/agent.go.
+ type AgentRunner interface {
+@@ -58,6 +61,8 @@ func NewAgentRunner(name string, config AgentRunnerConfig) AgentRunner {
+ 		return NewClaudeCodeRunner(config)
+ 	case AgentNameGemini:
+ 		return NewGeminiCLIRunner(config)
++	case AgentNameFactoryAIDroid:
++		return NewFactoryAIDroidRunner(config)
+ 	default:
+ 		// Return a runner that reports as unavailable
+ 		return &unavailableRunner{name: name}
+@@ -324,3 +329,113 @@ func (r *GeminiCLIRunner) RunPromptWithTools(ctx context.Context, workDir string
+ 	result.ExitCode = 0
+ 	return result, nil
+ }
++
++// FactoryAIDroidRunner implements AgentRunner for Factory AI Droid CLI.
++type FactoryAIDroidRunner struct {
++	Model     string
++	Timeout   time.Duration
++	AutoLevel string
++}
++
++// NewFactoryAIDroidRunner creates a new Factory AI Droid runner with the given config.
++func NewFactoryAIDroidRunner(config AgentRunnerConfig) *FactoryAIDroidRunner {
++	model := config.Model
++	if model == "" {
++		model = os.Getenv("E2E_DROID_MODEL")
++		// No default model — use droid's built-in default if not specified
++	}
++
++	timeout := config.Timeout
++	if timeout == 0 {
++		if envTimeout := os.Getenv("E2E_TIMEOUT"); envTimeout != "" {
++			if parsed, err := time.ParseDuration(envTimeout); err == nil {
++				timeout = parsed
++			}
++		}
++		if timeout == 0 {
++			timeout = 2 * time.Minute
++		}
++	}
++
++	return &FactoryAIDroidRunner{
++		Model:     model,
++		Timeout:   timeout,
++		AutoLevel: "medium",
++	}
++}
++
++func (r *FactoryAIDroidRunner) Name() string {
++	return AgentNameFactoryAIDroid
++}
++
++// IsAvailable checks if droid CLI is installed and FACTORY_API_KEY is set.
++// Droid uses API key authentication, not OAuth.
++func (r *FactoryAIDroidRunner) IsAvailable() (bool, error) {
++	if _, err := exec.LookPath("droid"); err != nil {
++		return false, fmt.Errorf("droid CLI not found in PATH: %w", err)
++	}
++
++	if os.Getenv("FACTORY_API_KEY") == "" {
++		return false, fmt.Errorf("FACTORY_API_KEY environment variable not set")
++	}
++
++	return true, nil
++}
++
++func (r *FactoryAIDroidRunner) RunPrompt(ctx context.Context, workDir string, prompt string) (*AgentResult, error) {
++	return r.RunPromptWithTools(ctx, workDir, prompt, nil)
++}
++
++func (r *FactoryAIDroidRunner) RunPromptWithTools(ctx context.Context, workDir string, prompt string, tools []string) (*AgentResult, error) {
++	args := []string{
++		"exec",
++		"--cwd", workDir,
++		"--auto", r.AutoLevel,
++		"-o", "text",
++	}
++
++	if len(tools) > 0 {
++		args = append(args, "--enabled-tools", strings.Join(tools, ","))
++	}
++
++	if r.Model != "" {
++		args = append(args, "-m", r.Model)
++	}
++
++	args = append(args, prompt)
++
++	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
++	defer cancel()
++
++	//nolint:gosec // args are constructed from trusted config, not user input
++	cmd := exec.CommandContext(ctx, "droid", args...)
++	cmd.Dir = workDir
++
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++
++	start := time.Now()
++	err := cmd.Run()
++	duration := time.Since(start)
++
++	result := &AgentResult{
++		Stdout:   stdout.String(),
++		Stderr:   stderr.String(),
++		Duration: duration,
++	}
++
++	if err != nil {
++		exitErr := &exec.ExitError{}
++		if errors.As(err, &exitErr) {
++			result.ExitCode = exitErr.ExitCode()
++		} else {
++			result.ExitCode = -1
++		}
++		//nolint:wrapcheck // error is from exec.Run, caller can check ExitCode in result
++		return result, err
++	}
++
++	result.ExitCode = 0
++	return result, nil
++}
+- Current branch: alisha/factoryai-agent
+- Recent commits: 12d2099e Fix Droid "(no prompt)" after commit by adding agent-specific transcript parsing
+cd0220e3 Merge branch 'main' into alisha/factoryai-agent
+c83248a7 Add Factory AI Droid integration tests
+da2c18a7 Simplify Droid transcript parsing code
+bdf4c1af Fix Factory AI Droid transcript parsing and session lifecycle issues
+3c37cf55 Add Factory AI Droid agent integration
+9e0d4603 Merge pull request #426 from entireio/soph/do-not-track-git-ignored-files-in-session
+16313647 Merge pull request #425 from entireio/rwr/refactor-agent-remove-GetHookConfigPath
+3524400d don't track gitignored files (for example node_modules) in our session metadata as untracked_files_at_start
+9ad1ad95 remove unused GetHookConfigPath from Agent interface
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

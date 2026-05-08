@@ -1,0 +1,267 @@
+Implement the following plan:
+
+# Plan: Agent Implementation Guide
+
+## Context
+
+Phases 1-4 of the agent interface refactor are merged (#360, #399). The CLI now has a clean `Agent` interface with a generic lifecycle dispatcher. Phase 5 calls for documentation. The primary audience is **AI coding agents** implementing new agent integrations, not human developers reading casually. The doc should be a self-contained, step-by-step reference with complete code templates.
+
+## What to create
+
+**Single file**: `docs/architecture/agent-guide.md`
+
+Skip legacy methods entirely — focus on the new interface surface.
+
+## Document structure
+
+1. **Architecture overview** — 1 paragraph on the passivation pattern (agents provide data, framework orchestrates). Include the flow diagram: `Agent hook → ParseHookEvent → Event → DispatchLifecycleEvent → framework actions`.
+
+2. **Quick reference** — Table of all interfaces (core + optional), which methods each has, and when to implement each.
+
+3. **Step-by-step implementation guide**:
+   - Step 1: Create package (`cmd/entire/cli/agent/<name>/`)
+   - Step 2: Define types (hook input structs, transcript format types, tool constants)
+   - Step 3: Implement core Agent interface (10 methods across 3 groups)
+   - Step 4: Implement `ParseHookEvent` — the main contribution surface
+   - Step 5: Choose and implement optional interfaces (decision tree)
+   - Step 6: Register via `init()`
+   - Step 7: Add compile-time interface assertions
+   - Step 8: Implement hook installation (if HookSupport)
+   - Step 9: Write tests
+
+4. **Complete code template** — A full, copy-paste-ready skeleton for a new agent with all core methods stubbed out and annotated.
+
+5. **Event mapping reference** — Table of all 7 event types, what they mean, what the framework does for each, and examples from both Claude Code and Gemini CLI.
+
+6. **Optional interface decision tree** — For each optional interface: what it enables, what the framework does without it (degradation behavior), and when to implement it.
+
+7. **Transcript format guide** — How to implement transcript storage/analysis for common formats (JSONL, JSON, custom). Reference chunking helpers.
+
+8. **Hook installation patterns** — How to write `InstallHooks` for JSON config files (Claude pattern) and other formats.
+
+9. **Testing patterns** — How to write unit tests for ParseHookEvent, transcript analysis, and hook installation. Reference existing test files.
+
+10. **Common pitfalls** — Extracted from the codebase: go-git bugs, repo root vs cwd, transcript flush timing, nil event return pattern.
+
+## Key source files to reference
+
+- `cmd/entire/cli/agent/agent.go` — Core + optional interfaces
+- `cmd/entire/cli/agent/event.go` — Event types, Event struct, ReadAndParseHookInput helper
+- `cmd/entire/cli/agent/registry.go` — Registration pattern
+- `cmd/entire/cli/agent/chunking.go` — Transcript chunking helpers (ChunkJSONL, ReassembleJSONL)
+- `cmd/entire/cli/agent/types.go` — TokenUsage, HookInput (legacy)
+- `cmd/entire/cli/agent/claudecode/` — Reference implementation (full-featured)
+- `cmd/entire/cli/agent/geminicli/` — Reference implementation (simpler, no subagents)
+- `cmd/entire/cli/lifecycle.go` — Dispatcher (what framework does with events)
+- `cmd/entire/cli/hook_registry.go` — How hooks are wired to commands
+
+## Verification
+
+- Review that all interface methods are documented with correct signatures
+- Cross-check against `agent.go` for completeness
+- Ensure code template compiles (signatures match interfaces)
+- Check that event mapping table covers all 7 event types
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+
+---
+
+is "passivation pattern" a thing?
+
+---
+
+commit this
+
+---
+
+[Request interrupted by user]
+
+---
+
+(10 core + 9 legacy stubs): <- "legacy stubs?"
+
+---
+
+I was more wondering about "legacy" why are they legacy?
+
+---
+
+why would we differentiate between those messages? or what is the main difference between the 10 and the 9?
+
+---
+
+can you look at the pr comment?
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user asked me to implement a plan for creating an "Agent Implementation Guide" documentation file at `docs/architecture/agent-guide.md`. The plan was detailed with 10 sections to cover.
+
+2. I read all the key source files:
+   - `cmd/entire/cli/agent/agent.go` - Core Agent interface + optional interfaces
+   - `cmd/entire/cli/agent/event.go` - Event types and Event struct
+   - `cmd/entire/cli/agent/registry.go` - Registration pattern
+   - `cmd/entire/cli/agent/chunking.go` - Transcript chunking helpers
+   - `cmd/entire/cli/agent/types.go` - TokenUsage, HookInput types
+   - `cmd/entire/cli/lifecycle.go` - Framework dispatcher
+   - `cmd/entire/cli/hook_registry.go` - Hook command wiring
+   - Claude Code implementation files (claude.go, lifecycle.go, types.go, hooks.go)
+   - Gemini CLI implementation files (gemini.go, lifecycle.go, types.go, hooks.go)
+   - Test files for both agents
+
+3. I created `docs/architecture/agent-guide.md` with comprehensive content.
+
+4. I ran a reviewer agent that found 2 issues:
+   - "10 methods" should account for all 19 (10 core + 9 legacy)
+   - "8 legacy methods" was actually 9 (missing FormatResumeCommand)
+
+5. I fixed both issues.
+
+6. User questioned: "is 'passivation pattern' a thing?" - I admitted it wasn't a real pattern name and changed it to "inversion of control"
+
+7. User asked to commit, but noticed "10 core + 9 legacy stubs" and questioned "legacy stubs?" - I fixed "stubs" to just "legacy" since they're only stubs for new agents.
+
+8. User then asked deeper: "why are they legacy?" - I explained the term came from a code comment about Phase 4 migration that didn't happen.
+
+9. User pushed further: "why would we differentiate between those messages? or what is the main difference between the 10 and the 9?" - This led to the realization that the distinction is artificial (an artifact of refactoring plans). I proposed dropping the legacy framing entirely and grouping all 19 methods by functional purpose: Identity (5), Event Mapping (2), Transcript (3), Session Management (9).
+
+10. I made the edits to:
+    - Update the quick reference table to show all 19 methods in one table with 4 functional groups
+    - Remove the separate "Legacy Methods" section
+    - Change "Legacy stubs" comments in code templates to "Session Management"
+
+11. Committed as `18b0516c`, then amended to `4b769916`.
+
+12. User asked to look at PR comments. I found PR #410 with 6 review comments from Cursor Bugbot:
+    1. SessionID/SessionRef requirements inconsistency - the doc says both are always required but the per-event table shows SessionRef is optional for some events
+    2. Unused `encoding/json` import in types.go example
+    3. Unused `time` import in youragent.go example
+    4. `${PROJECT_DIR}` env var doesn't match existing patterns (`${CLAUDE_PROJECT_DIR}`, `${GEMINI_PROJECT_DIR}`)
+    5. `HookHandler` described as optional but actually required for CLI hook subcommand registration
+    6. `ParseHookInput` stub returns error but integration tests call it
+
+13. I started addressing the comments:
+    - Fixed comment 1: Changed blanket "every event must have SessionID and SessionRef" to point to the per-EventType requirements table
+    - Fixed comment 2: Removed unused `encoding/json` import
+    - Fixed comment 3: Removed unused `time` import
+    - Comments 4, 5, 6 still need to be addressed
+
+The conversation was interrupted during the process of addressing PR review comments. I had fixed 3 of 6 comments and still need to address comments 4, 5, and 6.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked me to implement a plan for creating `docs/architecture/agent-guide.md` - a comprehensive documentation file for AI coding agents implementing new agent integrations into the Entire CLI. The plan specified 10 sections covering architecture overview, quick reference, step-by-step guide, code templates, event mapping, optional interfaces, transcript formats, hook installation, testing patterns, and common pitfalls. The primary audience is AI coding agents, not human developers. After creation, the user wanted it committed and then asked me to address PR review comments on PR #410.
+
+2. Key Technical Concepts:
+   - Agent interface with 19 methods across 4 functional groups (Identity, Event Mapping, Transcript, Session Management)
+   - 7 optional interfaces: HookSupport, HookHandler, TranscriptAnalyzer, TranscriptPreparer, TokenCalculator, SubagentAwareExtractor, FileWatcher
+   - 7 event types: SessionStart, TurnStart, TurnEnd, Compaction, SessionEnd, SubagentStart, SubagentEnd
+   - Inversion of control pattern: agents provide data, framework orchestrates
+   - Hook flow: Agent hook → ParseHookEvent → Event → DispatchLifecycleEvent → framework actions
+   - Agent registration via `init()` + `agent.Register()` factory pattern
+   - `ReadAndParseHookInput[T]` generic helper for JSON parsing
+   - Transcript formats: JSONL (Claude Code) and JSON with messages array (Gemini CLI)
+   - Chunking helpers: `ChunkJSONL`, `ReassembleJSONL` for large transcripts
+   - Compile-time interface assertions pattern
+   - `HookHandler` interface is effectively required (not truly optional) for CLI hook subcommand registration
+
+3. Files and Code Sections:
+   - `docs/architecture/agent-guide.md` (CREATED - the main deliverable)
+     - 1081-line comprehensive guide with all 10 planned sections
+     - Contains complete copy-paste code template (types.go, youragent.go, lifecycle.go, lifecycle_test.go)
+     - Currently being updated to address PR review comments
+   
+   - `cmd/entire/cli/agent/agent.go` (READ - defines all interfaces)
+     - Core `Agent` interface with 19 methods
+     - 7 optional interfaces: HookSupport, HookHandler, FileWatcher, TranscriptAnalyzer, TranscriptPreparer, TokenCalculator, SubagentAwareExtractor
+   
+   - `cmd/entire/cli/agent/event.go` (READ - event types and helpers)
+     - 7 EventType constants (SessionStart through SubagentEnd)
+     - Event struct with fields: Type, SessionID, PreviousSessionID, SessionRef, Prompt, Timestamp, ToolUseID, SubagentID, ToolInput, ResponseMessage, Metadata
+     - `ReadAndParseHookInput[T]` generic helper
+   
+   - `cmd/entire/cli/agent/registry.go` (READ - registration pattern)
+     - `Register()`, `Get()`, `List()`, `Detect()`, `DetectAll()` functions
+     - AgentName and AgentType type aliases
+   
+   - `cmd/entire/cli/agent/chunking.go` (READ - transcript chunking)
+     - `ChunkJSONL`, `ReassembleJSONL`, `ChunkFileName`, `ParseChunkIndex`, `SortChunkFiles`
+   
+   - `cmd/entire/cli/agent/types.go` (READ - shared types)
+     - HookType constants, HookInput struct, SessionChange, TokenUsage
+   
+   - `cmd/entire/cli/lifecycle.go` (READ - framework dispatcher)
+     - `DispatchLifecycleEvent()` routing all 7 event types to handlers
+     - Each handler's implementation (what the framework does for each event)
+   
+   - `cmd/entire/cli/hook_registry.go` (READ - hook command wiring)
+     - `newAgentHooksCmd()` requires `agent.HookHandler` interface
+     - `newAgentHookVerbCmdWithLogging()` - the actual hook command that calls ParseHookEvent → DispatchLifecycleEvent
+   
+   - `cmd/entire/cli/agent/claudecode/` (READ - reference implementation)
+     - claude.go, lifecycle.go, types.go, hooks.go, lifecycle_test.go
+     - Full-featured agent with all optional interfaces
+   
+   - `cmd/entire/cli/agent/geminicli/` (READ - simpler reference implementation)
+     - gemini.go, lifecycle.go, types.go, hooks.go, lifecycle_test.go
+     - Simpler agent without subagent support, but with Compaction event
+
+4. Errors and fixes:
+   - **"passivation pattern" terminology**: User questioned if this was a real thing. It's not - I made it up. Fixed by changing to "inversion of control" which accurately describes the pattern.
+   - **"legacy stubs" label**: User pointed out "stubs" was wrong since existing agents fully implement these methods. Fixed to just "legacy".
+   - **"legacy" label itself**: User asked why they're called legacy. The term came from a code comment `// --- Legacy methods (will move to optional interfaces in Phase 4) ---` but Phase 4 is already merged and they weren't moved. The distinction between "10 core" and "9 legacy" was artificial. Fixed by removing the legacy framing entirely and presenting all 19 methods in one table grouped by functional purpose (Identity, Event Mapping, Transcript, Session Management).
+   - **Method count errors** (found by reviewer agent): "10 methods" didn't account for the 9 session management methods, and "8 legacy methods" was actually 9 (missing FormatResumeCommand). Both fixed.
+   - **PR Comment 1 - SessionRef requirements inconsistency**: The doc said "every event must have SessionID and SessionRef" but the per-event table showed SessionRef is optional for Compaction and SessionEnd. Fixed by pointing readers to the per-EventType requirements table.
+   - **PR Comment 2 - Unused `encoding/json` import**: Removed from types.go example.
+   - **PR Comment 3 - Unused `time` import**: Removed from youragent.go example.
+   - **PR Comment 4 - `${PROJECT_DIR}` placeholder**: NOT YET FIXED. Existing agents use agent-specific env vars (`${CLAUDE_PROJECT_DIR}`, `${GEMINI_PROJECT_DIR}`).
+   - **PR Comment 5 - HookHandler described as optional but is required**: NOT YET FIXED. `hook_registry.go` requires `HookHandler` for CLI subcommand registration.
+   - **PR Comment 6 - ParseHookInput stub**: NOT YET FIXED. Integration tests call `ParseHookInput`, so an error-returning stub could break tests.
+
+5. Problem Solving:
+   - Successfully created comprehensive documentation from source code analysis
+   - Resolved naming/terminology issues through user feedback ("passivation", "legacy stubs")
+   - Addressed architectural framing issue (artificial core/legacy split) by regrouping methods by function
+   - Started addressing 6 PR review comments, completed 3 of 6
+
+6. All user messages:
+   - "Implement the following plan: [detailed plan for Agent Implementation Guide]"
+   - "is 'passivation pattern' a thing?"
+   - "commit this[Request interrupted by user](10 core + 9 legacy stubs): <- 'legacy stubs?'"
+   - "I was more wondering about 'legacy' why are they legacy?"
+   - "why would we differentiate between those messages? or what is the main difference between the 10 and the 9?"
+   - "can you look at the pr comment?"
+
+7. Pending Tasks:
+   - Address remaining 3 PR review comments on PR #410:
+     - Comment 4: Fix `${PROJECT_DIR}` placeholder in hook installation example to note it's a placeholder that must match the agent's actual env var and `entireHookPrefixes` logic
+     - Comment 5: Update `HookHandler` description to note it's currently required for CLI hook subcommand registration, not truly optional
+     - Comment 6: Address `ParseHookInput` stub - either show a real implementation or explain when stubbing is safe
+   - Amend or create new commit with these fixes
+   - Push changes if requested
+
+8. Current Work:
+   Addressing PR review comments on PR #410 for `docs/architecture/agent-guide.md`. I had completed fixes for 3 of 6 comments:
+   - Fixed: SessionRef requirements inconsistency (comment 1)
+   - Fixed: Removed unused `encoding/json` import (comment 2)  
+   - Fixed: Removed unused `time` import (comment 3)
+   
+   Still need to address:
+   - Comment 4: `${PROJECT_DIR}` env var placeholder
+   - Comment 5: `HookHandler` is required, not optional
+   - Comment 6: `ParseHookInput` stub guidance
+
+9. Optional Next Step:
+   Continue addressing the remaining 3 PR review comments (4, 5, 6). The user's most recent request was "can you look at the pr comment?" and I was in the process of fixing all 6 comments when the summary was requested. The last edit I made was removing the unused `time` import (comment 3). Next would be comment 4 (the `${PROJECT_DIR}` placeholder), then comment 5 (HookHandler required status), then comment 6 (ParseHookInput guidance).
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+can you look at the pr comment?

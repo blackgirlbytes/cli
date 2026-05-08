@@ -1,0 +1,311 @@
+can you push
+
+---
+
+says there's othign in teh link
+
+---
+
+review comments on https://github.com/entireio/cli/pull/846 and use /pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>ab3baaa8b04637efc</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli/1e341628-86ec-4a27-8980-6b7518777116/tasks/ab3baaa8b04637efc.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review of PR changes" completed</summary>
+<result>Now I have the full picture. Here is my review.
+
+---
+
+## Review: PR #846 -- `entire clean --all` to clean ALL sessions
+
+### Files reviewed
+
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/strategy/cleanup.go` (new `ListAllItems` function)
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/clean.go` (messaging and wiring changes)
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/clean_test.go` (updated tests, new regression test)
+
+---
+
+### Critical (90-100)
+
+**1. `ListAllItems` uses `strat.ListOrphanedItems()` which only returns shadow branches -- it does NOT return all shadow branches**
+Confidence: 95
+
+`ListOrphanedItems()` in `manual_commit.go:122-141` calls `ListShadowBranches()` and wraps every branch as a `CleanupItem` with reason `"shadow branch (should have been auto-cleaned)"`. Looking at the implementation, it actually does return ALL shadow branches (it iterates all branches matching the pattern with no filtering). So functionally the result is correct -- all shadow branches are returned.
+
+However, the function name `ListOrphanedItems` is semantically misleading in this context. The comment on `ListAllItems` says "all shadow branches" but calls `ListOrphanedItems`. This is confusing for future maintainers: the name implies orphaned-only semantics, and if `ListOrphanedItems` is ever changed to actually filter to orphans, `ListAllItems` would silently break.
+
+**Fix:** Call `ListShadowBranches(ctx)` directly and build `CleanupItem` values in `ListAllItems`, rather than relying on `ListOrphanedItems` happening to return everything. This is a correctness risk, not just a naming issue.
+
+```go
+branches, err := ListShadowBranches(ctx)
+if err != nil {
+    return nil, fmt.Errorf("listing shadow branches: %w", err)
+}
+for _, branch := range branches {
+    items = append(items, CleanupItem{
+        Type:   CleanupTypeShadowBranch,
+        ID:     branch,
+        Reason: "clean all",
+    })
+}
+```
+
+---
+
+### Important (80-89)
+
+**2. `ListAllCleanupItems` is now dead code**
+Confidence: 88
+
+After the PR, `runCleanAll` calls `ListAllItems` instead of `ListAllCleanupItems`. No other caller of `ListAllCleanupItems` exists in the codebase (confirmed via grep). The function should be removed or `golangci-lint` with `deadcode`/`unused` linters may flag it. Since the function is exported it may not trigger a lint error, but it is still dead code that creates confusion -- two similarly-named functions (`ListAllCleanupItems` vs `ListAllItems`) with different semantics and only one being used.
+
+**Fix:** Remove `ListAllCleanupItems` if no external consumers exist, or add a deprecation comment if it must remain for API compatibility.
+
+**3. No active session guard for `--all` without `--force`**
+Confidence: 85
+
+The `runCleanCurrentHead` path checks for active sessions (phase `ACTIVE`) and refuses to proceed without `--force`. The `runCleanAll` path has no such check -- it will delete active session state files. Since `--all` now explicitly targets ALL sessions (not just orphaned ones), this is a meaningful behavioral gap. A user running `entire clean --all` could destroy state for a session that is currently in use by an agent.
+
+The confirmation prompt provides some guard, but the `runCleanCurrentHead` path specifically warns about active sessions before the prompt, giving the user critical information. The `--all` path shows a generic item count.
+
+**Fix:** Add an active session warning in `runCleanAll` (or `runCleanAllWithItems`) similar to `runCleanCurrentHead`, or at minimum annotate active sessions in the preview output so the user can see which sessions are live before confirming.
+
+**4. `Short` description on the command still says "orphaned"**
+Confidence: 82
+
+Line 30 of the PR version: `Short: "Clean up session data and orphaned Entire data"`. The `--all` flag description and `Long` text were updated to remove "orphaned" references, but the `Short` description still mentions "orphaned." This is inconsistent with the PR's intent.
+
+**Fix:** Update to something like `"Clean up Entire session data"`.
+
+**5. Temp file filtering skips files for sessions being deleted by `--all`**
+Confidence: 80
+
+`listTempFiles` builds an `activeSessionIDs` set from `ListSessionStates` and skips temp files matching those session IDs. When `--all` is used, those sessions are about to be deleted, but their temp files will be preserved because the temp file listing runs before deletion. This means `--all` will not fully clean up -- orphaned temp files will remain after the session states are deleted.
+
+This is a minor issue since temp files are small and the user could run `clean --all` again, but it is inconsistent with the stated goal of cleaning "all" data.
+
+**Fix:** When called from the `--all` path, skip the active-session filtering in `listTempFiles` (e.g., pass a flag or use a separate function that lists all temp files).
+
+---
+
+### Assessment of external reviewer concerns
+
+1. **"ListAllItems calls strat.ListOrphanedItems() for shadow branches which is misleading -- should use ListShadowBranches directly"** -- Valid and important (issue #1 above). While the current implementation happens to return all branches, this is a fragile coupling.
+
+2. **"ListAllCleanupItems is now unused dead code"** -- Valid (issue #2 above). The exported function has no callers after this PR.
+
+3. **"Active sessions could be deleted without --force guard"** -- Valid (issue #3 above). The `--all` path lacks the active session check that `runCleanCurrentHead` has.
+
+4. **"Temp file logic may skip files for sessions being deleted"** -- Valid but lower severity (issue #5 above). The filtering will leave behind temp files for sessions that `--all` just deleted.</result>
+<usage><total_tokens>37957</total_tokens><tool_uses>14</tool_uses><duration_ms>79726</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae6ec72accd6e3b23</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli/1e341628-86ec-4a27-8980-6b7518777116/tasks/ae6ec72accd6e3b23.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage analysis" completed</summary>
+<result>Now I have a complete picture. Here is my analysis.
+
+---
+
+## Test Coverage Analysis for PR #846 (`fix/clean-all-sessions`)
+
+### 1. Summary
+
+The PR changes `entire clean --all` from cleaning only orphaned sessions to cleaning ALL sessions. The core change is in `runCleanAll`, which now calls `strategy.ListAllItems(ctx)` instead of `strategy.ListAllCleanupItems(ctx)`. A new `ListAllItems` function was added to `cleanup.go` that lists all session states (not just orphaned ones) and all shadow branches. The regression test `TestCleanCmd_All_FindsSessionWithShadowBranch` targets the exact bug scenario. However, there are several gaps worth addressing.
+
+### 2. Critical Gaps
+
+**2a. `ListAllItems` still uses `ListOrphanedItems` for shadow branches -- potential duplicate session state entries (Criticality: 9/10)**
+
+This is the most important finding. In `ListAllItems` (the new function at line 363 of `cleanup.go`), shadow branches are gathered via `strat.ListOrphanedItems(ctx)`. Looking at `ListOrphanedItems` in `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/strategy/manual_commit.go` (lines 122-142), it returns ALL shadow branches (every branch matching the pattern) as `CleanupItem` entries. That part is correct for the "clean all" use case.
+
+However, `ListAllCleanupItems` (the OLD function) also appends orphaned session states from `ListOrphanedSessionStates`. The NEW `ListAllItems` appends ALL session states from `store.List()`. But `ListOrphanedItems` only returns shadow branches, not session states, so there is no duplication issue here. The logic is sound.
+
+**However**, there is no test that verifies `ListAllItems` returns non-orphaned session states. The regression test (`TestCleanCmd_All_FindsSessionWithShadowBranch`) tests the full command pipeline, but does not unit-test `ListAllItems` directly. If someone refactors `ListAllItems` to accidentally re-introduce the orphan filter, the regression test would catch it, so this is partially covered. A dedicated unit test for `ListAllItems` would be more targeted but is not strictly critical since the integration-level test covers the scenario.
+
+**2b. No `t.Parallel()` on any test in `clean_test.go` (Criticality: 8/10)**
+
+CLAUDE.md explicitly states: "Always use `t.Parallel()` in tests. Every top-level test function and subtest should call `t.Parallel()` unless it modifies process-global state."
+
+Every test in `clean_test.go` calls `setupCleanTestRepo` which uses `t.Chdir()` -- this IS process-global state modification. So these tests legitimately CANNOT use `t.Parallel()`. The existing tests are in the same situation, not just the new one. This is acceptable per the documented exception.
+
+### 3. Important Improvements
+
+**3a. Missing test: session with checkpoints on `entire/checkpoints/v1` but no shadow branch (Criticality: 7/10)**
+
+The old `ListOrphanedSessionStates` skips sessions that have either a shadow branch OR checkpoints on the metadata branch. The new `ListAllItems` should return these sessions regardless. There is no test confirming that a session with committed checkpoints (but no shadow branch) is included in `--all` cleanup. This is a distinct scenario from the regression test, which only covers the "has shadow branch" case.
+
+A test creating a session state file plus a checkpoint entry on `entire/checkpoints/v1` (no shadow branch) would verify this path. If someone later adds an optimization that skips sessions with committed checkpoints, this test would catch it.
+
+**3b. Missing test: `ListAllItems` does not skip sessions within the grace period (Criticality: 7/10)**
+
+`ListOrphanedSessionStates` has a 10-minute grace period filter (`sessionGracePeriod`) that skips recently-created sessions. The new `ListAllItems` does NOT have this filter, which is correct for "clean all" semantics. However, there is no test asserting that brand-new sessions ARE returned by `ListAllItems` / the `--all` command. If someone copy-pastes the grace period logic into `ListAllItems`, this would silently re-introduce the old bug for very recent sessions.
+
+The `createSessionStateFile` helper already creates sessions with `time.Now()` timestamps (which would be within the grace period), and the regression test passes, so this is implicitly covered. But it would be stronger to have an explicit assertion about this.
+
+**3c. Missing test: multiple sessions where some have shadow branches and some do not (Criticality: 6/10)**
+
+The existing `TestCleanCmd_All_ForceMode` test creates shadow branches but no session state files. The regression test creates one session with one shadow branch. There is no test that mixes: session A with a shadow branch (previously invisible to `--all`), session B without a shadow branch (previously visible), and verifies BOTH are cleaned. This would catch any logic that accidentally returns only one category.
+
+**3d. No unit test for `ListAllItems` function directly (Criticality: 5/10)**
+
+`ListAllCleanupItems` also has no unit test, so this is pre-existing. But since `ListAllItems` is the key behavioral change in this PR, a unit test confirming it returns all sessions and all shadow branches (not just orphaned) would provide more targeted regression protection than the full-command integration test.
+
+### 4. Test Quality Issues
+
+**4a. Message assertion fragility**
+
+Tests like `TestCleanCmd_All_NoOrphanedItems` and `TestRunCleanAllWithItems_NoItems` assert on exact substring matches like `"No items to clean up"`. This is fine for verifying user-facing output changed correctly, but these tests will break if the message wording changes. This is a minor concern and pre-existing to this PR.
+
+**4b. The regression test does not verify the specific item count in output**
+
+`TestCleanCmd_All_FindsSessionWithShadowBranch` only checks that output contains `"Deleted"`. It does not verify that 2 items were deleted (1 session state + 1 shadow branch). Checking for `"Deleted 2 items"` would make the test more precise about the expected behavior.
+
+### 5. Positive Observations
+
+- The regression test `TestCleanCmd_All_FindsSessionWithShadowBranch` directly targets the bug scenario described in the PR. It creates a session with a shadow branch (which the OLD code would skip) and verifies both the session file and shadow branch are deleted. This is a well-constructed regression test.
+
+- The existing test assertions for the "no items" message were updated from `"No orphaned items"` to `"No items to clean up"`, keeping them consistent with the new behavior.
+
+- The `ListAllItems` function is cleanly separated from `ListAllCleanupItems`, preserving the old function for any other callers that still need orphan-only semantics.
+
+- The help text and flag description were updated to reflect the new behavior (removing "orphaned" language), which shows attention to user-facing consistency.
+
+- The implementation correctly avoids the grace period filter and orphan checks that were in the old code path, which is the right semantic for a "clean everything" operation.
+
+### Summary of Recommended Actions
+
+| Priority | Gap | Criticality |
+|----------|-----|-------------|
+| Should add | Test with session that has committed checkpoints but no shadow branch | 7/10 |
+| Should add | Test with mixed sessions (some with shadow branches, some without) | 6/10 |
+| Nice to have | Unit test for `ListAllItems` function directly | 5/10 |
+| Nice to have | Assert specific item count in regression test output | 4/10 |
+
+The most important observation is that the regression test adequately covers the primary bug scenario. The gaps above are about ensuring completeness for related edge cases that could regress independently.</result>
+<usage><total_tokens>45373</total_tokens><tool_uses>15</tool_uses><duration_ms>86401</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a885e5b6cea8c0597</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli/1e341628-86ec-4a27-8980-6b7518777116/tasks/a885e5b6cea8c0597.output</output-file>
+<status>completed</status>
+<summary>Agent "Silent failure analysis" completed</summary>
+<result>Now let me look at whether the `ListOrphanedSessionStates` function in `ListAllCleanupItems` would double-count sessions that `ListAllItems` also adds.
+
+Looking at the new `ListAllItems` function (lines 363-397 in the PR):
+
+1. It calls `strat.ListOrphanedItems(ctx)` which returns ALL shadow branches as `CleanupTypeShadowBranch` items
+2. Then it calls `store.List(ctx)` and adds ALL sessions as `CleanupTypeSessionState` items
+
+Versus the old `ListAllCleanupItems`:
+1. It calls `strat.ListOrphanedItems(ctx)` -- same shadow branches
+2. Then calls `ListOrphanedSessionStates(ctx)` -- only orphaned sessions (with grace period and checkpoint checks)
+
+Now I have the full picture. Let me compile my findings.
+
+---
+
+Here is my error handling audit of PR #846 (`fix/clean-all-sessions`).
+
+## Issue 1: No Active Session Protection in `--all` Path
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/clean.go`, lines 68-69 (routing) and the `runCleanAll` function (line ~261 on PR branch)
+
+**Severity:** CRITICAL
+
+**Issue Description:** The `runCleanCurrentHead` path (no `--all` flag) has an active session guard at lines 99-114 that checks for ACTIVE-phase sessions and refuses to proceed without `--force`. The `runCleanAll` path bypasses this guard entirely. The new `ListAllItems` function returns ALL sessions regardless of phase, meaning `--all` will happily delete session state for a session that an agent is actively using RIGHT NOW, without any warning about active sessions (unless the user omits `--force`, in which case they get a generic confirmation prompt that does not distinguish active sessions from idle/ended ones).
+
+**User Impact:** A user runs `entire clean --all --force` while an agent is mid-turn. The session state file is deleted. The agent's next lifecycle hook (e.g., `Stop`, `PostCommit`) tries to load session state, fails, and either errors cryptically or silently loses checkpoint data. The user has no idea their in-progress work was disrupted because no warning was shown.
+
+**Recommendation:** Add an active session check to `runCleanAll` that mirrors the guard in `runCleanCurrentHead`. At minimum, warn the user about active sessions and require `--force` to override. Better yet, have `ListAllItems` annotate active sessions so the preview output distinguishes them (e.g., "Session X (ACTIVE -- agent may be running)").
+
+## Issue 2: Grace Period Removed for All Sessions
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/strategy/cleanup.go`, new `ListAllItems` function (lines 363-397 in the PR)
+
+**Severity:** HIGH
+
+**Issue Description:** The old `ListAllCleanupItems` called `ListOrphanedSessionStates` which has a 10-minute grace period (line 193: `if now.Sub(state.StartedAt) &lt; sessionGracePeriod`). This protects sessions that just started but haven't created their first checkpoint yet. The new `ListAllItems` function iterates `store.List(ctx)` directly and adds every session unconditionally -- no grace period check. A session that started 5 seconds ago, before the agent has even produced its first checkpoint, will be listed for deletion.
+
+**User Impact:** User starts an agent session, then in another terminal runs `entire clean --all --force` (perhaps as part of a scripted cleanup). The brand-new session state is deleted before the agent can save its first checkpoint. The agent then operates in a ghost state -- it may continue running but all checkpoint/session tracking is broken.
+
+**Recommendation:** Either (a) apply the same grace period filter in `ListAllItems`, or (b) at minimum, mark recently-started sessions with a distinct reason like "active (started &lt;1m ago)" so the user sees a clear warning in the preview. The current `"clean all"` reason string does not communicate any risk.
+
+## Issue 3: Orphaned Temp Files When Deleting Active Sessions
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/clean.go`, `listTempFiles` (line 449) and `runCleanAll` (line ~261)
+
+**Severity:** HIGH
+
+**Issue Description:** This is the specific interaction you asked about. `listTempFiles` builds a set of active session IDs (line 463-468) and SKIPS temp files belonging to those sessions (lines 479-484). But `ListAllItems` lists those same sessions for deletion. The execution order in `runCleanAll` is:
+
+1. `ListAllItems` returns all sessions (including active ones)
+2. `listTempFiles` sees those sessions as active and skips their temp files
+3. `DeleteAllCleanupItems` deletes the session state files
+4. The temp files that were skipped in step 2 are now orphaned -- the session state is gone but the temp files remain
+
+These orphaned temp files will never be cleaned up by a future `--all` run because the same race exists: `listTempFiles` checks for active sessions at listing time, but by the time deletion happens, the state is gone. Actually, on a FUTURE run there would be no session state, so `listTempFiles` would NOT skip them. But on THIS run, the temp files are missed. The user would need to run `--all` again to catch them.
+
+**User Impact:** After a `clean --all`, leftover temp files in `.entire/tmp/` accumulate. Not catastrophic, but it contradicts the "clean ALL data" promise of the flag. A user who expects a complete cleanup will have stale data left behind with no indication.
+
+**Recommendation:** Either (a) list temp files AFTER the session state deletion (not before), or (b) when `--all` is specified, do not filter temp files by active session (since those sessions are about to be deleted anyway). The simplest fix: in `runCleanAll`, pass a flag or use a separate code path for `listTempFiles` that skips the active-session filtering when performing a full cleanup.
+
+## Issue 4: `ListOrphanedItems` Error Not Wrapped with Context
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/strategy/cleanup.go`, `ListAllItems` line ~375
+
+**Severity:** MEDIUM
+
+**Issue Description:** The call `strat.ListOrphanedItems(ctx)` is wrapped with `"listing shadow branches: %w"`, which is good. However, looking at `ListOrphanedItems` itself (manual_commit.go line 122), the internal call to `ListShadowBranches` returns a bare `err` without wrapping: `return nil, err`. If `ListShadowBranches` fails because the repo cannot be opened, the error message propagated up to the user would be: `"failed to list items: listing shadow branches: failed to open git repository: ..."` which is actually acceptable. This is a minor note -- the wrapping is adequate in the new code.
+
+**Severity adjusted to:** LOW (informational only)
+
+## Issue 5: Potential Duplicate Session State Items
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/strategy/cleanup.go`, `ListAllItems` lines 370-395
+
+**Severity:** MEDIUM
+
+**Issue Description:** `ListAllItems` calls `strat.ListOrphanedItems(ctx)` which returns shadow branches (type `CleanupTypeShadowBranch`). Then it separately lists all sessions via `store.List(ctx)` and adds them as `CleanupTypeSessionState`. There is no deduplication concern between these two because they are different types. However, `ListOrphanedItems` only returns shadow branches, while the old `ListAllCleanupItems` called BOTH `ListOrphanedItems` (shadow branches) AND `ListOrphanedSessionStates` (orphaned sessions). The new function replaces the orphaned session list with an ALL sessions list. This is the intended behavior change, but there is no deduplication between sessions that `ListOrphanedItems` might return as `CleanupTypeSessionState` in the future if the method signature changes. Currently safe but fragile.
+
+**Severity adjusted to:** LOW (design note)
+
+## Issue 6: `listTempFiles` Silently Swallows `ListSessionStates` Error
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/clean.go`, line 465
+
+**Severity:** MEDIUM (pre-existing, not introduced by this PR, but relevant to the interaction)
+
+**Issue Description:** `listTempFiles` calls `strategy.ListSessionStates(ctx)` and silently ignores the error (`if states, listErr := ...; listErr == nil`). If listing session states fails, `activeSessionIDs` will be empty, and ALL temp files will be listed for deletion -- including those belonging to active sessions. This is a pre-existing issue but it becomes more dangerous in combination with the `--all` change: if the session state listing fails here but succeeds in `ListAllItems`, temp files for active sessions will be listed for deletion alongside those sessions, resulting in a more thorough but completely unintended cleanup.
+
+**Hidden Errors:** Filesystem permission errors, corrupted session state files, context cancellation -- all silently result in no active session protection for temp files.
+
+**Recommendation:** At minimum, log a warning when `ListSessionStates` fails. Ideally, propagate the error since silently removing active session protections is exactly the kind of hidden failure that causes debugging nightmares.
+
+## Summary of Critical Findings
+
+The most significant issue in this PR is the **absence of active session protection** in the `--all` code path. The default `entire clean` (current HEAD) path has a well-implemented guard that checks for ACTIVE-phase sessions and refuses to proceed without `--force`. The `--all` path introduced by this PR has no such guard, and the new `ListAllItems` function has no grace period filtering. This means `entire clean --all --force` will silently destroy in-progress agent sessions.
+
+The **temp file orphaning** issue (Issue 3) is a correctness bug: the listing and deletion happen in the wrong order relative to each other, guaranteeing that temp files belonging to soon-to-be-deleted sessions will be missed.
+
+The error handling for `session.NewStateStore` and `store.List` in the new `ListAllItems` function is actually done well -- both errors are properly wrapped and propagated. That is the one thing this PR gets right from an error handling perspective.</result>
+<usage><total_tokens>35190</total_tokens><tool_uses>16</tool_uses><duration_ms>121618</duration_ms></usage>
+</task-notification>
+
+---
+
+yes, and did you review all the comments on the pr too

@@ -1,0 +1,117 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "89347a654b11",
+  "session_id": "af734be5-6421-4df4-a91c-5ad790462491",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-26T16:19:53.617816Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "986766868300",
+  "token_usage": {
+    "input_tokens": 4217,
+    "cache_creation_tokens": 305377,
+    "cache_read_tokens": 56609546,
+    "output_tokens": 96248,
+    "api_call_count": 302
+  },
+  "session_metrics": {
+    "turn_count": 17
+  },
+  "summary": {
+    "intent": "Clean up code via a simplify pass, add cost visibility to the `entire improve` command, fix `insights` and `improve` commands showing all-zero scores and no patterns, then make insights more useful with better scoring and tool usage tracking.",
+    "outcome": "All four goals completed and committed: code cleaned up (deduped functions, fixed UTF-8 truncation, DRY'd tracker), cost display added to `entire improve`, on-demand summary backfilling implemented so insights/improve work without pre-existing summaries, token efficiency scoring fixed (was always 0), improve pattern detection switched from exact-match SQL to keyword-theme analyzer, and a new tool_calls table added to surface tool usage in insights.",
+    "learnings": {
+      "repo": [
+        "Sessions created before summarization was enabled have no summaries in checkpoint metadata, causing all scoring dimensions to show zero — insights/improve must backfill summaries on demand.",
+        "`nullableFloat` stored 0.0 scores as SQL NULL, making 'not computed' indistinguishable from a real zero score — score columns should store 0.0 directly.",
+        "`QueryRecurringFriction` used exact text matching against friction strings that are always unique full sentences — it never produces matches. `AnalyzePatterns` (keyword-theme grouping) was already implemented but unused.",
+        "Token efficiency scoring used a ~8k tokens/file baseline; real sessions use 300k–6M tokens/file, so the score was always 0. Fixed to use tokens-per-turn with a realistic baseline.",
+        "`gofmt` repeatedly strips trailing `//nolint:ireturn` comments from function signatures in capabilities.go; the nolint fix from one commit was never actually staged/committed.",
+        "The `summarize` package's `Entry.ToolName` and `Entry.ToolDetail` fields provide per-turn tool call data usable for extracting tool usage counts from transcripts.",
+        "`termstyle.TotalTokens` recursively includes subagent tokens; the inline `InputTokens + OutputTokens` calculation in insights_cmd.go was missing subagent tokens."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/insightsdb/db.go",
+          "line": 1,
+          "end_line": 60,
+          "finding": "Schema version bumped for new `has_summary INTEGER DEFAULT 0` column on sessions table and new `tool_calls` table (checkpoint_id, session_index, tool_name, count)."
+        },
+        {
+          "path": "cmd/entire/cli/insightsdb/cache.go",
+          "line": 1,
+          "end_line": 200,
+          "finding": "`nullableFloat` helper removed; `HasSummary bool` added to `SessionRow`; `insertToolCalls` added; `UpdateSessionSummary` added for backfill path."
+        },
+        {
+          "path": "cmd/entire/cli/improve/analyzer.go",
+          "line": 1,
+          "end_line": 120,
+          "finding": "Theme keyword lists expanded with real-world patterns (api, ci, conflict, review, etc.); `maxFrictionExamples = 10` cap added to prevent unbounded LLM prompt growth."
+        },
+        {
+          "path": "cmd/entire/cli/insights/scorer.go",
+          "line": 1,
+          "end_line": 100,
+          "finding": "Token efficiency rewritten to use tokens-per-turn ratio; focus score rewritten with gaussian curve; friction penalty changed from 20 to 15 per item."
+        },
+        {
+          "path": "cmd/entire/cli/insights_cmd.go",
+          "line": 1,
+          "end_line": 400,
+          "finding": "`backfillSummaries` function added — queries sessions with `has_summary=false`, generates summaries via Claude, updates cache. Wired into both `runInsights` and `runImprove`. Tool extraction via `extractToolCounts` added to cache refresh loop."
+        },
+        {
+          "path": "cmd/entire/cli/llmcli/llmcli.go",
+          "line": 1,
+          "end_line": 80,
+          "finding": "`Execute` signature changed to return `(string, *UsageInfo, error)` where `UsageInfo` carries `InputTokens`, `OutputTokens`, `TotalCostUSD` parsed from Claude CLI JSON response."
+        },
+        {
+          "path": "cmd/entire/cli/improve_cmd.go",
+          "line": 1,
+          "end_line": 350,
+          "finding": "Switched both dry-run and full run to use `AnalyzePatterns` (theme grouping) instead of `buildFrictionPatterns` (exact SQL match). `attachTranscriptExcerpts` updated to use `AffectedSessions` from pattern directly. Cost display added via `renderUsageLine`."
+        },
+        {
+          "path": "cmd/entire/cli/strategy/manual_commit_condensation.go",
+          "line": 1,
+          "end_line": 400,
+          "finding": "Removed duplicated `totalTokensFromUsage` function; replaced with `termstyle.TotalTokens()`. Also resolved merge conflict keeping session scoring block from branch and `writeOpts` variable + v2 dual-write from main."
+        },
+        {
+          "path": "cmd/entire/cli/agent/capabilities.go",
+          "line": 1,
+          "end_line": 150,
+          "finding": "Requires `//nolint:ireturn // <explanation>` on each interface-returning function. The `nolintlint` linter enforces both specific linter names and explanatory text. gofmt does NOT strip these comments — they were simply missing from the committed state."
+        }
+      ],
+      "workflow": [
+        "When `replace_all` is used on a function name that appears in both its definition and its calls, it renames the definition too — requiring a follow-up edit to restore the function name.",
+        "Pre-commit hooks or gofmt runs can silently revert edits if files aren't staged before the format step runs.",
+        "The Claude CLI `--output-format json` response includes `total_cost_usd` and `usage.input_tokens`/`output_tokens` fields directly parseable for cost tracking.",
+        "Backfilling summaries at query time (rather than requiring a prior summarize run) is the right UX — commands should be self-sufficient, not depend on prior automation having run."
+      ]
+    },
+    "friction": [
+      "`gofmt` was blamed multiple times for stripping `//nolint:ireturn` comments, causing repeated re-add cycles across multiple commits — actual cause was that the file was never staged in the first commit that was supposed to fix it.",
+      "`nolintlint` linter requires both the specific linter name (`ireturn`) and explanatory text in nolint directives, causing lint failures after adding bare `//nolint:ireturn` comments.",
+      "capabilities.go nolint fix from the simplify commit was not actually included in that commit, so the same lint errors resurfaced in the next session.",
+      "`improve --dry-run` showed 0 patterns for weeks because `AnalyzePatterns` was implemented but wired to nothing — `runImprove` was calling the exact-match SQL path instead.",
+      "The `replace_all` edit on `totalTokensFromUsage` renamed the function definition as well as its call sites, requiring a follow-up fix.",
+      "Friction grouping defaults to 'other' for items not matching known theme keywords — the theme keyword lists needed manual expansion to be useful."
+    ],
+    "open_items": [
+      "`statusStyles` wrapper in `status_style.go` adds indirection over `termstyle.Styles` — could be removed but requires refactoring `status.go`.",
+      "`termstyle.TotalTokens` lives in the presentation package but performs data computation — should move to `agent` or a utility package.",
+      "N+1 query pattern in `insightsdb/queries.go` `populateDenormalized` — 3 extra queries per session row (friction, learnings, tool_calls).",
+      "`SessionRow.CacheTokens` field declared but never populated.",
+      "Stringly-typed status/priority/direction values across packages — would benefit from typed constants or enums.",
+      "Tool counts in `tool_calls` table only populate for sessions summarized after this change; existing sessions won't have tool data until re-summarized or cache is cleared.",
+      "Theme keyword coverage for `AnalyzePatterns` is manually maintained — friction items not matching any theme fall through to 'other' and may be missed by `improve`."
+    ]
+  }
+}

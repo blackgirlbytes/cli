@@ -1,0 +1,21 @@
+/simplify
+
+---
+
+1. cmd/entire/cli/plugin.go:74
+     A non-executable entire-<name> on PATH is treated as “no plugin found”, so the user falls through to Cobra’s generic unknown-command path instead of
+     getting the intended plugin launch error. exec.LookPath returns an error for this case, and resolvePlugin currently collapses that into ok=false. I
+     verified the behavior locally: a 0644 entire-bad file on PATH makes LookPath("entire-bad") return exec: "entire-bad": executable file not found in $PATH.
+     That means the current comment on MaybeDispatchPlugin is not actually true for one of the main launch-failure cases it calls out.
+  2. cmd/entire/main.go:36, cmd/entire/cli/root.go:45
+     Plugin invocations bypass rootCmd.ExecuteContext, so PersistentPostRun never runs for them. Today that drops versioncheck.CheckAndNotify(...) entirely for
+     plugin commands, which is a user-visible regression compared with every built-in top-level command. It also means any future shared post-run behavior
+     added at the root will silently not apply to plugins unless it is duplicated in the early-dispatch path.
+  3. cmd/entire/cli/plugin.go:40
+     Plugin telemetry is emitted unconditionally after runPlugin, even when the plugin failed to launch or exited non-zero. That differs from built-in command
+     telemetry, which is sent from PersistentPostRun and therefore only after successful Cobra execution. For allowlisted plugins this will inflate usage with
+     failed/crashing invocations and make plugin telemetry semantically different from the existing command event stream.
+
+---
+
+did you do meaningful commits?

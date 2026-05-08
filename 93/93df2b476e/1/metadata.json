@@ -1,0 +1,74 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "9393df2b476e",
+  "session_id": "46b6f0ad-8975-4306-94a6-56bf49f213dd",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-26T23:47:22.729174Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "6ecd4245b5cf",
+  "token_usage": {
+    "input_tokens": 6496,
+    "cache_creation_tokens": 232429,
+    "cache_read_tokens": 24607754,
+    "output_tokens": 91993,
+    "api_call_count": 163
+  },
+  "session_metrics": {
+    "turn_count": 19
+  },
+  "summary": {
+    "intent": "Build a full interactive TUI dashboard for the memory-loop subsystem using Charmbracelet/bubbletea libraries, covering all 12 subcommands in a single tabbed interface with full CRUD management.",
+    "outcome": "A 4-tab bubbletea TUI (`entire memory-loop tui`) was implemented with Memories, Injection, History, and Settings tabs. The implementation is functional with orange accent colors, bordered detail panes, lifecycle actions, prompt testing, and settings cycling — though several visual polish iterations were required.",
+    "learnings": {
+      "repo": [
+        "The CLI uses a `termstyle` package for ANSI 256-color styling and respects `NO_COLOR` and `ACCESSIBLE=1` env vars.",
+        "The `memoryloop` package exposes `TransitionRecordLifecycle`, `SelectRelevant`, `AddManualRecord`, `PruneRecords`, and `SaveState` as the core mutation functions.",
+        "The project follows a package-per-feature structure: `memoryloop/`, `insights/`, `settings/` — the TUI was placed in `memorylooptui/` to match.",
+        "The `docs/superpowers/` directory is gitignored — brainstorming artifacts and specs written there are not tracked.",
+        "The project uses lipgloss v1 API for TUI styling."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memorylooptui/root.go",
+          "line": 88,
+          "end_line": 126,
+          "finding": "In bubbletea's type switch `switch msg := msg.(type)`, the inner typed `msg` is scoped to each case. Delegation code outside the switch must use the outer `msg` parameter (type `tea.Msg`), but type assertions on it still work correctly since the underlying value is preserved."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/styles.go",
+          "finding": "Lipgloss color `\"8\"` (dark gray) is effectively invisible on dark terminals. Use `\"245\"` (light gray) for visible borders and inactive tab labels."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_settings.go",
+          "finding": "Settings key handling required refactoring the `tea.Cmd` closure to capture the full `settingsChangedMsg` struct rather than pointer fields from local variables to avoid scope/state issues with async bubbletea message dispatch."
+        }
+      ],
+      "workflow": [
+        "Subagent-driven development works well for incremental TUI feature builds — dispatching Tasks 1-3 together as a single agent (since they're tightly coupled foundational scaffold) was more efficient than separate dispatches.",
+        "The brainstorm visual companion server (localhost) is ephemeral and needs to be restarted when the session ends — it doesn't persist between sessions.",
+        "Using debug logging to a file (not stdout, which bubbletea owns) is the correct approach for debugging bubbletea key handling issues.",
+        "Setting `maxWidth` caps (e.g., 80 cols) causes layout problems on wider terminals — content should adapt to actual terminal width from `WindowSizeMsg`.",
+        "Lipgloss border width must be explicitly set relative to the available width (`width - 2`) to render correctly; without it borders may not appear.",
+        "The visual companion mockups and the actual TUI can diverge significantly in spacing/borders — mockups use HTML/CSS which renders differently from terminal box-drawing characters."
+      ]
+    },
+    "friction": [
+      "Lipgloss border color `\"8\"` was invisible on dark terminals, causing multiple 'borders not showing' feedback cycles before switching to `\"245\"`.",
+      "Settings tab key handling appeared broken for several iterations — root cause was unclear and required adding file-based debug logging to diagnose; turned out to work after refactoring the cmd closure.",
+      "Injection tab content overflowed terminal height pushing the tab bar off-screen, requiring explicit row count caps on the log table.",
+      "The `maxWidth=80` initial cap caused narrow layout on wider terminals and needed to be removed.",
+      "The visual companion server shut down between sessions, requiring a restart and re-generation of all HTML mockup content."
+    ],
+    "open_items": [
+      "History tab `R` key (trigger refresh) is a placeholder — async refresh via bubbletea spinner is not yet wired to the actual `memoryloop` refresh function.",
+      "No unit tests for the TUI package — the design spec explicitly deferred this to 'manual verification'.",
+      "The `prune` action keybinding (`D`) was added to the spec late but its full UX (confirmation dialog) may not be fully implemented.",
+      "Injection tab prompt tester match scoring display may need real integration testing with actual memory data.",
+      "The visual companion server needs a persistent restart mechanism or the mockup HTML should be committed somewhere accessible."
+    ]
+  }
+}

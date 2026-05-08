@@ -1,0 +1,472 @@
+Implement the following plan:
+
+# Plan: Add model tracking for Claude Code and Gemini CLI agents
+
+## Context
+
+PR #581 adds LLM model name tracking to session info, but missed two agents:
+- **Claude Code**: Sends `model` in `SessionStart` hook payload (confirmed in docs)
+- **Gemini CLI**: Sends `llm_request.model` in `BeforeModel` hook payload (confirmed in docs)
+
+Both agents deliver model info on hooks that fire as **separate CLI processes** from TurnStart/TurnEnd. We need cross-process persistence for the model value.
+
+Additionally, the PR review identified several secondary issues to fix.
+
+## Design: Model Hint Files
+
+Store model in `.git/entire-sessions/{session_id}.model` — a tiny text file that persists across hook invocations within the same session:
+- **Written by**: `handleLifecycleSessionStart` (Claude Code), `handleLifecycleModelUpdate` (Gemini)
+- **Read by**: `handleLifecycleTurnStart` and `handleLifecycleTurnEnd` when `event.Model == ""`
+- **Cleaned up**: Alongside session state file cleanup (existing mechanism)
+
+## Steps
+
+### 1. Add `ModelUpdate` event type
+**File**: `cmd/entire/cli/agent/event.go`
+- Add `ModelUpdate` to `EventType` iota (after existing types)
+- Add case to `String()` method
+
+### 2. Add model hint storage functions
+**File**: `cmd/entire/cli/strategy/session_state.go`
+- `StoreModelHint(ctx, sessionID, model)` — writes `.git/entire-sessions/{session_id}.model`
+- `LoadModelHint(ctx, sessionID) string` — reads model hint, returns "" on error
+- Update `ClearSessionState` to also remove the `.model` hint file
+
+### 3. Claude Code: capture model from SessionStart
+**File**: `cmd/entire/cli/agent/claudecode/types.go`
+- Add `Model string \`json:"model"\`` to `sessionInfoRaw`
+
+**File**: `cmd/entire/cli/agent/claudecode/lifecycle.go`
+- In `parseSessionStart`: set `Event.Model = raw.Model`
+
+**File**: `cmd/entire/cli/agent/claudecode/lifecycle_test.go`
+- `TestParseHookEvent_SessionStart_IncludesModel` — SessionStart with model field
+- `TestParseHookEvent_SessionStart_EmptyModel` — SessionStart without model (backward compat)
+
+### 4. Gemini CLI: capture model from BeforeModel
+**File**: `cmd/entire/cli/agent/geminicli/types.go`
+- Add `beforeModelRaw` struct with `SessionID`, `TranscriptPath`, and nested `LLMRequest struct { Model string }`
+
+**File**: `cmd/entire/cli/agent/geminicli/lifecycle.go`
+- Change `HookNameBeforeModel` from pass-through to parsing `beforeModelRaw`
+- Return `agent.Event{Type: ModelUpdate, SessionID, Model}` when model is present
+- Return nil when model is empty (graceful fallback)
+
+**File**: `cmd/entire/cli/agent/geminicli/lifecycle_test.go`
+- `TestParseHookEvent_BeforeModel_ReturnsModelUpdate` — model present
+- `TestParseHookEvent_BeforeModel_EmptyModel_ReturnsNil` — no model, still pass-through
+- Update `TestParseHookEvent_PassThroughHooks_ReturnNil` to remove `HookNameBeforeModel`
+- Update `TestParseHookEvent_AllLifecycleHooks` table to include BeforeModel → ModelUpdate
+
+### 5. Lifecycle: model hint integration
+**File**: `cmd/entire/cli/lifecycle.go`
+- Add `handleLifecycleModelUpdate(ctx, ag, event)` — stores model hint via `strategy.StoreModelHint`
+- Add `case agent.ModelUpdate:` to `DispatchLifecycleEvent`
+- In `handleLifecycleSessionStart`: if `event.Model != ""`, store hint + update existing state's `ModelName`
+- In `handleLifecycleTurnStart`: if `event.Model == ""`, read hint → use as model arg to `InitializeSession`
+- In `handleLifecycleTurnEnd`: if `event.Model == ""`, read hint → use as model arg to `transitionSessionTurnEnd`
+
+### 6. Review fixes
+**File**: `cmd/entire/cli/agent/factoryaidroid/transcript.go`
+- Add `slog.Warn` for `json.Unmarshal` error in `ExtractModelFromTranscript` (distinguish corrupt from missing)
+
+**File**: `cmd/entire/cli/agent/factoryaidroid/transcript_test.go`
+- Add `TestExtractModelFromTranscript_CorruptSettingsFile`
+
+**File**: `cmd/entire/cli/strategy/manual_commit_hooks.go`
+- Add doc comment line for `model` parameter on `InitializeSession`
+
+**File**: `cmd/entire/cli/strategy/manual_commit_session.go`
+- Add doc comment line for `model` parameter on `initializeSession`
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Manually verify:
+- All existing tests still pass
+- New tests cover model propagation for Claude Code and Gemini
+- Model hint files are created/read correctly
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-1/56599601-5154-4a0e-9c52-994cebb11f88.jsonl
+
+---
+
+can't we...put the model into the session state file as opposed to another file we need to manage?
+
+---
+
+hmm, does gemini do per-turn model settings? (do any of the other agents do that?)
+(I'll come back to claude)
+
+---
+
+do all agents have the concept of a 'startSession'?
+
+---
+
+so perhaps we could split the session file creation into two parts - the initialisation (timestamps, model, startTime) at startSession and the rest where it is now on turnStart?
+
+---
+
+investigate the no BaseCommit state - explore
+
+---
+
+let's make sure to document why we have this file then 😓
+
+---
+
+and once we read the model we stick it into the session state?
+
+---
+
+ok fine.
+
+can we break this up into a few commits?
+
+---
+
+yep do it
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user provided a detailed implementation plan for adding model tracking for Claude Code and Gemini CLI agents. The plan included 6 steps plus verification.
+
+2. I created tasks and began implementing:
+   - Step 1: Added `ModelUpdate` event type to `event.go`
+   - Step 2: Added `StoreModelHint`, `LoadModelHint` to `session_state.go`, updated `ClearSessionState`
+   - Step 3: Added `Model` field to Claude Code's `sessionInfoRaw`, updated `parseSessionStart`, added tests
+   - Step 4: Added `beforeModelRaw` struct to Gemini CLI, `parseBeforeModel` method, updated tests
+   - Step 5: Added `handleLifecycleModelUpdate`, wired `ModelUpdate` dispatch, added hint reads to TurnStart/TurnEnd, added hint write to SessionStart
+   - Step 6: Added `slog.Warn` for corrupt settings in factoryaidroid, doc comments for model params, test for corrupt settings
+
+3. Lint error: `wrapcheck` linter caught unwrapped `os.WriteFile` return in `StoreModelHint`. Fixed by wrapping with `fmt.Errorf`.
+
+4. All tests passed (`mise run test:ci`).
+
+5. User feedback - CRITICAL DESIGN DISCUSSION:
+   - User asked: "can't we...put the model into the session state file as opposed to another file we need to manage?"
+   - I explained the timing issue: Claude Code's SessionStart fires before the state file exists
+   - User asked: "is the problem just around the timing of the session state file creation?"
+   - I confirmed yes
+   - User asked about per-turn model settings for Gemini and other agents
+   - I provided a table showing all agents' model delivery mechanisms
+   - User asked: "do all agents have the concept of a 'startSession'?" - Yes, all 5 do
+   - User suggested: "perhaps we could split the session file creation into two parts - the initialisation (timestamps, model, startTime) at startSession and the rest where it is now on turnStart?"
+   - I launched an explore agent to investigate empty BaseCommit impact
+   - The investigation found that empty BaseCommit would break: shadow branch naming, checkpoint writing, doctor classification, SaveStep recovery
+   - User asked: "and once we read the model we stick it into the session state?" - I confirmed yes
+   - User said: "ok fine." - accepted the hint file approach
+   - User asked: "can we break this up into a few commits?" - I proposed 5 commits
+
+6. I then:
+   - Updated the `StoreModelHint` doc comment with full rationale for why a separate file
+   - Refactored `handleLifecycleModelUpdate` to prefer direct state update when state exists, only falling back to hint file
+   - Ran fmt + lint (clean)
+   - Made commit 1: event type + hint storage (event.go, session_state.go)
+   - Made commit 2: Claude Code model capture (types.go, lifecycle.go, lifecycle_test.go)
+
+Remaining commits:
+3. Gemini CLI model capture
+4. Lifecycle wiring
+5. Review fixes
+
+Let me document all the specific files and changes carefully.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to implement a plan from PR #581 that adds LLM model name tracking for Claude Code and Gemini CLI agents. The plan was provided in full at the start. After implementation, the user engaged in a design discussion about whether to use a separate `.model` hint file vs putting the model into the session state file. After investigation showed that creating a partial session state (with empty BaseCommit) would break multiple systems, the user accepted the hint file approach but requested thorough documentation of *why* it exists. The user then asked to break the changes into multiple commits.
+
+2. Key Technical Concepts:
+   - **Cross-process persistence**: Each hook invocation (SessionStart, TurnStart, TurnEnd, BeforeModel) runs as a separate CLI process — no shared memory between them
+   - **Model hint file**: `.git/entire-sessions/{session_id}.model` — a lightweight text file bridging the gap between model arrival (SessionStart/BeforeModel) and session state creation (TurnStart)
+   - **SessionState requires BaseCommit**: BaseCommit is deeply wired as a required field used for shadow branch naming, checkpoint writing, doctor classification. Empty BaseCommit would produce invalid branch names like `entire/-<hash>`
+   - **Agent model delivery timing**:
+     - OpenCode, Cursor: model on TurnStart + TurnEnd (state exists)
+     - Factory AI Droid: model on TurnStart + TurnEnd + `.settings.json` fallback (state exists)
+     - Claude Code: model on SessionStart only (state does NOT exist yet)
+     - Gemini CLI: model on BeforeModel (state exists — fires after TurnStart)
+   - **ModelUpdate event type**: New lifecycle event for hooks that carry model info but have no other lifecycle significance
+   - All 5 agents (Claude Code, Gemini CLI, OpenCode, Cursor, Factory AI Droid) have SessionStart
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/agent/event.go`** — Added `ModelUpdate` event type
+     - Added to `EventType` iota after `SubagentEnd`
+     - Added case to `String()` method
+     ```go
+     // ModelUpdate indicates the agent reported the LLM model being used.
+     ModelUpdate
+     ```
+     ```go
+     case ModelUpdate:
+         return "ModelUpdate"
+     ```
+
+   - **`cmd/entire/cli/strategy/session_state.go`** — Model hint file storage + cleanup
+     - Added `StoreModelHint(ctx, sessionID, model)` with full doc comment explaining why a separate file is needed
+     - Added `LoadModelHint(ctx, sessionID) string`
+     - Updated `ClearSessionState` to also remove `.model` hint file
+     - Final doc comment on `StoreModelHint`:
+     ```go
+     // StoreModelHint writes the LLM model name to a lightweight hint file
+     // (.git/entire-sessions/{session_id}.model) for cross-process persistence.
+     //
+     // Why a separate file instead of SessionState?
+     //
+     // SessionState requires BaseCommit (used for shadow branch naming, checkpoint
+     // writing, doctor classification, etc.) and is only created during TurnStart
+     // when the git repo is fully inspected. Some agents report the model on earlier
+     // hooks that fire as separate CLI processes before TurnStart:
+     //
+     //   - Claude Code sends "model" on SessionStart (before any TurnStart)
+     //   - Gemini CLI sends "llm_request.model" on BeforeModel (after TurnStart,
+     //     so handleLifecycleModelUpdate writes to SessionState directly when it
+     //     exists and only falls back to this hint file otherwise)
+     //
+     // The hint is read by handleLifecycleTurnStart/TurnEnd when event.Model is
+     // empty, passed to InitializeSession, and persisted in state.ModelName. After
+     // that the hint file is redundant — it sits unused until ClearSessionState
+     // removes it alongside the session state file.
+     ```
+
+   - **`cmd/entire/cli/agent/claudecode/types.go`** — Added `Model` field to `sessionInfoRaw`
+     ```go
+     type sessionInfoRaw struct {
+         SessionID      string `json:"session_id"`
+         TranscriptPath string `json:"transcript_path"`
+         Model          string `json:"model,omitempty"`
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/claudecode/lifecycle.go`** — Updated `parseSessionStart` to populate `Event.Model`
+     ```go
+     return &agent.Event{
+         Type:       agent.SessionStart,
+         SessionID:  raw.SessionID,
+         SessionRef: raw.TranscriptPath,
+         Model:      raw.Model,
+         Timestamp:  time.Now(),
+     }, nil
+     ```
+
+   - **`cmd/entire/cli/agent/claudecode/lifecycle_test.go`** — Added 2 tests
+     - `TestParseHookEvent_SessionStart_IncludesModel` — verifies model field is parsed
+     - `TestParseHookEvent_SessionStart_EmptyModel` — verifies backward compat when model absent
+
+   - **`cmd/entire/cli/agent/geminicli/types.go`** — Added `beforeModelRaw` struct
+     ```go
+     type beforeModelRaw struct {
+         SessionID      string `json:"session_id"`
+         TranscriptPath string `json:"transcript_path"`
+         LLMRequest     struct {
+             Model string `json:"model"`
+         } `json:"llm_request"`
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/geminicli/lifecycle.go`** — Changed BeforeModel from pass-through to parsed
+     - Moved `HookNameBeforeModel` out of the pass-through case into its own `case` calling `g.parseBeforeModel(stdin)`
+     - Added `parseBeforeModel` method returning `ModelUpdate` event when model is present, nil when empty
+     ```go
+     func (g *GeminiCLIAgent) parseBeforeModel(stdin io.Reader) (*agent.Event, error) {
+         raw, err := agent.ReadAndParseHookInput[beforeModelRaw](stdin)
+         if err != nil {
+             return nil, err
+         }
+         model := raw.LLMRequest.Model
+         if model == "" {
+             return nil, nil
+         }
+         return &agent.Event{
+             Type:      agent.ModelUpdate,
+             SessionID: raw.SessionID,
+             Model:     model,
+             Timestamp: time.Now(),
+         }, nil
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/geminicli/lifecycle_test.go`** — Added/updated tests
+     - `TestParseHookEvent_BeforeModel_ReturnsModelUpdate` — model present → ModelUpdate event
+     - `TestParseHookEvent_BeforeModel_EmptyModel_ReturnsNil` — empty model → nil event
+     - Removed `HookNameBeforeModel` from `TestParseHookEvent_PassThroughHooks_ReturnNil`
+     - Updated `TestParseHookEvent_AllLifecycleHooks` table: BeforeModel now expects `ModelUpdate` with `llm_request` payload instead of `expectNil: true`
+
+   - **`cmd/entire/cli/lifecycle.go`** — Lifecycle wiring for model hints
+     - Added `case agent.ModelUpdate:` to `DispatchLifecycleEvent`
+     - Added `handleLifecycleModelUpdate` — prefers direct state update, falls back to hint file
+     - Updated `handleLifecycleSessionStart` — stores hint when `event.Model != ""`, updates state.ModelName if state exists
+     - Updated `handleLifecycleTurnStart` — reads hint when `event.Model == ""`
+     - Updated `handleLifecycleTurnEnd` — reads hint when `event.Model == ""`
+
+   - **`cmd/entire/cli/agent/factoryaidroid/transcript.go`** — Added `slog.Warn` for corrupt settings JSON
+     ```go
+     if err := json.Unmarshal(data, &settings); err != nil {
+         slog.Warn("corrupt settings file, cannot extract model",
+             slog.String("path", settingsPath),
+             slog.Any("error", err))
+         return ""
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/factoryaidroid/transcript_test.go`** — Added `TestExtractModelFromTranscript_CorruptSettingsFile`
+
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** — Added doc comment for `model` param on `InitializeSession`
+
+   - **`cmd/entire/cli/strategy/manual_commit_session.go`** — Added doc comment for `model` param on `initializeSession`
+
+4. Errors and fixes:
+   - **`wrapcheck` lint error**: `StoreModelHint` returned `os.WriteFile(...)` directly. The `wrapcheck` linter requires wrapping errors from external packages. Fixed by wrapping: `if err := os.WriteFile(...); err != nil { return fmt.Errorf("failed to write model hint file: %w", err) }`.
+   - **User feedback on design**: User pushed back on the `.model` hint file, asking why not use the session state file. This led to a thorough investigation of empty BaseCommit impact, which showed it would break shadow branch naming, checkpoint writing, doctor classification, and SaveStep recovery. User accepted the hint file approach after seeing the evidence but insisted on thorough documentation.
+   - **User feedback on `handleLifecycleModelUpdate`**: During the design discussion, I refined this function to prefer direct state update when the state file exists (Gemini's case) and only fall back to the hint file when state doesn't exist yet (Claude Code's case).
+
+5. Problem Solving:
+   - Solved the cross-process model persistence problem using hint files
+   - Investigated and documented why a partial SessionState (empty BaseCommit) approach won't work
+   - Refined `handleLifecycleModelUpdate` to avoid unnecessary hint file writes when state exists
+
+6. All user messages:
+   - "Implement the following plan: [detailed plan for model tracking]"
+   - "can't we...put the model into the session state file as opposed to another file we need to manage?"
+   - "is the problem just around the timing of the session state file creation?"
+   - "hmm, does gemini do per-turn model settings? (do any of the other agents do that?) (I'll come back to claude)"
+   - "do all agents have the concept of a 'startSession'?"
+   - "so perhaps we could split the session file creation into two parts - the initialisation (timestamps, model, startTime) at startSession and the rest where it is now on turnStart?"
+   - "investigate the no BaseCommit state - explore"
+   - "and once we read the model we stick it into the session state?"
+   - "ok fine."
+   - "let's make sure to document why we have this file then 😓"
+   - "can we break this up into a few commits?"
+   - "yep do it"
+
+7. Pending Tasks:
+   - Commit 3: Gemini CLI model capture (geminicli/types.go, geminicli/lifecycle.go, geminicli/lifecycle_test.go)
+   - Commit 4: Lifecycle wiring (lifecycle.go)
+   - Commit 5: Review fixes (factoryaidroid/transcript.go, factoryaidroid/transcript_test.go, manual_commit_hooks.go, manual_commit_session.go)
+
+8. Current Work:
+   Breaking changes into 5 commits as the user requested. Two commits have been made:
+   - Commit 1 (`c0e073df`): "add ModelUpdate event type and model hint file storage" — `event.go`, `session_state.go`
+   - Commit 2 (`2d3f4fe8`): "capture model from Claude Code SessionStart hook" — claudecode `types.go`, `lifecycle.go`, `lifecycle_test.go`
+   
+   Three commits remain to be created. All code changes are already written and verified (fmt, lint, test:ci all pass). The remaining files just need to be staged and committed.
+
+9. Optional Next Step:
+   Create commit 3 (Gemini CLI model capture). The user said "yep do it" in response to the 5-commit breakdown. I had just completed commit 2 and was about to stage and commit the Gemini CLI files: `cmd/entire/cli/agent/geminicli/types.go`, `cmd/entire/cli/agent/geminicli/lifecycle.go`, `cmd/entire/cli/agent/geminicli/lifecycle_test.go`.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-1/993f4b55-d917-4933-8513-05c115a0f7ef.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+do this with the corresponding tests?
+
+---
+
+oh we already committed the test...keep going
+
+---
+
+our base branch got merged, we need to move this to a new branch (and eventually PR).
+
+can we cut a new branch and rebase on origin/main please?
+
+---
+
+let's move to a new branch
+
+---
+
+we can rename this branch, we did rebase on origin/main already right?
+
+---
+
+push
+
+---
+
+yes, draft please
+
+---
+
+Base directory for this skill: /Users/alex/.claude/plugins/cache/entire-internal/entire-internal/1.0.0/skills/github-pr-review
+
+# GitHub PR Review
+
+GitHub PR interaction via `gh` CLI. For *evaluating* feedback, use `superpowers:receiving-code-review`.
+
+## Commands
+
+Script paths are relative to this skill's base directory — resolve to full paths when invoking.
+
+### Review threads (inline code comments)
+
+| Operation | Command |
+|-----------|---------|
+| Get PR context | `pr-info` → `{owner_repo, number, author}` |
+| Unresolved threads | `pr-threads <owner/repo> <pr>` |
+| Threads needing response | `pr-threads <owner/repo> <pr> <author>` |
+| All threads (inc. resolved) | `pr-threads <owner/repo> <pr> --all` |
+| Read a thread | `pr-thread <thread_id>` → `{path, line, diff_hunk, is_resolved, comments}` |
+| Reply to a thread | `pr-reply <owner/repo> <pr> <reply_to_id> <body>` |
+
+`thread_id` and `reply_to_id` come from `pr-threads` output.
+
+### General PR conversation
+
+| Operation | Command |
+|-----------|---------|
+| PR conversation comments | `pr-comments <owner/repo> <pr>` → `[{id, author, body}]` |
+
+### PR management
+
+| Operation | Command |
+|-----------|---------|
+| Create PR | `gh pr create --title "T" --body "B" [--draft]` |
+| Mark ready / draft | `gh pr ready [--undo] [number]` |
+| Edit PR | `gh pr edit [number] --title "T" --body "B"` |
+
+## Workflow: Respond to PR Review
+
+1. **Get context:** `pr-info`
+2. **Fetch threads needing response:** `pr-threads` with author filter
+3. **For each thread:** `pr-thread` to read full conversation + diff context
+   - Group related threads (e.g. same line from multiple comments)
+   - Use `superpowers:receiving-code-review` for evaluation
+   - IMPORTANT: Step through grouped feedback one by one with the user
+   - Fix code and/or note reply
+4. **Commit and push fixes** (need commit shas for replies)
+5. **If rebased:** re-fetch threads — comment IDs change after force-push
+6. **Reply to each thread:** `pr-reply` using `reply_to_id` from thread, with commit ref + description
+7. Ask if ready to mark PR as ready for review
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Top-level reply | Use `pr-reply` (hits `/comments/{id}/replies`, not `/comments`) |
+| Wrong ID for reply | Use `reply_to_id` from `pr-threads` output, not `thread_id` |
+| Re-responding to threads | Pass author arg to `pr-threads` to filter |
+| Forgetting to reply after fix | Always reply to confirm fix |
+| 404 after rebase | Re-fetch threads — IDs change after force-push |
+
+## Setup (One-Time)
+
+Fine-grained PAT at github.com → Settings → Developer settings → Fine-grained tokens:
+
+| Permission | Level |
+|------------|-------|
+| Pull requests | Read & Write |
+| Contents | Read |
+
+Permissions are configured in the plugin's `settings.json`.

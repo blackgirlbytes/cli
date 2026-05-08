@@ -1,0 +1,356 @@
+Implement the following plan:
+
+# Remove Auto-Commit Strategy
+
+## Context
+
+The auto-commit strategy is no longer needed and should be removed from the codebase. Manual-commit is already the default strategy and provides all necessary functionality. Removing auto-commit will simplify the codebase by:
+
+- Eliminating 2,500+ lines of implementation and test code
+- Reducing maintenance burden for a strategy that's not being used
+- Simplifying documentation and user guidance
+- Removing complexity from the strategy system
+
+Manual-commit is already the default and will remain as the only strategy after this change.
+
+## Migration Strategy for Existing Users
+
+Users who have `"strategy": "auto-commit"` in their settings files need to be automatically migrated to manual-commit. The migration should:
+
+1. **Detect auto-commit settings**: When loading settings, check if `strategy == "auto-commit"`
+2. **Print clear warning**: Display a message explaining:
+   - Auto-commit strategy has been removed
+   - Settings are being automatically updated to use manual-commit
+   - Manual-commit provides similar functionality without modifying the active branch
+3. **Update settings files**: Automatically change strategy to "manual-commit" and save:
+   - `.entire/settings.json` (if it contains the auto-commit setting)
+   - `.entire/settings.local.json` (if it contains the override)
+4. **One-time migration**: After settings are updated, subsequent runs won't show the warning
+
+**Implementation location**: `cmd/entire/cli/settings/settings.go` - Add migration logic in the `Load()` function after settings are loaded and merged, but before returning.
+
+**Warning message example**:
+```
+⚠️  Auto-commit strategy has been removed and is no longer supported.
+   Your settings have been automatically updated to use 'manual-commit' strategy.
+
+   Manual-commit provides similar session management without creating commits
+   on your active branch. See 'entire help' for more details.
+```
+
+## Files to Delete
+
+### Core Implementation
+1. **`cmd/entire/cli/strategy/auto_commit.go`** (1,106 lines)
+   - Main auto-commit strategy implementation
+   - Factory function and interface implementation
+
+2. **`cmd/entire/cli/strategy/auto_commit_test.go`** (1,038 lines)
+   - Unit tests for auto-commit strategy
+   - Comprehensive coverage of all auto-commit features
+
+3. **`cmd/entire/cli/integration_test/auto_commit_checkpoint_fix_test.go`** (319 lines)
+   - Integration tests for ENT-70 bug fix
+   - Tests specific to auto-commit behavior
+
+## Files to Modify
+
+### Settings Migration (NEW - for backward compatibility)
+
+**`cmd/entire/cli/settings/settings.go`**
+- Add migration function to detect and update auto-commit settings
+- Call migration after loading settings in `Load()` function (line ~88, after `applyDefaults()`)
+- Migration logic:
+  ```go
+  // After applyDefaults(settings)
+  migrated, err := migrateDeprecatedStrategy(settings)
+  if err != nil {
+      return nil, fmt.Errorf("migrating settings: %w", err)
+  }
+  if migrated {
+      // Print warning to stderr
+      fmt.Fprintln(os.Stderr, "⚠️  Auto-commit strategy has been removed...")
+  }
+  ```
+- New helper function `migrateDeprecatedStrategy()`:
+  - Checks if `settings.Strategy == "auto-commit"`
+  - Updates to `"manual-commit"`
+  - Saves to both `.entire/settings.json` and `.entire/settings.local.json` (check which file contains the auto-commit setting)
+  - Returns `true` if migration occurred, `false` if no migration needed
+- **Edge case**: Handle read-only settings files gracefully (log warning but don't fail)
+- **Testing**: Add unit test to verify migration logic
+
+### Strategy Package
+
+**`cmd/entire/cli/strategy/registry.go`**
+- Remove `StrategyNameAutoCommit` constant (lines 56-58)
+- Update `List()` function documentation to reflect single strategy
+- Note: Auto-commit registers itself via `init()` in auto_commit.go, which will be deleted
+
+### CLI Commands
+
+**`cmd/entire/cli/setup.go`**
+- Remove auto-commit display name constants (lines 24-26)
+- Remove auto-commit from display name mappings (lines 36-44)
+- Update help text (line 64) to remove auto-commit mention
+- Simplify strategy selection logic (may be able to remove strategy selection entirely)
+
+**`cmd/entire/cli/debug.go`**
+- Remove `debug auto-commit` subcommand (lines 28-56)
+- Remove auto-commit check from debug output (line 70)
+- Consider if debug command is still needed with only one strategy
+
+### Integration Tests
+
+**Critical: Several tests ONLY test auto-commit and need conversion**
+
+**`cmd/entire/cli/integration_test/resume_test.go`** (HIGH PRIORITY)
+- Lines 23-24: Comment explains tests only use auto-commit
+- 16 test functions explicitly using `StrategyNameAutoCommit`
+- **Action**: Convert all tests to use `StrategyNameManualCommit` or `RunForAllStrategies`
+- **Rationale**: Resume functionality should work with manual-commit too
+
+**`cmd/entire/cli/integration_test/worktree_test.go`** (HIGH PRIORITY)
+- Lines 25-27: Comment says "only tests auto-commit"
+- Tests worktree functionality specifically with auto-commit
+- **Action**: Convert to test with manual-commit strategy
+- **Rationale**: Worktree support works with manual-commit too
+
+**`cmd/entire/cli/integration_test/testenv.go`**
+- Line 191: Remove `StrategyNameAutoCommit` from test strategies list
+- Line 471: Update comment about strategy behavior
+
+**`cmd/entire/cli/integration_test/testenv_test.go`**
+- Line 219: Update expected strategy list (remove auto-commit)
+
+**`cmd/entire/cli/integration_test/hooks_test.go`**
+- Line 198: Remove special auto-commit handling in test assertions
+- Simplify test logic that differentiates between strategies
+
+**`cmd/entire/cli/integration_test/rewind_test.go`**
+- Lines 441-449: Remove auto-commit specific test cases
+- Update comments that reference auto-commit behavior
+
+**`cmd/entire/cli/integration_test/subagent_checkpoints_test.go`**
+- Lines 299-302: Remove auto-commit special case handling
+- Simplify test assertions
+
+**Other test files** (update assertions/references):
+- `cmd/entire/cli/setup_test.go`
+- `cmd/entire/cli/status_test.go`
+- `cmd/entire/cli/reset_test.go`
+- `cmd/entire/cli/resume_test.go`
+- `cmd/entire/cli/config_test.go`
+- `cmd/entire/cli/explain_test.go`
+- `cmd/entire/cli/strategy/clean_test.go`
+- `cmd/entire/cli/strategy/rewind_test.go`
+
+### E2E Tests
+
+**`cmd/entire/cli/e2e_test/scenario_checkpoint_test.go`**
+- Remove or update auto-commit references in E2E test scenarios
+
+### Documentation
+
+**`CLAUDE.md`** (primary documentation)
+- Line 292: Update strategy comparison table (remove auto-commit row)
+- Lines 310-337: Remove "Auto-Commit Strategy" section entirely
+- Line 435: Update checkpoint ID generation section (remove auto-commit specifics)
+- Line 503: Update commit trailers section (remove auto-commit examples)
+- Simplify "Session Strategies" section since only manual-commit remains
+- Update "Available Strategies" table to show only manual-commit
+- Consider renaming "Session Strategies" section to "Session Management" since there's only one approach now
+
+**`README.md`**
+- Line 187: Update `--strategy` flag documentation (remove or simplify)
+- Lines 193-194: Remove auto-commit example
+- Line 236: Update settings table (remove strategy column if no longer relevant)
+- Line 287: Update rewind error messages (remove auto-commit specific errors)
+
+**`GEMINI.md`**
+- Same changes as CLAUDE.md (appears to be a copy)
+
+**`CHANGELOG.md`**
+- Line 46: Keep historical reference (don't modify old changelog entries)
+- Optionally add entry for this removal in next release
+
+**`docs/architecture/sessions-and-checkpoints.md`**
+- Line 152: Remove `AutoCommitStrategy.SaveChanges()` reference
+- Update document to focus on manual-commit implementation
+
+**`docs/architecture/logging.md`**
+- Line 152: Update checkpoint logging reference (remove auto-commit specific examples)
+
+**`docs/architecture/claude-hooks-integration.md`**
+- Line 123: Update session state update examples (remove auto-commit)
+
+**Skills and Agent Documentation** (minor updates):
+- `.claude/skills/test-repo/SKILL.md`
+- `.claude/skills/test-repo/test-harness.sh`
+- `.claude/agents/reviewer.md`
+- `.gemini/agents/reviewer.md`
+
+**Issue Template**:
+- `.github/ISSUE_TEMPLATE/bug_report.yml` (update if strategy field needs changing)
+
+### Strategy Package Shared Code
+
+**`cmd/entire/cli/strategy/common.go`**
+- Review for auto-commit specific code (likely none, but verify)
+
+**`cmd/entire/cli/strategy/push_common.go`**
+- Review shared PrePush logic (likely unchanged, as manual-commit also pushes metadata)
+
+**`cmd/entire/cli/strategy/session.go`**
+- Review for auto-commit specific types or logic
+
+**`cmd/entire/cli/checkpoint/checkpoint.go`**
+- Review types (CommittedCheckpoint still needed for manual-commit's condensed metadata)
+
+## Implementation Steps
+
+### Phase 1: Delete Core Files
+1. Delete `auto_commit.go`
+2. Delete `auto_commit_test.go`
+3. Delete `auto_commit_checkpoint_fix_test.go`
+
+### Phase 2: Add Settings Migration (for backward compatibility)
+1. Add `migrateDeprecatedStrategy()` function to `settings/settings.go`
+2. Call migration from `Load()` function after `applyDefaults()`
+3. Test migration with unit test (create fake settings with auto-commit, verify it gets updated)
+4. Verify warning message displays correctly
+
+### Phase 3: Update Strategy Registry
+1. Remove constant from `registry.go`
+2. Update `setup.go` to remove strategy selection (or simplify)
+3. Update `debug.go` to remove auto-commit subcommand
+
+### Phase 4: Fix Tests (CRITICAL)
+1. **Convert resume tests** (`resume_test.go`) to use manual-commit
+2. **Convert worktree tests** (`worktree_test.go`) to use manual-commit
+3. Update `testenv.go` to remove auto-commit from test strategies
+4. Update all other test files to remove auto-commit assertions
+5. Run `mise run test:integration` to verify all tests pass
+
+### Phase 5: Update Documentation
+1. Update `CLAUDE.md` (remove auto-commit sections, simplify strategy documentation)
+2. Update `README.md` (remove auto-commit examples and references)
+3. Update `GEMINI.md` (mirror CLAUDE.md changes)
+4. Update architecture docs in `docs/architecture/`
+5. Update skills/agents documentation
+
+### Phase 6: Cleanup and Polish
+1. Review shared strategy code for any auto-commit remnants
+2. Search for remaining "auto-commit" or "auto_commit" strings
+3. Consider if strategy selection UI is still needed (setup.go)
+4. Consider if debug command needs simplification
+
+## Testing Strategy
+
+### Unit Tests
+```bash
+mise run test
+```
+Should pass after removing auto-commit tests.
+
+### Integration Tests (CRITICAL)
+```bash
+mise run test:integration
+```
+Must pass after converting resume_test.go and worktree_test.go to manual-commit.
+
+### Full CI Suite
+```bash
+mise run test:ci
+```
+Runs both unit and integration tests - must pass before merging.
+
+### Linting
+```bash
+mise run fmt && mise run lint
+```
+Ensure code formatting and lint checks pass.
+
+### Manual Verification
+1. Run `entire enable` - should work without strategy selection
+2. Run `entire status` - should show manual-commit as strategy
+3. Run `entire debug` - should not show auto-commit subcommand
+4. Verify session workflow: UserPromptSubmit → Stop → PostCommit hooks work correctly
+
+## Key Decisions
+
+### How to Handle Existing Auto-Commit Users?
+**Decision: Automatic migration with one-time warning**
+
+Alternatives considered:
+1. ❌ **Fail with error** - Would break existing users' workflows
+2. ❌ **Silent fallback** - Would confuse users who wonder why their setting isn't being respected
+3. ❌ **Manual migration command** - Adds friction and requires user action
+4. ✅ **Automatic migration with warning** - Best user experience, transparent, and one-time
+
+Implementation approach:
+- Migration happens in `settings.Load()` function
+- Detect `strategy == "auto-commit"` after loading and merging settings
+- Print clear warning message to stderr explaining the change
+- Update settings file(s) to use "manual-commit"
+- Gracefully handle read-only files (log warning but don't fail)
+- Migration happens once - subsequent runs won't trigger warning
+
+### Keep or Remove Strategy Selection?
+Since there's only one strategy now:
+- **Option 1**: Remove strategy selection entirely from `enable` command - simplify to just enable manual-commit
+- **Option 2**: Keep strategy infrastructure for potential future strategies
+- **Recommendation**: Keep infrastructure (registry.go, Strategy interface) but simplify setup.go to not prompt for strategy selection
+
+### Simplify Debug Command?
+- Current: `entire debug auto-commit` subcommand
+- After removal: Only manual-commit remains
+- **Recommendation**: Keep `entire debug` command but remove strategy-specific subcommands
+
+### Documentation Simplification
+- Current: Heavy emphasis on comparing two strategies
+- After removal: Focus on how manual-commit works
+- **Recommendation**: Rename "Session Strategies" to "Session Management", remove comparison tables
+
+## Verification Checklist
+
+After implementation:
+- [ ] All files deleted (3 files)
+- [ ] Settings migration implemented and tested
+- [ ] Migration warning message displays correctly
+- [ ] All tests pass (`mise run test:ci`)
+- [ ] Linting passes (`mise run lint`)
+- [ ] No remaining "auto-commit" or "AutoCommit" references in code (except historical CHANGELOG)
+- [ ] Documentation updated (CLAUDE.md, README.md, GEMINI.md, architecture docs)
+- [ ] `entire enable` works without strategy selection
+- [ ] `entire status` shows manual-commit
+- [ ] `entire debug` works (no auto-commit subcommand)
+- [ ] Resume functionality tested with manual-commit
+- [ ] Worktree functionality tested with manual-commit
+
+### Migration Testing
+Test the migration manually:
+1. Create test repo with `.entire/settings.json` containing `"strategy": "auto-commit"`
+2. Run any `entire` command (e.g., `entire status`)
+3. Verify warning message is displayed
+4. Verify settings file now contains `"strategy": "manual-commit"`
+5. Run command again, verify no warning (migration only happens once)
+
+## Critical Files for Review
+
+Files that require careful testing after modification:
+1. `cmd/entire/cli/integration_test/resume_test.go` - 16 test functions to convert
+2. `cmd/entire/cli/integration_test/worktree_test.go` - worktree tests to convert
+3. `cmd/entire/cli/setup.go` - strategy selection logic to simplify
+4. `CLAUDE.md` - extensive documentation to update
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.REDACTED.jsonl
+
+---
+
+mise run test:e2e is failing
+
+---
+
+you should run them now, because its failing and I want you to fix them

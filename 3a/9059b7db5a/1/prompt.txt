@@ -1,0 +1,235 @@
+Implement the following plan:
+
+# Fix Droid "(no prompt)" after commit
+
+## Context
+
+When a Factory AI Droid session creates checkpoints and the user commits, `entire explain` shows `(no prompt)` for the committed checkpoint. Before the commit, the temporary (shadow branch) checkpoint correctly shows the prompt.
+
+**Root cause**: Three functions parse transcripts in an agent-aware way (Gemini vs Claude Code) but lack a Droid-specific path. Since Droid uses a different JSONL envelope (`{"type":"message","message":{"role":"user",...}}`) vs Claude Code (`{"type":"user","message":{"content":...}}`), the generic Claude Code parser fails to find user messages. The top-level `type` is always `"message"`, which doesn't match the `"user"`/`"human"` check.
+
+Temporary checkpoints work because `SaveStep()` uses the agent-specific `ExtractPrompts()` method (in `lifecycle.go`) which correctly handles the Droid envelope. Committed checkpoints fail because condensation re-extracts prompts from the raw transcript using the generic parser.
+
+## Changes
+
+### 1. Add Droid handling to `extractUserPrompts()`
+**File**: `cmd/entire/cli/strategy/manual_commit_condensation.go:500-527`
+
+Add a `case agent.AgentTypeFactoryAIDroid` branch that uses `factoryaidroid.ParseDroidTranscriptFromBytes()` to normalize the transcript, then extracts user messages from the normalized lines using `transcript.ExtractUserContent()`.
+
+```go
+func extractUserPrompts(agentType agent.AgentType, content string) []string {
+    if content == "" {
+        return nil
+    }
+
+    // Droid has its own envelope format — use its parser
+    if agentType == agent.AgentTypeFactoryAIDroid {
+        lines, err := factoryaidroid.ParseDroidTranscriptFromBytes([]byte(content))
+        if err != nil {
+            return nil
+        }
+        var prompts []string
+        for _, line := range lines {
+            if line.Type != transcript.TypeUser {
+                continue
+            }
+            if text := transcript.ExtractUserContent(line.Message); text != "" {
+                if stripped := textutil.StripIDEContextTags(text); stripped != "" {
+                    prompts = append(prompts, stripped)
+                }
+            }
+        }
+        return prompts
+    }
+
+    // (existing Gemini + Claude Code logic unchanged)
+    ...
+}
+```
+
+### 2. Add Droid handling to `calculateTokenUsage()`
+**File**: `cmd/entire/cli/strategy/manual_commit_condensation.go:533-562`
+
+Add a `case agent.AgentTypeFactoryAIDroid` branch that uses `factoryaidroid.ParseDroidTranscriptFromBytes()` + `factoryaidroid.CalculateTokenUsage()`.
+
+```go
+func calculateTokenUsage(agentType agent.AgentType, data []byte, startOffset int) *agent.TokenUsage {
+    ...
+    // Droid has its own envelope format — use its parser
+    if agentType == agent.AgentTypeFactoryAIDroid {
+        lines, err := factoryaidroid.ParseDroidTranscriptFromBytes(data)
+        if err != nil || len(lines) == 0 {
+            return &agent.TokenUsage{}
+        }
+        if startOffset > 0 && startOffset < len(lines) {
+            lines = lines[startOffset:]
+        }
+        return factoryaidroid.CalculateTokenUsage(lines)
+    }
+    ...
+}
+```
+
+### 3. Add Droid handling to `BuildCondensedTranscriptFromBytes()`
+**File**: `cmd/entire/cli/summarize/summarize.go:115-128`
+
+The function already groups `AgentTypeFactoryAIDroid` with Claude Code (line 119), but then uses `transcript.ParseFromBytes()` which doesn't normalize the Droid envelope. Fix: use `factoryaidroid.ParseDroidTranscriptFromBytes()` for Droid, then pass normalized lines to `BuildCondensedTranscript()`.
+
+```go
+func BuildCondensedTranscriptFromBytes(content []byte, agentType agent.AgentType) ([]Entry, error) {
+    switch agentType {
+    case agent.AgentTypeGemini:
+        return buildCondensedTranscriptFromGemini(content)
+    case agent.AgentTypeFactoryAIDroid:
+        lines, err := factoryaidroid.ParseDroidTranscriptFromBytes(content)
+        if err != nil {
+            return nil, fmt.Errorf("failed to parse Droid transcript: %w", err)
+        }
+        return BuildCondensedTranscript(lines), nil
+    case agent.AgentTypeClaudeCode, agent.AgentTypeUnknown:
+        // Claude format - fall through to shared logic below
+    }
+    lines, err := transcript.ParseFromBytes(content)
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse transcript: %w", err)
+    }
+    return BuildCondensedTranscript(lines), nil
+}
+```
+
+### 4. Add import for `factoryaidroid` package
+**Files**:
+- `cmd/entire/cli/strategy/manual_commit_condensation.go` - add `"github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid"`
+- `cmd/entire/cli/summarize/summarize.go` - add `"github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid"`
+
+Both files already import other agent packages (`claudecode`, `geminicli`), so this is consistent.
+
+## Existing code to reuse
+
+- `factoryaidroid.ParseDroidTranscriptFromBytes()` — `cmd/entire/cli/agent/factoryaidroid/transcript.go:50` — normalizes Droid JSONL to `transcript.Line` (already exists, tested)
+- `factoryaidroid.CalculateTokenUsage()` — `cmd/entire/cli/agent/factoryaidroid/transcript.go:171` — computes token usage from normalized lines (already exists, handles streaming dedup)
+- `transcript.ExtractUserContent()` — `cmd/entire/cli/transcript/parse.go` — extracts text from normalized message (already used by Droid's `ExtractPrompts()`)
+- `textutil.StripIDEContextTags()` — strips IDE context tags (already used everywhere)
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci` — all tests pass, no lint errors
+2. Manual test: run a Droid session, create a checkpoint, commit, then `entire explain` — prompt should now appear
+3. Existing integration tests should continue to pass (no behavioral change for Claude Code or Gemini)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.REDACTED.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   cmd/entire/cli/strategy/manual_commit_condensation.go
+	modified:   cmd/entire/cli/summarize/summarize.go
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/strategy/manual_commit_condensation.go b/cmd/entire/cli/strategy/manual_commit_condensation.go
+index fc24205d..27401495 100644
+--- a/cmd/entire/cli/strategy/manual_commit_condensation.go
++++ b/cmd/entire/cli/strategy/manual_commit_condensation.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
+ 	"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"
++	"github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid"
+ 	"github.com/entireio/cli/cmd/entire/cli/agent/geminicli"
+ 	cpkg "github.com/entireio/cli/cmd/entire/cli/checkpoint"
+ 	"github.com/entireio/cli/cmd/entire/cli/checkpoint/id"
+@@ -502,6 +503,26 @@ func extractUserPrompts(agentType agent.AgentType, content string) []string {
+ 		return nil
+ 	}
+ 
++	// Droid has its own envelope format — use its parser to normalize first
++	if agentType == agent.AgentTypeFactoryAIDroid {
++		lines, err := factoryaidroid.ParseDroidTranscriptFromBytes([]byte(content))
++		if err != nil {
++			return nil
++		}
++		var prompts []string
++		for _, line := range lines {
++			if line.Type != transcript.TypeUser {
++				continue
++			}
++			if text := transcript.ExtractUserContent(line.Message); text != "" {
++				if stripped := textutil.StripIDEContextTags(text); stripped != "" {
++					prompts = append(prompts, stripped)
++				}
++			}
++		}
++		return prompts
++	}
++
+ 	// Try Gemini format first if agentType is Gemini, or as fallback if Unknown
+ 	if agentType == agent.AgentTypeGemini || agentType == agent.AgentTypeUnknown {
+ 		prompts, err := geminicli.ExtractAllUserPrompts([]byte(content))
+@@ -535,6 +556,18 @@ func calculateTokenUsage(agentType agent.AgentType, data []byte, startOffset int
+ 		return &agent.TokenUsage{}
+ 	}
+ 
++	// Droid has its own envelope format — use its parser to normalize first
++	if agentType == agent.AgentTypeFactoryAIDroid {
++		lines, err := factoryaidroid.ParseDroidTranscriptFromBytes(data)
++		if err != nil || len(lines) == 0 {
++			return &agent.TokenUsage{}
++		}
++		if startOffset > 0 && startOffset < len(lines) {
++			lines = lines[startOffset:]
++		}
++		return factoryaidroid.CalculateTokenUsage(lines)
++	}
++
+ 	// Try Gemini format first if agentType is Gemini, or as fallback if Unknown
+ 	if agentType == agent.AgentTypeGemini || agentType == agent.AgentTypeUnknown {
+ 		// Attempt to parse as Gemini JSON
+diff --git a/cmd/entire/cli/summarize/summarize.go b/cmd/entire/cli/summarize/summarize.go
+index 4fdbec97..c03ef2a5 100644
+--- a/cmd/entire/cli/summarize/summarize.go
++++ b/cmd/entire/cli/summarize/summarize.go
+@@ -9,6 +9,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
++	"github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid"
+ 	"github.com/entireio/cli/cmd/entire/cli/agent/geminicli"
+ 	"github.com/entireio/cli/cmd/entire/cli/checkpoint"
+ 	"github.com/entireio/cli/cmd/entire/cli/transcript"
+@@ -116,7 +117,14 @@ func BuildCondensedTranscriptFromBytes(content []byte, agentType agent.AgentType
+ 	switch agentType {
+ 	case agent.AgentTypeGemini:
+ 		return buildCondensedTranscriptFromGemini(content)
+-	case agent.AgentTypeClaudeCode, agent.AgentTypeFactoryAIDroid, agent.AgentTypeUnknown:
++	case agent.AgentTypeFactoryAIDroid:
++		// Droid has its own envelope format — normalize before condensing
++		droidLines, err := factoryaidroid.ParseDroidTranscriptFromBytes(content)
++		if err != nil {
++			return nil, fmt.Errorf("failed to parse Droid transcript: %w", err)
++		}
++		return BuildCondensedTranscript(droidLines), nil
++	case agent.AgentTypeClaudeCode, agent.AgentTypeUnknown:
+ 		// Claude format - fall through to shared logic below
+ 	}
+ 	// Claude format (JSONL) - handles Claude Code, Unknown, and any future agent types
+- Current branch: alisha/factoryai-agent
+- Recent commits: cd0220e3 Merge branch 'main' into alisha/factoryai-agent
+c83248a7 Add Factory AI Droid integration tests
+da2c18a7 Simplify Droid transcript parsing code
+bdf4c1af Fix Factory AI Droid transcript parsing and session lifecycle issues
+3c37cf55 Add Factory AI Droid agent integration
+9e0d4603 Merge pull request #426 from entireio/soph/do-not-track-git-ignored-files-in-session
+16313647 Merge pull request #425 from entireio/rwr/refactor-agent-remove-GetHookConfigPath
+3524400d don't track gitignored files (for example node_modules) in our session metadata as untracked_files_at_start
+9ad1ad95 remove unused GetHookConfigPath from Agent interface
+cef002c0 Merge pull request #403 from entireio/gtrrz-victor/fix-restore-sessions
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

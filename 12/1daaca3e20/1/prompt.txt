@@ -1,0 +1,99 @@
+Implement the following plan:
+
+# Deep Dive: Why Cursor CLI E2E Tests Are Flaky
+
+## Context
+
+CI run [22831463580](https://github.com/entireio/cli/actions/runs/22831463580) (commit `a258927d`) shows 2/42 cursor-cli tests failing: `TestPartialStaging` and `TestUserSplitsAgentChanges`. Additionally, the current branch HEAD (`e90e3f9c`) reverted the per-session config isolation fix, meaning the ENOENT race condition is also unfixed.
+
+There are **two independent flakiness sources** for cursor-cli:
+
+---
+
+## Finding 1: Premature WaitFor Settle (Root Cause of CI Failures)
+
+### Evidence
+
+**TestPartialStaging** — second prompt produced no file changes:
+- `split_commits_test.go:89`: `git commit -m Add goodbye world failed: exit status 1` — "nothing added to commit"
+- Console shows agent started, displayed "Claude 4.6 Opus (Thinking)" + status bar `/ commands · @ files · ! shell`, but never produced output
+- `RunPrompt` returned **without error** (no timeout), meaning WaitFor matched and settled
+
+**TestUserSplitsAgentChanges** — agent created zero files:
+- `split_commits_test.go:27-28`: `expected files matching docs/c.md` / `docs/d.md` — empty
+- Same pattern: agent showed "Thinking" + `/ commands` status bar, then WaitFor settled
+
+### Root Cause
+
+The Cursor CLI's TUI **always shows `/ commands` in the status bar**, including during the "Thinking" phase. The WaitFor mechanism:
+
+1. Matches `/ commands` pattern against full pane content (line 138 of tmux.go)
+2. Checks content changed since Send (it did — prompt was echoed)
+3. Waits for 2 seconds of stable content (`settleTime = 2 * time.Second`)
+4. Returns success
+
+**The problem**: When the model takes >2 seconds to start producing visible output after "Thinking" starts, the pane content is stable (nothing is changing visually), and WaitFor settles on the stale `/ commands` text. The test thinks the agent finished, but it's still thinking.
+
+This explains why 40/42 tests pass — most of the time the model responds fast enough that the content keeps changing (file edits, response text), preventing premature settle.
+
+### Fix: Use Completion-Specific Pattern
+
+**File**: `e2e/agents/cursor_cli.go`
+
+Change the completion WaitFor in `RunPrompt` (line 113) from:
+```go
+content, waitErr := s.WaitFor(a.PromptPattern(), timeout)
+```
+to:
+```go
+content, waitErr := s.WaitFor(`Add a follow-up`, timeout)
+```
+
+The `Add a follow-up` text only appears in Cursor's input box **after** the agent finishes processing a prompt. It does NOT appear during the "Thinking" phase.
+
+Keep `PromptPattern()` as `/ commands` for initial startup detection (used in `acceptTrustDialogIfNeeded` and the startup WaitFor).
+
+Similarly update `StartSession`'s `SendPrompt` flow if it exists, and the `Session` `WaitForReady` pattern.
+
+---
+
+## Finding 2: ENOENT Config Race (Reverted Fix)
+
+### Evidence
+
+The current HEAD (`e90e3f9c`) reverted commit `a258927d` which isolated each cursor session's config directory. Without isolation, parallel cursor sessions write to the shared `~/.config/cursor/cli-config.json` via atomic temp-file rename, causing ENOENT crashes.
+
+### Fix: Re-apply Config Isolation
+
+**File**: `e2e/agents/cursor_cli.go`
+
+Re-implement `cursorConfigDir()` from commit `a258927d`:
+- Create unique temp dir per session: `/tmp/cursor-e2e-config-<random>/`
+- Set `XDG_CONFIG_HOME` and `HOME` to this directory
+- Pre-seed `cursor/cli-config.json` with `{}`
+- Register cleanup via `s.OnClose()`
+
+---
+
+## Files to Modify
+
+| File | Change |
+|------|--------|
+| `e2e/agents/cursor_cli.go` | Change completion WaitFor pattern to `Add a follow-up`; re-add `cursorConfigDir()` per-session isolation |
+
+## Verification
+
+1. `mise run fmt && mise run lint`
+2. `mise run test:e2e:canary` — Vogon canary must pass
+3. `mise run test:e2e --agent cursor-cli` — full cursor-cli suite (requires user approval due to API costs)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/0a5e04c5-bd7f-4ac9-a2a5-6cb259d7c813.jsonl
+
+---
+
+that didn;t work update the @.claude/skills/e2e/implement.md to always run the appropriate e2e tests to verify changes
+
+---
+
+[Request interrupted by user for tool use]

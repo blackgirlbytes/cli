@@ -1,0 +1,1038 @@
+Implement the following plan:
+
+# Fix: Stale ACTIVE sessions condensed into every commit
+
+## Context
+
+Checkpoint `6e19340bc0c8` on `entire/checkpoints/v1` contains 7 unrelated sessions (PR reviews, merge conflicts, logging work) all condensed together. Root cause: when an agent is killed without the Stop hook firing, its session remains in ACTIVE phase permanently. PostCommit unconditionally sets `hasNew = true` for ACTIVE sessions (line 611-612) and skips the `filesOverlapWithContent` check (line 494), so stale ACTIVE sessions get condensed into every commit.
+
+PR #359 fixed this for **IDLE** sessions but left stale **ACTIVE** sessions unaddressed.
+
+## Fix
+
+### File: `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+**1. Pass `filesTouchedBefore` to the handler** (around line 645)
+
+Add a `filesTouchedBefore` field to `postCommitActionHandler`. Set it from the already-computed `filesTouchedBefore` variable (line 630-634), which includes transcript-extracted files for ACTIVE sessions.
+
+**2. Apply overlap check in `HandleCondense` for ALL sessions** (line 487-503)
+
+Current:
+```go
+shouldCondense := h.hasNew
+if shouldCondense && !state.Phase.IsActive() {
+    shouldCondense = filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, state.FilesTouched)
+}
+```
+
+Change to:
+```go
+shouldCondense := h.hasNew
+if shouldCondense {
+    filesToCheck := h.filesTouchedBefore
+    if len(filesToCheck) > 0 {
+        shouldCondense = filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, filesToCheck)
+    }
+    // When filesToCheck is empty (transcript extraction failed + no SaveChanges yet),
+    // trust hasNew to avoid data loss for mid-turn commits.
+}
+```
+
+Key behavior changes:
+- **Currently active session**: `filesTouchedBefore` populated from transcript (line 632-634) -> overlap check succeeds against committed files -> condensed correctly
+- **Stale ACTIVE session**: `filesTouchedBefore` populated from old transcript -> overlap check fails (different files committed) -> NOT condensed
+- **ACTIVE session with empty filesTouchedBefore** (transcript extraction failed): overlap check skipped, trusts `hasNew` -> condensed (fail-open, same as current)
+- **IDLE/ENDED sessions**: `filesTouchedBefore == state.FilesTouched` -> same behavior as current
+
+### File: `cmd/entire/cli/strategy/phase_postcommit_test.go`
+
+**3. Add regression test**: `TestPostCommit_StaleActiveSession_NotCondensed`
+
+Setup:
+- Create an old ACTIVE session at a previous commit with `FilesTouched` from unrelated work
+- Create a checkpoint on the shadow branch (so it exists)
+- Advance HEAD with an unrelated commit
+- Create a new ACTIVE session at new HEAD
+- Make a commit from the new session
+
+Verify:
+- Old stale ACTIVE session is NOT condensed (no overlap between its files and committed files)
+- New ACTIVE session IS condensed
+- Old session's BaseCommit IS updated to new HEAD (ACTIVE sessions still get `updateBaseCommitIfChanged`)
+
+**4. Update existing test**: `TestPostCommit_ActiveSessionAlwaysCondenses` (line 180)
+
+This test verifies ACTIVE sessions always condense. It needs to be updated to ensure the test's ACTIVE session has `filesTouchedBefore` that overlaps with the committed files (it already does via `setupSessionWithCheckpoint` which modifies `test.txt`).
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Specifically:
+```bash
+go test -v -run "TestPostCommit_StaleActive" ./cmd/entire/cli/strategy/...
+go test -v -run "TestPostCommit_ActiveSession" ./cmd/entire/cli/strategy/...
+go test -v -run "TestPostCommit_OldIdleSession" ./cmd/entire/cli/strategy/...
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-2/0ad1ad8c-06d4-4015-8ca9-ee94dfe1d0ad.jsonl
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user provided a detailed implementation plan to fix stale ACTIVE sessions being condensed into every commit.
+
+2. The plan identified the root cause: when an agent is killed without the Stop hook firing, its session remains in ACTIVE phase permanently. PostCommit unconditionally sets `hasNew = true` for ACTIVE sessions and skips the `filesOverlapWithContent` check, so stale ACTIVE sessions get condensed into every commit.
+
+3. The plan specified changes to two files:
+   - `cmd/entire/cli/strategy/manual_commit_hooks.go` - Add `filesTouchedBefore` field and apply overlap check for ALL sessions
+   - `cmd/entire/cli/strategy/phase_postcommit_test.go` - Add regression test and update existing test
+
+4. I started implementing:
+   - Read `manual_commit_hooks.go` and `phase_postcommit_test.go`
+   - Created 4 tasks for tracking
+   - Added `filesTouchedBefore` field to `postCommitActionHandler` struct
+   - Passed `filesTouchedBefore` when constructing the handler
+   - Modified `HandleCondense` to apply overlap check for ALL sessions
+
+5. First implementation of HandleCondense was:
+```go
+shouldCondense := h.hasNew
+if shouldCondense && len(h.filesTouchedBefore) > 0 {
+    shouldCondense = filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, h.filesTouchedBefore)
+}
+```
+
+6. First test run: The new regression test failed because `filesOverlapWithContent` checks if a file EXISTS in the parent tree (not if it was CHANGED), so `test.txt` passed the overlap check even when it wasn't actually modified in the commit. The stale session wasn't filtered out.
+
+7. I fixed this by intersecting `filesTouchedBefore` with `committedFileSet` before calling `filesOverlapWithContent`:
+```go
+var committedTouchedFiles []string
+for _, f := range h.filesTouchedBefore {
+    if _, ok := h.committedFileSet[f]; ok {
+        committedTouchedFiles = append(committedTouchedFiles, f)
+    }
+}
+```
+
+8. Second test run: The regression test STILL failed because the checkpoint ID in the test (`stale1stale2`) contained non-hex characters. `trailers.ParseCheckpoint` validates hex format, so it returned `found=false`, causing PostCommit to exit early without processing any sessions.
+
+9. Fixed the checkpoint ID to `de1de2de3de4` (valid hex).
+
+10. Third test run: The regression test passed, but `TestHandleTurnEnd_PartialFailure` failed. This test creates 2 mid-turn commits and expects 2 checkpoint IDs. After the first commit, `test.txt` content is already on the main branch ("agent modified content"), so in the second commit `test.txt` isn't in the diff (same content). The intersection of `filesTouchedBefore=["test.txt"]` with `committedFileSet={"second.txt"}` is empty, so the second commit's condensation is skipped.
+
+11. I was about to fix this test when the summary was requested. The test needs to be updated so that the session's FilesTouched includes files that are actually changed in the second commit (like `second.txt`), and the shadow branch also has those files.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked me to implement a specific plan to fix stale ACTIVE sessions being condensed into every commit. The plan was provided in detail with exact file locations, code changes, and test additions. The root cause: when an agent is killed without the Stop hook firing, its session remains in ACTIVE phase permanently. PostCommit unconditionally sets `hasNew = true` for ACTIVE sessions (line 611-612) and skips the `filesOverlapWithContent` check (line 494), so stale ACTIVE sessions get condensed into every commit. PR #359 fixed this for IDLE sessions but left stale ACTIVE sessions unaddressed.
+
+2. Key Technical Concepts:
+   - Manual-commit strategy with shadow branches for checkpoint storage
+   - Session phase state machine (ACTIVE, IDLE, ENDED)
+   - `postCommitActionHandler` struct and `HandleCondense` method
+   - `filesOverlapWithContent` - content-aware overlap detection comparing shadow branch content with committed content
+   - `filesChangedInCommit` - diffs commit against parent to get changed files
+   - `filesTouchedBefore` - files the session touched, computed before state machine transition
+   - Checkpoint ID format: 12-hex-char string validated by `trailers.ParseCheckpoint`
+   - Intersection of `filesTouchedBefore` with `committedFileSet` needed to avoid false positives from files that exist in tree but weren't changed in the commit
+
+3. Files and Code Sections:
+   - `cmd/entire/cli/strategy/manual_commit_hooks.go`
+     - Core file being modified. Contains PostCommit logic, `postCommitActionHandler`, and `HandleCondense`.
+     - **Change 1**: Added `filesTouchedBefore []string` field to `postCommitActionHandler` struct (after `hasNew bool` field)
+     - **Change 2**: Passed `filesTouchedBefore` when constructing handler in PostCommit loop (~line 645):
+       ```go
+       handler := &postCommitActionHandler{
+           ...
+           hasNew:                 hasNew,
+           filesTouchedBefore:     filesTouchedBefore,
+       }
+       ```
+     - **Change 3**: Rewrote `HandleCondense` to apply overlap check for ALL sessions:
+       ```go
+       func (h *postCommitActionHandler) HandleCondense(state *session.State) error {
+           shouldCondense := h.hasNew
+           if shouldCondense && len(h.filesTouchedBefore) > 0 {
+               var committedTouchedFiles []string
+               for _, f := range h.filesTouchedBefore {
+                   if _, ok := h.committedFileSet[f]; ok {
+                       committedTouchedFiles = append(committedTouchedFiles, f)
+                   }
+               }
+               if len(committedTouchedFiles) > 0 {
+                   shouldCondense = filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, committedTouchedFiles)
+               } else {
+                   shouldCondense = false
+               }
+           }
+           if shouldCondense {
+               h.condensed = h.s.condenseAndUpdateState(h.logCtx, h.repo, h.checkpointID, state, h.head, h.shadowBranchName, h.shadowBranchesToDelete, h.committedFileSet)
+           } else {
+               h.s.updateBaseCommitIfChanged(h.logCtx, state, h.newHead)
+           }
+           return nil
+       }
+       ```
+
+   - `cmd/entire/cli/strategy/phase_postcommit_test.go`
+     - Test file. Added regression test `TestPostCommit_StaleActiveSession_NotCondensed` (~135 lines) at end of file.
+     - Test creates a stale ACTIVE session with `FilesTouched: ["test.txt"]`, advances HEAD, creates a new ACTIVE session touching `new-feature.txt`, commits only `new-feature.txt`, and verifies:
+       - Stale session is NOT condensed (StepCount unchanged)
+       - Stale session's BaseCommit IS updated (ACTIVE sessions get BaseCommit updated)
+       - New session IS condensed (StepCount reset to 0)
+       - `entire/checkpoints/v1` branch exists
+
+   - `cmd/entire/cli/strategy/content_overlap.go`
+     - Read-only. Contains `filesOverlapWithContent` which checks content overlap between committed files and shadow branch. Important detail: for "modified files" (exist in parent tree), it returns `true` immediately without content check. This is why intersecting with `committedFileSet` is necessary - files that exist in the tree but weren't actually changed in the commit would otherwise pass.
+
+   - `cmd/entire/cli/checkpoint/temporary.go`
+     - Read-only. Contains `WriteTemporary` which creates shadow branch trees. The tree is built from HEAD tree as base, overlaying modified/new files and metadata. Shadow branches contain ALL files from HEAD plus session changes.
+
+4. Errors and fixes:
+   - **Error 1: `filesOverlapWithContent` false positive for unchanged files**
+     - `filesOverlapWithContent` checks if a file EXISTS in the parent tree (isModified=true → immediate overlap), not if it was actually CHANGED in the commit. So `test.txt` in the stale session always passed the check since it exists in every commit's tree.
+     - Fix: Added intersection filter - only check files that are in BOTH `filesTouchedBefore` AND `committedFileSet` (files actually changed in the commit).
+   
+   - **Error 2: Invalid hex in checkpoint ID `"stale1stale2"`**
+     - Characters 's', 't', 'l' are not valid hex digits. `trailers.ParseCheckpoint` validates hex format, returning `found=false`, causing PostCommit to exit early via `postCommitUpdateBaseCommitOnly` path.
+     - Fix: Changed to `"de1de2de3de4"` (valid 12-char hex string).
+   
+   - **Error 3: `TestHandleTurnEnd_PartialFailure` now fails (CURRENT)**
+     - After first commit, `test.txt` content ("agent modified content") is already on main branch. Second commit stages test.txt again but content hasn't changed, so `filesChangedInCommit` only returns `{"second.txt"}`. The session's `FilesTouched=["test.txt"]` has no intersection with committed files, so condensation is skipped. Test expects 2 checkpoint IDs but only gets 1.
+     - Not yet fixed - this is the current work.
+
+5. Problem Solving:
+   - Successfully implemented the core fix: ACTIVE sessions now go through the same overlap check as IDLE/ENDED sessions
+   - Added necessary `committedFileSet` intersection to avoid false positives from `filesOverlapWithContent`'s "isModified" shortcut
+   - New regression test `TestPostCommit_StaleActiveSession_NotCondensed` passes
+   - All other PostCommit tests pass except `TestHandleTurnEnd_PartialFailure` which needs updating
+
+6. All user messages:
+   - User's single message: "Implement the following plan: [detailed plan for fixing stale ACTIVE sessions condensed into every commit]" with full context including the plan steps, file locations, code changes, and verification commands. The plan also referenced a transcript file path.
+
+7. Pending Tasks:
+   - Fix `TestHandleTurnEnd_PartialFailure` - needs updating so the second commit's session touches files actually changed in that commit (include `second.txt` in session's FilesTouched AND shadow branch)
+   - Run full verification: `mise run fmt && mise run lint && mise run test:ci`
+
+8. Current Work:
+   I was fixing the failing `TestHandleTurnEnd_PartialFailure` test. The test at lines 1189-1211 creates 2 mid-turn commits expecting 2 checkpoint IDs, but only 1 is created because:
+   - After first PostCommit, `test.txt` is already committed with "agent modified content"
+   - `setupSessionWithCheckpoint` refreshes shadow branch with only `test.txt` as modified file
+   - Second commit via `commitFilesWithTrailer(t, repo, dir, "b2c3d4e5f6a1", "second.txt")` stages test.txt + second.txt, but test.txt content hasn't changed so `filesChangedInCommit` returns only `{"second.txt"}`
+   - `filesTouchedBefore=["test.txt"]` has empty intersection with `committedFileSet={"second.txt"}`
+   - Condensation is skipped, so only 1 TurnCheckpointID instead of expected 2
+
+   The fix needs to ensure the second SaveChanges call includes `second.txt` as a new file so both `state.FilesTouched` and the shadow branch contain it. This way the intersection with `committedFileSet={"second.txt"}` will be non-empty.
+
+9. Optional Next Step:
+   Fix `TestHandleTurnEnd_PartialFailure` by replacing the `setupSessionWithCheckpoint` call for the second round with a direct `SaveChanges` call that includes `second.txt` as a new file (so both `state.FilesTouched` and the shadow branch contain it). Then run full verification (`mise run fmt && mise run lint && mise run test:ci`).
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-2/d54f5fdd-71a4-43e3-a8cf-ee0722e84c19.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+You are an expert code reviewer. Follow these steps:
+
+      1. If no PR number is provided in the args, run `gh pr list` to show open PRs
+      2. If a PR number is provided, run `gh pr view <number>` to get PR details
+      3. Run `gh pr diff <number>` to get the diff
+      4. Analyze the changes and provide a thorough code review that includes:
+         - Overview of what the PR does
+         - Analysis of code quality and style
+         - Specific suggestions for improvements
+         - Any potential issues or risks
+
+      Keep your review concise but thorough. Focus on:
+      - Code correctness
+      - Following project conventions
+      - Performance implications
+      - Test coverage
+      - Security considerations
+
+      Format your review with clear sections and bullet points.
+
+      PR number:
+
+---
+
+okay well let's push this change and raise a PR for now, but I'm not conviced we've gotten to the bottom of this
+
+---
+
+let's dig into what's actually happening with that checkpoint 6e19340bc0c8. are there any session that were referenced still in `.git/entire-sessions`?
+
+---
+
+you are looking at the checkpoint creation time, not the session start times
+
+---
+
+you can also use entire explain -c {checkpoint_id}
+
+---
+
+so how do we actually fix this properly?
+
+---
+
+also, how long has this been happening?
+
+---
+
+do you know which commit introduced the problem?
+
+---
+
+but we changed something - probably the state machine stuff which started sending traffic down this branch...
+
+okay never mind, let's fix it
+
+---
+
+we have a merge conflict
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Initial Context**: The conversation started from a previous session that ran out of context. A plan existed to fix stale ACTIVE sessions being condensed into every commit. The plan was partially implemented - `filesTouchedBefore` field was added to `postCommitActionHandler`, `HandleCondense` was modified, and a regression test was added.
+
+2. **Continuing Implementation**: I picked up where the previous session left off, needing to fix `TestHandleTurnEnd_PartialFailure`. The issue was that after the first commit, `test.txt` content was already on main, so the second commit's `committedFileSet` only contained `second.txt`, but the session's `FilesTouched` only had `test.txt`. Fixed by replacing `setupSessionWithCheckpoint` with direct `SaveChanges` call including `second.txt` as a new file.
+
+3. **goconst lint error**: The string `"new-active-session"` appeared 3 times. Fixed by extracting `testNewActiveSessionID` constant.
+
+4. **Full verification passed**: `mise run fmt && mise run lint && mise run test:ci` all passed.
+
+5. **User asked for /review**: I reviewed the uncommitted changes and provided analysis. Noted that `HandleCondenseIfFilesTouched` for ENDED sessions was not updated - flagged as lower risk but worth noting.
+
+6. **User asked to push and create PR**: Committed, pushed, created PR #418.
+
+7. **User wanted to dig deeper**: "let's dig into what's actually happening with that checkpoint 6e19340bc0c8"
+
+8. **Investigation of checkpoint 6e19340bc0c8**: Found 7 sessions condensed together, all claiming to touch `testenv.go`. All session state files were MISSING from `.git/entire-sessions/`.
+
+9. **User corrected me**: I was looking at checkpoint creation time (condensation time), not session start times. The `created_at` field was from condensation, not session start.
+
+10. **User suggested using `entire explain`**: I used it to get more details.
+
+11. **Deep investigation**: Found that sessions spanned Feb 8-18 with completely different purposes (PR reviews, merge conflicts, logging plan). All 7 were condensed on Feb 18.
+
+12. **User skepticism**: "I don't buy that I had that many 'stuck-in-ACTIVE' sessions"
+
+13. **Log analysis**: Found `entire.log` in worktree 2. The logs revealed:
+    - Sessions 0, 2 were **IDLE** going through `HandleCondense`
+    - Sessions 3, 4, 5 were **ENDED** going through `HandleCondenseIfFilesTouched` with NO overlap check
+    - Session 1 was **IDLE** with `has_new: true`
+    - Session 6 was **ACTIVE** (the actual working session)
+    - The `HandleCondenseIfFilesTouched` handler had zero overlap checking
+
+14. **User asked "how do we actually fix this properly?"**: I explained the root cause - `HandleCondenseIfFilesTouched` (ENDED path) had no overlap check, and carry-forward created a self-perpetuating cycle.
+
+15. **User asked how long this has been happening**: Investigation showed zombie sessions snowballing since Feb 8, 11 days, 12 checkpoints polluted, 18 duplicate condensation events.
+
+16. **User asked which commit introduced the problem**: Traced back through git history. The original PostCommit (initial commit `e72157d0`) had `filterSessionsWithNewContent` which condensed ALL sessions where `sessionHasNewContent` returned true with no overlap check. The overlap check (`filesOverlapWithContent`) wasn't added until Feb 14 commit `6a3b6814`, and even then only for non-ACTIVE sessions in `HandleCondense`, never for ENDED sessions.
+
+17. **User said "okay never mind, let's fix it"**: I implemented the fix:
+    - Extracted `shouldCondenseWithOverlapCheck()` as a shared method
+    - Used it in both `HandleCondense` and `HandleCondenseIfFilesTouched`
+    - Added `TestPostCommit_EndedSessionCarryForward_NotCondensedIntoUnrelatedCommit` test
+    - All tests passed, pushed as second commit
+
+18. **User said "we have a merge conflict"**: Merged origin/main, got conflicts in `manual_commit_hooks.go`. Main had added logging to both handlers. Resolved by keeping our `shouldCondenseWithOverlapCheck()` calls while incorporating the logging from main.
+
+19. **Rename issue**: Main renamed `SaveContext` to `StepContext` and `SaveChanges` to `SaveStep`. Fixed all references in test file.
+
+20. **gomod issue**: `go mod tidy` needed but still failing. This is where we are now.
+
+Key files:
+- `cmd/entire/cli/strategy/manual_commit_hooks.go` - Core changes: `shouldCondenseWithOverlapCheck()` method, both handlers updated
+- `cmd/entire/cli/strategy/phase_postcommit_test.go` - New tests and fixes
+- `go.mod` / `go.sum` - Modified by merge, need `go mod tidy`
+
+Current state: Merge conflict resolved, but `lint:gomod` is still failing after `go mod tidy`. Need to stage and check go.mod/go.sum, then commit the merge.
+
+Summary:
+1. Primary Request and Intent:
+   The user initially asked to implement a plan to fix stale ACTIVE sessions being condensed into every commit (from a previous session). After the initial fix was shipped as PR #418, the user wanted to investigate the actual checkpoint `6e19340bc0c8` to understand the root cause better. Investigation revealed the problem was broader than stale ACTIVE sessions — it was primarily **ENDED sessions with carry-forward files** going through `HandleCondenseIfFilesTouched` which had zero overlap checking. The user then asked to fix it properly by applying the overlap check to ALL condensation paths. After pushing that fix, a merge conflict with `origin/main` needs to be resolved.
+
+2. Key Technical Concepts:
+   - Manual-commit strategy with shadow branches for checkpoint storage
+   - Session phase state machine (ACTIVE, IDLE, ENDED) with different handlers per phase
+   - `postCommitActionHandler` struct with `HandleCondense` (ACTIVE/IDLE) and `HandleCondenseIfFilesTouched` (ENDED)
+   - `filesOverlapWithContent` — content-aware overlap detection between shadow branch and committed content
+   - `filesChangedInCommit` returns `committedFileSet` — files actually changed in a commit
+   - `filesTouchedBefore` — session's files computed before state machine transition
+   - Carry-forward mechanism: after condensation, uncommitted files are kept in `FilesTouched`, creating a self-perpetuating cycle
+   - `sessionHasNewContent` returns true when `FilesTouched` is non-empty (line 949-950), feeding the cycle
+   - Intersection of `filesTouchedBefore` with `committedFileSet` needed before `filesOverlapWithContent` to avoid false positives
+   - `SaveContext`/`SaveChanges` were renamed to `StepContext`/`SaveStep` in main
+
+3. Files and Code Sections:
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** — Core file with all condensation logic
+     - Added `filesTouchedBefore []string` field to `postCommitActionHandler` struct
+     - Passed `filesTouchedBefore` when constructing handler in PostCommit loop (~line 682)
+     - Extracted `shouldCondenseWithOverlapCheck()` method used by both handlers
+     - Both `HandleCondense` and `HandleCondenseIfFilesTouched` now use shared overlap check
+     - After merge conflict resolution, logging from main was incorporated:
+     ```go
+     func (h *postCommitActionHandler) HandleCondense(state *session.State) error {
+         shouldCondense := h.shouldCondenseWithOverlapCheck()
+         logging.Debug(h.logCtx, "post-commit: HandleCondense decision",
+             slog.String("session_id", state.SessionID),
+             slog.String("phase", string(state.Phase)),
+             slog.Bool("has_new", h.hasNew),
+             slog.Bool("should_condense", shouldCondense),
+             slog.String("shadow_branch", h.shadowBranchName),
+         )
+         if shouldCondense {
+             h.condensed = h.s.condenseAndUpdateState(h.logCtx, h.repo, h.checkpointID, state, h.head, h.shadowBranchName, h.shadowBranchesToDelete, h.committedFileSet)
+         } else {
+             h.s.updateBaseCommitIfChanged(h.logCtx, state, h.newHead)
+         }
+         return nil
+     }
+
+     func (h *postCommitActionHandler) HandleCondenseIfFilesTouched(state *session.State) error {
+         shouldCondense := len(state.FilesTouched) > 0 && h.shouldCondenseWithOverlapCheck()
+         logging.Debug(h.logCtx, "post-commit: HandleCondenseIfFilesTouched decision",
+             slog.String("session_id", state.SessionID),
+             slog.String("phase", string(state.Phase)),
+             slog.Bool("has_new", h.hasNew),
+             slog.Int("files_touched", len(state.FilesTouched)),
+             slog.Bool("should_condense", shouldCondense),
+             slog.String("shadow_branch", h.shadowBranchName),
+         )
+         if shouldCondense {
+             h.condensed = h.s.condenseAndUpdateState(h.logCtx, h.repo, h.checkpointID, state, h.head, h.shadowBranchName, h.shadowBranchesToDelete, h.committedFileSet)
+         } else {
+             h.s.updateBaseCommitIfChanged(h.logCtx, state, h.newHead)
+         }
+         return nil
+     }
+
+     func (h *postCommitActionHandler) shouldCondenseWithOverlapCheck() bool {
+         if !h.hasNew {
+             return false
+         }
+         if len(h.filesTouchedBefore) == 0 {
+             return true // Fail-open: no file list to check against
+         }
+         var committedTouchedFiles []string
+         for _, f := range h.filesTouchedBefore {
+             if _, ok := h.committedFileSet[f]; ok {
+                 committedTouchedFiles = append(committedTouchedFiles, f)
+             }
+         }
+         if len(committedTouchedFiles) == 0 {
+             return false
+         }
+         return filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, committedTouchedFiles)
+     }
+     ```
+
+   - **`cmd/entire/cli/strategy/phase_postcommit_test.go`** — Test file
+     - Added `const testNewActiveSessionID = "new-active-session"` to fix goconst lint
+     - Fixed `TestHandleTurnEnd_PartialFailure`: replaced `setupSessionWithCheckpoint` with direct `SaveStep` call including `second.txt` as new file
+     - Added `TestPostCommit_EndedSessionCarryForward_NotCondensedIntoUnrelatedCommit`: ENDED session with carry-forward files + `CheckpointTranscriptStart=0` (so `hasNew=true`) is NOT condensed into unrelated commit
+     - Added `TestPostCommit_StaleActiveSession_NotCondensed`: stale ACTIVE session not condensed into unrelated commit
+     - After merge: renamed `SaveChanges(SaveContext{` → `SaveStep(StepContext{` (3 occurrences) and `"SaveChanges should succeed"` → `"SaveStep should succeed"`
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation.go`** — Read-only. Lines 160-168: fallback that sets `files_touched` from `committedFiles` when session has no files — explains why all 7 zombie sessions showed `testenv.go`
+
+   - **`cmd/entire/cli/session/phase.go`** — Read-only. State machine: IDLE+GitCommit → `ActionCondense`(HandleCondense), ACTIVE+GitCommit → `ActionCondense`(HandleCondense), ENDED+GitCommit+HasFilesTouched → `ActionCondenseIfFilesTouched`(HandleCondenseIfFilesTouched)
+
+   - **`go.mod` / `go.sum`** — Modified by merge from main, `go mod tidy` run but `lint:gomod` still failing
+
+4. Errors and fixes:
+   - **`TestHandleTurnEnd_PartialFailure` failure (from previous session)**: Second commit's `committedFileSet={"second.txt"}` had no intersection with session's `FilesTouched=["test.txt"]`. Fixed by replacing `setupSessionWithCheckpoint` with direct `SaveChanges`/`SaveStep` call including `second.txt` as new file.
+   - **goconst lint error**: `"new-active-session"` appeared 3 times. Fixed by extracting `testNewActiveSessionID` constant.
+   - **Merge conflict with origin/main**: Main added logging (`logging.Debug`) to both `HandleCondense` and `HandleCondenseIfFilesTouched`. Resolved by keeping our `shouldCondenseWithOverlapCheck()` calls while incorporating the logging statements.
+   - **`SaveContext`/`SaveChanges` renamed in main**: Main renamed to `StepContext`/`SaveStep`. Fixed all 3 occurrences in test file with `replace_all`.
+   - **`lint:gomod` failure**: `go mod tidy` was run but `lint:gomod` still reports `go.mod`/`go.sum` modified. Likely need to stage these files as part of the merge commit.
+
+5. Problem Solving:
+   - **Investigation of checkpoint 6e19340bc0c8**: Found 7 sessions spanning Feb 8-18 all condensed together on Feb 18. All showed `files_touched: ['testenv.go']` which was actually from the fallback in `manual_commit_condensation.go:163-168`.
+   - **Root cause discovery via logs**: `entire.log` at line 5585 showed session `37a27d31` (IDLE, phase="idle", has_new=true, should_condense=true) and line 5621 showed session `7505c804` (ENDED via `HandleCondenseIfFilesTouched`, phase="ended", has_new=true, files_touched=1). The ENDED sessions had NO overlap check.
+   - **Carry-forward cycle**: After condensation, carry-forward sets `FilesTouched` with uncommitted files → next commit: `sessionHasNewContent` returns true → `HandleCondenseIfFilesTouched` condenses again → carry-forward recalculates → repeat forever.
+   - **Timeline**: Bug exists since initial commit `e72157d0`. `filesOverlapWithContent` was added Feb 14 (`6a3b6814`) but only for non-ACTIVE in `HandleCondense`. Never applied to ENDED sessions. Zombie sessions snowballed since Feb 8 (11 days, 12 checkpoints polluted, 18 duplicate condensation events).
+
+6. All user messages:
+   - (Continuation from previous session — implementing the plan to fix stale ACTIVE sessions)
+   - "okay well let's push this change and raise a PR for now, but I'm not conviced we've gotten to the bottom of this"
+   - `/review` (invoked code review skill)
+   - "let's dig into what's actually happening with that checkpoint 6e19340bc0c8. are there any session that were referenced still in `.git/entire-sessions`?"
+   - "you can also use entire explain -c {checkpoint_id}"
+   - (rejected running from main repo) "can do it from this worktree"
+   - "you are looking at the checkpoint creation time, not the session start times"
+   - "because I don't buy that I had that many 'stuck-in-ACTIVE' sessions..."
+   - "hmm, which worktree were these in? we may be able to look in our entire.log"
+   - "so how do we actually fix this properly?"
+   - "also, how long has this been happening?"
+   - "do you know which commit introduced the problem?"
+   - "but we changed something - probably the state machine stuff which started sending traffic down this branch... okay never mind, let's fix it"
+   - "we have a merge conflict"
+
+7. Pending Tasks:
+   - Complete the merge conflict resolution: `go.mod`/`go.sum` need to be staged, the merge committed, and pushed
+   - The `lint:gomod` check is still failing — need to resolve the go.mod/go.sum state
+
+8. Current Work:
+   Resolving a merge conflict after `git merge origin/main`. The code conflicts in `manual_commit_hooks.go` have been resolved (main added logging to both handlers; we kept our `shouldCondenseWithOverlapCheck()` calls and incorporated the logging). The `SaveContext`→`StepContext` / `SaveChanges`→`SaveStep` rename from main has been applied to the test file. The code compiles (`go build` succeeds), `lint:go` passes with 0 issues, but `lint:gomod` is still failing saying `go.mod` and `go.sum` are modified. Running `go mod tidy` did not fully resolve it. Need to check if the issue is that these files just need to be staged as part of the merge commit.
+
+9. Optional Next Step:
+   Stage `go.mod` and `go.sum` (they're likely dirty from the merge), run `mise run lint` to confirm it passes, run `mise run test:ci`, then commit the merge and push. The user's last request was "we have a merge conflict" — completing the merge resolution and pushing is the immediate task.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-2/d54f5fdd-71a4-43e3-a8cf-ee0722e84c19.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+Base directory for this skill: /Users/alex/.claude/skills/github-pr-review
+
+# GitHub PR Review
+
+## Overview
+
+Technical mechanics for GitHub PR review workflows via `gh` CLI. Covers fetching review comments, replying to threads, creating/updating PRs.
+
+**Companion skill:** For *how to evaluate* feedback, see `superpowers:receiving-code-review`. This skill covers *how to interact* with GitHub.
+
+**Security:** Use fine-grained PAT with minimal permissions.
+
+## Setup (One-Time)
+
+### Fine-Grained PAT
+
+Create at github.com -> Settings -> Developer settings -> Personal access tokens -> Fine-grained tokens:
+
+| Permission | Level |
+|------------|-------|
+| Pull requests | Read & Write |
+| Contents | Read |
+
+**Can't:** Delete repos, push code, delete branches, manage settings.
+
+### Configure & Allowlist
+
+```bash
+export GH_TOKEN="github_pat_xxxx"
+```
+
+Add to `.claude/settings.json`:
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh repo view:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr ready:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(gh api repos/*/*/pulls/*/comments:*)",
+      "Bash(gh api repos/*/*/pulls/*/comments/*/replies:*)"
+    ]
+  }
+}
+```
+
+## Quick Reference
+
+| Operation | Command |
+|-----------|---------|
+| Get owner/repo | `gh repo view --json owner,name -q '"\(.owner.login)/\(.name)"'` |
+| Get PR number | `gh pr view --json number -q .number` |
+| Get PR author | `gh pr view --json author -q .author.login` |
+| Fetch all review comments | `gh api repos/{owner}/{repo}/pulls/{pr}/comments --paginate` |
+| Get single comment | `gh api repos/{owner}/{repo}/pulls/comments/{comment_id}` |
+| Reply to comment | `gh api repos/{owner}/{repo}/pulls/{pr}/comments/{comment_id}/replies -f body="msg"` |
+| Create PR | `gh pr create --title "T" --body "B" [--draft]` |
+| Mark ready | `gh pr ready [number]` |
+| Convert to draft | `gh pr ready --undo [number]` |
+| Edit PR | `gh pr edit [number] --title "T" --body "B"` |
+
+## Workflow: Respond to PR Review
+
+### 1. Get repo info and PR details
+
+```bash
+owner_repo=$(gh repo view --json owner,name -q '"\(.owner.login)/\(.name)"')
+pr_number=$(gh pr view --json number -q .number)
+pr_author=$(gh pr view --json author -q .author.login)
+```
+
+### 2. Fetch and analyze threads
+
+```bash
+# Fetch all comments and group into threads, showing last author per thread
+gh api repos/${owner_repo}/pulls/${pr_number}/comments --paginate | jq 'sort_by([.in_reply_to_id // .id, .created_at]) | group_by(.in_reply_to_id // .id) | map({thread_id: (.[0].in_reply_to_id // .[0].id), path: .[0].path, line: (.[0].line // .[0].original_line), last_author: .[-1].user.login, last_body: .[-1].body[0:100], count: length})'
+```
+
+### 3. Filter to threads needing response
+
+```bash
+# Filter to threads where last_author != PR author
+# Note: Use '| not' instead of '!=' to avoid shell escaping issues with !
+... | jq --arg author "$pr_author" '[.[] | select(.last_author == $author | not)]'
+```
+
+For each thread needing response:
+- Read the comment + file/line context
+- Apply `superpowers:receiving-code-review` skill for evaluation
+- Fix code and/or reply to thread
+
+### 4. Commit fixes and push
+- run the build, tests, linting as required
+- commit the changes, noting the commit sha
+- push the changes so they're visible
+- We need to do this FIRST so we have the commit shas to put into the replies to the pr review
+
+### 5. Re-fetch comment IDs (if rebased)
+
+**Important:** If you rebased or force-pushed, comment IDs may have changed. Re-fetch the comment threads before replying:
+
+```bash
+gh api repos/${owner_repo}/pulls/${pr_number}/comments --paginate | jq '...'
+```
+
+### 6. Reply to a thread
+
+```bash
+gh api repos/${owner_repo}/pulls/${pr_number}/comments/{comment_id}/replies \
+  -f body="Fixed in commit abc123. [description of fix]"
+```
+
+### 7. Summarize and finish
+
+After all threads addressed, ask if ready to mark PR ready for review.
+
+**Note:** REST API doesn't expose "resolved" status. We infer "done" when PR author made last comment in thread.
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Broad PAT permissions | Use fine-grained PAT with only Pull requests + Contents |
+| Missing pagination | Always use `--paginate` for comment fetching |
+| Top-level reply | Use `/comments/{id}/replies` endpoint, not `/comments` |
+| Re-responding to threads | Skip threads where PR author made last comment |
+| Forgetting to reply after fix | Always reply to confirm the fix was made |
+| jq `!=` fails with shell error | Use `select(.x == "y" \| not)` instead of `select(.x != "y")` |
+| 404 on reply after rebase | Comment IDs change after force-push/rebase. Re-fetch comments before replying |
+
+---
+
+Base directory for this skill: /Users/alex/.claude/plugins/cache/claude-plugins-official/superpowers/4.3.0/skills/receiving-code-review
+
+# Code Review Reception
+
+## Overview
+
+Code review requires technical evaluation, not emotional performance.
+
+**Core principle:** Verify before implementing. Ask before assuming. Technical correctness over social comfort.
+
+## The Response Pattern
+
+```
+WHEN receiving code review feedback:
+
+1. READ: Complete feedback without reacting
+2. UNDERSTAND: Restate requirement in own words (or ask)
+3. VERIFY: Check against codebase reality
+4. EVALUATE: Technically sound for THIS codebase?
+5. RESPOND: Technical acknowledgment or reasoned pushback
+6. IMPLEMENT: One item at a time, test each
+```
+
+## Forbidden Responses
+
+**NEVER:**
+- "You're absolutely right!" (explicit CLAUDE.md violation)
+- "Great point!" / "Excellent feedback!" (performative)
+- "Let me implement that now" (before verification)
+
+**INSTEAD:**
+- Restate the technical requirement
+- Ask clarifying questions
+- Push back with technical reasoning if wrong
+- Just start working (actions > words)
+
+## Handling Unclear Feedback
+
+```
+IF any item is unclear:
+  STOP - do not implement anything yet
+  ASK for clarification on unclear items
+
+WHY: Items may be related. Partial understanding = wrong implementation.
+```
+
+**Example:**
+```
+your human partner: "Fix 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+
+❌ WRONG: Implement 1,2,3,6 now, ask about 4,5 later
+✅ RIGHT: "I understand items 1,2,3,6. Need clarification on 4 and 5 before proceeding."
+```
+
+## Source-Specific Handling
+
+### From your human partner
+- **Trusted** - implement after understanding
+- **Still ask** if scope unclear
+- **No performative agreement**
+- **Skip to action** or technical acknowledgment
+
+### From External Reviewers
+```
+BEFORE implementing:
+  1. Check: Technically correct for THIS codebase?
+  2. Check: Breaks existing functionality?
+  3. Check: Reason for current implementation?
+  4. Check: Works on all platforms/versions?
+  5. Check: Does reviewer understand full context?
+
+IF suggestion seems wrong:
+  Push back with technical reasoning
+
+IF can't easily verify:
+  Say so: "I can't verify this without [X]. Should I [investigate/ask/proceed]?"
+
+IF conflicts with your human partner's prior decisions:
+  Stop and discuss with your human partner first
+```
+
+**your human partner's rule:** "External feedback - be skeptical, but check carefully"
+
+## YAGNI Check for "Professional" Features
+
+```
+IF reviewer suggests "implementing properly":
+  grep codebase for actual usage
+
+  IF unused: "This endpoint isn't called. Remove it (YAGNI)?"
+  IF used: Then implement properly
+```
+
+**your human partner's rule:** "You and reviewer both report to me. If we don't need this feature, don't add it."
+
+## Implementation Order
+
+```
+FOR multi-item feedback:
+  1. Clarify anything unclear FIRST
+  2. Then implement in this order:
+     - Blocking issues (breaks, security)
+     - Simple fixes (typos, imports)
+     - Complex fixes (refactoring, logic)
+  3. Test each fix individually
+  4. Verify no regressions
+```
+
+## When To Push Back
+
+Push back when:
+- Suggestion breaks existing functionality
+- Reviewer lacks full context
+- Violates YAGNI (unused feature)
+- Technically incorrect for this stack
+- Legacy/compatibility reasons exist
+- Conflicts with your human partner's architectural decisions
+
+**How to push back:**
+- Use technical reasoning, not defensiveness
+- Ask specific questions
+- Reference working tests/code
+- Involve your human partner if architectural
+
+**Signal if uncomfortable pushing back out loud:** "Strange things are afoot at the Circle K"
+
+## Acknowledging Correct Feedback
+
+When feedback IS correct:
+```
+✅ "Fixed. [Brief description of what changed]"
+✅ "Good catch - [specific issue]. Fixed in [location]."
+✅ [Just fix it and show in the code]
+
+❌ "You're absolutely right!"
+❌ "Great point!"
+❌ "Thanks for catching that!"
+❌ "Thanks for [anything]"
+❌ ANY gratitude expression
+```
+
+**Why no thanks:** Actions speak. Just fix it. The code itself shows you heard the feedback.
+
+**If you catch yourself about to write "Thanks":** DELETE IT. State the fix instead.
+
+## Gracefully Correcting Your Pushback
+
+If you pushed back and were wrong:
+```
+✅ "You were right - I checked [X] and it does [Y]. Implementing now."
+✅ "Verified this and you're correct. My initial understanding was wrong because [reason]. Fixing."
+
+❌ Long apology
+❌ Defending why you pushed back
+❌ Over-explaining
+```
+
+State the correction factually and move on.
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Performative agreement | State requirement or just act |
+| Blind implementation | Verify against codebase first |
+| Batch without testing | One at a time, test each |
+| Assuming reviewer is right | Check if breaks things |
+| Avoiding pushback | Technical correctness > comfort |
+| Partial implementation | Clarify all items first |
+| Can't verify, proceed anyway | State limitation, ask for direction |
+
+## Real Examples
+
+**Performative Agreement (Bad):**
+```
+Reviewer: "Remove legacy code"
+❌ "You're absolutely right! Let me remove that..."
+```
+
+**Technical Verification (Good):**
+```
+Reviewer: "Remove legacy code"
+✅ "Checking... build target is 10.15+, this API needs 13+. Need legacy for backward compat. Current impl has wrong bundle ID - fix it or drop pre-13 support?"
+```
+
+**YAGNI (Good):**
+```
+Reviewer: "Implement proper metrics tracking with database, date filters, CSV export"
+✅ "Grepped codebase - nothing calls this endpoint. Remove it (YAGNI)? Or is there usage I'm missing?"
+```
+
+**Unclear Item (Good):**
+```
+your human partner: "Fix items 1-6"
+You understand 1,2,3,6. Unclear on 4,5.
+✅ "Understand 1,2,3,6. Need clarification on 4 and 5 before implementing."
+```
+
+## GitHub Thread Replies
+
+When replying to inline review comments on GitHub, reply in the comment thread (`gh api repos/{owner}/{repo}/pulls/{pr}/comments/{id}/replies`), not as a top-level PR comment.
+
+## The Bottom Line
+
+**External feedback = suggestions to evaluate, not orders to follow.**
+
+Verify. Question. Then implement.
+
+No performative agreement. Technical rigor always.
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+why are the tests timing out?
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+but it's been 5 minutes...
+
+---
+
+<task-notification>
+<task-id>bb2ad77</task-id>
+<output-file>/private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-2/tasks/bb2ad77.output</output-file>
+<status>failed</status>
+<summary>Background command "Full CI check" failed with exit code 1</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-2/tasks/bb2ad77.output
+
+---
+
+uhh, is that a 'flaky' test?
+
+---
+
+when did it come in?
+
+---
+
+does it use _our_ repo's git state?
+
+---
+
+this is a problem more generally then??
+
+---
+
+yes please
+
+---
+
+make sure that linear is in Project:Troy
+
+---
+
+yes, commit and push
+
+---
+
+can you update the PR description to cover all three commits
+
+---
+
+Base directory for this skill: /Users/alex/.claude/skills/github-pr-review
+
+# GitHub PR Review
+
+## Overview
+
+Technical mechanics for GitHub PR review workflows via `gh` CLI. Covers fetching review comments, replying to threads, creating/updating PRs.
+
+**Companion skill:** For *how to evaluate* feedback, see `superpowers:receiving-code-review`. This skill covers *how to interact* with GitHub.
+
+**Security:** Use fine-grained PAT with minimal permissions.
+
+## Setup (One-Time)
+
+### Fine-Grained PAT
+
+Create at github.com -> Settings -> Developer settings -> Personal access tokens -> Fine-grained tokens:
+
+| Permission | Level |
+|------------|-------|
+| Pull requests | Read & Write |
+| Contents | Read |
+
+**Can't:** Delete repos, push code, delete branches, manage settings.
+
+### Configure & Allowlist
+
+```bash
+export GH_TOKEN="github_pat_xxxx"
+```
+
+Add to `.claude/settings.json`:
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh repo view:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr ready:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(gh api repos/*/*/pulls/*/comments:*)",
+      "Bash(gh api repos/*/*/pulls/*/comments/*/replies:*)"
+    ]
+  }
+}
+```
+
+## Quick Reference
+
+| Operation | Command |
+|-----------|---------|
+| Get owner/repo | `gh repo view --json owner,name -q '"\(.owner.login)/\(.name)"'` |
+| Get PR number | `gh pr view --json number -q .number` |
+| Get PR author | `gh pr view --json author -q .author.login` |
+| Fetch all review comments | `gh api repos/{owner}/{repo}/pulls/{pr}/comments --paginate` |
+| Get single comment | `gh api repos/{owner}/{repo}/pulls/comments/{comment_id}` |
+| Reply to comment | `gh api repos/{owner}/{repo}/pulls/{pr}/comments/{comment_id}/replies -f body="msg"` |
+| Create PR | `gh pr create --title "T" --body "B" [--draft]` |
+| Mark ready | `gh pr ready [number]` |
+| Convert to draft | `gh pr ready --undo [number]` |
+| Edit PR | `gh pr edit [number] --title "T" --body "B"` |
+
+## Workflow: Respond to PR Review
+
+### 1. Get repo info and PR details
+
+```bash
+owner_repo=$(gh repo view --json owner,name -q '"\(.owner.login)/\(.name)"')
+pr_number=$(gh pr view --json number -q .number)
+pr_author=$(gh pr view --json author -q .author.login)
+```
+
+### 2. Fetch and analyze threads
+
+```bash
+# Fetch all comments and group into threads, showing last author per thread
+gh api repos/${owner_repo}/pulls/${pr_number}/comments --paginate | jq 'sort_by([.in_reply_to_id // .id, .created_at]) | group_by(.in_reply_to_id // .id) | map({thread_id: (.[0].in_reply_to_id // .[0].id), path: .[0].path, line: (.[0].line // .[0].original_line), last_author: .[-1].user.login, last_body: .[-1].body[0:100], count: length})'
+```
+
+### 3. Filter to threads needing response
+
+```bash
+# Filter to threads where last_author != PR author
+# Note: Use '| not' instead of '!=' to avoid shell escaping issues with !
+... | jq --arg author "$pr_author" '[.[] | select(.last_author == $author | not)]'
+```
+
+For each thread needing response:
+- Read the comment + file/line context
+- Apply `superpowers:receiving-code-review` skill for evaluation
+- Fix code and/or reply to thread
+
+### 4. Commit fixes and push
+- run the build, tests, linting as required
+- commit the changes, noting the commit sha
+- push the changes so they're visible
+- We need to do this FIRST so we have the commit shas to put into the replies to the pr review
+
+### 5. Re-fetch comment IDs (if rebased)
+
+**Important:** If you rebased or force-pushed, comment IDs may have changed. Re-fetch the comment threads before replying:
+
+```bash
+gh api repos/${owner_repo}/pulls/${pr_number}/comments --paginate | jq '...'
+```
+
+### 6. Reply to a thread
+
+```bash
+gh api repos/${owner_repo}/pulls/${pr_number}/comments/{comment_id}/replies \
+  -f body="Fixed in commit abc123. [description of fix]"
+```
+
+### 7. Summarize and finish
+
+After all threads addressed, ask if ready to mark PR ready for review.
+
+**Note:** REST API doesn't expose "resolved" status. We infer "done" when PR author made last comment in thread.
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Broad PAT permissions | Use fine-grained PAT with only Pull requests + Contents |
+| Missing pagination | Always use `--paginate` for comment fetching |
+| Top-level reply | Use `/comments/{id}/replies` endpoint, not `/comments` |
+| Re-responding to threads | Skip threads where PR author made last comment |
+| Forgetting to reply after fix | Always reply to confirm the fix was made |
+| jq `!=` fails with shell error | Use `select(.x == "y" \| not)` instead of `select(.x != "y")` |
+| 404 on reply after rebase | Comment IDs change after force-push/rebase. Re-fetch comments before replying |

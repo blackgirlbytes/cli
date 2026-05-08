@@ -1,0 +1,52 @@
+You are implementing Task 3 of the current plan in the Go repo at `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/entire-review` on branch `feat/entire-review`.
+
+You are not alone in the codebase: other agents and the controller may have edits in adjacent files. Do not revert or overwrite changes you did not make. Keep ownership to these files only:
+- `cmd/entire/cli/review.go`
+- `cmd/entire/cli/review_test.go`
+
+Do not commit.
+
+Task 3 goal: implement the `entire review` checkpoint context brief renderer, with TDD. The existing state already has:
+- `reviewScope` includes `BaseRef`.
+- `detectReviewScope` uses `BaseRef`.
+- `composeReviewPrompt(skills []string, brief string)` exists and current production call passes `""`.
+
+Plan/spec requirements:
+- Add `renderReviewBrief(ctx context.Context, scope reviewScope) string`, a recover-safe wrapper using `paths.WorktreeRoot(ctx)` and logging Debug on global setup failure/panic.
+- Add `renderReviewBriefForRepo(ctx context.Context, repoRoot string, scope reviewScope) string` for tests without `t.Chdir()`.
+- Renderer walks commits in newest-first order over `scope.BaseRef..head`, where head is `scope.Branch`, falling back to `scope.HeadSHA`, then `HEAD`.
+- Return `""` when `scope.BaseRef == ""`, no commits in range, repo open/setup fails, or other global setup failure.
+- Each row includes short commit hash, checkpoint column, changed file count, agent, and truncated subject. Use ASCII `-` placeholders.
+- Parse `Entire-Checkpoint` from commit message using `trailers.ParseCheckpoint`.
+- Commits without checkpoint show checkpoint `-`, agent `-`, and git-derived changed-file count.
+- Commits with unresolved checkpoint show `<id> (unresolved)`, keep git-derived file count, agent `-`, and log Debug.
+- For resolved checkpoints, file count comes from `CheckpointSummary.FilesTouched`.
+- Agent comes from the latest non-review session metadata, walking sessions backward and skipping `session.Kind(...).IsReview()`. Map agent type via `agent.GetByAgentType`; fallback to raw agent type string when unknown. If only review sessions exist, agent `-`.
+- Use `checkpoint.ResolveCommittedReaderForCheckpoint`, `checkpoint.NewGitStore`, `checkpoint.NewV2GitStore`, `remote.FetchURL(ctx)`, and `settings.IsCheckpointsV2Enabled(ctx)`. Treat missing v2 remote as non-fatal.
+- Render header exactly including `Commits in scope (newest first):` and instructions mentioning `entire explain <id>`, `entire explain <id> --raw-transcript`, and `git show <commit>`.
+- Add small helpers as needed: `gitLines`, `reviewBriefRow`, `shortCommit`, `truncateReviewSubject`, `gitChangedFileCount`, `latestNonReviewAgent`, table formatter.
+
+Tests to add in `review_test.go`:
+- Test helper `commitWithMessage` using `testutil.WriteFile`, `testutil.GitAdd`, and `runGit(..., "commit", "-m", subject, optional "-m", body)`.
+- Test helper `writeReviewBriefCheckpoint` using `git.PlainOpen`, `checkpoint.NewGitStore`, `store.WriteCommitted`, `id.MustCheckpointID`, `redact.AlreadyRedacted`, and options including `FilesTouched`, `Agent`, `Kind`.
+- `TestRenderReviewBriefForRepo_MixedCommits`: temp repo, base branch `main`, feature branch, one commit with checkpoint and one without; assert header, checkpoint ID, `claude-code`, subjects, uncheckpointed short hash, and `entire explain <id>` are present.
+- Empty scope returns `""`.
+- Missing base ref returns `""`.
+- Unresolved trailer renders `<id> (unresolved)`.
+- Checkpoint with implementation session plus later `session.KindAgentReview` still displays implementation agent.
+- Checkpoint with only review sessions displays agent placeholder `-`.
+- Long subject truncates to ellipsis and omits the full long subject.
+- Newest-first ordering matches `git rev-list` default.
+
+Keep renderer tests `t.Parallel()` because they should call `renderReviewBriefForRepo` directly and not call `t.Chdir()`.
+
+Verification requirement:
+1. First add the renderer tests and run `go test ./cmd/entire/cli -run TestRenderReviewBriefForRepo -count=1` to see the expected failure.
+2. Implement production code.
+3. Run `go test ./cmd/entire/cli -run TestRenderReviewBriefForRepo -count=1 -v` and report the exact result.
+
+Return status `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`, list changed files, tests run, and any concerns.
+
+---
+
+Status check: please report whether you are still implementing, blocked, or running tests. If blocked, return `BLOCKED` with the exact blocker. Do not commit.

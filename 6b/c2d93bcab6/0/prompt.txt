@@ -1,0 +1,199 @@
+Implement the following plan:
+
+# Replace fmt.Fprintf(os.Stderr) with logging in agent hook paths
+
+## Context
+
+When the Entire CLI runs as an agent hook (Claude Code, Gemini, OpenCode, Cursor), `fmt.Fprintf(os.Stderr, ...)` output is unreliable:
+- **OpenCode**: stderr explicitly suppressed - `entire_plugin.ts:42` sets `stderr: "ignore"` in `Bun.spawnSync`, and line 23 uses `.quiet()` for async hooks
+- **Git hooks** (prepare-commit-msg, post-commit): stderr redirected to `/dev/null` in `strategy/hooks.go:174,190`
+- **Claude Code / Gemini / Cursor**: stderr handling depends on agent runtime - not guaranteed visible to user
+
+The `logging` package already exists and writes structured JSON to `.entire/logs/entire.log`, which is always captured. The lifecycle code already uses `logging.Info()` for top-level event dispatch but then falls back to `fmt.Fprintf(os.Stderr)` for everything else.
+
+## Approach
+
+Replace `fmt.Fprintf(os.Stderr, ...)` calls with appropriate `logging.*()` calls **only in agent hook code paths**. User-facing commands (resume, rewind, reset, doctor, setup) keep their stderr prints since the user directly invokes those.
+
+### Level mapping
+- `"Warning: ..."` messages → `logging.Warn(ctx, ...)`
+- Informational operational messages → `logging.Info(ctx, ...)`
+- Detailed debugging messages (file lists, offsets, paths) → `logging.Debug(ctx, ...)`
+
+---
+
+## Complete replacement list
+
+### 1. `cmd/entire/cli/lifecycle.go` (52 prints)
+
+| Line | Current message | Level |
+|------|----------------|-------|
+| 95 | `Warning: failed to load session state on start: %v` | Warn |
+| 98 | `Warning: session start transition failed: %v` | Warn |
+| 101 | `Warning: failed to update session state on start: %v` | Warn |
+| 133 | `Warning: failed to ensure strategy setup: %v` | Warn |
+| 138 | `Warning: failed to initialize session state: %v` | Warn |
+| 171 | `Entire: skipping checkpoint. Will activate after first commit.` | Info |
+| 188 | `Warning: failed to prepare transcript: %v` | Warn |
+| 201 | `Copied transcript to: %s` | Debug |
+| 206 | `Warning: failed to load pre-prompt state: %v` | Warn |
+| 224 | `Warning: failed to extract prompts: %v` | Warn |
+| 231 | `Warning: failed to extract summary: %v` | Warn |
+| 239 | `Warning: failed to extract modified files (with subagents): %v` | Warn |
+| 246 | `Warning: failed to extract modified files: %v` | Warn |
+| 259 | `Extracted %d prompt(s) to: %s` | Debug |
+| 266 | `Extracted summary to: %s` | Debug |
+| 274 | `Using commit message: %s` | Debug |
+| 284 | `Pre-prompt state: %d pre-existing untracked files` | Debug |
+| 291 | `Warning: failed to compute file changes: %v` | Warn |
+| 317 | `No files were modified during this session` | Info |
+| 318 | `Skipping commit` | Info |
+| 321 | `Warning: failed to cleanup pre-prompt state: %v` | Warn |
+| 334 | `Created context file: %s` | Debug |
+| 382 | `Warning: failed to cleanup pre-prompt state: %v` | Warn |
+| 402 | `Warning: failed to load session state for compaction: %v` | Warn |
+| 406 | `Warning: compaction transition failed: %v` | Warn |
+| 410 | `Warning: failed to save session state after compaction: %v` | Warn |
+| 414 | `Context compaction detected` | Info |
+| 436 | `Warning: failed to mark session ended: %v` | Warn |
+| 451 | `[entire] Subagent started` | Info |
+| 452 | `Session ID: %s` | Info (merged into line 451 as attr) |
+| 453 | `Tool Use ID: %s` | Info (merged into line 451 as attr) |
+| 454 | `Transcript: %s` | Info (merged into line 451 as attr) |
+| 490 | `[entire] Subagent completed` | Info |
+| 491 | `Session ID: %s` | Info (merged into line 490 as attr) |
+| 492 | `Tool Use ID: %s` | Info (merged into line 490 as attr) |
+| 494 | `Agent ID: %s` | Info (merged into line 490 as attr) |
+| 497 | `Subagent Transcript: %s` | Info (merged into line 490 as attr) |
+| 508 | `Warning: failed to extract modified files from subagent: %v` | Warn |
+| 517 | `Warning: failed to load pre-task state: %v` | Warn |
+| 525 | `Warning: failed to compute file changes: %v` | Warn |
+| 544 | `[entire] No file changes detected, skipping task checkpoint` | Info |
+| 598 | `Pre-prompt state found: parsing transcript from offset %d` | Debug |
+| 605 | `Warning: failed to load session state: %v` | Warn |
+| 609 | `Session state found: parsing transcript from offset %d` | Debug |
+| 658 | `Warning: failed to load session state for turn end: %v` | Warn |
+| 665 | `Warning: turn-end transition failed: %v` | Warn |
+| 672 | `Warning: turn-end action dispatch failed: %v` | Warn |
+| 676 | `Warning: failed to update session phase on turn end: %v` | Warn |
+| 691 | `Warning: session stop transition failed: %v` | Warn |
+| 705-718 | `Files modified/created/deleted during session` (multi-line) | Debug (single log with file counts + attrs) |
+
+### 2. `cmd/entire/cli/state.go` (3 prints)
+
+| Line | Current message | Level |
+|------|----------------|-------|
+| 120 | `Warning: failed to get transcript position: %v` | Warn |
+| 144 | `Captured state before prompt: %d untracked files, transcript offset: %d` | Debug |
+| 450 | `Captured state before task: %d untracked files` | Debug |
+
+### 3. `cmd/entire/cli/hooks_claudecode_posttodo.go` (6 prints)
+
+| Line | Current message | Level |
+|------|----------------|-------|
+| 60 | `Entire: skipping incremental checkpoint on branch '%s'` | Info |
+| 67 | `Warning: failed to detect changed files: %v` | Warn |
+| 73 | `[entire] No file changes detected, skipping incremental checkpoint` | Info |
+| 80 | `Warning: failed to get git author: %v` | Warn |
+| 138 | `Warning: failed to save incremental task step: %v` | Warn |
+| 142 | `[entire] Created incremental checkpoint #%d for %s (task: %s)` | Info |
+
+### 4. `cmd/entire/cli/strategy/manual_commit_hooks.go` (10 prints)
+
+| Line | Current message | Level |
+|------|----------------|-------|
+| 720 | `[entire] Warning: failed to clean up %s: %v` | Warn |
+| 722 | `[entire] Cleaned up shadow branch: %s` | Info |
+| 834 | `[entire] Warning: post-commit action handler error: %v` | Warn |
+| 872 | `[entire] Warning: failed to update session state: %v` | Warn |
+| 898 | `[entire] Warning: condensation failed for session %s: %v` | Warn |
+| 929 | `[entire] Condensed session %s: %s (%d checkpoints)` | Info |
+| 1000 | `[entire] Warning: failed to update session state: %v` | Warn |
+| 1548 | `[entire] Warning: turn start transition failed: %v` | Warn |
+| 1609 | `[entire] Warning: turn start transition failed: %v` | Warn |
+| 1620 | `Initialized shadow session: %s` | Info |
+
+### 5. `cmd/entire/cli/strategy/manual_commit_git.go` (5 prints)
+
+| Line | Current message | Level |
+|------|----------------|-------|
+| 112 | `Skipped checkpoint (no changes since last checkpoint)` | Info |
+| 145 | `Created shadow branch '%s' and committed changes` | Info |
+| 147 | `Committed changes to shadow branch '%s'` | Info |
+| 262 | `Created shadow branch '%s' and committed task checkpoint` | Info |
+| 264 | `Committed task checkpoint to shadow branch '%s'` | Info |
+
+### 6. `cmd/entire/cli/strategy/manual_commit_migration.go` (3 prints)
+
+| Line | Current message | Level |
+|------|----------------|-------|
+| 54 | `Updated session base commit to %s (HEAD changed during session)` | Info |
+| 70 | `Warning: failed to remove old shadow branch %s: %v` | Warn |
+| 73 | `Moved shadow branch from %s to %s (HEAD changed during session)` | Info |
+
+Needs `logging` import added.
+
+### 7. `cmd/entire/cli/strategy/push_common.go` (4 prints)
+
+| Line | Current message | Level |
+|------|----------------|-------|
+| 81 | `[entire] Pushing session logs to %s...` | Info |
+| 89 | `[entire] Syncing with remote session logs...` | Info |
+| 92 | `[entire] Warning: couldn't sync sessions: %v` | Warn |
+| 98 | `[entire] Warning: failed to push sessions after sync: %v` | Warn |
+
+Needs `logging` import added.
+
+### 8. `cmd/entire/cli/strategy/common.go` (2 prints in hook path + 8 in dead code)
+
+Only replacing the 2 prints in `EnsureMetadataBranch` (called from `EnsureSetup`, hook path):
+
+| Line | Current message | Level |
+|------|----------------|-------|
+| 305 | `Created local branch '%s' from origin` | Info |
+| 352 | `Created orphan branch '%s' for session metadata` | Info |
+
+The 8 prints in `StageFiles` (lines 998-1027) are dead code (no callers). Skip.
+
+Needs `logging` import added.
+
+### 9. `cmd/entire/cli/agent/token_usage.go` (2 prints)
+
+| Line | Current message | Level |
+|------|----------------|-------|
+| 17 | `Warning: failed to calculate token usage (with subagents): %v` | Warn |
+| 25 | `Warning: failed to calculate token usage: %v` | Warn |
+
+Needs: add `ctx context.Context` parameter, import `logging`. Single caller in `lifecycle.go` already has `ctx`.
+
+---
+
+**Total: 87 stderr prints → logging calls**
+
+### Files NOT modified (user-facing commands)
+- `resume.go`, `rewind.go`, `reset.go`, `doctor.go`, `setup.go`
+- `strategy/manual_commit_reset.go`, `strategy/manual_commit_rewind.go`
+- `strategy/hooks.go` (hook installation - user-facing)
+- `session/gen_state_diagram.go` (codegen tool)
+- `integration_test/setup_test.go` (test setup)
+- `logging/logger.go` (the logger itself)
+- `strategy/common.go` StageFiles function (dead code)
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Also verify no remaining `fmt.Fprintf(os.Stderr` in the hook paths:
+```bash
+grep -n 'fmt.Fprintf(os.Stderr' cmd/entire/cli/lifecycle.go cmd/entire/cli/state.go cmd/entire/cli/hooks_claudecode_posttodo.go cmd/entire/cli/strategy/manual_commit_hooks.go cmd/entire/cli/strategy/manual_commit_git.go cmd/entire/cli/strategy/manual_commit_migration.go cmd/entire/cli/strategy/push_common.go cmd/entire/cli/agent/token_usage.go
+```
+Should return no matches.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-old-prs/e1f29414-807e-4293-86d0-096ddaef404b.jsonl
+
+---
+
+commit this and delete the dead code after
