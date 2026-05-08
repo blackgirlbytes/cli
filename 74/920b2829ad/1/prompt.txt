@@ -1,0 +1,40 @@
+can you check the changes in this branch and look at the PR, I think the approach is to risky, what I more think:
+
+- if we are in `/path/to/repo/.claude/worktrees/<something>` then we try to get the session log as if we would be in the repo root, so lookup path would be `/Users/soph/.claude/projects/-path-to-repo/`
+- if it does not exist we try `/Users/soph/.claude/projects/-path-to-repo--claude-worktrees-something` (the logic as today)
+- it that also doesn't work we could consider scanning but I feel this is to expensive, so I rather still fail and maybe we can surface a better message to the user via a hook?
+
+
+this was the error message in claude code:
+
+Ran 1 stop hook (ctrl+o to expand)
+  ⎿  Stop hook error: Failed with non-blocking status code: 2026/05/08 16:34:22 INFO
+  turn-end component=lifecycle agent=claude-code event=TurnEnd
+  session_id=e0c25dfd-8725-4137-92b8-bac567fe7add session_ref=/Users/matthiaswenz/.cl
+  aude/projects/-Users-matthiaswenz-Development-matthiaswenz-activity--claude-worktre
+  es-agents-no-squash/e0c25dfd-8725-4137-92b8-bac567fe7add.jsonl model=""
+  transcript file not found: /Users/matthiaswenz/.claude/projects/-Users-matthiaswenz
+  -Development-matthiaswenz-activity--claude-worktrees-agents-no-squash/e0c25dfd-8725
+  -4137-92b8-bac567fe7add.jsonl
+
+---
+
+yes
+
+---
+
+can we add an integration test for this? do we have already?
+
+---
+
+**Findings**
+
+- Medium: [`worktreeParentCandidate`](file:///Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/claudecode/lifecycle.go) at [lifecycle.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/claudecode/lifecycle.go:264) uses `strings.Index(projectSeg, claudeWorktreeMarker)`, which cuts at the first `--claude-worktrees-` occurrence. That breaks valid repos whose sanitized root already contains that token. Example: a repo rooted at `/Users/me/acme--claude-worktrees-tools/repo` and run from Claude’s worktree feature would produce a project segment like `-Users-me-acme--claude-worktrees-tools-repo--claude-worktrees-feature`; the current code truncates it to `-Users-me-acme`, so the fallback points at the wrong project dir and the dropped-checkpoint bug still reproduces for that class of repos. The added tests only cover the simple “marker appears once as the synthetic suffix” case in [lifecycle_test.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/agent/claudecode/lifecycle_test.go:548) and [claude_worktree_path_test.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/integration_test/claude_worktree_path_test.go:34), so this regression would not be caught.
+
+No other substantive issues stood out in the current worktree.
+
+I ran `go test` for the touched unit coverage and the new integration test:
+`env GOCACHE=/tmp/go-build go test ./cmd/entire/cli/agent/claudecode -run 'TestWorktreeParentCandidate|TestResolveTranscriptPath'`
+and
+`env GOCACHE=/tmp/go-build go test ./cmd/entire/cli/integration_test -tags integration -run TestClaudeCode_WorktreePathFallback`
+Both passed.
