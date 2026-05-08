@@ -1,0 +1,60 @@
+pr 1105 is the first of five prs for review refactor. review 1105 first, and see feedback from just this one, but make sure to get the whole picture by reviewing 1106,1107, 1111, and 1112. here is feedback, Verified the BLOCKER. Now I'll summarize for you.
+
+## Review of PR #1105 — refactor(review): replace pending-marker file; add reviewer interfaces (1/3)
+
+*Verdict: REQUEST CHANGES* — the headline claim is broken in production. Tests pass because they bypass the spawn site.
+
+### :red_circle: BLOCKER — Review tagging is silently broken end-to-end
+
+runReview (cmd/entire/cli/review.go:603–646) still writes a PendingReviewMarker and then calls launcher.LaunchCmd(...).Run() — *but never sets ENTIRE_REVIEW_SESSION/AGENT/SKILLS/PROMPT anywhere*. Meanwhile lifecycle.go removed the marker reader and replaced it with adoptReviewEnv that only consults env vars. All launchers (claudecode/claude.go:388, codex/codex.go:239, geminicli/gemini.go:395) do cmd.Env = os.Environ(), so the child inherits an empty handshake.
+
+Net effect after merge: *no real-world entire review invocation tags a session as Kind=agent_review*. HasReview is never set; entire status and the re-run guard never fire. The integration test TestReview_EnvVarAdoptionCondensesReviewMetadataOnNextCommit (integration_test/review_test.go:21) hand-injects env vars on the hook subprocess and so masks the missing wiring.
+
+This contradicts the description's "no user-visible behaviour change" — it's a full regression. Fix: set execCmd.Env = append(os.Environ(), ENTIRE_REVIEW_*=...) before Run() in review.go:646, and add an integration test that exercises runReview itself, not just the hook in isolation.
+
+### :large_orange_circle: HIGH
+
+
+*EnvSession="1" has no scoping.* A shell with export ENTIRE_REVIEW_SESSION=1 tags every subsequent agent session in every repo as a review. Old marker had worktree/agent/SHA scoping; env vars don't. At minimum, gate adoption on EnvAgent == ag.Name() in lifecycle.go:986 — the value is read but never compared (only logged).
+*Deleted regression tests guard a still-live abstraction.* PR removes TestReview_MarkerAdoption_WrongAgentDoesNotAdoptMarker and the worktree/SHA/stale-marker tests, but runReview still writes a marker and PendingReviewMarker (with WorktreePath, StartingSHA) still exists. Either delete the writer + struct (the right call per the description's spirit) or restore the tests.
+*Process.Wait contract is internally inconsistent* (review/types/reviewer.go:71–78): says "must be called exactly once" then "safe to call after Events has closed" with no rule about whether Events must be drained. The orchestrator (PR-A2) will leak goroutines if a sender is mid-send when Wait returns. Pick: must-drain, or buffered/lossy.
+
+
+### :large_yellow_circle: MEDIUM
+
+
+*EnvStartingSHA is dead-on-arrival* (review/env.go:43–52). Doc says "reserved for future code". Drop it from this PR or wire it.
+*EncodeSkills([]) → "[]", DecodeSkills("") → nil is asymmetric* (review/env.go:55–78). Either fix the asymmetry or add an explicit empty-slice round-trip test.
+*Tokens "cumulative not delta"* (reviewer.go:127) — Copilot's session-aggregate-on-shutdown adapter could violate monotonic non-decreasing. Worth one sentence in the doc.
+
+
+### Praise
+
+TestEnvNamesAreStable (env_test.go:24) is a nice contract pin.
+Event sealing via private isEvent() is the canonical Go pattern, implemented correctly.
+paths.ClearWorktreeRootCache() calls in t.Chdir tests are correct.
+JSON-format pinning in checkpoint_test.go is on the right struct and pins the right keys.
+
+
+### Bottom line
+CU2 (type-only contracts) is clean. CU1's contract is defined and consumed on the read side but *never written by runReview*. ~30-line fix at the spawn site plus a real end-to-end integration test would close the BLOCKER. The deleted scoping tests need to either come back (in different form) or the marker writer needs to die in this PR, not be deferred to PR-A3.
+
+---
+
+do any of these changes effect downstream prs? Also, please run tests to verify behavior after changes
+
+---
+
+in terms of functionality, is there anything downstream that is effected and did you test and make sure fucntionality and smoke tests maintain desired outcome
+
+---
+
+did you run local smoke test
+
+---
+
+did you run full suite of tests like mise, lint, all ci tests, etc
+
+---
+
+okay what is next step
