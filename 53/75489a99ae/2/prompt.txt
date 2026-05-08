@@ -1,0 +1,152 @@
+Implement the following plan:
+
+# Plan: PR #372 Review Feedback - ireturn fix + Dashboard Tests
+
+## Context
+
+PR #372 added an interactive TUI dashboard command. Copilot review flagged two issues:
+1. `//nolint:ireturn` comments were incorrectly removed from strategy factory functions (lint will fail)
+2. Missing test coverage for the new `dashboard` package and `dashboard_cmd.go`
+
+## Part 1: Fix ireturn lint issue
+
+**Approach:** Add `Strategy` to the ireturn allow list in `.golangci.yaml` instead of restoring 5 scattered `nolint` comments. This is cleaner since the factory/registry pattern is intentional.
+
+**File to modify:**
+- `.golangci.yaml` (line ~110): Add `github.com/entireio/cli/cmd/entire/cli/strategy.Strategy` to `ireturn.allow`
+
+This also lets us remove existing `nolint:ireturn` comments on factory functions if desired, though they can stay harmlessly.
+
+## Part 2: Add Dashboard Tests
+
+### Test Files to Create (in priority order)
+
+#### 1. `cmd/entire/cli/dashboard/data_test.go` - Pure function tests
+- `TestTimeAgo` - table-driven: just now, minutes, hours, days
+- `TestTruncate` - table-driven: short, exact, long, maxLen<3, empty, unicode
+
+#### 2. `cmd/entire/cli/dashboard/model_test.go` - Root model state machine
+- `TestNewModel_DefaultState` - initial field values
+- `TestModel_TabSwitching` - tab/shift+tab wrapping
+- `TestModel_QuitKeys` - q and ctrl+c set quitting + tea.Quit
+- `TestModel_ToggleHelp` - ? toggles showHelp
+- `TestModel_DataMessages` - sessionsMsg/checkpointsMsg/activeSessionsMsg/settingsDataMsg update state
+- `TestModel_DataMessagesWithError` - error propagation
+- `TestModel_RewindRequestMsg` - sets rewindReq, quitting=true
+- `TestModel_ViewWhileQuitting` - returns empty string
+- `TestModel_WindowSizeMsg` - updates width/height
+- `TestModel_IsTabCapturingInput` - filtering/confirming blocks tab switch
+- `TestModel_ContentHeight` - overhead calculation with/without help
+
+#### 3. `cmd/entire/cli/dashboard/checkpoints_tab_test.go` - Most complex tab
+- `TestCheckpointsModel_Navigation` - j/k cursor movement, bounds
+- `TestCheckpointsModel_DetailToggle` - enter opens/closes, esc closes, empty list guard
+- `TestCheckpointsModel_FilterMode` - /, type, enter confirms, esc clears, backspace
+- `TestCheckpointsModel_ApplyFilter` - case-insensitive match on ID/Message/SessionPrompt
+- `TestCheckpointsModel_FilterCursorAdjustment` - cursor clamped when results shrink
+- `TestCheckpointsModel_RewindConfirmation` - r -> confirming, y -> rewindRequestMsg, n/esc cancel
+- `TestCheckpointsModel_RewindGuards` - blocked in detail view, blocked on empty list
+- `TestCheckpointsModel_ViewStates` - error, empty, checkpoint type labels
+
+#### 4. `cmd/entire/cli/dashboard_cmd_test.go` - Command-level tests
+- `TestFormatResumeCommand` - known agents return correct command, unknown returns ""
+- `TestNewDashboardCmd_Exists` - cmd.Use == "dashboard"
+
+#### 5. `cmd/entire/cli/dashboard/sessions_tab_test.go` - Sessions tab
+- `TestSessionsModel_Navigation` - j/k cursor movement
+- `TestSessionsModel_DetailToggle` - enter/esc, scrollPos reset
+- `TestSessionsModel_FilterMode` - /, type, enter, esc, backspace
+- `TestSessionsModel_ViewStates` - error, empty, no-description
+
+#### 6. `cmd/entire/cli/dashboard/active_tab_test.go` - Active tab
+- `TestActiveModel_SetSessionsFiltersEnded` - only non-ended sessions kept
+- `TestActiveModel_Navigation` - j/k cursor movement
+- `TestActiveModel_DetailToggle` - enter/esc
+- `TestActiveModel_ViewStates` - error, empty
+
+#### 7. `cmd/entire/cli/dashboard/settings_tab_test.go` - Settings tab (low priority)
+- `TestSettingsModel_SetData` - lines populated from settings
+- `TestSettingsModel_Scroll` - j/k within bounds
+- `TestSettingsModel_ViewStates` - error, no data
+
+### Shared Test Helpers
+
+Create `cmd/entire/cli/dashboard/testhelpers_test.go`:
+- `keyMsg(s string) tea.KeyMsg` - build KeyMsg for common keys (tab, shift+tab, ctrl+c, j, k, etc.)
+- `testRewindPoints(n int) []strategy.RewindPoint` - generate test data
+- `testSessions(n int) []strategy.Session` - generate test data
+- `testSessionStates(n int, includeEnded bool) []*session.State` - generate test data
+
+### Test Parallelization
+- All `dashboard/` package tests use `t.Parallel()` (in-memory models, no filesystem)
+- `dashboard_cmd_test.go` tests that use `setupTestRepo` cannot use `t.Parallel()` (t.Chdir)
+
+### What NOT to test
+- `Run()` / `RunAccessible()` - require real terminal/stdin
+- Lipgloss style rendering details - fragile, no value
+- `loadSessionsCmd` etc. - require real git repo, better for integration tests
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Specifically:
+1. `mise run lint` - verify ireturn no longer flags Strategy returns
+2. `go test ./cmd/entire/cli/dashboard/...` - new dashboard tests pass
+3. `go test ./cmd/entire/cli/...` - dashboard_cmd_test.go passes
+4. `mise run test:ci` - all existing tests still pass
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/sakamotoyasuaki/.REDACTED.jsonl
+
+---
+
+You are an AI assistant integrated into a git-based version control system. Your task is to fetch and display comments from a GitHub pull request.
+
+Follow these steps:
+
+1. Use `gh pr view --json number,headRepository` to get the PR number and repository info
+2. Use `gh api /repos/{owner}/{repo}/issues/{number}/comments` to get PR-level comments
+3. Use `gh api /repos/{owner}/{repo}/pulls/{number}/comments` to get review comments. Pay particular attention to the following fields: `body`, `diff_hunk`, `path`, `line`, etc. If the comment references some code, consider fetching it using eg `gh api /repos/{owner}/{repo}/contents/{path}?ref={branch} | jq .content -r | base64 -d`
+4. Parse and format all comments in a readable way
+5. Return ONLY the formatted comments, with no additional text
+
+Format the comments as:
+
+## Comments
+
+[For each comment thread:]
+- @author file.ts#line:
+  ```diff
+  [diff_hunk from the API response]
+  ```
+  > quoted comment text
+
+  [any replies indented]
+
+If there are no comments, return "No comments found."
+
+Remember:
+1. Only show the actual comments, no explanatory text
+2. Include both PR-level and code review comments
+3. Preserve the threading/nesting of comment replies
+4. Show the file and line number context for code review comments
+5. Use jq to parse the JSON responses from the GitHub API
+
+---
+
+co push
+
+---
+
+[Request interrupted by user]
+
+---
+
+対応出来た?
+
+---
+
+はい

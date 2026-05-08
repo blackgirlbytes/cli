@@ -1,0 +1,29 @@
+can we add a `-y` / `--yes` option that when you run `entire enable` with would accept all suggestions, uses the users account to create an repo in and enables all available agents
+
+---
+
+Findings:
+
+1. `--yes` still fails in non-interactive agent-management flows on already-configured repos. In [cmd/entire/cli/setup.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/setup.go:320), `runManageAgents` returns early when `interactive.CanPromptInteractively()` is false, before it ever consults the injected `selectFn`. That means `entire configure --yes` / `entire enable --yes` cannot actually “skip prompts” in CI or other non-TTY contexts once the repo is already set up; it just prints “Cannot show agent selection in non-interactive mode.” The new tests only cover `detectOrSelectAgent`, not this path.
+
+2. `--yes` overrides explicit telemetry opt-out and the env opt-out. In [cmd/entire/cli/setup.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/setup.go:907), `opts.Yes` unconditionally sets `settings.Telemetry = true`, bypassing the existing precedence rules in [promptTelemetryConsent](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/setup.go:1628). As written, `entire configure --yes --telemetry=false` still enables telemetry, and `ENTIRE_TELEMETRY_OPTOUT=1 entire configure --yes` also enables telemetry. That contradicts both the flag semantics and the prior env-based opt-out behavior.
+
+I ran `go test ./cmd/entire/cli -run 'TestEnableUsesSetupFlow|TestSelectAllAgents|TestDetectOrSelectAgent_YesSelectsAll'`, and those targeted tests pass.
+
+---
+
+1. `cmd/entire/cli/strategy/manual_commit_condensation.go:490` likely reintroduces an `ireturn` lint failure. `.golangci.yaml` enables `ireturn`, and `summarize.Generator` is not in the allowlist. This function previously had a targeted `//nolint:ireturn` with an explanation matching the comment above it; removing that suppression looks accidental rather than semantic. I couldn’t get `golangci-lint` to run cleanly in this sandboxed environment, but from the repo config this should be flagged again.
+
+The two earlier `setup` issues look fixed: `selectFn` now bypasses the non-interactive bail-out in `runManageAgents`, and `--yes` now respects `--telemetry=false` plus `ENTIRE_TELEMETRY_OPTOUT`. I also ran the targeted tests for the new `setup` coverage, and they pass.
+
+---
+
+can you commit
+
+---
+
+follow up question: can I combine the added params with --yes ? like for example if I only want one agent? did we add test coverage for `--yes` or can we add some for this scenario?
+
+---
+
+try again now, I cleaned the golangiclint cache

@@ -1,0 +1,107 @@
+Implement the following plan:
+
+# Implement TranscriptAnalyzer for Cursor agent
+
+## Context
+
+Cursor uses the same JSONL transcript format as Claude Code (the shared `transcript` package already normalizes `role` → `type` and strips `` tags). However, Cursor doesn't implement `TranscriptAnalyzer`, which means:
+
+- Prompts are never extracted → shadow branch commit messages fall back to generic fallback
+- No summary is extracted from the session
+- Transcript position tracking doesn't work (offset-based incremental parsing)
+
+The only real limitation is that Cursor transcripts don't contain `tool_use` blocks, so `ExtractModifiedFilesFromOffset` can't extract file paths from the transcript. But that's already handled by git-status-based detection in `lifecycle.go` — we just need `ExtractModifiedFilesFromOffset` to return the current position for offset tracking.
+
+## Implementation
+
+### 1. Add `transcript.go` to Cursor agent package
+
+**New file:** `cmd/entire/cli/agent/cursor/transcript.go`
+
+Implement the 4 `TranscriptAnalyzer` methods on `*CursorAgent`:
+
+- **`GetTranscriptPosition(path string) (int, error)`** — Count JSONL lines. Same logic as Claude Code's implementation since both use JSONL. Use `bufio.Reader` + `ReadBytes('\n')` to handle arbitrarily long lines.
+
+- **`ExtractPrompts(sessionRef string, fromOffset int) ([]string, error)`** — Reuse `transcript.ParseFromFileAtLine()` + `transcript.ExtractUserContent()` + `textutil.StripIDEContextTags()`. Identical to Claude Code's implementation since the shared transcript package already normalizes `role` → `type` and strips `` tags.
+
+- **`ExtractSummary(sessionRef string) (string, error)`** — Reuse `transcript.ParseFromBytes()`, walk backward to find last assistant text block. Identical to Claude Code's implementation.
+
+- **`ExtractModifiedFilesFromOffset(path string, startOffset int) ([]string, int, error)`** — Return an error: `(nil, 0, ErrNoToolUseBlocks)`. Cursor transcripts don't contain `tool_use` blocks, so file extraction is not supported. Returning an error (rather than nil files) makes the intent explicit: "can't extract" vs "found nothing." All 3 call sites handle errors gracefully — they print a warning and fall through to git-status-based detection. Define a package-level sentinel: `var ErrNoToolUseBlocks = errors.New("cursor transcripts do not contain tool_use blocks; file detection uses git status")`.
+
+### 2. Remove "does NOT implement" comment
+
+**File:** `cmd/entire/cli/agent/cursor/lifecycle.go` (line 47-49)
+
+Remove the comment block:
+```go
+// Note: CursorAgent does NOT implement TranscriptAnalyzer. Cursor's transcript
+// format does not contain tool_use blocks that would allow extracting modified
+// files. File detection relies on git status instead.
+```
+
+### 3. Remove "ModifiedFiles left empty" comment
+
+**File:** `cmd/entire/cli/agent/cursor/cursor.go` (lines 106-107)
+
+Update the `ReadSession` comment from:
+```go
+// Note: ModifiedFiles is left empty because Cursor's transcript format does not
+// contain tool_use blocks. File detection relies on git status instead.
+```
+To:
+```go
+// Note: ModifiedFiles is left empty because Cursor's transcript does not contain
+// tool_use blocks for file detection. TranscriptAnalyzer extracts prompts and
+// summaries; file detection relies on git status.
+```
+
+### 4. Add tests
+
+**New file:** `cmd/entire/cli/agent/cursor/transcript_test.go`
+
+Tests using `sampleTranscriptLines()` (already defined in `cursor_test.go`):
+
+- **`TestCursorAgent_GetTranscriptPosition`** — Write sample transcript, verify line count = 4
+- **`TestCursorAgent_GetTranscriptPosition_EmptyPath`** — Empty path returns 0
+- **`TestCursorAgent_GetTranscriptPosition_NonexistentFile`** — Returns 0, nil
+- **`TestCursorAgent_ExtractPrompts`** — Verify 2 prompts extracted, `` tags stripped
+- **`TestCursorAgent_ExtractPrompts_WithOffset`** — fromOffset=2, only second prompt returned
+- **`TestCursorAgent_ExtractPrompts_EmptyFile`** — Returns empty slice
+- **`TestCursorAgent_ExtractSummary`** — Returns last assistant message text
+- **`TestCursorAgent_ExtractSummary_EmptyFile`** — Returns empty string
+- **`TestCursorAgent_ExtractModifiedFilesFromOffset`** — Returns nil files, correct position (4)
+- **`TestCursorAgent_ExtractModifiedFilesFromOffset_EmptyPath`** — Returns 0
+- **Compile-time interface check:** `var _ agent.TranscriptAnalyzer = (*CursorAgent)(nil)`
+
+### 5. Add compile-time interface check
+
+In `transcript.go`, add:
+```go
+var _ agent.TranscriptAnalyzer = (*CursorAgent)(nil)
+```
+
+## Key reuse points
+
+- `transcript.ParseFromFileAtLine()` — shared JSONL parser with `role` → `type` normalization (`cmd/entire/cli/transcript/parse.go`)
+- `transcript.ParseFromBytes()` — shared byte-level parser (`cmd/entire/cli/transcript/parse.go`)
+- `transcript.ExtractUserContent()` — extracts user content from raw message (`cmd/entire/cli/transcript/parse.go`)
+- `textutil.StripIDEContextTags()` — strips `` and other IDE tags (`cmd/entire/cli/textutil/ide_tags.go`)
+- `sampleTranscriptLines()` / `writeSampleTranscript()` — existing test helpers (`cmd/entire/cli/agent/cursor/cursor_test.go`)
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. Verify `var _ agent.TranscriptAnalyzer = (*CursorAgent)(nil)` compiles
+3. Verify prompts are extracted with `` tags stripped
+4. Verify `ExtractModifiedFilesFromOffset` returns empty files but correct position
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-cli/f4a723a3-f761-475d-9b45-5fa0a3282374.jsonl
+
+---
+
+look like, now, we are creating commit at the shadow with cursor even though there are not files modified. is it a side effect of this new implementation?
+
+---
+
+commit all the changes, push the branch and create a PR

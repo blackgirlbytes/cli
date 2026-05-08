@@ -1,0 +1,66 @@
+Implement the following plan:
+
+# Fix Droid E2E: Add Interactive Warmup After Startup
+
+## Context
+
+After replacing the droid handshake with settle-only mode (commit `dce5f576`), CI E2E test `TestAttributionOnAgentCommit` fails with a 3-minute timeout. The pane content at timeout shows droid's splash screen, startup markers, and the echoed test prompt — but **no response from droid**.
+
+**Root cause**: The old handshake acted as an interactive warmup — it sent a prompt and got a response, proving droid was responsive. Without it, the first test prompt hits droid "cold" in interactive mode, and droid doesn't respond (likely an initialization delay or API setup that happens on first prompt). The settle-only logic correctly requires content to change after `Send` before settling, but since droid produces no output, it hangs.
+
+**The settle-only logic itself is correct** — this is not a settle detection bug. Droid genuinely doesn't respond to the first prompt in CI without a warmup round-trip.
+
+## Approach: Lightweight Interactive Warmup
+
+Add a warmup step in `StartSession` after startup markers are detected. Much simpler than the old handshake — no token matching, no separate retry counters.
+
+### Changes
+
+#### 1. `e2e/agents/droid.go` — Add warmup in StartSession
+
+After startup markers are detected, send a warmup prompt and wait for content to settle:
+
+```go
+// After startup markers detected...
+
+// Interactive warmup: send a lightweight prompt to ensure droid
+// can process input. The first interactive prompt often has extra
+// initialization delay in CI.
+if err := s.Send("Reply with OK and nothing else. Do not create files or run commands."); err != nil {
+    _ = s.Close()
+    lastErr = fmt.Errorf("send warmup: %w", err)
+    // continue to retry
+}
+if _, err := s.WaitFor("", cfg.warmupTimeout); err != nil {
+    _ = s.Close()
+    lastErr = fmt.Errorf("warmup response: %w", err)
+    // continue to retry
+}
+
+s.stableAtSend = ""
+return s, nil
+```
+
+Add `warmupTimeout` to `droidStartupConfig`:
+- Default: 60s
+- CI: 90s
+- Overridable via `E2E_DROID_WARMUP_TIMEOUT` env var
+
+#### 2. `e2e/agents/droid_test.go` — Update config tests
+
+Add `warmupTimeout` field to the default/override expectations in `TestDroidStartupConfigFromEnv_Defaults` and `TestDroidStartupConfigFromEnv_Overrides`.
+
+### Files
+- `e2e/agents/droid.go` — add warmup step + warmupTimeout config field
+- `e2e/agents/droid_test.go` — update config test expectations
+
+### Verification
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. CI will run `mise run test:e2e --agent factoryai-droid TestAttributionOnAgentCommit`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-droid-e2e-fix/1f16d7cf-395f-440f-b041-fe3156f9b13d.jsonl
+
+---
+
+commit and push

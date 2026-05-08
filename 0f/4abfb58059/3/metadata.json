@@ -1,0 +1,91 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "0f4abfb58059",
+  "session_id": "b7610b4e-f75e-49b0-83a2-44cd42cf0316",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-01T17:53:49.44375Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "cmd/entire/cli/permissions/analyzer_test.go",
+    "cmd/entire/cli/permissions/permissions.go",
+    "cmd/entire/cli/permissions_cmd.go",
+    "cmd/entire/cli/permissions_cmd_test.go",
+    "cmd/entire/cli/root.go",
+    "cmd/entire/cli/skilldb/cache.go",
+    "cmd/entire/cli/skilldb/cache_test.go",
+    "cmd/entire/cli/skilldb/discovery.go",
+    "cmd/entire/cli/skilltui/picker.go",
+    "cmd/entire/cli/skilltui/root.go"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "7e6b235be1fc",
+  "token_usage": {
+    "input_tokens": 300,
+    "cache_creation_tokens": 154009,
+    "cache_read_tokens": 12174050,
+    "output_tokens": 43962,
+    "api_call_count": 123
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "summary": {
+    "intent": "Fix the friction tab in the agent skill improvement TUI, which was always showing empty despite friction data existing in the database.",
+    "outcome": "Two root causes were identified and fixed: (1) plugin-based skills (Superpowers, Codex, etc.) were never discovered by DiscoverSkills, so their friction data had no skill to attach to; (2) the transcript-based session attribution path in PopulateFromInsightsDB never carried friction data from insightsdb into skilldb. Both fixes landed with tests, and the friction tab now shows populated data.",
+    "learnings": {
+      "repo": [
+        "DiscoverSkills only scanned .claude/skills/ and .claude/commands/ — it was blind to plugin-based skills in ~/.claude/plugins/cache/{org}/{plugin}/{version}/",
+        "PopulateFromInsightsDB runs in two steps: Step 1 fetches skill_signals (has friction, fails on name resolution), Step 2 attributes sessions via transcript matching (resolves names, but never looked at friction). The mismatch caused a silent data loss.",
+        "ResolveSkillName handles plugin prefixes like superpowers:brainstorming and codex:review by matching on the last segment, so once plugins were discovered, name resolution worked without additional changes.",
+        "cacheVersion must be bumped whenever discovery logic or population logic changes, to force re-population for existing users.",
+        "The pre-existing TestDiscoverSkills_YAMLNameExtraction test is environment-sensitive — it picks up personal skills from ~/.claude/ and fails on developer machines with installed skills.",
+        "The permissions package has 12 pre-existing lint errors unrelated to skilldb changes."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/skilldb/cache.go",
+          "finding": "signalsBySession lookup map built from already-fetched skill_signals allows Step 2 (transcript attribution) to carry friction and missing instructions without any additional DB queries."
+        },
+        {
+          "path": "cmd/entire/cli/skilldb/discovery.go",
+          "finding": "Added ScopePlugin constant and discoverPluginSkills function. Plugin cache layout is ~/.claude/plugins/cache/{org}/{plugin}/{version}/ with skills/, commands/, and agent-defs/ subdirectories. Latest version is selected by sorting version dirs."
+        },
+        {
+          "path": "cmd/entire/cli/skilldb/cache_test.go",
+          "finding": "New tests TestPopulateFromInsightsDB_TranscriptFallbackCarriesFriction and TestPopulateFromInsightsDB_TranscriptFallbackMultipleFrictionItems cover the session attribution + friction carry-over path with mismatched LLM skill names."
+        }
+      ],
+      "workflow": [
+        "When a bug involves a data pipeline, trace each stage independently in the DB before reading code — the SQL queries revealed the disconnect (29 friction rows in insightsdb, 0 in skilldb) immediately.",
+        "goconst lint rule flags string literals used 3+ times; extracting constants (outcomeSuccess, outcomeFriction) is required to pass lint.",
+        "unparam lint flags functions that always return nil error — simplify signatures to remove the error return to fix cleanly.",
+        "Verify pre-existing lint/test failures on main before attributing them to your changes to avoid wasted debugging."
+      ]
+    },
+    "friction": [
+      "improve --dry-run does not trigger skill TUI repopulation, requiring a manual test program to verify end-to-end behavior after cache clear.",
+      "Multiple rounds of lint fixes needed: goconst (string literals), nilerr (nil return after error check), unparam (always-nil error returns), wrapcheck (unwrapped os.ReadDir error) — each requiring a separate read-edit-lint cycle.",
+      "The skills showing up as empty (second user complaint) turned out to be a separate transient issue unrelated to the friction fix — root cause was not fully diagnosed in the transcript.",
+      "Cache version must be manually tracked and bumped; no automated mechanism to detect when a bump is needed."
+    ],
+    "open_items": [
+      "TestDiscoverSkills_YAMLNameExtraction is environment-sensitive and fails on machines with personal skills installed — needs a mock or isolated test environment.",
+      "Plugin skill discovery uses latest version dir by sorting, but no test coverage for multi-version plugin cache layout.",
+      "The skilltui picker only has Repo/Personal filter scopes — plugin skills appear under All but there is no Plugin filter tab for discoverability.",
+      "permissions package has 12 pre-existing lint errors that were not addressed."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-01T17:53:21.857593Z",
+    "agent_lines": 1736,
+    "agent_removed": 0,
+    "human_added": 643,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 2379,
+    "total_lines_changed": 0,
+    "agent_percentage": 72.97183690626314
+  }
+}

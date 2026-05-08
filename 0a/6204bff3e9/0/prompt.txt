@@ -1,0 +1,116 @@
+Implement the following plan:
+
+# Fix exhaustive switch lint errors for AgentTypeFactoryAIDroid in explain.go
+
+## Context
+
+The `AgentTypeFactoryAIDroid` type was recently added to the agent registry but two switch statements in `explain.go` were not updated, causing `exhaustive` lint failures.
+
+## Changes
+
+**File: `cmd/entire/cli/explain.go`**
+
+1. **Line 539** — `scopeTranscriptForCheckpoint`: Add `agent.AgentTypeFactoryAIDroid` to the Claude Code case:
+   ```go
+   case agent.AgentTypeClaudeCode, agent.AgentTypeOpenCode, agent.AgentTypeFactoryAIDroid, agent.AgentTypeUnknown:
+   ```
+   Factory AI Droid uses JSONL format (same as Claude Code), so line-based slicing is correct.
+
+2. **Line 1539** — `transcriptOffset`: Add `agent.AgentTypeFactoryAIDroid` to the Claude Code case:
+   ```go
+   case agent.AgentTypeClaudeCode, agent.AgentTypeOpenCode, agent.AgentTypeFactoryAIDroid, agent.AgentTypeUnknown:
+   ```
+   Same reasoning — JSONL uses line counting, not message counting.
+
+## Verification
+
+```bash
+mise run lint    # Confirm exhaustive switch errors are gone
+mise run test:ci # Confirm no regressions
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.REDACTED.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   cmd/entire/cli/explain.go
+	modified:   cmd/entire/cli/summarize/summarize.go
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/explain.go b/cmd/entire/cli/explain.go
+index 97aea8d6..6990b225 100644
+--- a/cmd/entire/cli/explain.go
++++ b/cmd/entire/cli/explain.go
+@@ -536,7 +536,7 @@ func scopeTranscriptForCheckpoint(fullTranscript []byte, startOffset int, agentT
+ 	switch agentType {
+ 	case agent.AgentTypeGemini:
+ 		return geminicli.SliceFromMessage(fullTranscript, startOffset)
+-	case agent.AgentTypeClaudeCode, agent.AgentTypeOpenCode, agent.AgentTypeUnknown:
++	case agent.AgentTypeClaudeCode, agent.AgentTypeOpenCode, agent.AgentTypeFactoryAIDroid, agent.AgentTypeUnknown:
+ 		return transcript.SliceFromLine(fullTranscript, startOffset)
+ 	}
+ 	return transcript.SliceFromLine(fullTranscript, startOffset)
+@@ -1536,7 +1536,7 @@ func transcriptOffset(transcriptBytes []byte, agentType agent.AgentType) int {
+ 			return 0
+ 		}
+ 		return len(t.Messages)
+-	case agent.AgentTypeClaudeCode, agent.AgentTypeOpenCode, agent.AgentTypeUnknown:
++	case agent.AgentTypeClaudeCode, agent.AgentTypeOpenCode, agent.AgentTypeFactoryAIDroid, agent.AgentTypeUnknown:
+ 		return countLines(transcriptBytes)
+ 	}
+ 	return countLines(transcriptBytes)
+diff --git a/cmd/entire/cli/summarize/summarize.go b/cmd/entire/cli/summarize/summarize.go
+index 97d266d8..bc721c01 100644
+--- a/cmd/entire/cli/summarize/summarize.go
++++ b/cmd/entire/cli/summarize/summarize.go
+@@ -119,12 +119,7 @@ func BuildCondensedTranscriptFromBytes(content []byte, agentType agent.AgentType
+ 	case agent.AgentTypeGemini:
+ 		return buildCondensedTranscriptFromGemini(content)
+ 	case agent.AgentTypeFactoryAIDroid:
+-		// Droid has its own envelope format — normalize before condensing
+-		droidLines, err := factoryaidroid.ParseDroidTranscriptFromBytes(content)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to parse Droid transcript: %w", err)
+-		}
+-		return BuildCondensedTranscript(droidLines), nil
++		return buildCondensedTranscriptFromDroid(content)
+ 	case agent.AgentTypeOpenCode:
+ 		return buildCondensedTranscriptFromOpenCode(content)
+ 	case agent.AgentTypeClaudeCode, agent.AgentTypeUnknown:
+@@ -216,6 +211,15 @@ func buildCondensedTranscriptFromOpenCode(content []byte) ([]Entry, error) {
+ 	return entries, nil
+ }
+ 
++// buildCondensedTranscriptFromDroid parses Droid transcript and extracts a condensed view.
++func buildCondensedTranscriptFromDroid(content []byte) ([]Entry, error) {
++	droidLines, err := factoryaidroid.ParseDroidTranscriptFromBytes(content)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse Droid transcript: %w", err)
++	}
++	return BuildCondensedTranscript(droidLines), nil
++}
++
+ // extractGenericToolDetail extracts an appropriate detail string from a tool's input/args map.
+ // Checks common fields in order of preference. Used by both OpenCode and Gemini condensation.
+ func extractGenericToolDetail(input map[string]interface{}) string {
+- Current branch: alisha/factoryai-agent
+- Recent commits: c5a1d93d Merge branch 'main' into alisha/factoryai-agent
+94a1d70d Implement GetSessionDir for Factory AI Droid
+ac7c4438 Add Factory AI Droid E2E test runner
+12d2099e Fix Droid "(no prompt)" after commit by adding agent-specific transcript parsing
+56fc2bce Merge pull request #442 from entireio/soph/better-agent-agent-instructions
+7b5f027e Merge pull request #441 from entireio/soph/small-rewind-refactor
+e386c99a Merge pull request #440 from entireio/rwr/streamline-setup
+b7247804 Merge branch 'main' into soph/better-agent-agent-instructions
+f73457db setup: fix test
+7c0e56d1 Merge branch 'main' into rwr/streamline-setup
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

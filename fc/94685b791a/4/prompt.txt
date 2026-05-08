@@ -1,0 +1,954 @@
+Implement the following plan:
+
+# Store Stripped Transcripts in MySQL
+
+## Context
+
+The transcript pipeline has a GitHub API bottleneck. Today, transcripts (`full.jsonl`) are fetched from GitHub in three places:
+1. **Search indexing** (`processSearchIndexBatch`) — fetches per-checkpoint via REST on every index
+2. **Transcript endpoint** (`/checkpoints/:id/transcript`) — fetches from GitHub on KV cache miss (first user click)
+3. **Backfills** — repo sync discovers checkpoints but never fetches transcripts; search indexing does it later
+
+By storing stripped transcripts in MySQL at webhook time, all downstream consumers (search, UI, backfill) read from the DB. GitHub API calls for transcripts drop to zero after initial ingest.
+
+The Python `strip-transcript.py` script reduces JSONL by ~60-80% by keeping only fields the parsers actually read — making DB storage practical.
+
+## Architecture Decision: No New Queue
+
+We already have `SEARCH_INDEX_QUEUE`. Today it: fetches checkpoints from DB → fetches transcripts from GitHub → indexes to Turbopuffer. The change: fetch transcript from GitHub → strip → store in DB → index to Turbopuffer (using DB transcript). Same queue, same trigger points, just adds a DB write step. No new queue needed.
+
+For backfill of newly connected repos, `repo-sync-service` already queues to `SEARCH_INDEX_QUEUE` — we just need to make sure it does so consistently. The search index queue handler becomes the single place where transcripts are fetched from GitHub and stored.
+
+## Schema: New Column on `repo_checkpoints`
+
+**Why not a separate table?** The transcript is 1:1 with a checkpoint. A separate table adds JOIN complexity and a second upsert in every write path. A LONGTEXT column on the existing table keeps things simple. MySQL stores LONGTEXT off-page, so it doesn't affect queries that don't SELECT it. We just need to avoid `SELECT *` in hot paths (already the case — all queries use explicit column lists).
+
+**Storage format: per-session JSON map.** Multi-session checkpoints store each session's stripped JSONL separately, matching the GitHub folder structure:
+```json
+{"0": "...stripped session 0 jsonl...", "1": "...stripped session 1 jsonl..."}
+```
+This makes it easy to serve individual sessions and matches the `0/full.jsonl`, `1/full.jsonl` structure on GitHub.
+
+## Changes
+
+### 1. DB Migration: Add `transcript_stripped` column
+
+**New file: `api/db/migrations/004_add_transcript_stripped.ts`**
+
+```sql
+ALTER TABLE repo_checkpoints ADD COLUMN transcript_stripped JSON;
+```
+
+Using Kysely migration pattern (see `003_index_users_github_login.ts`). JSON column stores per-session map `{"0": "...", "1": "..."}`. MySQL JSON supports up to 1GB — stripped transcripts are typically 50-200KB total.
+
+**Update: `api/db/types.ts`** — add `transcript_stripped: string | null` to generated types.
+
+**Update: `api/src/lib/db/checkpoints.ts`** — add `transcript_stripped: string | null` to `RepoCheckpoint` interface.
+
+### 2. TypeScript `stripTranscript()` function
+
+**New file: `api/src/lib/strip-transcript.ts`**
+
+Port of `strip-transcript.py`. Core function:
+
+```typescript
+export function stripTranscript(jsonlContent: string): string
+```
+
+- Processes line-by-line (no full parse into memory)
+- Drops entry types: `progress`, `file-history-snapshot`, `queue-operation`, `system`
+- For `assistant`: keeps `type`, `timestamp`, `message.id`, `message.content` (drops thinking blocks, tool_use `caller`)
+- For `user` tool_result: keeps `type`, `content[].tool_use_id`, `toolUseResult.{type,file,error,answers}`
+- For `user` text: keeps `type`, `timestamp`, `uuid`, `message.content`
+- Returns JSONL string (newline-separated)
+- Agent-agnostic: the stripping targets the common JSONL superset. Non-Claude agents that use different entry types just pass through user/assistant entries
+
+**New file: `api/src/lib/strip-transcript.test.ts`** — unit tests verifying:
+- Thinking blocks dropped
+- Progress/system entries dropped
+- Tool use caller stripped
+- User text entries preserved
+- Tool result entries minimized
+- Round-trip: stripped JSONL still parses correctly via `ClaudeCodeParser`
+- Empty/malformed input handled
+
+### 3. Search Index Queue: Fetch → Strip → Store → Index
+
+**Modify: `api/src/lib/search-index-queue.ts`**
+
+Change `processSearchIndexBatch` flow:
+
+```
+Current:  DB(checkpoints) → GitHub(transcript) → parse → Turbopuffer
+New:      DB(checkpoints) → check DB(transcript_stripped) →
+            if missing: GitHub(full.jsonl) → strip → store in DB →
+          parse stripped transcript → Turbopuffer
+```
+
+Concrete changes:
+- After fetching checkpoints from DB, check which ones already have `transcript_stripped` populated
+- For those missing transcripts: fetch from GitHub, call `stripTranscript()`, upsert to `repo_checkpoints.transcript_stripped`
+- For Turbopuffer indexing: parse the stripped transcript (same `getParserForAgent` + excerpt extraction as today)
+- Need to add `transcript_stripped` to the `getByIds` query in the checkpoints DB layer
+
+**Modify: `api/src/lib/planetscale/checkpoints.ts`**
+
+Add a method to update transcript_stripped:
+
+```typescript
+async updateTranscriptBatch(
+  repoId: string,
+  updates: Array<{ checkpoint_id: string; transcript_stripped: string }>
+): Promise<number>
+```
+
+Also update `getByIds` to include `transcript_stripped` in the SELECT when a flag requests it (to avoid loading large text by default).
+
+### 4. Transcript Endpoint: DB-First with GitHub Fallback
+
+**Modify: `api/src/routes/cache.ts`** (transcript endpoint, ~line 2585)
+
+New flow:
+```
+Request → KV cache hit? → return cached
+        → DB has transcript_stripped? → parse + return (+ cache to KV)
+        → GitHub fallback (existing code) → return (+ cache to KV)
+```
+
+The DB lookup is a simple query: get `transcript_stripped` and `sessions` JSON from `repo_checkpoints` where `checkpoint_id = ?`. The `sessions` column already has per-session metadata (agent, sessionId, tokenUsage, attribution, transcriptIdentifierAtStart).
+
+For multi-session checkpoints: the `transcript_stripped` JSON column contains `{"0": "...jsonl...", "1": "...jsonl..."}`. The `sessions` JSON column has per-session metadata (agent, sessionId, tokenUsage, attribution, transcriptIdentifierAtStart). The transcript endpoint iterates sessions, pulls the JSONL for each index from the map, and parses with the appropriate agent parser — same as today's GitHub fetch loop but from a single DB read.
+
+**Important**: The stripped transcript preserves all fields the parsers read, so existing parsing code works unchanged.
+
+### 5. Backfill: Repo Sync → Search Index Queue
+
+**Modify: `api/src/lib/repo-sync-service.ts`**
+
+After `syncRepoCheckpoints` finishes upserting checkpoints, queue discovered checkpoint IDs to `SEARCH_INDEX_QUEUE`:
+
+```typescript
+// After successful sync, queue for transcript storage + search indexing
+if (checkpointIds.length > 0 && env.SEARCH_INDEX_QUEUE) {
+  for (let i = 0; i < checkpointIds.length; i += 50) {
+    await env.SEARCH_INDEX_QUEUE.send({
+      repoId,
+      checkpointIds: checkpointIds.slice(i, i + 50),
+      queuedAt: new Date().toISOString(),
+    });
+  }
+}
+```
+
+**Modify: `api/src/lib/repo-sync-queue.ts`**
+
+Pass `env` to `syncRepoCheckpoints` (or pass the queue directly) so it can enqueue. Currently the sync result is returned to the queue consumer which has access to `env` — so the queuing can happen in the consumer after sync completes.
+
+Add to `RepoSyncResult`:
+```typescript
+discoveredCheckpointIds?: string[];
+```
+
+Return this from `syncRepoCheckpoints`, then in the queue consumer (`processRepoSyncBatch`), queue to SEARCH_INDEX_QUEUE after successful sync.
+
+### 6. Wire DB Types
+
+**Modify: `api/src/lib/db/checkpoints.ts`**
+- Add `transcript_stripped: string | null` to `RepoCheckpoint`
+- Add `transcript_stripped?: string | null` to `CheckpointWithCommit` (optional — only populated when requested)
+
+**Modify: `api/src/lib/db/db-types.ts`**
+- Add `getTranscript(repoId: string, checkpointId: string): Promise<{ transcript_stripped: string | null; sessions: Json | null } | null>` to `CheckpointsNamespace`
+- Add `updateTranscriptBatch(...)` to `CheckpointsNamespace`
+
+## Files Modified
+
+| File | Change |
+|------|--------|
+| `api/db/migrations/004_add_transcript_stripped.ts` | **New** — migration adding LONGTEXT column |
+| `api/db/types.ts` | Add `transcript_stripped` to generated types |
+| `api/src/lib/strip-transcript.ts` | **New** — TypeScript port of strip-transcript.py |
+| `api/src/lib/strip-transcript.test.ts` | **New** — unit tests for stripping |
+| `api/src/lib/search-index-queue.ts` | Fetch → strip → store in DB → index flow |
+| `api/src/lib/db/checkpoints.ts` | Add transcript field to types |
+| `api/src/lib/db/db-types.ts` | Add transcript methods to CheckpointsNamespace |
+| `api/src/lib/planetscale/checkpoints.ts` | Implement updateTranscriptBatch + getTranscript |
+| `api/src/routes/cache.ts` | Transcript endpoint: DB-first lookup |
+| `api/src/lib/repo-sync-service.ts` | Return discoveredCheckpointIds in result |
+| `api/src/lib/repo-sync-queue.ts` | Queue to SEARCH_INDEX_QUEUE after sync |
+
+## Verification
+
+1. `npx tsx scripts/migrate.ts` — run migration against local MySQL
+2. `npx vitest run` — strip-transcript tests pass + existing tests pass
+3. `npx tsc --noEmit` — type check
+4. Manual: trigger a webhook push → verify `transcript_stripped` populated in DB
+5. Manual: hit transcript endpoint → verify it reads from DB (no GitHub call in logs)
+6. Manual: search a checkpoint → verify transcript content appears in search results
+7. Manual: connect a new repo → verify backfill queues search indexing → transcripts stored
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/15d78905-f78b-4346-b227-e5baa6c24e13.jsonl
+
+---
+
+commit and push this
+
+---
+
+how do we backfill the entire/cli repo to store the stripped transciprts in the mysql db?
+
+---
+
+whats the mechanism we use to make sure we're not constantly backfilling? how do we know when we've done teh bacfill?
+
+---
+
+let's talk through option 1 and see if it makes sense or if we need to do somethign like add a flag to denote an initial sync.
+
+---
+
+yeah i think this is finhe then. we should only rarely force the sync and in that case, you probably want to resync everytyhing anyways.
+
+---
+
+in the local dev experience, we have a button in the chekpoints page called "Fetch from Github" which pulls in new checkpoints. I want ot make sure that when that button is pushed it doesn't trigger a new sync everytime. it shoudl only pull in new chekcpointsa dn index them
+
+---
+
+i think we should? what do you think? will we even have the queue running locally?
+
+---
+
+this comes back to the local vs. production experience for developers. today, we have a namespace in turbopuffer that is for the entire/cli which is pulled from the prod db. but the problem is thta we don't use queues locally so it's a little weird to do the indexing locally via another command - that seems messy. 
+
+i think we leave it as-is for now and make a note that we'll come back to this and today search is pulling from turbopuffer prod.
+
+---
+
+commit and push
+
+---
+
+why is that there? we don't use supabase
+
+---
+
+yeah delete it - we shoudln't be running any supabaswe commands
+
+---
+
+okay, let's do a review and see where we are with everything. i want to push this to prod behind an is_admin flag soon so that others can try it and give feedback before we open this up to all of our customers.
+
+---
+
+two things:
+1. i only want admin users to have the new search functionality with semantic search and BM25 with everyting we implemented
+2. everyone else should continue using the basic client side filtering approach that we have today
+
+i want that to be controlled by the env_var
+
+---
+
+today in the main branch, we just have basic client side filtering of the checkpoints that we show. so in my mind, let's keep that experience the same for everyone else besides admins. admins shoudl get the ugpraded search with turbopuffer. so that probably means gating the search endpoint behind the is_admin flag. thoughts?
+
+---
+
+it already has it , so you should be ble to re-use it. and yes this sounds good
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically go through the entire conversation:
+
+1. **Initial Plan**: User provided a detailed plan for "Store Stripped Transcripts in MySQL" - eliminating GitHub API bottleneck by storing stripped transcripts in the DB.
+
+2. **Exploration Phase**: I used agents to explore the codebase - migrations, types, checkpoints, planetscale, search-index-queue, cache.ts transcript endpoint, repo-sync-service, repo-sync-queue. Read all relevant files.
+
+3. **Implementation Phase** (7 tasks):
+   - Task 1: Created migration `004_add_transcript_stripped.ts`
+   - Task 2: Updated DB types (types.ts, checkpoints.ts, db-types.ts)
+   - Task 3: Created `strip-transcript.ts` and `strip-transcript.test.ts` (18 tests, all passing)
+   - Task 4: Added `getCheckpointTranscript` and `updateTranscriptBatch` to planetscale/checkpoints.ts
+   - Task 5: Rewrote search-index-queue.ts with DB-first flow
+   - Task 6: Added DB-first lookup in cache.ts transcript endpoint
+   - Task 7: Added discoveredCheckpointIds to repo-sync-service, queuing in repo-sync-queue
+
+4. **Code Review**: Reviewer agent found issues:
+   - JSON serialization comment needed on getCheckpointTranscript
+   - Broad try/catch in cache.ts should be narrowed
+   - Sequential DB lookups (accepted as OK for background queue)
+   - discoveredCheckpointIds returns all checkpoints on backfill (accepted as OK)
+   
+   I fixed #1 (added comment) and #2 (narrowed try/catch, added shape validation).
+
+5. **Commit and Push**: Committed as `6f05de748` to `tp_poc` branch.
+
+6. **Backfill Discussion**: User asked how to backfill entireio/cli repo. I explained the trigger-reconciliation admin endpoint flow.
+
+7. **Preventing Constant Backfill**: User asked about mechanism to prevent constant backfilling. I traced through and found that the cursor mechanism (`checkpoints_sync_cursor`) in `syncRepoCheckpoints` already handles this for steady-state. Only force-sync re-queues everything, and `ensureTranscriptsStored` skips GitHub fetch if transcript_stripped already populated. User agreed this is fine.
+
+8. **Local Dev "Fetch from GitHub" Button**: User asked about this button. I found it calls `syncRepoCheckpoints` directly (not through the queue), so transcript storage doesn't happen through this path. But it's already incremental via the cursor. User asked if we should add queuing - I explained the queue likely doesn't run locally. User decided to leave it as-is.
+
+9. **Supabase Directory**: Found untracked `api/supabase/` directory - leftover from Supabase CLI. User asked me to delete it.
+
+10. **Production Readiness Review**: User wants to push behind is_admin flag. I launched an exploration agent that found:
+    - Three entry points queue to SEARCH_INDEX_QUEUE (two webhook paths, one repo-sync)
+    - No feature flag system exists - only isAdmin and isLocalDev
+    - Write path is ungated - would affect all repos
+    - Read path (DB-first in cache.ts) is safe - falls back gracefully
+
+11. **Admin Gating Discussion**: User wants:
+    - Admin users: new search with semantic search + BM25
+    - Everyone else: basic client-side filtering
+    - Controlled by env var
+
+12. **Architecture Discovery**: I found there's NO client-side filtering in the tp_poc branch - it's all Turbopuffer. The main branch has client-side filtering.
+
+13. **Final Agreement**: User confirmed the approach:
+    - Backend search endpoint: gate behind is_admin
+    - Backend transcript storage: gate behind ENABLE_TRANSCRIPT_STORAGE env var
+    - Frontend: check is_admin, admins get server search, non-admins get client-side filtering (reuse from main branch)
+
+The main branch client-side filtering code (from CheckpointsPage.tsx):
+```typescript
+const allCheckpoints = data?.checkpoints ?? [];
+const checkpoints = searchQuery.trim()
+  ? allCheckpoints.filter((cp) => {
+      const query = searchQuery.toLowerCase();
+      const prompt = cp.sessions?.[0]?.prompt?.trim();
+      const displayedTitle = (
+        prompt && prompt.length > 0 ? prompt : (cp.commitMessage ?? "")
+      ).toLowerCase();
+      const author = cp.commitAuthorUsername?.toLowerCase() ?? "";
+      return displayedTitle.includes(query) || author.includes(query);
+    })
+  : allCheckpoints;
+```
+
+The tp_poc branch currently has:
+```typescript
+const { data: searchData, isFetching: isSearching } = useSearchCheckpointsQuery(
+  org, repo, debouncedQuery, branch,
+);
+const isSearchActive = debouncedQuery.length > 0;
+const allCheckpoints = data?.checkpoints ?? [];
+const checkpoints = isSearchActive
+  ? (searchData?.checkpoints ?? [])
+  : allCheckpoints;
+```
+
+Now I need to implement the gating. The pending tasks are:
+1. Gate the search endpoint behind is_admin
+2. Gate transcript storage behind ENABLE_TRANSCRIPT_STORAGE env var
+3. Frontend: conditionally use server search (admins) vs client-side filtering (non-admins)
+
+Summary:
+1. Primary Request and Intent:
+   The user requested implementation of a "Store Stripped Transcripts in MySQL" feature to eliminate GitHub API bottleneck in the transcript pipeline. Transcripts (`full.jsonl`) were being fetched from GitHub in three places (search indexing, transcript endpoint, backfills). The solution stores stripped transcripts in MySQL at ingest time so all downstream consumers read from DB.
+   
+   After implementation, the user wants to push to production behind an `is_admin` flag so only admin users get the upgraded Turbopuffer search (semantic search + BM25 with transcript-enriched indexing), while everyone else continues using basic client-side filtering. This should be controlled by an env var (`ENABLE_TRANSCRIPT_STORAGE`) for the write side and `is_admin` for the read/search side.
+
+2. Key Technical Concepts:
+   - JSONL transcript stripping (~60-80% size reduction) for efficient DB storage
+   - Per-session JSON map storage format: `{"0": "...stripped session 0 jsonl...", "1": "..."}`
+   - Three-tier transcript lookup: KV cache → MySQL `transcript_stripped` → GitHub fallback
+   - Cloudflare Queues (`SEARCH_INDEX_QUEUE`, `REPO_SYNC_QUEUE`) for async processing
+   - Turbopuffer hybrid search (vector + BM25) with Reciprocal Rank Fusion (RRF)
+   - Kysely ORM with MySQL/PlanetScale (JSON columns auto-parsed on read, re-stringified for return)
+   - `checkpoints_sync_cursor` for incremental sync (prevents constant re-backfilling)
+   - `isAdmin(env, dbIsAdmin)` gating pattern (returns true for local dev or `is_admin=1` in DB)
+   - No feature flag system exists — gating done via `isAdmin` checks and env vars
+
+3. Files and Code Sections:
+
+   - **`api/db/migrations/004_add_transcript_stripped.ts`** (NEW)
+     - DB migration adding JSON column to repo_checkpoints
+     ```typescript
+     import { type Kysely, sql } from "kysely";
+     export async function up(db: Kysely<unknown>): Promise<void> {
+       await sql`ALTER TABLE repo_checkpoints ADD COLUMN transcript_stripped JSON`.execute(db);
+     }
+     export async function down(db: Kysely<unknown>): Promise<void> {
+       await sql`ALTER TABLE repo_checkpoints DROP COLUMN transcript_stripped`.execute(db);
+     }
+     ```
+
+   - **`api/db/types.ts`**
+     - Added `transcript_stripped: Json | null` to `RepoCheckpoints` interface (alphabetically between `synced_at` and `transcript_uuid_at_start`)
+
+   - **`api/src/lib/db/checkpoints.ts`**
+     - Added `transcript_stripped: Json | null` to `RepoCheckpoint` interface
+
+   - **`api/src/lib/db/db-types.ts`**
+     - Added two methods to `CheckpointsNamespace`:
+     ```typescript
+     getTranscript(repoId: string, checkpointId: string): Promise<{ transcript_stripped: string | null; sessions: string | null } | null>;
+     updateTranscriptBatch(repoId: string, updates: Array<{ checkpoint_id: string; transcript_stripped: string }>): Promise<number>;
+     ```
+
+   - **`api/src/lib/strip-transcript.ts`** (NEW)
+     - Core `stripTranscript()` function that processes JSONL line-by-line
+     - Drops: progress, file-history-snapshot, queue-operation, system entries
+     - For assistant: removes thinking/redacted_thinking blocks, strips `caller` from tool_use
+     - For user: minimizes tool_result content blocks (keeps only type + tool_use_id), strips toolUseResult to keep only type/file/error/answers
+
+   - **`api/src/lib/strip-transcript.test.ts`** (NEW)
+     - 18 vitest unit tests covering all stripping rules, edge cases, round-trip parsing
+
+   - **`api/src/lib/planetscale/checkpoints.ts`**
+     - Added `getCheckpointTranscript()` — reads transcript_stripped and sessions columns, re-stringifies Kysely's auto-parsed JSON
+     - Added `updateTranscriptBatch()` — batch UPDATE statements for transcript_stripped
+     - Wired both into `createCheckpointsNamespace()` factory
+     - Comment explaining JSON serialization contract (Kysely auto-parses JSON on read)
+
+   - **`api/src/lib/search-index-queue.ts`** (REWRITTEN)
+     - New flow: `ensureTranscriptsStored()` checks DB for transcript_stripped → fetches from GitHub if missing → strips → stores in DB → parses for Turbopuffer indexing
+     - `fetchAndStripTranscript()` — fetches per-session full.jsonl from GitHub, strips each
+     - `parseTranscriptExcerpt()` — converts stripped JSONL to searchable text for Turbopuffer
+     - `processSearchIndexBatch()` updated to use `ensureTranscriptsStored()`
+
+   - **`api/src/routes/cache.ts`** (lines 2626-2727)
+     - Added DB-first transcript lookup between KV cache check and GitHub fallback
+     - Narrowed try/catch to only wrap `db.checkpoints.getTranscript()` call
+     - Validates parsed JSON shape (must be non-null, non-array object)
+     - Parses per-session metadata from DB `sessions` column for agent, sessionId, transcriptIdentifierAtStart, tokenUsage, attribution
+     - Caches successful DB results to KV
+
+   - **`api/src/lib/repo-sync-service.ts`**
+     - Added `discoveredCheckpointIds?: string[]` to `RepoSyncResult` interface
+     - Return `discoveredCheckpointIds: checkpointIds` in successful sync result
+
+   - **`api/src/lib/repo-sync-queue.ts`**
+     - After successful sync, queues discovered checkpoint IDs to `SEARCH_INDEX_QUEUE` in batches of 50
+     - Added import for `SearchIndexMessage` type
+
+   - **`api/vitest.unit.config.ts`**
+     - Added `src/lib/strip-transcript.test.ts` to include list
+
+   - **Main branch `CheckpointsPage.tsx`** (client-side filtering to reuse):
+     ```typescript
+     const allCheckpoints = data?.checkpoints ?? [];
+     const checkpoints = searchQuery.trim()
+       ? allCheckpoints.filter((cp) => {
+           const query = searchQuery.toLowerCase();
+           const prompt = cp.sessions?.[0]?.prompt?.trim();
+           const displayedTitle = (
+             prompt && prompt.length > 0 ? prompt : (cp.commitMessage ?? "")
+           ).toLowerCase();
+           const author = cp.commitAuthorUsername?.toLowerCase() ?? "";
+           return displayedTitle.includes(query) || author.includes(query);
+         })
+       : allCheckpoints;
+     ```
+
+   - **tp_poc branch `CheckpointsPage.tsx`** (current server search, to be gated):
+     ```typescript
+     const { data: searchData, isFetching: isSearching } = useSearchCheckpointsQuery(
+       org, repo, debouncedQuery, branch,
+     );
+     const isSearchActive = debouncedQuery.length > 0;
+     const allCheckpoints = data?.checkpoints ?? [];
+     const checkpoints = isSearchActive
+       ? (searchData?.checkpoints ?? [])
+       : allCheckpoints;
+     ```
+
+   - **Backend search endpoint** (`api/src/routes/cache.ts` lines 2343-2439):
+     - `GET /:org/:repo/checkpoints/search?q=...&branch=...`
+     - Currently uses `optionalAuth` — needs to be gated behind `requireAuth` + `isAdmin`
+
+   - **`api/src/env.ts`** (existing gating pattern):
+     ```typescript
+     export function isAdmin(env: { ENVIRONMENT: string }, dbIsAdmin: boolean | number): boolean {
+       return isLocalDev(env) || dbIsAdmin === true || dbIsAdmin === 1;
+     }
+     ```
+
+   - **Webhook paths** that queue to SEARCH_INDEX_QUEUE:
+     - `api/src/lib/webhook/processing.ts` line 969 (checkpoint branch push)
+     - `api/src/lib/webhook/processing.ts` line 1233 (user branch push)
+     - These need to be gated by `ENABLE_TRANSCRIPT_STORAGE` env var
+
+4. Errors and Fixes:
+   - **Code review findings** (from reviewer agent):
+     - `getCheckpointTranscript` JSON serialization was undocumented → Added explanatory comment about Kysely auto-parsing JSON columns
+     - Broad try/catch in cache.ts swallowed parsing errors → Narrowed catch to only wrap `db.checkpoints.getTranscript()`, added JSON shape validation (`typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)`)
+     - Sequential DB lookups in search-index-queue (one per checkpoint) → Accepted as OK since it's primary-key lookups in a background queue
+     - `discoveredCheckpointIds` returns ALL checkpoints on backfill → Accepted as OK since `ensureTranscriptsStored` short-circuits if transcript_stripped already exists
+
+5. Problem Solving:
+   - **Backfill mechanism**: Traced through to confirm `checkpoints_sync_cursor` provides incremental sync for steady-state. Only force-sync re-queues everything, and `ensureTranscriptsStored` prevents redundant GitHub fetches. User agreed this is sufficient.
+   - **Local dev "Fetch from GitHub" button**: Found it calls `syncRepoCheckpoints` directly (not through queue), so transcript storage doesn't happen. Already incremental via cursor. User decided to leave as-is since Cloudflare Queues don't run locally.
+   - **Deleted `api/supabase/` directory**: Leftover from Supabase CLI, not needed.
+   - **No client-side filtering exists on tp_poc branch**: Discovered that main branch has it but tp_poc replaced it entirely with Turbopuffer server search. Need to conditionally use one or the other based on is_admin.
+
+6. All User Messages:
+   - "Implement the following plan: [detailed plan for Store Stripped Transcripts in MySQL]"
+   - "commit and push this"
+   - "how do we backfill the entire/cli repo to store the stripped transcripts in the mysql db?"
+   - "whats the mechanism we use to make sure we're not constantly backfilling? how do we know when we've done the backfill?"
+   - "yeah i think this is fine then. we should only rarely force the sync and in that case, you probably want to resync everything anyways."
+   - "in the local dev experience, we have a button in the checkpoints page called 'Fetch from Github' which pulls in new checkpoints. I want to make sure that when that button is pushed it doesn't trigger a new sync everytime. it should only pull in new checkpoints and index them"
+   - "i think we should? what do you think? will we even have the queue running locally?"
+   - "this comes back to the local vs. production experience for developers. today, we have a namespace in turbopuffer that is for the entire/cli which is pulled from the prod db. but the problem is that we don't use queues locally so it's a little weird to do the indexing locally via another command - that seems messy. i think we leave it as-is for now and make a note that we'll come back to this and today search is pulling from turbopuffer prod."
+   - "commit and push" (second time — no changes to commit)
+   - "why is that there? we don't use supabase"
+   - "yeah delete it - we shouldn't be running any supabase commands"
+   - "okay, let's do a review and see where we are with everything. i want to push this to prod behind an is_admin flag soon so that others can try it and give feedback before we open this up to all of our customers."
+   - "two things: 1. i only want admin users to have the new search functionality with semantic search and BM25 with everything we implemented 2. everyone else should continue using the basic client side filtering approach that we have today. i want that to be controlled by the env_var"
+   - "let's talk through option 1 and see if it makes sense or if we need to do something like add a flag to denote an initial sync."
+   - "today in the main branch, we just have basic client side filtering of the checkpoints that we show. so in my mind, let's keep that experience the same for everyone else besides admins. admins should get the upgraded search with turbopuffer. so that probably means gating the search endpoint behind the is_admin flag. thoughts?"
+   - "it already has it, so you should be able to re-use it. and yes this sounds good"
+
+7. Pending Tasks:
+   - **Gate backend search endpoint** (`/checkpoints/search`) behind `requireAuth` + `isAdmin` check. Non-admins get 403.
+   - **Gate transcript storage** (`ensureTranscriptsStored` in search-index-queue.ts) behind `ENABLE_TRANSCRIPT_STORAGE` env var. When unset, fall back to old GitHub-direct-fetch for Turbopuffer indexing (no DB writes).
+   - **Gate frontend search**: In `CheckpointsPage.tsx`, check `user.is_admin`. Admins use `useSearchCheckpointsQuery` (Turbopuffer server search). Non-admins use client-side filtering (reuse code from main branch that filters on prompt/commit message/author).
+
+8. Current Work:
+   We had just agreed on the gating approach and I confirmed the main branch has the client-side filtering code. The user's last message was "it already has it, so you should be able to re-use it. and yes this sounds good" — confirming the plan to:
+   1. Gate search endpoint behind is_admin
+   2. Gate transcript storage behind ENABLE_TRANSCRIPT_STORAGE env var
+   3. Frontend: admins get server search, non-admins get client-side filtering
+
+   All code is committed and pushed to `tp_poc` branch as commit `6f05de748`.
+
+9. Optional Next Step:
+   Implement the three gating changes agreed upon. The user confirmed "yes this sounds good" to the plan of:
+   - Backend: Gate search endpoint behind `requireAuth` + `isAdmin`
+   - Backend: Gate `ensureTranscriptsStored()` behind `ENABLE_TRANSCRIPT_STORAGE` env var
+   - Frontend: Conditionally use server search (admins) vs client-side filtering from main branch (non-admins)
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/7b00d0eb-2059-470c-98d1-eb2a08e97a71.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+commit and push
+
+---
+
+go in the PR and update the summary with all of the changes that we've been making so it's comprehensive
+
+---
+
+rebase this onto main
+
+---
+
+look at the cursor comments and failed frontend tests and resolve them: https://github.com/entirehq/entire.io/pull/902
+
+---
+
+there are still some open cursor bugbot issues, please review and resolve. ask me for any clarifications
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Context from previous session**: The conversation started with a continuation from a previous session. The summary indicates:
+   - A plan for "Store Stripped Transcripts in MySQL" was implemented
+   - 7 tasks were completed: migration, DB types, strip-transcript function, planetscale methods, search-index-queue rewrite, cache.ts DB-first lookup, repo-sync discoveredCheckpointIds
+   - Code review was done, fixes applied
+   - Committed and pushed to `tp_poc` branch
+   - Admin gating was agreed upon: search endpoint behind is_admin, transcript storage behind ENABLE_TRANSCRIPT_STORAGE env var, frontend conditional search
+
+2. **First action in this session**: Implementing the three gating changes that were agreed upon at the end of the previous session.
+
+3. **Task 1 - Gate search endpoint**: Changed `/checkpoints/search` from `optionalAuth` to `requireAuth`, added `isAdmin` check returning 403 for non-admins.
+
+4. **Task 2 - Gate transcript storage**: Added `ENABLE_TRANSCRIPT_STORAGE?: string` to Env interface. Gated `ensureTranscriptsStored` behind this env var. Gated DB-first transcript lookup in cache.ts behind same var.
+
+5. **Task 3 - Frontend gating**: Added `useAuth()` to CheckpointsPage, `useMemo` for client-side filtering for non-admins, server search for admins only.
+
+6. **User request: "commit and push"** - Committed as `7fb19d9ac` and pushed to `tp_poc`.
+
+7. **User request: "go in the PR and update the summary"** - Updated PR #902 title to "Turbopuffer hybrid search with transcript storage pipeline" with comprehensive body.
+
+8. **User request: "rebase this onto main"** - Rebased 14 commits onto latest main. Resolved 3 conflicts:
+   - `api/src/env.ts`: kept both Darwin (main) and Turbopuffer (ours)
+   - `api/src/lib/webhook/processing.ts`: kept both imports
+   - `frontend/CheckpointsPage.tsx`: accepted our branch's version (major conflict with main's new day-grouped UI)
+   - Force pushed as `d98d2da54`
+
+9. **User request: "look at the cursor comments and failed frontend tests and resolve them"**
+   - Found PR #902 has Cursor Bugbot comments (10 issues) and 8 failing frontend tests
+   - Test failure root cause: `useAuth must be used within an AuthProvider` - our `useAuth()` call in CheckpointsPage
+   - Fixed all issues:
+     1. Added `useAuth` mock to test file
+     2. Removed debug console.logs from turbopuffer.ts
+     3. Fixed HighlightText stateful regex (g flag)
+     4. Added query truncation in embedQuery
+     5. Fixed truncateToBytes multi-byte fast-path
+     6. Fixed backfill script ID mismatch (sequential → FNV-1a hash)
+     7. Wrapped queue send after ack in try/catch
+     8. Renamed shadowed `batch` variable
+     9. Wrapped JSON.parse in try/catch in cache.ts
+     10. Fixed eslint warning (allCheckpoints in useMemo)
+   - Also needed to install `date-fns` dependency (rebase issue)
+   - Committed as `0bbf80ab1` and pushed
+
+10. **User request: "there are still some open cursor bugbot issues, please review and resolve. ask me for any clarifications"**
+    - Fetched latest bugbot comments (from 2026-03-06T05:00:00Z onwards)
+    - Found 4 new issues:
+      1. **HIGH: Wrong env var for GitHub App auth** - `GITHUB_CLIENT_ID` used instead of numeric App ID in search-index-queue.ts `getInstallationToken` call
+      2. **MEDIUM: Missing try/catch around queue send in webhooks** - Two locations in processing.ts
+      3. **MEDIUM: Backend doesn't return `filesTouched` in API response** - `mapCheckpointToInfo` doesn't include it
+      4. **LOW: Backfill script truncateToBytes same multi-byte issue** - Same fix needed as production
+
+This is where the conversation was interrupted for the summary request. I had just fetched the 4 new bugbot issues and was about to analyze and fix them.
+
+Let me verify key details:
+- The `GITHUB_CLIENT_ID` issue: I need to check if this is actually wrong. Let me look at the existing code patterns - in `repo-sync-queue.ts` line 158, `getInstallationToken` is called with `appId: env.GITHUB_CLIENT_ID`. This is the existing pattern used across the codebase, so bugbot may be wrong here. Need to verify.
+- The webhook queue send issue: Lines 981-988 and 1245-1252 in processing.ts
+- The filesTouched issue: Need to check `mapCheckpointToInfo` function
+- The backfill truncateToBytes: Need to apply same ASCII check as production
+
+Current state: On `tp_poc` branch, commit `0bbf80ab1`, all frontend tests passing locally, ready to address these 4 remaining bugbot issues.
+
+Summary:
+1. Primary Request and Intent:
+   The user is building a full checkpoint search system powered by Turbopuffer hybrid search (semantic + BM25) with a transcript storage pipeline. The conversation in this session focused on:
+   - Implementing admin/env var gating for the search endpoint, transcript storage, and frontend search experience
+   - Committing and pushing to `tp_poc` branch
+   - Updating PR #902 summary to be comprehensive
+   - Rebasing onto latest main
+   - Resolving Cursor Bugbot review comments and failed frontend tests
+   - The user's most recent explicit request: "there are still some open cursor bugbot issues, please review and resolve. ask me for any clarifications"
+
+2. Key Technical Concepts:
+   - Turbopuffer hybrid search (semantic + BM25 with Reciprocal Rank Fusion)
+   - OpenAI text-embedding-3-small for vector embeddings
+   - Cloudflare Queues (`SEARCH_INDEX_QUEUE`, `REPO_SYNC_QUEUE`) for async processing
+   - Stripped JSONL transcript storage in MySQL JSON column (`transcript_stripped`)
+   - `isAdmin(env, dbIsAdmin)` gating pattern (returns true for local dev or `is_admin=1` in DB)
+   - `ENABLE_TRANSCRIPT_STORAGE` env var for write-side gating
+   - `useAuth()` hook in frontend for checking `user.is_admin`
+   - FNV-1a hash for deterministic Turbopuffer vector IDs
+   - Kysely ORM with MySQL/PlanetScale
+   - Three-tier transcript lookup: KV cache → MySQL `transcript_stripped` → GitHub fallback
+
+3. Files and Code Sections:
+
+   - **`api/src/routes/cache.ts`** (search endpoint + transcript endpoint)
+     - Search endpoint changed from `optionalAuth` to `requireAuth` + `isAdmin` check
+     - DB-first transcript lookup gated behind `ENABLE_TRANSCRIPT_STORAGE`
+     - JSON.parse of transcript_stripped wrapped in try/catch
+     ```typescript
+     // Search endpoint gating
+     repoRoutes.get("/:org/:repo/checkpoints/search", requireAuth, async (c) => {
+       const userId = c.get("userId");
+       const db = getDb(c.env);
+       const user = await db.users.findById(userId);
+       if (!user || !isAdmin(c.env, user.is_admin ?? false)) {
+         return c.json({ error: "Forbidden" }, 403);
+       }
+       // ... rest of handler
+     ```
+     ```typescript
+     // Transcript DB lookup gating
+     if (c.env.ENABLE_TRANSCRIPT_STORAGE) {
+       let dbRow = ...;
+       // ... DB-first lookup with JSON.parse wrapped in try/catch
+     }
+     ```
+
+   - **`api/src/env.ts`** — Added `ENABLE_TRANSCRIPT_STORAGE?: string` to Env interface
+     ```typescript
+     // Transcript storage (optional — when set, stripped transcripts are stored in DB)
+     ENABLE_TRANSCRIPT_STORAGE?: string;
+     ```
+
+   - **`api/src/lib/search-index-queue.ts`** — `ensureTranscriptsStored` gated behind env var, shadowed `batch` renamed to `transcriptBatch`
+     ```typescript
+     const transcripts = env.ENABLE_TRANSCRIPT_STORAGE
+       ? await ensureTranscriptsStored(db, repoId, repo.full_name, ...)
+       : new Map<string, string | null>();
+     ```
+
+   - **`api/src/lib/turbopuffer.ts`** — Multiple fixes:
+     - Removed 5 debug `console.log` statements from search function
+     - Fixed `truncateToBytes` fast-path for multi-byte chars: `if (str.length <= maxBytes && !/[^\x00-\x7F]/.test(str)) return str;`
+     - Added query truncation in `embedQuery`: `const truncated = text.slice(0, MAX_EMBEDDING_CHARS);`
+
+   - **`api/src/lib/repo-sync-queue.ts`** — Wrapped `SEARCH_INDEX_QUEUE.send` in try/catch after `msg.ack()` to prevent erroneous retries
+     ```typescript
+     try {
+       // ... queue send
+       log("search_index_queued", { repoId, checkpointCount: cpIds.length });
+     } catch (queueErr) {
+       log("search_index_queue_error", { repoId, error: errorString(queueErr) });
+     }
+     ```
+
+   - **`api/scripts/backfill-search.ts`** — Fixed vector ID generation to use FNV-1a hash (matching production `hashToNumericId`)
+     ```typescript
+     let hash = 0x811c9dc5;
+     for (let c = 0; c < cp.checkpoint_id.length; c++) {
+       hash ^= cp.checkpoint_id.charCodeAt(c);
+       hash = Math.imul(hash, 0x01000193);
+     }
+     const globalId = hash >>> 0;
+     ```
+
+   - **`frontend/src/domains/platform/checkpoints/pages/CheckpointsPage.tsx`** — Admin vs non-admin search gating
+     ```typescript
+     const { user } = useAuth();
+     const isAdminUser = !!user?.is_admin;
+     
+     // Admin: server search; non-admin: empty query (disabled)
+     const { data: searchData, isFetching: isSearching } = useSearchCheckpointsQuery(
+       org, repo, isAdminUser ? debouncedQuery : "", branch,
+     );
+     
+     const allCheckpoints = useMemo(() => data?.checkpoints ?? [], [data?.checkpoints]);
+     
+     // Client-side filtering for non-admins
+     const clientFilteredCheckpoints = useMemo(() => {
+       if (!isSearchActive || isAdminUser) return allCheckpoints;
+       const query = debouncedQuery.toLowerCase();
+       return allCheckpoints.filter((cp) => {
+         const prompt = cp.sessions?.[0]?.prompt?.trim();
+         const displayedTitle = (
+           prompt && prompt.length > 0 ? prompt : (cp.commitMessage ?? "")
+         ).toLowerCase();
+         const author = cp.commitAuthorUsername?.toLowerCase() ?? "";
+         return displayedTitle.includes(query) || author.includes(query);
+       });
+     }, [allCheckpoints, debouncedQuery, isSearchActive, isAdminUser]);
+     
+     const checkpoints = isSearchActive
+       ? (isAdminUser ? (searchData?.checkpoints ?? []) : clientFilteredCheckpoints)
+       : allCheckpoints;
+     ```
+
+   - **`frontend/src/domains/platform/checkpoints/pages/CheckpointsPage.test.tsx`** — Added useAuth mock
+     ```typescript
+     vi.mock("@/domains/platform/auth", () => ({
+       useAuth: () => ({ user: { id: "user-1", github_login: "testuser", is_admin: false, discovery_enabled: false, created_at: "" } }),
+     }));
+     ```
+
+   - **`frontend/src/components/HighlightText.tsx`** — Fixed stateful regex bug
+     ```typescript
+     const testPattern = new RegExp(`^(${words.join("|")})Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Context from previous session**: The conversation started with a continuation from a previous session. The summary indicates:
+   - A plan for "Store Stripped Transcripts in MySQL" was implemented
+   - 7 tasks were completed: migration, DB types, strip-transcript function, planetscale methods, search-index-queue rewrite, cache.ts DB-first lookup, repo-sync discoveredCheckpointIds
+   - Code review was done, fixes applied
+   - Committed and pushed to `tp_poc` branch
+   - Admin gating was agreed upon: search endpoint behind is_admin, transcript storage behind ENABLE_TRANSCRIPT_STORAGE env var, frontend conditional search
+
+2. **First action in this session**: Implementing the three gating changes that were agreed upon at the end of the previous session.
+
+3. **Task 1 - Gate search endpoint**: Changed `/checkpoints/search` from `optionalAuth` to `requireAuth`, added `isAdmin` check returning 403 for non-admins.
+
+4. **Task 2 - Gate transcript storage**: Added `ENABLE_TRANSCRIPT_STORAGE?: string` to Env interface. Gated `ensureTranscriptsStored` behind this env var. Gated DB-first transcript lookup in cache.ts behind same var.
+
+5. **Task 3 - Frontend gating**: Added `useAuth()` to CheckpointsPage, `useMemo` for client-side filtering for non-admins, server search for admins only.
+
+6. **User request: "commit and push"** - Committed as `7fb19d9ac` and pushed to `tp_poc`.
+
+7. **User request: "go in the PR and update the summary"** - Updated PR #902 title to "Turbopuffer hybrid search with transcript storage pipeline" with comprehensive body.
+
+8. **User request: "rebase this onto main"** - Rebased 14 commits onto latest main. Resolved 3 conflicts:
+   - `api/src/env.ts`: kept both Darwin (main) and Turbopuffer (ours)
+   - `api/src/lib/webhook/processing.ts`: kept both imports
+   - `frontend/CheckpointsPage.tsx`: accepted our branch's version (major conflict with main's new day-grouped UI)
+   - Force pushed as `d98d2da54`
+
+9. **User request: "look at the cursor comments and failed frontend tests and resolve them"**
+   - Found PR #902 has Cursor Bugbot comments (10 issues) and 8 failing frontend tests
+   - Test failure root cause: `useAuth must be used within an AuthProvider` - our `useAuth()` call in CheckpointsPage
+   - Fixed all issues:
+     1. Added `useAuth` mock to test file
+     2. Removed debug console.logs from turbopuffer.ts
+     3. Fixed HighlightText stateful regex (g flag)
+     4. Added query truncation in embedQuery
+     5. Fixed truncateToBytes multi-byte fast-path
+     6. Fixed backfill script ID mismatch (sequential → FNV-1a hash)
+     7. Wrapped queue send after ack in try/catch
+     8. Renamed shadowed `batch` variable
+     9. Wrapped JSON.parse in try/catch in cache.ts
+     10. Fixed eslint warning (allCheckpoints in useMemo)
+   - Also needed to install `date-fns` dependency (rebase issue)
+   - Committed as `0bbf80ab1` and pushed
+
+10. **User request: "there are still some open cursor bugbot issues, please review and resolve. ask me for any clarifications"**
+    - Fetched latest bugbot comments (from 2026-03-06T05:00:00Z onwards)
+    - Found 4 new issues:
+      1. **HIGH: Wrong env var for GitHub App auth** - `GITHUB_CLIENT_ID` used instead of numeric App ID in search-index-queue.ts `getInstallationToken` call
+      2. **MEDIUM: Missing try/catch around queue send in webhooks** - Two locations in processing.ts
+      3. **MEDIUM: Backend doesn't return `filesTouched` in API response** - `mapCheckpointToInfo` doesn't include it
+      4. **LOW: Backfill script truncateToBytes same multi-byte issue** - Same fix needed as production
+
+This is where the conversation was interrupted for the summary request. I had just fetched the 4 new bugbot issues and was about to analyze and fix them.
+
+Let me verify key details:
+- The `GITHUB_CLIENT_ID` issue: I need to check if this is actually wrong. Let me look at the existing code patterns - in `repo-sync-queue.ts` line 158, `getInstallationToken` is called with `appId: env.GITHUB_CLIENT_ID`. This is the existing pattern used across the codebase, so bugbot may be wrong here. Need to verify.
+- The webhook queue send issue: Lines 981-988 and 1245-1252 in processing.ts
+- The filesTouched issue: Need to check `mapCheckpointToInfo` function
+- The backfill truncateToBytes: Need to apply same ASCII check as production
+
+Current state: On `tp_poc` branch, commit `0bbf80ab1`, all frontend tests passing locally, ready to address these 4 remaining bugbot issues.
+
+, "i");
+     // Use testPattern.test(part) instead of pattern.test(part) to avoid g flag statefulness
+     ```
+
+4. Errors and fixes:
+   - **Rebase conflicts (3 files)**:
+     - `api/src/env.ts`: Darwin env vars from main conflicted with Turbopuffer vars from ours → kept both
+     - `api/src/lib/webhook/processing.ts`: import conflict → kept both imports (darwin + search-index-queue)
+     - `frontend/CheckpointsPage.tsx`: Major conflict with main's new day-grouped UI → accepted our branch's version since subsequent commits transform it further
+   - **All 8 frontend tests failing** with `useAuth must be used within an AuthProvider`:
+     - Root cause: Our `useAuth()` call in CheckpointsPage wasn't mocked in tests
+     - Fix: Added `vi.mock("@/domains/platform/auth", ...)` to test file
+   - **Missing `date-fns` dependency** causing test runner to fail with `Failed to resolve import "date-fns"`:
+     - Root cause: Rebase brought in BubbleChart component from main that uses date-fns, but lock file wasn't regenerated
+     - Fix: `npm install date-fns` (was already in package.json, just needed lock file update)
+   - **ESLint warning** `react-hooks/exhaustive-deps` on `allCheckpoints` in useMemo:
+     - Fix: Wrapped `allCheckpoints` in its own `useMemo(() => data?.checkpoints ?? [], [data?.checkpoints])`
+
+5. Problem Solving:
+   - Successfully implemented three-layer admin gating (backend search, backend transcript storage, frontend conditional search)
+   - Resolved all Cursor Bugbot issues from the first scan (10 issues)
+   - Fixed all 8 failing frontend tests
+   - Successfully rebased 14 commits onto main resolving 3 conflicts
+   - A second scan by Cursor Bugbot found 4 new issues that still need to be resolved
+
+6. All user messages:
+   - [Context from previous session summary about implementing gating]
+   - "commit and push"
+   - "go in the PR and update the summary with all of the changes that we've been making so it's comprehensive"
+   - "rebase this onto main"
+   - "look at the cursor comments and failed frontend tests and resolve them: https://github.com/entirehq/entire.io/pull/902"
+   - "there are still some open cursor bugbot issues, please review and resolve. ask me for any clarifications"
+
+7. Pending Tasks:
+   Four new Cursor Bugbot issues from the latest scan (commit `0bbf80ab1`) need to be resolved:
+   
+   1. **HIGH: Wrong env var for GitHub App auth** (`search-index-queue.ts` line 150-154) — Bugbot claims `GITHUB_CLIENT_ID` is OAuth Client ID, not the numeric App ID needed for JWT auth. Need to verify if this is actually wrong by checking how `getInstallationToken` is called elsewhere in the codebase (e.g., `repo-sync-queue.ts` uses the same pattern `appId: env.GITHUB_CLIENT_ID`).
+   
+   2. **MEDIUM: Missing try/catch around queue send in webhooks** (`processing.ts` lines 981-988 and 1245-1252) — `SEARCH_INDEX_QUEUE.send()` calls lack try/catch, could abort webhook handler on failure.
+   
+   3. **MEDIUM: Backend doesn't return `filesTouched` in API response** — `mapCheckpointToInfo` doesn't include `filesTouched`, so frontend file highlight feature for keyword matches never renders.
+   
+   4. **LOW: Backfill script `truncateToBytes` multi-byte issue** (`backfill-search.ts` line 155-168) — Same fast-path bug that was fixed in production `turbopuffer.ts` but not in the backfill script's copy.
+
+8. Current Work:
+   I had just fetched and displayed the 4 new Cursor Bugbot issues. I was about to analyze each one and implement fixes. The user's last message was: "there are still some open cursor bugbot issues, please review and resolve. ask me for any clarifications"
+
+   The current branch is `tp_poc` at commit `0bbf80ab1`, pushed to origin. PR is #902.
+
+9. Optional Next Step:
+   Resolve the 4 remaining Cursor Bugbot issues. Specifically:
+   - Investigate the `GITHUB_CLIENT_ID` vs App ID issue (may need to ask user for clarification since it appears the same pattern is used everywhere in the codebase — could be a bugbot false positive)
+   - Wrap webhook `SEARCH_INDEX_QUEUE.send()` calls in try/catch at both locations in `processing.ts`
+   - Check if `mapCheckpointToInfo` needs to include `filesTouched` and fix if so
+   - Apply the ASCII-only fast-path fix to the backfill script's `truncateToBytes`
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/7b00d0eb-2059-470c-98d1-eb2a08e97a71.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+yes
+
+---
+
+this is still an issue:
+
+getInstallationToken is called with env.GITHUB_CLIENT_ID as the appId, but GITHUB_CLIENT_ID is the OAuth Client ID (a string like Iv1.abc123), not the numeric GitHub App ID needed for JWT-based installation token generation. The env definition clearly separates these: GITHUB_CLIENT_ID: string vs GITHUB_APP_ID: string // GitHub App ID (numeric). This will cause all transcript fetches during search indexing to fail with authentication errors.
+
+
+look at how its working in the getInstallationToken() in the cache.ts file, by using the context.
+
+---
+
+okay how about these ones:
+
+Non-admin users' client-side filtering now depends on debouncedQuery (300ms delay) instead of searchQuery directly. Previously, client-side filtering was instant — the old code used searchQuery.toLowerCase() for immediate matching. Now both the isSearchActive check and clientFilteredCheckpoints memo use debouncedQuery, so non-admin users see the full unfiltered list for 300ms after typing before results appear. The debounce is only needed for the admin server-side API call.
+
+hashToNumericId uses a 32-bit FNV-1a hash as the Turbopuffer document ID. Due to the birthday paradox, the probability of a collision reaches ~50% at around 77,000 checkpoints per repo namespace. A collision would cause one checkpoint's search index entry to silently overwrite another's, making the overwritten checkpoint permanently unsearchable.
+
+---
+
+explain to me why we're doing the hashToNumericId? It seems overly complex and brittle. 
+
+// Hash checkpoint_id to a deterministic numeric ID for Turbopuffer
+// Uses two FNV-1a 32-bit hashes (different seeds) combined into a 53-bit integer
+// to stay within Number.MAX_SAFE_INTEGER while avoiding birthday-paradox collisions
+// (50% collision probability at ~94M entries vs ~77K with 32-bit)
+export function hashToNumericId(checkpointId: string): number {
+  // First hash: standard FNV-1a 32-bit
+  let h1 = 0x811c9dc5;
+  for (let i = 0; i < checkpointId.length; i++) {
+    h1 ^= checkpointId.charCodeAt(i);
+    h1 = Math.imul(h1, 0x01000193);
+  }
+  h1 = h1 >>> 0;
+
+  // Second hash: FNV-1a with different offset basis
+  let h2 = 0x050c5d1f;
+  for (let i = 0; i < checkpointId.length; i++) {
+    h2 ^= checkpointId.charCodeAt(i);
+    h2 = Math.imul(h2, 0x01000193);
+  }
+  h2 = h2 >>> 0;
+
+  // Combine: 21 bits from h2 (high) + 32 bits from h1 (low) = 53 bits
+  return (h2 & 0x1fffff) * 0x100000000 + h1;
+}
+
+---
+
+yes
+
+---
+
+getting this issue:
+
+The frontend adds filesTouched: string[] | null to CheckpointInfo and uses it to render file highlights in search result cards for keyword/both matches. However, mapCheckpointToInfo in the backend was not updated to include this field — it explicitly constructs the return object and doesn't spread the DB row. The search endpoint at line 2442 calls ordered.map(mapCheckpointToInfo), so filesTouched will always be undefined in the API response, and file highlights in search results will never display.
+
+---
+
+okay i think we're near the end here. is there anything else we need to think about? if you were a reviewer, is there anytying that you'd pick up on and want to check/change? The only thing i can think of is that since we're hiding this behind an env var for only admins, how do we specify which repos it should sync?
+
+---
+
+i want the admins to be able to search and the webhooks to fire so we can see it working for our orgs. So let's enable it just for the entireio organization repos. lets also handle the checkpointIdToNumeric. Come up with a plan fo the N+1 queries but don't fix it yet.
+
+---
+
+okay let's implement it
+
+---
+
+okay nice, do i need to set any environment variables to get this to run locally?
+
+---
+
+lets add some log statements to the API liek:
+
+[repo-sync] sync_complete {"repoId":"019ca7ec-f5b9-7d49-bab3-54b3fed93277","fullName":"entireio/cli","checkpointsDiscovered":95,"checkpointsWithCommits":94,"totalSessions":125,"checkpointsWithSessions":95}
+
+but specifically for the semantic search. let's log when we start the search and end it and if it was semantic or bm25 or both
+
+---
+
+lets also add logs for new checkpoint indexing through the pipeline
+
+---
+
+review this and fix:
+
+repo.installation_id is an internal database FK (a UUID-like string), not the numeric GitHub installation ID. Passing Number(installationId) produces NaN for UUID strings. The correct approach is to resolve the GitHub installation ID via db.installations.getGithubId(), as done in repo-sync-queue.ts. This causes getInstallationToken to always fail, silently preventing transcript fetching and storage from the search index queue consumer.

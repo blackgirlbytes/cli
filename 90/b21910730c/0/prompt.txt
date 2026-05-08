@@ -1,0 +1,136 @@
+Implement the following plan:
+
+# Plan: Agent-Contributed Custom Checkpoint Files (Cursor Chat Export)
+
+## Context
+
+When Cursor creates a checkpoint, we want to also include a cursor-chat export archive (`.cursor-chat.json`) in the checkpoint metadata. This is agent-specific data — other agents don't have Cursor's `store.db`. We need a simple extensibility point so any agent can contribute custom files to checkpoints in the future.
+
+## Approach: `CheckpointContributor` Optional Interface
+
+The simplest approach with zero changes to the strategy layer:
+
+1. Define a new optional agent interface `CheckpointContributor` with one method
+2. Implement it on `CursorAgent` — it runs the cursor-export logic and writes the file to the session metadata dir
+3. Call it in `handleLifecycleTurnEnd` before `strat.SaveStep()` — the existing `addDirectoryToChanges()` in the checkpoint layer automatically picks up any file in the metadata dir
+
+**Why this works with no strategy changes:** The metadata directory (`sessionDirAbs`) is already recursively walked by `addDirectoryToChanges()` in `checkpoint/temporary.go:753`. Any file written there before `SaveStep()` is automatically included in the checkpoint tree. Same for condensation — `copyMetadataDir()` copies everything.
+
+## Files to Modify
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/agent/agent.go` | Add `CheckpointContributor` interface |
+| `cmd/entire/cli/agent/cursor/checkpoint.go` | **Create** — implement `CheckpointContributor` for Cursor |
+| `cmd/entire/cli/lifecycle.go` | Add 5 lines to call `ContributeCheckpointFiles` before `SaveStep` |
+| `cmd/entire/cli/cursor_export.go` | Extract `exportCursorChat(ctx, agentID) ([]byte, error)` from `runCursorExport` |
+
+## Step 1: Add `CheckpointContributor` interface
+
+**File:** `cmd/entire/cli/agent/agent.go`
+
+```go
+// CheckpointContributor is an optional interface for agents that contribute
+// custom files to checkpoint metadata. Files are written to the session
+// metadata directory and automatically included in the checkpoint tree.
+type CheckpointContributor interface {
+	// ContributeCheckpointFiles writes agent-specific files to metadataDir.
+	// Called before SaveStep; any files written are automatically included.
+	// Errors are non-fatal (logged as warnings, checkpoint still proceeds).
+	ContributeCheckpointFiles(ctx context.Context, sessionID string, metadataDir string) error
+}
+```
+
+That's it — one method, simple contract: write your files to `metadataDir`, they get included.
+
+## Step 2: Refactor `cursor_export.go` — extract reusable export function
+
+**File:** `cmd/entire/cli/cursor_export.go`
+
+Extract the core export logic out of `runCursorExport` into a function that doesn't need a `cobra.Command`:
+
+```go
+// exportCursorChatArchive exports a Cursor chat session as a JSON archive.
+// Returns the marshaled archive bytes. agentID is the Cursor conversation UUID.
+func exportCursorChatArchive(ctx context.Context, agentID string) ([]byte, error) {
+    // Same logic as runCursorExport but returns []byte instead of writing to file
+    // Uses existing findCursorFile, exportCursorDB, readCursorTranscript
+}
+```
+
+The `runCursorExport` command handler becomes a thin wrapper that calls this and writes to disk.
+
+## Step 3: Implement on CursorAgent
+
+**File:** `cmd/entire/cli/agent/cursor/checkpoint.go` (new)
+
+```go
+// ContributeCheckpointFiles exports the Cursor chat store.db as a
+// .cursor-chat.json archive into the checkpoint metadata directory.
+func (c *CursorAgent) ContributeCheckpointFiles(ctx context.Context, sessionID string, metadataDir string) error {
+    data, err := cli.ExportCursorChatArchive(ctx, sessionID)
+    if err != nil {
+        return err
+    }
+    return os.WriteFile(filepath.Join(metadataDir, sessionID+".cursor-chat.json"), data, 0o600)
+}
+```
+
+**Import cycle concern:** The cursor agent package can't import the `cli` package directly. Two options:
+- **(a)** Move `exportCursorChatArchive` into a shared package (e.g., `cmd/entire/cli/agent/cursor/chatexport/`)
+- **(b)** Move the export logic into the cursor agent package itself (it only uses `database/sql` + `encoding/json` + `filepath.Glob` — no `cli` dependency)
+
+**Option (b) is simpler** — the export logic is self-contained (SQLite read + JSON marshal). Move the core functions (`findCursorFile`, `exportCursorDB`, `readCursorTranscript`, archive types) into `cmd/entire/cli/agent/cursor/chatexport.go`. The CLI command in `cursor_export.go` calls into it.
+
+## Step 4: Call in lifecycle.go
+
+**File:** `cmd/entire/cli/lifecycle.go`, in `handleLifecycleTurnEnd`, right before `strat.SaveStep()` (around line 375):
+
+```go
+// Let agent contribute custom files to the checkpoint metadata
+if contributor, ok := ag.(agent.CheckpointContributor); ok {
+    if err := contributor.ContributeCheckpointFiles(ctx, event.SessionID, sessionDirAbs); err != nil {
+        fmt.Fprintf(os.Stderr, "Warning: agent checkpoint contribution failed: %v\n", err)
+    }
+}
+```
+
+Non-fatal — if the export fails (e.g., no store.db found), the checkpoint still proceeds normally.
+
+## File Layout After Changes
+
+```
+cmd/entire/cli/agent/
+  agent.go                      # + CheckpointContributor interface (5 lines)
+  cursor/
+    checkpoint.go               # NEW — implements ContributeCheckpointFiles
+    chatexport.go               # NEW — cursor chat export logic (moved from cli package)
+    ...
+cmd/entire/cli/
+  cursor_export.go              # CLI command — thin wrapper calling cursor/chatexport
+  cursor_import.go              # Unchanged
+  lifecycle.go                  # + 5 lines calling CheckpointContributor
+```
+
+## What This Enables for Future Agents
+
+Any agent can implement `CheckpointContributor`:
+- **Claude Code**: Could export Claude's conversation cache
+- **Gemini CLI**: Could export Gemini session state
+- **OpenCode**: Could export its session metadata
+
+Each agent writes whatever files it wants to `metadataDir`. The framework doesn't need to know what those files are.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+# Manual test: trigger a Cursor checkpoint and verify .cursor-chat.json appears in the shadow branch tree
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-cli/f5d5ee18-4bb5-41ad-bc48-3375f441c0e8.jsonl
+
+---
+
+it does not create custom files into the checkpoint at entire/checkpoint/v1 branch when the checkpoint commit is being created. why ?

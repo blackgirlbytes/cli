@@ -1,0 +1,372 @@
+Implement the following plan:
+
+# Fix: Commit Hook Performance (O(n) Tree Walks)
+
+## Context
+
+Post-commit hook takes **5.4s** on large repos (~58k files). Two hotspots, both doing expensive tree comparisons via go-git when `git diff-tree` does the same thing in ~30ms:
+
+| Hotspot | Current | With `git diff-tree` | Where |
+|---|---|---|---|
+| `filesChangedInCommit` | 703ms | 25ms | PostCommit, HEAD~1→HEAD |
+| `getAllChangedFilesBetweenTrees` | 4,685ms | 36ms | Attribution, AttributionBaseCommit→HEAD |
+
+**Note:** `getAllChangedFilesBetweenTrees` intentionally compares `AttributionBaseCommit→HEAD` (not HEAD~1→HEAD) to capture user edits from any manual commits made between condensations. This range must be preserved.
+
+**Expected improvement: 5.4s → ~200ms.**
+
+## Changes
+
+### 1. Create `cmd/entire/cli/gitops/` package
+
+New leaf package for git CLI operations. Start with two functions:
+
+**`gitops/diff.go`:**
+- `DiffTreeFiles(ctx context.Context, commit1, commit2 string) (map[string]struct{}, error)` — runs `git diff-tree --no-commit-id -r -z <commit1> <commit2>`, parses null-separated output, returns set of changed file paths. For initial commits (empty commit1), use `git diff-tree --root -r -z <commit2>`.
+- `DiffTreeFileList(ctx context.Context, commit1, commit2 string) ([]string, error)` — same but returns `[]string` (attribution needs a list, not a set). Or just have one function returning both/either — decide during implementation.
+
+### 2. Replace `filesChangedInCommit`
+
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+Replace the body of `filesChangedInCommit` (line 2174) to call `gitops.DiffTreeFiles(ctx, parentHash, headHash)`.
+
+Signature changes — needs `ctx` and commit hash strings instead of go-git tree objects. Update the call site at line 836. The pre-resolved `headTree`/`parentTree` are still needed by other callers (content overlap, carry-forward, attribution), so don't remove those — just stop passing them to `filesChangedInCommit`.
+
+### 3. Replace `getAllChangedFilesBetweenTrees` in attribution
+
+**File:** `cmd/entire/cli/strategy/manual_commit_attribution.go`
+
+Replace the call at line 229:
+```go
+nonAgentFiles, err := getAllChangedFilesBetweenTrees(ctx, baseTree, headTree)
+```
+with a call to `gitops.DiffTreeFiles(ctx, attributionBaseCommit, headCommit)`.
+
+This requires threading the commit hash strings into `CalculateAttributionWithAccumulated`. Add a new parameter or options struct for the commit hashes.
+
+**Call chain to update:**
+- `PostCommit` → `postCommitProcessSession` → `CondenseSession` → `calculateSessionAttributions` → `CalculateAttributionWithAccumulated`
+- Thread `attributionBaseCommit` (from `state.AttributionBaseCommit`) and `headCommitHash` (from `head.Hash().String()`) through `attributionOpts`
+
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go`
+
+- Add commit hash fields to `attributionOpts` struct (line 307)
+- Pass them from `CondenseSession` → `calculateSessionAttributions` → `CalculateAttributionWithAccumulated`
+
+### 4. Handle `CondenseSessionByID` (doctor command)
+
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go` (line 743)
+
+`CondenseSessionByID` calls `CondenseSession` without a specific commit context. When commit hashes aren't available, fall back to the current go-git tree walk (or skip non-agent attribution). This is a salvage path, not performance-critical.
+
+### 5. Update tests
+
+**File:** `cmd/entire/cli/strategy/manual_commit_attribution_test.go`
+
+- Update `CalculateAttributionWithAccumulated` call sites for new signature
+- `TestGetAllChangedFilesBetweenTrees` (line 777) — delete (function removed)
+- `TestCalculateAttributionWithAccumulated_UserEditsNonAgentFile` (line 697) — key test, update to pass commit hashes; may need a real git repo fixture instead of in-memory trees for the non-agent file detection path
+
+**New file:** `cmd/entire/cli/gitops/diff_test.go`
+- Test `DiffTreeFiles` with a real git repo (create temp repo, make commits, verify output)
+- Test initial commit (no parent) case
+- Test multi-commit range
+
+### 6. Remove dead code
+
+- Delete `getAllChangedFilesBetweenTrees` from `manual_commit_attribution.go`
+- Delete `TestGetAllChangedFilesBetweenTrees` from test file
+
+### 7. Remove timing instrumentation
+
+Remove the timing `logging.Info` calls added during investigation from:
+- `manual_commit_hooks.go` — PrepareCommitMsg and PostCommit timing logs
+- `manual_commit_condensation.go` — CondenseSession timing logs
+
+## Files Modified
+
+- **`cmd/entire/cli/gitops/diff.go`** (new) — `DiffTreeFiles` using `git diff-tree`
+- **`cmd/entire/cli/gitops/diff_test.go`** (new) — tests for above
+- `cmd/entire/cli/strategy/manual_commit_hooks.go` — update `filesChangedInCommit` + remove timing logs
+- `cmd/entire/cli/strategy/manual_commit_attribution.go` — new params, remove `getAllChangedFilesBetweenTrees`
+- `cmd/entire/cli/strategy/manual_commit_condensation.go` — thread commit hashes through opts + remove timing logs
+- `cmd/entire/cli/strategy/manual_commit_attribution_test.go` — update tests
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. Build binary, test on rust repo (~58k files): `time git commit -m 'test'` — expect <500ms
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-3/86a4c45c-4c6f-441c-9e41-80eb453d2c7d.jsonl
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation to capture all important details.
+
+1. The user provided a detailed implementation plan to fix commit hook performance (O(n) tree walks) by replacing go-git tree walks with `git diff-tree` CLI calls.
+
+2. The plan has 7 steps:
+   - Create `cmd/entire/cli/gitops/` package with DiffTreeFiles
+   - Replace `filesChangedInCommit` 
+   - Replace `getAllChangedFilesBetweenTrees` in attribution
+   - Handle `CondenseSessionByID` fallback
+   - Update tests
+   - Remove dead code
+   - Remove timing instrumentation
+
+3. I created 5 tasks to track progress and started working through them.
+
+4. Task 1 (COMPLETED): Created gitops package
+   - Created `cmd/entire/cli/gitops/diff.go` with `DiffTreeFiles`, `DiffTreeFileList`, `diffTreeRaw`, `parseDiffTreeOutput`, `extractStatus`
+   - Created `cmd/entire/cli/gitops/diff_test.go` with tests
+   - Hit error: tests using `os.Chdir` with `t.Parallel()` caused "fatal: bad object" errors because parallel tests switched directories
+   - Fixed by removing `t.Parallel()` from tests using `os.Chdir()` and using `t.Chdir(dir)` instead of manual `os.Chdir`/defer pattern
+
+5. Task 2 (COMPLETED): Replaced `filesChangedInCommit`
+   - Changed signature from `func filesChangedInCommit(commit *object.Commit, headTree, parentTree *object.Tree) map[string]struct{}` to `func filesChangedInCommit(ctx context.Context, commit *object.Commit) map[string]struct{}`
+   - Updated call site at line ~836 to `filesChangedInCommit(ctx, commit)`
+   - Added `gitops` import to manual_commit_hooks.go
+   - Updated comment about pre-resolved trees (removed filesChangedInCommit from the list)
+
+6. Task 3 (COMPLETED): Replaced `getAllChangedFilesBetweenTrees` in attribution
+   - Added `attributionBaseCommit` and `headCommitHash` fields to `attributionOpts` struct
+   - Added `headCommitHash` field to `condenseOpts` struct
+   - Updated `CondenseSession` to compute `attrBase` and pass it through
+   - Updated both `condenseAndUpdateState` call sites to include `headCommitHash: h.newHead`
+   - Changed `CalculateAttributionWithAccumulated` signature to accept `attributionBaseCommit string, headCommitHash string`
+   - Replaced `getAllChangedFilesBetweenTrees` with `getNonAgentChangedFiles` which uses fast `gitops.DiffTreeFileList` when hashes available, falls back to slow go-git tree walk when not
+   - Renamed old function to `getAllChangedFilesBetweenTreesSlow` as the fallback implementation
+
+7. Task 4 (IN PROGRESS): Update tests and remove dead code
+   - Updated all `CalculateAttributionWithAccumulated` test call sites to add `"", ""` parameters (10 occurrences)
+   - Deleted `TestGetAllChangedFilesBetweenTrees` test
+   - Updated `filesChangedInCommit` tests in `phase_postcommit_test.go` - changed from `filesChangedInCommit(commit, nil, nil)` to `filesChangedInCommit(context.Background(), commit)` and deleted `TestFilesChangedInCommit_CacheEquivalence` (no longer relevant since function doesn't accept pre-resolved trees)
+   - Removed timing instrumentation from PrepareCommitMsg (removed `hookStart`, `t0`, `t1`, `t2` timing variables and their associated `logging.Info` calls)
+   - Removed timing instrumentation from PostCommit (removed `hookStart`, `t0`, `t1`, `t2`, `tSess`, `tCleanup` and all timing `logging.Info` calls)
+   - Still need to remove timing instrumentation from CondenseSession in manual_commit_condensation.go
+
+8. Task 5 (PENDING): Run fmt, lint, and test:ci
+
+Let me now check what's remaining in task 4:
+- CondenseSession timing logs in manual_commit_condensation.go still need to be removed
+- Need to verify `time` import is still needed in hooks file
+- Need to check if unused imports remain
+
+Looking at the CondenseSession function, I see timing logs at:
+- extractSessionData timing (line ~166-171)
+- calculateAttribution timing (was already removed when I updated it)
+- summarize timing (line ~257-260)  
+- WriteCommitted timing (line ~288-291)
+- total timing (line ~293-296)
+
+These all need to be removed per the plan.
+
+Also I need to verify:
+- The `condenseStart` and `logCtx` timing variables in CondenseSession
+- Whether `time` import is still needed (likely yes for other uses)
+
+Summary:
+1. Primary Request and Intent:
+   The user asked me to implement a detailed performance optimization plan titled "Fix: Commit Hook Performance (O(n) Tree Walks)". The plan targets two hotspots in the post-commit hook that cause 5.4s latency on large repos (~58k files):
+   - `filesChangedInCommit`: 703ms → 25ms (PostCommit, HEAD~1→HEAD)
+   - `getAllChangedFilesBetweenTrees`: 4,685ms → 36ms (Attribution, AttributionBaseCommit→HEAD)
+   
+   Both should be replaced with `git diff-tree` CLI calls. The plan also includes removing timing instrumentation added during investigation, updating tests, and removing dead code. Expected improvement: 5.4s → ~200ms.
+
+2. Key Technical Concepts:
+   - `git diff-tree --no-commit-id -r -z` for fast file diff between commits (null-separated output)
+   - `git diff-tree --root -r -z` for initial commits (no parent)
+   - go-git v5 tree walks (O(n) per tree) vs git CLI diff-tree (native C, much faster)
+   - Shadow branch architecture: `entire/<commit-hash[:7]>-<worktreeHash[:6]>`
+   - Attribution system: base→shadow (agent work) vs shadow→head (user edits) vs base→head (all changes including non-agent files)
+   - `condenseOpts` / `attributionOpts` structs for threading pre-resolved git objects
+   - Session phase state machine (ACTIVE, IDLE, ENDED)
+   - `CondenseSessionByID` as a salvage/doctor path that may not have commit hashes available
+   - `t.Chdir()` (Go 1.24+) vs `os.Chdir()` with `t.Parallel()` restrictions
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/gitops/diff.go`** (NEW)
+     - New leaf package for git CLI operations
+     - Contains `DiffTreeFiles` (returns `map[string]struct{}`), `DiffTreeFileList` (returns `[]string`), `diffTreeRaw`, `parseDiffTreeOutput`, `extractStatus`
+     ```go
+     package gitops
+
+     import (
+         "bytes"
+         "context"
+         "fmt"
+         "os/exec"
+         "strings"
+     )
+
+     func DiffTreeFiles(ctx context.Context, commit1, commit2 string) (map[string]struct{}, error) {
+         files, err := diffTreeRaw(ctx, commit1, commit2)
+         if err != nil {
+             return nil, err
+         }
+         result := make(map[string]struct{}, len(files))
+         for _, f := range files {
+             result[f] = struct{}{}
+         }
+         return result, nil
+     }
+
+     func DiffTreeFileList(ctx context.Context, commit1, commit2 string) ([]string, error) {
+         return diffTreeRaw(ctx, commit1, commit2)
+     }
+
+     func diffTreeRaw(ctx context.Context, commit1, commit2 string) ([]string, error) {
+         var cmd *exec.Cmd
+         if commit1 == "" {
+             cmd = exec.CommandContext(ctx, "git", "diff-tree", "--root", "--no-commit-id", "-r", "-z", commit2)
+         } else {
+             cmd = exec.CommandContext(ctx, "git", "diff-tree", "--no-commit-id", "-r", "-z", commit1, commit2)
+         }
+         var stdout, stderr bytes.Buffer
+         cmd.Stdout = &stdout
+         cmd.Stderr = &stderr
+         if err := cmd.Run(); err != nil {
+             return nil, fmt.Errorf("git diff-tree failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+         }
+         return parseDiffTreeOutput(stdout.Bytes()), nil
+     }
+     ```
+     - `parseDiffTreeOutput` handles null-separated format including rename/copy status detection
+     - `extractStatus` parses the status line format `:old-mode new-mode old-hash new-hash status`
+
+   - **`cmd/entire/cli/gitops/diff_test.go`** (NEW)
+     - Tests for `DiffTreeFiles`, `DiffTreeFileList`, `parseDiffTreeOutput`
+     - Tests use real git repos via `initTestRepo` helper
+     - Tests using `t.Chdir(dir)` are NOT parallel (Go restriction)
+     - `TestParseDiffTreeOutput` subtests ARE parallel (no os.Chdir)
+     - Covers: normal commit, initial commit (--root), multi-commit range, deleted file, no changes, subdirectory files
+
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** (MODIFIED)
+     - Added `"github.com/entireio/cli/cmd/entire/cli/gitops"` import
+     - `filesChangedInCommit` signature changed from `(commit *object.Commit, headTree, parentTree *object.Tree) map[string]struct{}` to `(ctx context.Context, commit *object.Commit) map[string]struct{}`
+     - New implementation:
+       ```go
+       func filesChangedInCommit(ctx context.Context, commit *object.Commit) map[string]struct{} {
+           var parentHash string
+           if commit.NumParents() > 0 {
+               parentHash = commit.ParentHashes[0].String()
+           }
+           result, err := gitops.DiffTreeFiles(ctx, parentHash, commit.Hash.String())
+           if err != nil {
+               return make(map[string]struct{})
+           }
+           return result
+       }
+       ```
+     - Call site updated: `committedFileSet := filesChangedInCommit(ctx, commit)`
+     - Comment updated to remove `filesChangedInCommit` from list of functions using pre-resolved trees
+     - Both `condenseOpts` in `HandleCondense` and `HandleCondenseIfFilesTouched` now include `headCommitHash: h.newHead`
+     - Removed ALL timing instrumentation:
+       - PrepareCommitMsg: removed `hookStart`, `t0` (OpenRepository), `t1` (findSessionsForWorktree), `t2` (filterSessionsWithNewContent) and their logging.Info calls
+       - PostCommit: removed `hookStart`, `t0` (OpenRepository), `t1` (Head+CommitObject), `t2` (findSessionsForWorktree), `tSess` (processSession), `tCleanup` (shadowBranchCleanup), total timing and their logging.Info calls
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation.go`** (MODIFIED)
+     - `condenseOpts` struct gained `headCommitHash string` field
+     - `attributionOpts` struct gained `attributionBaseCommit string` and `headCommitHash string` fields
+     - `CondenseSession` now computes `attrBase` and passes it through to `calculateSessionAttributions`:
+       ```go
+       attrBase := state.AttributionBaseCommit
+       if attrBase == "" {
+           attrBase = state.BaseCommit
+       }
+       attribution := calculateSessionAttributions(ctx, repo, ref, sessionData, state, attributionOpts{
+           headTree:              o.headTree,
+           attributionBaseCommit: attrBase,
+           headCommitHash:        o.headCommitHash,
+       })
+       ```
+     - Removed `t1` timing variable and timing log for calculateAttribution phase
+     - **Still has timing logs remaining** for: extractSessionData, summarize, WriteCommitted, and total phases
+
+   - **`cmd/entire/cli/strategy/manual_commit_attribution.go`** (MODIFIED)
+     - Added `"github.com/entireio/cli/cmd/entire/cli/gitops"` import
+     - `CalculateAttributionWithAccumulated` signature gained two new parameters: `attributionBaseCommit string, headCommitHash string`
+     - Replaced `getAllChangedFilesBetweenTrees(ctx, baseTree, headTree)` call with `getNonAgentChangedFiles(ctx, baseTree, headTree, attributionBaseCommit, headCommitHash)`
+     - New `getNonAgentChangedFiles` function:
+       ```go
+       func getNonAgentChangedFiles(ctx context.Context, baseTree, headTree *object.Tree, baseCommitHash, headCommitHash string) ([]string, error) {
+           if baseCommitHash != "" && headCommitHash != "" {
+               return gitops.DiffTreeFileList(ctx, baseCommitHash, headCommitHash)
+           }
+           return getAllChangedFilesBetweenTreesSlow(ctx, baseTree, headTree)
+       }
+       ```
+     - Old `getAllChangedFilesBetweenTrees` renamed to `getAllChangedFilesBetweenTreesSlow` (fallback for CondenseSessionByID)
+
+   - **`cmd/entire/cli/strategy/manual_commit_attribution_test.go`** (MODIFIED)
+     - All 10 `CalculateAttributionWithAccumulated` call sites updated to add `"", ""` parameters (empty strings = fall back to slow tree walk path, which is correct for tests using in-memory trees without real git repos)
+     - Deleted entire `TestGetAllChangedFilesBetweenTrees` function (~150 lines)
+     - Unused imports check: `sort`, `plumbing`, `memory` still used by `buildTestTree`
+
+   - **`cmd/entire/cli/strategy/phase_postcommit_test.go`** (MODIFIED)
+     - `TestFilesChangedInCommit`: changed `filesChangedInCommit(commit, nil, nil)` to `filesChangedInCommit(context.Background(), commit)`
+     - `TestFilesChangedInCommit_InitialCommit`: same change
+     - `TestFilesChangedInCommit_CacheEquivalence`: **deleted entirely** (no longer relevant since function doesn't accept pre-resolved trees)
+
+4. Errors and fixes:
+   - **gitops test parallel failure**: Tests using `t.Parallel()` with `os.Chdir()` caused "fatal: bad object" errors because parallel tests changed the working directory concurrently, making git commands run in wrong repos.
+     - Fix: Removed `t.Parallel()` from all tests using directory changes, switched from manual `os.Chdir`/defer pattern to `t.Chdir(dir)` which auto-restores
+   - **Compiler errors after signature changes**: Expected cascading errors from changing `filesChangedInCommit` and `CalculateAttributionWithAccumulated` signatures. Fixed by updating all call sites systematically.
+   - **Unused variable `hookStart`**: After removing timing logs that referenced `hookStart` in PostCommit and PrepareCommitMsg, the variable became unused. Fixed by removing the variable declarations.
+
+5. Problem Solving:
+   - Successfully replaced two O(n) go-git tree walks with O(n log n) git diff-tree CLI calls
+   - Handled the CondenseSessionByID fallback path by creating a dual-path `getNonAgentChangedFiles` function that uses fast git CLI when commit hashes are available, falls back to slow go-git when not
+   - Preserved the important AttributionBaseCommit→HEAD range (not HEAD~1→HEAD) for non-agent file detection
+   - Threading commit hashes through the opts chain: PostCommit handler → condenseOpts → CondenseSession → attributionOpts → calculateSessionAttributions → CalculateAttributionWithAccumulated → getNonAgentChangedFiles
+
+6. All user messages:
+   - "Implement the following plan: [detailed plan for Fix: Commit Hook Performance (O(n) Tree Walks)]" — with full context about the two hotspots, expected improvements, specific files to modify, and verification steps.
+
+7. Pending Tasks:
+   - **Task 4 (IN PROGRESS)**: Remove remaining timing instrumentation from `manual_commit_condensation.go` (CondenseSession has timing logs for extractSessionData, summarize, WriteCommitted, and total phases that still need removal)
+   - **Task 5 (PENDING)**: Run `mise run fmt && mise run lint && mise run test:ci` for final verification
+   - Verify no unused imports remain (especially `time` in hooks file, `slog` usage)
+   - Verify the full build compiles cleanly
+
+8. Current Work:
+   Working on Task 4 — removing timing instrumentation and dead code. Have completed:
+   - All test updates for changed function signatures
+   - Deletion of `TestGetAllChangedFilesBetweenTrees` and `TestFilesChangedInCommit_CacheEquivalence`
+   - Removal of all timing logs from PrepareCommitMsg and PostCommit in `manual_commit_hooks.go`
+   
+   Still need to:
+   - Remove timing logs from `CondenseSession` in `manual_commit_condensation.go` (lines with `condenseStart`, `logCtx := logging.WithComponent(ctx, "condense-timing")`, `t0`/extractSessionData timing, `t2`/summarize timing, `t3`/WriteCommitted timing, and total timing)
+   - Check if `time` import is still needed in modified files after removing timing code
+   - Check if `slog` import is still needed after removing timing Info calls
+
+9. Optional Next Step:
+   Continue removing timing instrumentation from `CondenseSession` in `manual_commit_condensation.go`. The plan explicitly states: "Remove the timing `logging.Info` calls added during investigation from: manual_commit_condensation.go — CondenseSession timing logs". The CondenseSession function still has these timing logs:
+   - `condenseStart := time.Now()` and `logCtx := logging.WithComponent(ctx, "condense-timing")`
+   - extractSessionData timing block (lines ~166-171)
+   - summarize timing block (lines ~257-260)
+   - WriteCommitted timing block (lines ~288-291)
+   - total timing block (lines ~293-296)
+   
+   After that, run Task 5: `mise run fmt && mise run lint && mise run test:ci`.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-3/fb42308e-354a-411c-b67d-ce9adbeb36fb.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+are we sure we haven't lost any test/scenario coverage?
+
+---
+
+yeah let's keep it for the Slow fallback please, targeting directly would be ace
+
+---
+
+commit, push, raise a PR

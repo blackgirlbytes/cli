@@ -1,0 +1,134 @@
+Implement the following plan:
+
+# Fix Flaky Droid E2E Tests in CI
+
+## Context
+
+Droid E2E tests consistently fail in CI during the **startup handshake** phase. The handshake verifies droid is responsive by sending a token and waiting for it to echo back. This works. But step 3 of `performHandshake()` then waits for the prompt pattern `[│|] >` to reappear — and **this pattern never appears** in `tmux capture-pane` output for droid v0.66.0.
+
+**Evidence from CI:** `startup handshake failed (prompt=false startup_markers=true)` — startup succeeded via markers (`ENTER to send` + `Current folder:`), never via the `│ >` prompt glyph.
+
+The `[│|] >` pattern is used in 3 places:
+1. `performHandshake()` step 3 (`droid.go:370`) — blocks startup
+2. `PromptPattern()` (`droid.go:35`) — used by all interactive test `WaitFor` calls
+3. `recoverDroidPromptTimeoutWithHandshake()` (`repo.go:411`) — recovery also waits for it
+
+---
+
+## Options
+
+### Option A: Hybrid Fix — Remove Handshake Step 3 + Use `ENTER to send` as Prompt Pattern (Recommended)
+
+**Rationale:** The token echo already proves droid is responsive — the additional prompt wait is redundant. For interactive tests, `ENTER to send` is always visible in droid's TUI status bar when idle and is already proven capturable (used in startup detection).
+
+**Changes:**
+
+1. **`e2e/agents/droid.go`**
+   - `PromptPattern()` → return `ENTER to send` (instead of `[│|] >`)
+   - `performHandshake()` → remove step 3 (the `WaitFor(d.PromptPattern())` call)
+   - `droidPromptReady()` → add `ENTER to send` as a valid prompt indicator
+   - `droidStartupReadyPattern()` → simplify (prompt pattern now matches what markers already detect)
+
+2. **`e2e/testutil/repo.go`**
+   - `recoverDroidPromptTimeoutWithHandshake()` → remove the post-token `WaitFor(pattern)` call (token echo + settle = ready)
+
+3. **`e2e/agents/droid_test.go`**
+   - Update `TestDroidPromptPattern_DoesNotMatchAssistantMarker` — new pattern expectations
+   - Adjust startup pattern test if needed
+
+4. **`e2e/testutil/repo_test.go`**
+   - Update `fakeAgent` prompt string from `[│|] >` to `ENTER to send`
+   - Update `TestRecoverDroidPromptTimeoutWithHandshake` — recovery now expects 1 wait (token only), not 2
+
+**Reliability:** High. `ENTER to send` is always present in droid's idle TUI. `WaitFor`'s settle mechanism (content must change from pre-Send AND stabilize for 2s) prevents premature matching during response streaming.
+
+**Risk:** Low. Only fails if droid removes `ENTER to send` from its TUI (which would also break startup detection already).
+
+**Complexity:** Low. ~4 files, mostly small edits.
+
+---
+
+### Option B: Content-Settling Mode (No Pattern Required)
+
+**Concept:** Add a `WaitForSettle()` method to `TmuxSession` that waits for content to change and then stop changing, with no pattern match required. Droid uses this instead of pattern-based readiness.
+
+**Changes:**
+
+1. **`e2e/agents/tmux.go`** — Add `WaitForSettle(timeout) (string, error)` method
+2. **`e2e/agents/droid.go`** — `PromptPattern()` returns `""` (sentinel for settle mode)
+3. **`e2e/testutil/repo.go`** — `WaitFor` branches: if pattern is `""`, call `session.WaitForSettle()`; remove recovery mechanism
+4. **`e2e/agents/agent.go`** — Add `WaitForSettle` to `Session` interface (or keep it as a `TmuxSession`-only method and type-assert)
+5. **Tests** — Update expectations
+
+**Reliability:** Medium-High. Content-settling is sound but risks false positives if droid pauses mid-response for >2s (e.g., thinking indicator stops).
+
+**Risk:** Medium. No positive readiness signal — only absence of change. A slow network or API timeout could cause premature settle detection.
+
+**Complexity:** Low-Medium. New method, interface change, branching logic.
+
+---
+
+### Option C: Wait for Stop Hook Output as Readiness Signal
+
+**Concept:** After each response, droid's Stop hook fires and outputs `Result : Exit code: 0`. Use this as the readiness pattern instead of `│ >`.
+
+**Changes:**
+
+1. **`e2e/agents/droid.go`** — `PromptPattern()` returns `Result\s*:\s*Exit code: 0`
+2. **`e2e/agents/droid.go`** — `performHandshake()` step 3 uses Stop hook pattern
+3. **Tests** — Update expectations
+
+**Reliability:** Medium. The Stop hook output reliably appears after every response in the current E2E setup. However, this pattern is tied to the `entire hooks` output format, which could change.
+
+**Risk:** Medium-High. If hook output format changes, or if hooks are disabled/fail, the pattern won't match. Also, if hooks fire but droid isn't truly ready for the next prompt (still rendering), we'd send input too early.
+
+**Complexity:** Very Low. Just change the string.
+
+---
+
+### Option D: Skip Post-Response Readiness Check Entirely
+
+**Concept:** Remove all post-response readiness waiting from the droid flow. After sending a prompt and seeing the expected response content, immediately consider droid ready. The `WaitFor` in test code already uses settle logic.
+
+**Changes:**
+
+1. **`e2e/agents/droid.go`** — `performHandshake()` remove step 3; `PromptPattern()` return `""`
+2. **`e2e/testutil/repo.go`** — When `PromptPattern()` is `""`, skip `WaitFor` entirely after responses
+3. **Tests** — Remove all `s.WaitFor(t, session, s.Agent.PromptPattern(), ...)` calls for droid, or make them no-ops
+
+**Reliability:** Medium. Relies on the test's response-content `WaitFor` calls (waiting for file creation output, commit output, etc.) to implicitly confirm readiness. No explicit idle-state verification.
+
+**Risk:** High. Without any readiness signal, sending the next prompt too fast could cause input to be dropped or interleaved with the previous response. Especially problematic for fast follow-up prompts.
+
+**Complexity:** Low but requires auditing all test files that call `WaitFor` with `PromptPattern()`.
+
+---
+
+## Recommendation
+
+**Option A** is the strongest choice:
+- Fixes the root cause (prompt pattern doesn't match droid's actual TUI)
+- Uses an already-proven-capturable string (`ENTER to send`)
+- Minimal changes, no new abstractions
+- Leverages existing `WaitFor` settle mechanism for correctness
+- Falls back gracefully (if `ENTER to send` ever fails, Option B can be added later)
+
+## Verification
+
+1. Run unit tests: `mise run test` (validates updated droid_test.go and repo_test.go)
+2. Run integration tests: `mise run test:integration`
+3. If user approves, run droid E2E: `mise run test:e2e --agent factoryai-droid`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-droid-e2e-fix/965a13ba-5187-4522-9b70-ad66a75ba158.jsonl
+
+---
+
+this just hangs ~/Projects/wt/droid-e2e-fix (alisha/droid-e2e-fix) $ mise run test:e2e --agent factoryai-droid TestAttributionOnAgentCommit
+[build] $ ~/Projects/wt/droid-e2e-fix/mise-tasks/build
+artifacts: /Users/alisha/Projects/wt/droid-e2e-fix/e2e/artifacts/2026-03-03T16-45-32
+[e2e/tests]
+
+---
+
+[Request interrupted by user for tool use]

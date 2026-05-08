@@ -1,0 +1,126 @@
+Implement the following plan:
+
+# Plan: Support Cursor CLI Hook Differences
+
+## Context
+
+The Cursor agent implementation was built from Cursor IDE hook samples. We now have real hook data from **Cursor CLI** and need to update the implementation to support both. The critical issue is that Cursor CLI never provides `transcript_path`, which breaks the turn-end handler.
+
+**Source data**: IDE log (`simple-session-ide.log`), CLI log (`simple-session-agent-cli.log`), CLI transcript (`agent-transcripts/723fa68d-....jsonl`)
+
+## Corrected Differences (IDE vs CLI)
+
+Comparing both logs reveals the actual differences:
+
+| Hook | IDE `transcript_path` | CLI `transcript_path` |
+|------|----------------------|----------------------|
+| sessionStart | `null` | `null` |
+| beforeSubmitPrompt | `null` | `null` |
+| **stop** | **nested path provided** | **`null`** |
+| **sessionEnd** | **nested path provided** | **`null`** |
+
+| Aspect | Cursor IDE | Cursor CLI |
+|--------|-----------|------------|
+| Transcript location | `agent-transcripts/<id>/<id>.jsonl` (nested dir) | `agent-transcripts/<id>.jsonl` (flat file) |
+| `transcript_path` on stop/sessionEnd | Provided | `null` |
+| `cursor_version` format | Semver (`2.5.17`) | Date-based (`2026.02.13-41ac335`) |
+| `composer_mode` on sessionStart | Present (`"agent"`) | Absent |
+| `model` on sessionStart | `"default"` | Actual model name |
+| `sessionEnd` richer fields | Present (both have `reason`, `duration_ms`, etc.) | Present |
+| `stop` extra fields | Present (both have `status`, `loop_count`) | Present |
+
+**Key insight**: `sessionEnd` richer fields (`reason`, `duration_ms`, `is_background_agent`, `final_status`) and `stop` extra fields (`status`, `loop_count`) exist in **both** IDE and CLI — they were always there, just not captured by our types.
+
+## Critical Issue
+
+CLI `stop` hook has `transcript_path: null`, so `SessionRef` is empty on TurnEnd. The lifecycle dispatcher (`lifecycle.go:161-163`) errors:
+```go
+if transcriptRef == "" {
+    return errors.New("transcript file not specified")
+}
+```
+
+## Changes
+
+### 1. Fix `GetSessionDir` to include `agent-transcripts/`
+
+**File**: `cmd/entire/cli/agent/cursor/cursor.go:78-89`
+
+Current: `~/.cursor/projects/<sanitized-path>`
+Fix: `~/.cursor/projects/<sanitized-path>/agent-transcripts`
+
+This matches the real filesystem layout in both IDE and CLI.
+
+### 2. Fix `ResolveSessionFile` to support both flat (CLI) and nested (IDE) layouts
+
+**File**: `cmd/entire/cli/agent/cursor/cursor.go:70-72`
+
+Current: `<sessionDir>/<id>.jsonl`
+Fix: Check both:
+1. `<sessionDir>/<id>/<id>.jsonl` (IDE nested) — if exists, return it
+2. `<sessionDir>/<id>.jsonl` (CLI flat) — fallback/default
+
+Same pattern as `geminicli.ResolveSessionFile`.
+
+### 3. Compute transcript path in `ParseHookEvent` when `transcript_path` is null
+
+**File**: `cmd/entire/cli/agent/cursor/lifecycle.go`
+
+Only needed for `stop` (TurnEnd) and `sessionEnd` — those are the hooks where IDE provides the path but CLI doesn't. For sessionStart and beforeSubmitPrompt, `transcript_path` is null in **both** IDE and CLI, and the system already handles that.
+
+When `raw.TranscriptPath` is empty on stop/sessionEnd:
+- Use `paths.WorktreeRoot(ctx)` to get repo root (same approach as OpenCode)
+- Call `c.GetSessionDir(repoRoot)` then `c.ResolveSessionFile(sessionDir, conversationID)`
+- Change `_ context.Context` to `ctx context.Context` in parse methods that need it
+
+Extract a helper like `(c *CursorAgent) resolveTranscriptRef(ctx, sessionID, rawPath) string` to keep it DRY.
+
+### 4. Enrich types to capture fields present in both IDE and CLI
+
+**File**: `cmd/entire/cli/agent/cursor/types.go`
+
+**a) Add `sessionEndRaw` struct** (currently uses generic `sessionInfoRaw`):
+- `SessionID`, `Reason`, `DurationMs`, `IsBackgroundAgent`, `FinalStatus`
+- These fields exist in both IDE and CLI
+
+**b) Add `stopHookInputRaw` struct** (currently uses generic `sessionInfoRaw`):
+- `Status`, `LoopCount`
+- These fields exist in both IDE and CLI
+
+**c) Add `sessionStartRaw` struct** (currently uses generic `sessionInfoRaw`):
+- `SessionID`, `IsBackgroundAgent`, `ComposerMode` (IDE-only)
+
+Update corresponding parse functions in `lifecycle.go` to use the new types.
+
+### 5. Update tests
+
+**File**: `cmd/entire/cli/agent/cursor/lifecycle_test.go`
+- Add tests with `transcript_path` absent/null (CLI pattern) for stop and sessionEnd
+- Add test with real CLI hook payload from `simple-session-agent-cli.log`
+- Existing tests (with `transcript_path` provided) remain for IDE backward compat
+
+**File**: `cmd/entire/cli/agent/cursor/cursor_test.go`
+- `TestCursorAgent_GetSessionDir_DefaultPath`: verify path ends with `agent-transcripts`
+- `TestCursorAgent_ResolveSessionFile`: test both flat and nested layouts
+- Add test for `ResolveSessionFile` preferring nested when it exists
+
+## Files to Modify
+
+1. `cmd/entire/cli/agent/cursor/cursor.go` — `GetSessionDir`, `ResolveSessionFile`
+2. `cmd/entire/cli/agent/cursor/lifecycle.go` — transcript path fallback, use ctx
+3. `cmd/entire/cli/agent/cursor/types.go` — `sessionEndRaw`, `stopHookInputRaw`, `sessionStartRaw`
+4. `cmd/entire/cli/agent/cursor/lifecycle_test.go` — CLI-format tests
+5. `cmd/entire/cli/agent/cursor/cursor_test.go` — updated session dir/file tests
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. `go test ./cmd/entire/cli/agent/cursor/... -v` — cursor-specific tests
+3. Test with exact JSON from both `simple-session-ide.log` and `simple-session-agent-cli.log`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/robin/.claude/projects/-Users-robin-Developer-cli/434923a2-837c-48e9-99fe-642ba90ceba1.jsonl
+
+---
+
+commit this and create a draft pr

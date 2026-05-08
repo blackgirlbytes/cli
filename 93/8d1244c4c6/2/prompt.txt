@@ -1,0 +1,408 @@
+I did test the opencode code in /Users/soph/Work/entire/devenv/cli_experiments, I opened a session, run a prompt, filechanges were made, commited them -> checkpoint created, trailer included (last commit) then I resumed the old session opencode -s ses_384943532ffeDB42zezuVEwuKq and did run another prompt again changes where made, exited but this time there was no new shadow branch created and when I opened git commit no trailer was suggested (I aborted the commit) can you investigate?
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user asked me to investigate a bug with OpenCode session resumption in `/Users/soph/Work/entire/devenv/cli_experiments`. The specific issue:
+   - First session: opened, ran prompt, file changes made, committed → checkpoint created, trailer included
+   - Resumed same session with `opencode -s ses_384943532ffeDB42zezuVEwuKq`
+   - Ran another prompt, changes were made
+   - Exited, but NO new shadow branch created and NO trailer suggested on git commit
+
+2. I launched an Explore agent to investigate the codebase, which provided a detailed analysis of the `InitializeSession` flow.
+
+3. I then read multiple key files:
+   - `manual_commit_hooks.go` (lines 1390-1510) - InitializeSession logic
+   - `manual_commit_git.go` (lines 1-160) - SaveStep logic
+   - OpenCode lifecycle.go, hooks.go, plugin.go, types.go, transcript.go, cli_commands.go
+   - `lifecycle.go` - the generic lifecycle event dispatcher
+   - `session/phase.go` - phase state machine
+   - `manual_commit_hooks.go` PrepareCommitMsg, PostCommit, condenseAndUpdateState, sessionHasNewContent, filterSessionsWithNewContent
+
+4. Initially I was looking at the wrong directory. The logs in `/Users/soph/Work/entire/devenv/cli_experiments/.entire/logs/entire.log` showed only Claude Code sessions. The `.opencode/plugins/` directory didn't exist in the cli_experiments repo.
+
+5. Key breakthrough: I found that OpenCode sessions ran in `/Users/soph/Work/entire/test/opencode_test1/` (not cli_experiments). I discovered this through the OpenCode system logs at `~/.local/share/opencode/log/`.
+
+6. I then read the ACTUAL test directory's logs and session state:
+   - `/Users/soph/Work/entire/test/opencode_test1/.entire/logs/entire.log` - the real OpenCode logs
+   - `/Users/soph/Work/entire/test/opencode_test1/.git/entire-sessions/ses_384943532ffeDB42zezuVEwuKq.json` - the session state
+
+7. The critical finding from the logs for session `ses_384943532ffeDB42zezuVEwuKq`:
+   - Line 52-57: First session - session-start → turn-start → turn-end → **checkpoint saved** (count=1, shadow branch `entire/0b20122-e3b0c4`)
+   - Line 58-61: User committed → trailer added (`4ee9272dc397`) → condensed → shadow branch deleted
+   - Line 62-65: **Resumed session** - turn-start → turn-end → **NO "checkpoint saved" log entry!** → phase just transitions active→idle
+
+8. The session state file shows:
+   - `checkpoint_count: 0` (reset by condensation, never incremented again)
+   - `checkpoint_transcript_start: 4` (from condensation)
+   - `phase: idle` (turn ended without saving)
+   - `pending_prompt_attribution` still exists (was set on turn-start but never consumed by SaveStep)
+
+9. So the hooks DID fire on resume (turn-start at 15:20:34, turn-end at 15:21:01), but SaveStep either wasn't called or didn't save a checkpoint. The turn-end fired (line 64) but there's no "checkpoint saved" log after it. This means in `handleLifecycleTurnEnd`, the code hit the `totalChanges == 0` path (no files detected) and returned early without calling SaveStep.
+
+10. The root cause is likely in how file changes are detected on resume:
+    - The transcript offset after condensation was 4 (messages)
+    - On resume, `opencode export` returns the full transcript which now has more messages
+    - `ExtractModifiedFilesFromOffset` with offset=4 should find new files
+    - BUT `filterToUncommittedFiles` might filter them out if the same files were already committed
+    - OR `DetectFileChanges` (git status) might not find changes if the changes are the same as what was committed
+
+The key issue: after the first commit, the file changes were committed to HEAD. When the agent modifies the SAME files again in the resumed session, `filterToUncommittedFiles` checks if the file content in the working tree matches HEAD. If the agent only made small additional changes or the same changes, and if git status doesn't show them as modified, they'd be filtered out.
+
+But actually, looking more carefully at the turn-end for the resumed session (15:21:01 vs turn-start at 15:20:34 = 27 seconds), and checking that `opencode export` was called at 15:21:01 (matching the log timestamp for `opencode export ses_384943532ffeDB42zezuVEwuKq` in OpenCode's own logs at 14:44:02... wait that doesn't match. Let me re-check.
+
+Actually, the OpenCode logs at `~/.local/share/opencode/log/` show export calls at 14:19, 14:21, and 14:44. But the Entire log shows the resumed turn-end at 15:21. There should be an export call at ~15:21 too but I didn't check if there are more OpenCode log files after 14:44.
+
+The most important finding is that the turn-end fired for the resumed session but no checkpoint was saved. The `handleLifecycleTurnEnd` function must have determined `totalChanges == 0`.
+
+This could be because:
+1. The `opencode export` on resume returned a transcript where the message offset skips new content
+2. `ExtractModifiedFilesFromOffset` with the old offset didn't find new tool calls
+3. `DetectFileChanges` (git status) didn't find uncommitted changes
+4. `filterToUncommittedFiles` filtered out all detected files
+
+I haven't completed the investigation yet - I was still analyzing the logs when the summary was requested.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked me to investigate a bug with OpenCode session resumption. Specifically:
+   - They opened an OpenCode session, ran a prompt, file changes were made, committed them → checkpoint was created and trailer was included in the last commit
+   - They then resumed the same session with `opencode -s ses_384943532ffeDB42zezuVEwuKq`
+   - Ran another prompt, changes were made by the agent
+   - Exited OpenCode, but this time NO new shadow branch was created and when they ran `git commit`, NO trailer was suggested (they aborted the commit)
+   - They asked me to investigate the root cause
+
+2. Key Technical Concepts:
+   - **Manual-commit strategy**: Shadow branches store checkpoints; user commits manually; condensation happens on post-commit
+   - **Shadow branches**: Named `entire/<HEAD-commit-hash[:7]>-<worktreeHash[:6]>`, hold temporary checkpoint data
+   - **Session lifecycle**: session-start → turn-start → (agent works) → turn-end → (user commits) → post-commit condensation
+   - **OpenCode plugin**: TypeScript plugin at `.opencode/plugins/entire.ts` that fires hooks on OpenCode events
+   - **Phase state machine**: IDLE → ACTIVE (on TurnStart) → IDLE (on TurnEnd) → ENDED (on SessionStop)
+   - **Condensation**: Moves checkpoint data from shadow branch to `entire/checkpoints/v1` orphan branch on user commit
+   - **Checkpoint ID trailer**: `Entire-Checkpoint: <12-hex-char>` added to commit messages by prepare-commit-msg hook
+   - **Transcript offset**: Used to parse only NEW messages from transcript on resumed sessions
+
+3. Files and Code Sections:
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** (lines 1397-1461) - `InitializeSession()`:
+     - Critical function for session initialization. On resume (state exists with BaseCommit != ""), takes an early return path that updates TurnID, clears checkpoint IDs, calculates attribution, and checks for shadow branch migration.
+     - On fresh sessions, calls `s.initializeSession()` which creates full session state.
+   
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** (lines 602-797) - `PostCommit()`:
+     - Handles condensation after user commits. Calls `condenseAndUpdateState()` which resets `state.StepCount = 0`, `state.CheckpointTranscriptStart = result.TotalTranscriptLines`, updates `BaseCommit` to new HEAD, and deletes old shadow branch.
+   
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** (lines 929-1074) - `sessionHasNewContent()` / `filterSessionsWithNewContent()`:
+     - Used by PrepareCommitMsg to determine if a trailer should be added. Checks shadow branch for transcript content, compares transcript lines against `CheckpointTranscriptStart`.
+   
+   - **`cmd/entire/cli/strategy/manual_commit_git.go`** (lines 24-160) - `SaveStep()`:
+     - Creates shadow branch checkpoints. Calls `WriteTemporary()`, updates `StepCount`, records `FilesTouched`.
+   
+   - **`cmd/entire/cli/lifecycle.go`** (lines 150-413) - `handleLifecycleTurnEnd()`:
+     - The main turn-end handler. Reads transcript, extracts metadata, detects file changes via git status, filters/normalizes paths, calls `filterToUncommittedFiles()`, checks `totalChanges == 0` (skips if no changes), then calls `strat.SaveStep(ctx)`.
+     - Key code path for the bug:
+     ```go
+     totalChanges := len(relModifiedFiles) + len(relNewFiles) + len(relDeletedFiles)
+     if totalChanges == 0 {
+         fmt.Fprintf(os.Stderr, "No files were modified during this session\n")
+         fmt.Fprintf(os.Stderr, "Skipping commit\n")
+         transitionSessionTurnEnd(sessionID)
+         // ...
+         return nil
+     }
+     ```
+   
+   - **`cmd/entire/cli/agent/opencode/entire_plugin.ts`** - The OpenCode plugin:
+     - Handles events: `session.created`, `message.updated`, `message.part.updated`, `session.idle`, `session.compacted`, `session.deleted`
+     - `session.created` sets `currentSessionID` - may NOT fire on session resume
+     - `message.part.updated` fires `turn-start` using `msg.sessionID ?? currentSessionID`
+     - `session.idle` fires `turn-end` using `event.properties.sessionID`
+   
+   - **`cmd/entire/cli/agent/opencode/lifecycle.go`** - OpenCode hook event parsing:
+     - `turn-end` hook calls `fetchAndCacheExport(sessionID)` which runs `opencode export <sessionID>` and writes to `.entire/tmp/<sessionID>.json`
+   
+   - **`cmd/entire/cli/agent/opencode/transcript.go`** - Transcript handling:
+     - `ExtractModifiedFilesFromOffset()` iterates messages from `startOffset` to find file-modifying tool calls
+     - `GetTranscriptPosition()` returns `len(session.Messages)`
+   
+   - **`cmd/entire/cli/session/phase.go`** - Phase state machine:
+     - Defines transitions: IDLE+TurnStart→ACTIVE, ACTIVE+TurnEnd→IDLE, IDLE+GitCommit→IDLE(+Condense), ENDED+TurnStart→ACTIVE
+   
+   - **`cmd/entire/cli/state.go`** - `CapturePrePromptState()`:
+     - Called during turn-start to capture pre-prompt untracked files and transcript offset
+   
+   - **Test directory**: `/Users/soph/Work/entire/test/opencode_test1/` - Where the actual OpenCode testing occurred (NOT in cli_experiments)
+   
+   - **Session state file** `/Users/soph/Work/entire/test/opencode_test1/.git/entire-sessions/ses_384943532ffeDB42zezuVEwuKq.json`:
+     ```json
+     {
+       "session_id": "ses_384943532ffeDB42zezuVEwuKq",
+       "base_commit": "091c2e131365873eb7dfa21f7cd62bc5dea5e707",
+       "phase": "idle",
+       "checkpoint_count": 0,
+       "checkpoint_transcript_start": 4,
+       "agent_type": "OpenCode",
+       "transcript_path": ".../ses_384943532ffeDB42zezuVEwuKq.json",
+       "pending_prompt_attribution": { "checkpoint_number": 1, ... }
+     }
+     ```
+     Key finding: `checkpoint_count: 0` means no checkpoint was saved on the resumed session. `pending_prompt_attribution` still present means SaveStep was never called (it consumes and clears this field).
+
+4. Errors and fixes:
+   - **Wrong directory investigated initially**: I first looked at `.entire/logs/` in cli_experiments, which only had Claude Code sessions. The actual OpenCode testing was in `/Users/soph/Work/entire/test/opencode_test1/`. Found the right directory by checking OpenCode's system logs at `~/.local/share/opencode/log/`.
+   - No code fixes have been made yet - still in investigation phase.
+
+5. Problem Solving:
+   **Root cause identified from logs**: The Entire log at `/Users/soph/Work/entire/test/opencode_test1/.entire/logs/entire.log` shows:
+   
+   - **First session (lines 52-61)**: session-start → turn-start → turn-end → **"checkpoint saved"** (shadow branch created) → user commits → trailer added → condensed → shadow branch deleted. ✅ Working.
+   
+   - **Resumed session (lines 62-65)**: turn-start (15:20:34) → turn-end (15:21:01) → **NO "checkpoint saved" entry** → phase just goes active→idle. ❌ Bug.
+   
+   The hooks DID fire on resume (both turn-start and turn-end). But `handleLifecycleTurnEnd` returned without calling `SaveStep()`. This means the `totalChanges == 0` check was triggered - the system determined no files were modified.
+   
+   **Most likely root cause**: After condensation set `CheckpointTranscriptStart = 4` (4 messages from first turn), and the resumed session's `opencode export` returns the full transcript. The `ExtractModifiedFilesFromOffset(path, 4)` should find new tool calls, but if the agent modified the SAME files that were already committed, `filterToUncommittedFiles()` would filter them out (matching HEAD content). Combined with `DetectFileChanges()` possibly not showing git status changes if the same file was modified with the same or no content delta, `totalChanges` becomes 0.
+   
+   **Alternative possibility**: The `opencode export` on the resumed session might not include the new turn's data if the export was called before the data was persisted, or the transcript offset was wrong.
+
+6. All user messages:
+   - "I did test the opencode code in /Users/soph/Work/entire/devenv/cli_experiments, I opened a session, run a prompt, filechanges were made, commited them -> checkpoint created, trailer included (last commit) then I resumed the old session opencode -s ses_384943532ffeDB42zezuVEwuKq and did run another prompt again changes where made, exited but this time there was no new shadow branch created and when I opened git commit no trailer was suggested (I aborted the commit) can you investigate?"
+
+7. Pending Tasks:
+   - Complete the root cause analysis by examining what `opencode export` returned for the resumed session (check `.REDACTED.json` content)
+   - Verify the exact code path that caused `totalChanges == 0` on resume
+   - Check git status / file state in the test repo to understand why file changes weren't detected
+   - Propose and implement a fix for the bug
+
+8. Current Work:
+   I had just finished reading the complete Entire log file at `/Users/soph/Work/entire/test/opencode_test1/.entire/logs/entire.log` and the session state file. The key finding is that for the resumed session `ses_384943532ffeDB42zezuVEwuKq`:
+   - Both `turn-start` (line 62) and `turn-end` (line 64) fired correctly
+   - But no "checkpoint saved" log entry appears after turn-end
+   - The session state shows `checkpoint_count: 0` and `pending_prompt_attribution` still present (never consumed by SaveStep)
+   - This confirms `handleLifecycleTurnEnd` hit the `totalChanges == 0` early return path
+
+9. Optional Next Step:
+   Continue investigating why `totalChanges == 0` on resume by:
+   1. Check the cached transcript at `/Users/soph/Work/entire/test/opencode_test1/.REDACTED.json` to see if the export included the resumed turn's data
+   2. Check the git state of the test repo (git log, git status, what files exist) to understand the file change detection failure
+   3. Determine whether the issue is in transcript-based file extraction (wrong offset / missing tool calls) or in git-status-based detection (files matching HEAD after being re-modified)
+   
+   The user's explicit request was: "can you investigate?" - I was in the middle of investigating and had identified that the hooks fire but no checkpoint is saved due to zero detected file changes.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+do we have an e2e test that would catch this scenario?
+
+---
+
+yes, and fix the test data
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Initial context**: This is a continuation of a previous conversation that ran out of context. The summary from the previous conversation established that the user asked to investigate a bug with OpenCode session resumption where:
+   - First session: opened, ran prompt, file changes made, committed → checkpoint created, trailer included
+   - Resumed same session with `opencode -s ses_384943532ffeDB42zezuVEwuKq`
+   - Ran another prompt, changes were made
+   - Exited, but NO new shadow branch created and NO trailer suggested on git commit
+
+2. **Investigation continued**: I checked the cached transcript, git state, and entire log in the test repo at `/Users/soph/Work/entire/test/opencode_test1/`:
+   - Git status showed `random_letter.rb` IS modified (uncommitted changes exist)
+   - No shadow branch exists (only `entire/checkpoints/v1`)
+   - The entire log confirmed: turn-start and turn-end fired on resume (lines 62-65) but no "checkpoint saved" entry
+
+3. **Read the full transcript** at `.REDACTED.json` - 12 messages total:
+   - Messages 0-3: first turn (create ruby script)
+   - Messages 4-11: resumed turn (add color to letters)
+   - Message 5: failed edit tool (error status)
+   - Message 7: successful edit tool modifying `random_letter.rb`
+
+4. **Traced through `handleLifecycleTurnEnd`** in lifecycle.go lines 154-413:
+   - It collects `modifiedFiles` from transcript extraction
+   - It gets `changes.New` and `changes.Deleted` from git status
+   - `changes.Modified` is computed by `DetectFileChanges` but NEVER USED
+   - `totalChanges = len(relModifiedFiles) + len(relNewFiles) + len(relDeletedFiles)`
+   - If `totalChanges == 0`, early return with no checkpoint
+
+5. **ROOT CAUSE FOUND**: `extractFilePathFromInput()` at transcript.go:164 checks for keys `["file_path", "path", "file", "filename"]` but OpenCode tools use `"filePath"` (camelCase). The function returns empty string for ALL OpenCode tool calls.
+
+   Why first turn worked: `random_letter.rb` was NEW (untracked), detected by `DetectFileChanges().New`
+   Why resumed turn failed: `random_letter.rb` was now tracked+modified. `changes.Modified` is populated but never used. Transcript extraction returned empty due to key mismatch. So `totalChanges = 0`.
+
+6. **Fix applied**: Added `"filePath"` to the key list in `extractFilePathFromInput`:
+   ```go
+   for _, key := range []string{"filePath", "file_path", "path", "file", "filename"} {
+   ```
+
+7. **Added tests**: 
+   - `TestExtractFilePathFromInput` - table-driven test for all key formats
+   - `testCamelCaseExportJSON` - test transcript using camelCase keys
+   - `TestExtractModifiedFilesFromOffset_CamelCaseFilePath` - integration of camelCase extraction
+
+8. **User asked**: "do we have an e2e test that would catch this scenario?" - I investigated and found NO existing test covers the resumed-session-after-commit scenario.
+
+9. **User asked**: "yes, and fix the test data" - meaning:
+   - Add an integration test for resumed-session-after-commit
+   - Fix all OpenCode test data to use `"filePath"` (camelCase) instead of `"file_path"` (snake_case)
+
+10. **Test data fixes applied**:
+    - `agent/opencode/transcript_test.go` lines 32, 49: `"file_path"` → `"filePath"`
+    - `integration_test/hooks.go` line 932: `"file_path"` → `"filePath"` 
+    - `integration_test/agent_test.go` lines 1002, 1004: `"file_path"` → `"filePath"`
+    - `summarize/summarize_test.go` line 740: `"file_path"` → `"filePath"`
+
+11. **Fixed `CreateOpenCodeTranscript` helper** to accumulate messages across calls (matching real `opencode export` behavior):
+    - Added `messages []map[string]interface{}` field to `OpenCodeSession` struct
+    - Changed `CreateOpenCodeTranscript` to append to `s.messages` instead of creating fresh `var messages`
+
+12. **Added integration test** `TestOpenCodeResumedSessionAfterCommit` in `opencode_hooks_test.go`
+
+13. **Compilation error**: `lastPoint.FilesTouched undefined` - the integration test's `RewindPoint` struct doesn't have a `FilesTouched` field. I was about to fix this when the summary was requested.
+
+Let me catalog all the exact file changes and their current state:
+
+**Files modified:**
+1. `cmd/entire/cli/agent/opencode/transcript.go` - Added `"filePath"` to key list
+2. `cmd/entire/cli/agent/opencode/transcript_test.go` - Fixed test data to use `"filePath"`, added new tests
+3. `cmd/entire/cli/integration_test/hooks.go` - Fixed `"file_path"` → `"filePath"`, added message accumulation
+4. `cmd/entire/cli/integration_test/agent_test.go` - Fixed `"file_path"` → `"filePath"` in OpenCode JSON
+5. `cmd/entire/cli/summarize/summarize_test.go` - Fixed `"file_path"` → `"filePath"` in OpenCode JSON
+6. `cmd/entire/cli/integration_test/opencode_hooks_test.go` - Added `TestOpenCodeResumedSessionAfterCommit`
+
+**Current compilation error**: The new integration test references `lastPoint.FilesTouched` but the integration test's `RewindPoint` struct doesn't have that field.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to investigate a bug where resuming an OpenCode session after a commit failed to create a new checkpoint. Specifically:
+   - First session: created file, committed → checkpoint created, trailer included
+   - Resumed same session (`opencode -s ses_384943532ffeDB42zezuVEwuKq`), ran another prompt, changes were made
+   - Exited, but NO new shadow branch created and NO trailer suggested on git commit
+   
+   After investigation identified the root cause, the user asked: "do we have an e2e test that would catch this scenario?" and upon learning no such test exists, said: "yes, and fix the test data" — meaning add an integration test for the resumed-session-after-commit scenario AND fix all OpenCode test data to use the correct `"filePath"` (camelCase) key format matching real OpenCode exports.
+
+2. Key Technical Concepts:
+   - **Manual-commit strategy**: Shadow branches store checkpoints; user commits manually; condensation happens on post-commit
+   - **OpenCode export format**: Uses camelCase `"filePath"` for tool input keys, unlike Claude Code which uses `"file_path"`
+   - **Transcript-based file extraction**: `extractFilePathFromInput()` extracts file paths from tool call inputs in the transcript
+   - **Git status detection**: `DetectFileChanges()` returns `New`, `Modified`, `Deleted` — but `handleLifecycleTurnEnd` only uses `New` and `Deleted`, relying on transcript extraction for modified files
+   - **Transcript offset**: `CapturePrePromptState` records the message count at turn-start; `ExtractModifiedFilesFromOffset` scans messages from that offset
+   - **Message accumulation**: Real `opencode export` returns the full session history; the test helper was recreating fresh each time
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/agent/opencode/transcript.go`** (line 165)
+     - Contains `extractFilePathFromInput()` — the root cause of the bug
+     - **Fix applied**: Added `"filePath"` as first key in lookup list
+     ```go
+     // BEFORE:
+     for _, key := range []string{"file_path", "path", "file", "filename"} {
+     // AFTER:
+     for _, key := range []string{"filePath", "file_path", "path", "file", "filename"} {
+     ```
+
+   - **`cmd/entire/cli/agent/opencode/transcript_test.go`**
+     - Fixed test data to use `"filePath"` (camelCase) matching real OpenCode format:
+     ```go
+     // Line 32 - BEFORE: Input: map[string]any{"file_path": "main.go"}
+     // AFTER:
+     {Type: "tool", Tool: "edit", CallID: "call-1", State: &ToolState{Status: "completed", Input: map[string]any{"filePath": "main.go"}, Output: "Applied edit"}},
+     // Line 49 - same change for "util.go"
+     ```
+     - Added `TestExtractFilePathFromInput` table-driven test covering all key formats (camelCase, snake_case, path, file, filename, empty, non-string)
+     - Added `testCamelCaseExportJSON` test transcript using camelCase keys
+     - Added `TestExtractModifiedFilesFromOffset_CamelCaseFilePath` verifying extraction works with real OpenCode format
+
+   - **`cmd/entire/cli/integration_test/hooks.go`**
+     - Fixed `CreateOpenCodeTranscript` tool input key: `"file_path"` → `"filePath"` (line 932)
+     - Added `messages` field to `OpenCodeSession` struct for accumulation:
+     ```go
+     type OpenCodeSession struct {
+         ID             string
+         TranscriptPath string
+         env            *TestEnv
+         msgCounter     int
+         // messages accumulates all messages across turns, matching real `opencode export`
+         messages []map[string]interface{}
+     }
+     ```
+     - Changed `CreateOpenCodeTranscript` to append to `s.messages` instead of creating a fresh local `messages` var each call, and builds export from `s.messages`
+
+   - **`cmd/entire/cli/integration_test/agent_test.go`** (lines 1002, 1004)
+     - Fixed inline OpenCode JSON transcript data: `"file_path"` → `"filePath"`
+
+   - **`cmd/entire/cli/summarize/summarize_test.go`** (line 740)
+     - Fixed inline OpenCode JSON transcript data: `"file_path"` → `"filePath"`
+
+   - **`cmd/entire/cli/integration_test/opencode_hooks_test.go`**
+     - Added `TestOpenCodeResumedSessionAfterCommit` — tests the exact bug scenario:
+       1. Turn 1: create new file → checkpoint → user commits (condensation)
+       2. Turn 2 (resumed): modify the now-tracked file → checkpoint should be created
+     - Uses `RunForAllStrategies` to test both manual-commit and auto-commit
+
+   - **`cmd/entire/cli/lifecycle.go`** (lines 150-413) — read-only, `handleLifecycleTurnEnd`:
+     - Key insight: `changes.Modified` from `DetectFileChanges()` is computed but NEVER used
+     - Only `changes.New` and `changes.Deleted` feed into `totalChanges`
+     - `relModifiedFiles` comes exclusively from transcript extraction
+
+   - **`cmd/entire/cli/state.go`** — read-only:
+     - `DetectFileChanges()` returns `FileChanges{New, Modified, Deleted}`
+     - `filterToUncommittedFiles()` compares working tree content vs HEAD
+     - `CapturePrePromptState()` calls `ag.GetTranscriptPosition(sessionRef)` to set offset
+
+   - **Test repo** `/Users/soph/Work/entire/test/opencode_test1/`:
+     - Session state: `checkpoint_count: 0`, `checkpoint_transcript_start: 4`, `phase: idle`
+     - Git log: `091c2e1 add random letter script`, `0b20122 enable all the things`
+     - Git status: `modified: random_letter.rb` (uncommitted changes from resumed session)
+
+4. Errors and fixes:
+   - **Lint error**: `json.Marshal` error not checked in test data initialization:
+     - Fixed by changing `data, _ := json.Marshal(session)` to `data, err := json.Marshal(session)` with `panic(err)` pattern matching existing tests
+   - **Compilation error** (CURRENT): `lastPoint.FilesTouched undefined` in new integration test:
+     - The integration test's `RewindPoint` struct (at `integration_test/testenv.go:651`) does NOT have a `FilesTouched` field
+     - NOT YET FIXED — this is where work was interrupted
+
+5. Problem Solving:
+   - **Root cause identified**: `extractFilePathFromInput()` didn't recognize OpenCode's camelCase `"filePath"` key. This caused transcript-based file extraction to silently return empty for ALL OpenCode sessions. First turns worked only because new files were caught by git status (`changes.New`). Modified tracked files were invisible because `changes.Modified` is unused in `handleLifecycleTurnEnd`.
+   - **Test data gap identified**: All existing OpenCode test data used `"file_path"` (snake_case) instead of `"filePath"` (camelCase), so unit and integration tests never caught the mismatch.
+   - **Test coverage gap identified**: No existing test covers the resumed-session-after-commit scenario where files transition from "new" to "tracked+modified".
+
+6. All user messages:
+   - (From previous context) "I did test the opencode code in /Users/soph/Work/entire/devenv/cli_experiments, I opened a session, run a prompt, filechanges were made, commited them -> checkpoint created, trailer included (last commit) then I resumed the old session opencode -s ses_384943532ffeDB42zezuVEwuKq and did run another prompt again changes where made, exited but this time there was no new shadow branch created and when I opened git commit no trailer was suggested (I aborted the commit) can you investigate?"
+   - "do we have an e2e test that would catch this scenario?"
+   - "yes, and fix the test data"
+
+7. Pending Tasks:
+   - Fix the compilation error in `TestOpenCodeResumedSessionAfterCommit`: `lastPoint.FilesTouched` is not a field on the integration test's `RewindPoint` struct — need to either add the field or change the assertion approach
+   - Run `mise run fmt && mise run lint` to verify no lint issues
+   - Run `mise run test:ci` (unit + integration tests) to verify all changes pass
+   - Verify the `CreateOpenCodeTranscript` accumulation change doesn't break existing OpenCode integration tests
+
+8. Current Work:
+   I was adding the integration test `TestOpenCodeResumedSessionAfterCommit` and hit a compilation error. The test references `lastPoint.FilesTouched` but the integration test's `RewindPoint` struct doesn't have that field. The test compiled and ran for unit tests but failed to compile for integration tests.
+
+9. Optional Next Step:
+   Fix the compilation error in the new integration test by removing the `FilesTouched` assertion (the `RewindPoint` struct in `integration_test/testenv.go:651` doesn't have that field) or finding the correct way to verify the checkpoint includes `app.go`. Then run `mise run fmt && mise run lint && mise run test:ci` to verify everything passes. The user's request was "yes, and fix the test data" — both the integration test and the test data fixes are in progress but need the compilation error resolved.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+hmm, but this is mixing logic from two different formats in summarize? I also noticed that the file is written as ".jsonl" in the checkpoint, that is wrong too
+
+---
+
+[Request interrupted by user for tool use]

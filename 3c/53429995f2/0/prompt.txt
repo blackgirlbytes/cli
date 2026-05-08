@@ -1,0 +1,106 @@
+<context>
+Repo: /Users/pfleidi/entire/cli
+Current working tree should be clean. Previous attempted edits were rolled back; do not assume any local patch exists.
+
+Reported regression:
+Running `entire migrate --checkpoints v2` in the peregrine repo migrated 13 checkpoints but created an archived v2 full-generation ref:
+
+  refs/entire/checkpoints/v2/full/0000000000001
+  refs/entire/checkpoints/v2/full/current
+
+This is unexpected because the v2 generation rotation threshold is 100 checkpoints, and 13 is below that threshold. Expected behavior: under-threshold migrated raw transcripts should not create a numbered archived `/full/<n>` generation merely because migration completed.
+</context>
+
+<root_cause_summary>
+The migrate path has its own raw-transcript packing flow that differs from normal v2 writes.
+
+Relevant current source:
+- `cmd/entire/cli/migrate.go`
+  - `migrateCheckpointsV2` creates a `generationPacker` and queues migrated raw transcripts with `packer.add(...)`.
+  - `migrateOneCheckpoint` writes v2 `/main` data using `mainOpts.Transcript = redact.AlreadyRedacted(nil)`, so raw transcripts are intentionally not written by `WriteCommittedWithSessionIndex` during migration.
+  - `generationPacker.add` flushes only when `len(p.pending) >= p.batchSize`.
+  - `generationPacker.finalize` unconditionally calls `p.flush(ctx)`, so the final partial batch is archived into `refs/entire/checkpoints/v2/full/<n>` even when it contains fewer than `DefaultMaxCheckpointsPerGeneration` checkpoints.
+
+Normal v2 writes behave differently:
+- `cmd/entire/cli/checkpoint/v2_committed.go`
+  - `rotateCurrentIfNeeded` counts checkpoints in `/full/current` and returns early when `checkpointCount < s.maxCheckpoints()`.
+- `cmd/entire/cli/checkpoint/v2_generation.go`
+  - `DefaultMaxCheckpointsPerGeneration = 100`.
+
+So the regression is: migration treats the rotation threshold as a packing batch size and archives the final partial batch at process finalization, while normal writes only archive after the threshold is reached.
+</root_cause_summary>
+
+<introducing_pr>
+PR that introduced the regression:
+- PR #1091: "Fix v2 checkpoint migration generation packing"
+- URL: https://github.com/entireio/cli/pull/1091
+- Merge commit: `7b871ec72dc899e6ca64e1ef1a4d26613db628f5`
+- Head branch: `fix/entire-migrate-checkpoint-order`
+
+Specific commits in that PR:
+- `949c27e1d50be14b78b3ceb3bce7428d86151f43` (`Pack migrated checkpoint generations chronologically`) first changed migration to collect raw transcripts and write them into numbered archived `/full/<n>` generations. Its test expected 5 checkpoints with batch size 2 to create three archived refs, including a final 1-checkpoint generation.
+- `8ee3ff03e05d554f3e34f2d670a4aff5babda3d9` (`Address review findings on migration and repair helpers`) refactored that behavior into the current `generationPacker`. The current bug is visible in `generationPacker.finalize`, which flushes pending checkpoints unconditionally.
+</introducing_pr>
+
+<task>
+Implement a minimal fix so `entire migrate --checkpoints v2` does not create a numbered archived `refs/entire/checkpoints/v2/full/<n>` generation when the number of migrated checkpoints is below the rotation threshold.
+
+Likely desired behavior:
+- Full batches at or above `migrateMaxCheckpointsPerGeneration` can still archive into `/full/<n>`.
+- A final partial batch should remain in `/full/current` or otherwise avoid creating a numbered archived generation until the threshold is reached.
+- Preserve existing migration goals: chronological ordering, bounded memory, force-migration pruning, raw transcript readability, task metadata preservation, generation metadata on archived refs, and idempotent reruns.
+
+Do not make broad refactors. Keep the diff scoped to migration packing and directly related tests.
+</task>
+
+<constraints>
+- Follow the repo's AGENTS.md workflow: for this non-trivial behavior change, read source and produce an implementation plan first; wait for approval before editing.
+- Do not commit.
+- Do not add dependencies.
+- Do not rename or reorganize unrelated code.
+- If editing Go files, run: `go build ./...`, `go vet ./...`, and the project lint task (`mise run lint`) before completion.
+- Also run focused migration tests, at minimum: `go test ./cmd/entire/cli -run 'TestMigrateCheckpointsV2|TestPruneV2CheckpointForForce' -count=1`.
+</constraints>
+
+<test_guidance>
+Add/adjust tests in `cmd/entire/cli/migrate_test.go`.
+
+Coverage needed:
+1. Regression test: set `migrateMaxCheckpointsPerGeneration = 5`, migrate 3 v1 checkpoints, assert:
+   - `v2Store.ListArchivedGenerations()` is empty.
+   - `/full/current` exists and contains 3 checkpoints.
+   - migrated raw transcripts remain readable via `v2Store.ReadSessionContent`.
+2. Existing tests that currently expect final partial archived batches probably need expectation updates:
+   - `TestMigrateCheckpointsV2_PacksFullGenerationsOldestFirst`
+   - `TestMigrateCheckpointsV2_RerunPacksCheckpointsMissingFullArtifacts`
+   - force/repair tests that currently assume fresh migration always leaves `/full/current` empty.
+3. Keep a test for threshold-sized migration archiving so we do not break actual rotation behavior.
+</test_guidance>
+
+<helpful_commands>
+Inspect current behavior:
+- `sed -n '180,540p' cmd/entire/cli/migrate.go`
+- `sed -n '698,720p' cmd/entire/cli/checkpoint/v2_committed.go`
+- `sed -n '22,30p' cmd/entire/cli/checkpoint/v2_generation.go`
+
+History:
+- `git show --stat --format=fuller 7b871ec72dc899e6ca64e1ef1a4d26613db628f5`
+- `git show 949c27e1d50be14b78b3ceb3bce7428d86151f43 -- cmd/entire/cli/migrate.go cmd/entire/cli/migrate_test.go`
+- `git show 8ee3ff03e05d554f3e34f2d670a4aff5babda3d9 -- cmd/entire/cli/migrate.go`
+</helpful_commands>
+
+---
+
+Note: I pulled in more-migration-speedups to avoid merge conflicts for this fix.
+
+---
+
+Do it
+
+---
+
+Where does `p.pending` get assigned and what does it represent. The pending checkpoints that have not been flushed to git, yet?
+
+---
+
+Where does `p.pending` get assigned and what does it represent? The pending checkpoints that have not been flushed to git, yet?

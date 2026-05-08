@@ -1,0 +1,270 @@
+/codex:adversarial-review
+
+---
+
+Start by adding the integration test
+
+---
+
+Before doing anything else, can you check the review against the project plan? I think the finding might be reporting something that's intended that way: Try to capture transcript logs and don't record a session if there aren't any touched files, transcripts, etc.
+
+---
+
+Didn't we validate that the codex review process is, in fact, not run as a subagent but as a tool? Whenever it's run, it spins off a node process. Please validate again and persist that knowledge in the plan if our assumptions were wrong here.
+
+---
+
+I don't think it's true that the companion plugin doesn't create entire sessions. The very reason I started debugging this problem was based on the fact that we were listing entire sessions for the plugin invokations but didn't have any matching transcripts. Can you elaborate?
+
+---
+
+Yes commit them
+
+---
+
+That being said: Your summary doesn't answer my question about the likelihood of codex plugin reviews actually ending up with a workable transcript. Want to elaborate?
+
+---
+
+In that case, can we simplify the changes in this branch and specifically not "try harder to find transcripts" rather than adding more complexity?
+
+---
+
+yes. Try to condense the changes to the essentials which will address the issue only.
+
+---
+
+commit
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a69fa24b50257117c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-best-effort-transcript-capture/aae844c1-f577-4647-90bb-2e38e82c96ed/tasks/a69fa24b50257117c.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>I've completed the analysis. Here is my report.
+
+---
+
+## Code Reuse Review Findings
+
+### 1. `extractOrCreateSessionData` -- No duplication found
+
+This is a clean extraction. The two underlying methods (`extractSessionData` and `extractSessionDataFromLiveTranscript`) are now called **only** from `extractOrCreateSessionData`. The new `default` branch (empty session data fallback) is genuinely new logic that didn't exist before -- the old code returned an error in that case. No pre-existing helper covers this three-way dispatch.
+
+### 2. Empty-session check in `tryAgentCommitFastPath` -- Intentional divergence from skip gate, but sync risk exists
+
+The fast-path check (`state.TranscriptPath == "" && len(state.FilesTouched) == 0 && state.StepCount == 0`) operates on **session state fields** before extraction, while the skip gate in `CondenseSession` operates on **extracted data** (`len(sessionData.Transcript) == 0 && len(sessionData.FilesTouched) == 0`). These are semantically different checks at different layers:
+
+- Fast path: "will this session produce anything to condense?" (predictive, from state)
+- Skip gate: "did extraction actually produce anything?" (definitive, from data)
+
+The code comment (`// NOTE: must stay in sync with the skip gate in CondenseSession`) correctly flags the coupling. This is the only real concern: these two conditions can drift if someone changes the skip gate without updating the fast path. However, extracting a shared predicate would be awkward because they operate on different types (`*SessionState` vs `*ExtractedSessionData`). The sync comment is the right approach.
+
+### 3. `Skipped` pattern on `CondenseResult` -- Consistent with `WriteTemporaryResult`
+
+`WriteTemporaryResult` at `/Users/pfleidi/entire/cli/.worktrees/feat/best-effort-transcript-capture/cmd/entire/cli/checkpoint/checkpoint.go:116` has exactly the same pattern: a `Skipped bool` field, and callers check `result.Skipped` to decide whether to skip state updates. The handling pattern is consistent across both:
+- `WriteTemporaryResult.Skipped`: checked in `manual_commit_git.go:121` -- logs and returns early, no state update
+- `CondenseResult.Skipped`: checked in `condenseAndUpdateState`, `CondenseSessionByID`, `CondenseAndMarkFullyCondensed` -- returns false/early, no state update (or marks FullyCondensed)
+
+This is the established pattern in the codebase. The new `Skipped` field follows it correctly.
+
+### 4. `writeTranscript` returning `(bool, error)` -- No existing helper
+
+This is the only `write*` function in the checkpoint package that returns `(bool, error)`. Other write functions return just `error`. The `(bool, error)` return is appropriate here because the caller needs to conditionally set file paths -- it's not a pattern that should be generalized. No duplication.
+
+### 5. Skipped-handling blocks in `CondenseSessionByID` and `CondenseAndMarkFullyCondensed`
+
+These two Skipped-handling blocks are **not** duplicates despite appearing similar. They have different behaviors:
+- `CondenseSessionByID`: returns `nil` without modifying state (preserves the session for future condensation attempts)
+- `CondenseAndMarkFullyCondensed`: sets `FullyCondensed = true` and saves state (prevents PostCommit retries)
+
+The divergence is intentional and correct.
+
+### Summary
+
+Nothing found. The diff does not introduce code duplication with existing helpers, the `Skipped` field follows the established `WriteTemporaryResult` pattern, and the `extractOrCreateSessionData` consolidation is a net improvement (reducing inline branching in `CondenseSession`). The only fragility is the sync comment between `tryAgentCommitFastPath` and the skip gate, which is already documented in code.</result>
+<usage><total_tokens>79694</total_tokens><tool_uses>23</tool_uses><duration_ms>83402</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abba0134295dff4d5</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-best-effort-transcript-capture/aae844c1-f577-4647-90bb-2e38e82c96ed/tasks/abba0134295dff4d5.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Now I have a complete picture of the changes. Here is my analysis.
+
+---
+
+## Efficiency Review
+
+### 1. Skip gate placement (lines 159-172 of condensation.go) -- minor wasted work, acceptable
+
+Before the skip gate fires, `CondenseSession` executes:
+- `resolveTranscriptPath(state)` -- filesystem stat, best-effort (was already there before this branch)
+- `extractOrCreateSessionData` -- in the default/empty case this is just an allocation of `ExtractedSessionData` with a copy of `state.FilesTouched`, negligible
+- `sessionStateBackfillTokenUsage` -- short-circuits immediately when `len(transcript) == 0` (line 513), so no real work
+- `filterFilesTouched` -- short-circuits at `len(committedFiles) == 0` or does a cheap loop over `FilesTouched`
+
+**Verdict:** The work before the skip gate when hitting the empty path is trivial -- a stat call, a small allocation, and two fast short-circuits. No concern.
+
+### 2. `extractOrCreateSessionData` -- pure dispatch, no redundancy
+
+The function replaces an inline if/else with a switch. It does not introduce any new I/O or computation. The `hasShadowBranch` and `state.TranscriptPath != ""` checks were already being evaluated in the original code. **No efficiency issue.**
+
+### 3. `tryAgentCommitFastPath` condition check (lines 1949-1955 of hooks.go) -- negligible
+
+The added condition `state.TranscriptPath == "" && len(state.FilesTouched) == 0 && state.StepCount == 0` is three field reads on a struct already in hand. This runs once per active session in the `prepare-commit-msg` hook. The loop already iterates all sessions. **No concern.**
+
+**Sync correctness note:** The fast-path guard (`TranscriptPath == "" && FilesTouched == 0 && StepCount == 0`) is a conservative approximation of the skip gate (`Transcript == 0 && FilesTouched == 0` after extraction). When `StepCount > 0`, a shadow branch exists, so `extractSessionData` would extract a transcript even if `TranscriptPath` is empty -- the fast path correctly allows that through. The sync comment on line 1948 is accurate.
+
+### 4. `writeTranscript` returning `(bool, error)` -- no overhead
+
+Adding a bool return is free. The early-return at `len(transcriptBytes) == 0` was already there; now it returns `false` instead of `nil`. The caller uses the bool to avoid setting phantom paths. **No overhead, prevents a real bug.**
+
+### 5. Three `result.Skipped` checks -- trivially cheap
+
+These are single boolean field reads. Each sits in a different code path:
+- `condenseAndUpdateState` (PostCommit hook handler)
+- `CondenseSessionByID` (explicit condense-by-ID)
+- `CondenseAndMarkFullyCondensed` (eager condensation)
+
+Each is guarded correctly and returns early. **No concern.**
+
+### 6. WARN log in `extractOrCreateSessionData` default case -- appropriate but could be noisy in one scenario
+
+The WARN fires when `!hasShadowBranch && state.TranscriptPath == ""`. Per the comment, this happens for agents that never set `TranscriptPath` (Codex is cited). 
+
+**Is WARN appropriate?** Mostly yes. This is a genuinely unexpected state for most agents -- having a session with no shadow branch and no transcript path means the session produced nothing capturable. WARN is correct for surfacing that.
+
+**Noise risk:** If Codex (or a future agent) routinely sends sessions where hooks fire but no transcript path is ever set, you would get one WARN per condensation for each such session. However, for this to trigger, the session must reach `CondenseSession`, which requires a commit. An agent that never sets a transcript path and never calls `SaveStep` (no shadow branch) is essentially a no-op session. The skip gate then fires immediately after, so the WARN + skip is one log pair per empty session per commit. This should be infrequent in practice.
+
+**Recommendation:** WARN is fine. If it turns out to be noisy for a particular agent, the fix is to set `TranscriptPath` in that agent's hooks, not to downgrade the log level. The WARN correctly signals "we're entering a fallback path."
+
+### Summary
+
+No efficiency issues found. The changes are net-positive on performance: the skip gate prevents all downstream work (redaction, store creation, tree building, blob writes) for empty sessions, and the fast-path guard in `tryAgentCommitFastPath` prevents dangling trailers without adding meaningful overhead. The `writeTranscript` bool return eliminates phantom path recording at zero cost. The WARN log level is appropriate for the fallback case.</result>
+<usage><total_tokens>37246</total_tokens><tool_uses>22</tool_uses><duration_ms>83454</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a052cde465eb9962a</task-id>
+<tool-use-id>toolu_01PXDr1ffDB9bMzGPTUTFRzz</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-pfleidi-entire-cli--worktrees-feat-best-effort-transcript-capture/aae844c1-f577-4647-90bb-2e38e82c96ed/tasks/a052cde465eb9962a.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Good, now I have everything I need. Here is my review.
+
+---
+
+## Review Findings
+
+### 1. Stale comment in `extractOrCreateSessionData` default case (confirmed)
+
+**File:** `/Users/pfleidi/entire/cli/.worktrees/feat/best-effort-transcript-capture/cmd/entire/cli/strategy/manual_commit_condensation.go`, lines 385-389
+
+The default case comment says:
+
+> The fallback resolution and skip gate in CondenseSession will attempt to locate the transcript via the agent's storage, or skip condensation if nothing is found.
+
+Commit `ecd1e6ae0` ("simplify: remove transcript fallback resolution that cannot work") deleted the `resolveTranscriptFromAgentStorage` function entirely. The "fallback resolution" half of this sentence no longer exists. Only the skip gate remains. The log message on line 389 also says `"attempting fallback resolution"` which is misleading -- nothing is being "attempted" anymore; the function just returns empty data and relies on the skip gate.
+
+The comment should say something like: "The skip gate in CondenseSession will skip condensation if nothing is found." The log message should say `"no shadow branch and no transcript path, returning empty session data"` or similar.
+
+### 2. Divergent semantics across the three `result.Skipped` handlers
+
+The three callers handle `Skipped` differently in ways that are intentional but one case is questionable:
+
+| Caller | On `Skipped` | Shadow branch cleanup | State mutation |
+|---|---|---|---|
+| `condenseAndUpdateState` (hooks.go:1318) | return false | Skipped (correct) | None |
+| `CondenseSessionByID` (condensation.go:1079) | return nil, log "state preserved" | Skipped | **None -- but state is not saved either** |
+| `CondenseAndMarkFullyCondensed` (condensation.go:1201) | set `FullyCondensed=true`, save state | Skipped | Marks fully condensed |
+
+**`CondenseSessionByID`** logs "state preserved" but does not actually call `saveSessionState`. Since it loaded state at the top but never persists it, "preserved" is technically correct (nothing changed), but the session remains stuck forever -- `entire doctor` will keep finding and trying to condense it, getting `Skipped` each time. It should either clear the state (like the no-shadow-branch case above it does) or mark it `FullyCondensed` (like `CondenseAndMarkFullyCondensed` does). This looks like a bug or at minimum a latent infinite-retry loop for `entire doctor`.
+
+### 3. Parameter sprawl: `extractSessionData` (9 params via passthrough)
+
+`extractOrCreateSessionData` has 6 parameters, but line 366 calls `s.extractSessionData` with **9 positional arguments** unpacked from `state`:
+
+```go
+s.extractSessionData(ctx, repo, shadowHash, state.SessionID, state.FilesTouched, state.AgentType, state.TranscriptPath, state.CheckpointTranscriptStart, state.Phase.IsActive())
+```
+
+The refactoring consolidated the call site but did not reduce the underlying parameter count. Since `extractSessionData` takes 6 of its 9 params from `*SessionState`, it could take `*SessionState` directly (or an options struct). This isn't new to this diff, but the refactoring was an opportunity to address it. Not blocking, but worth noting.
+
+### 4. `tryAgentCommitFastPath` skip condition diverges from skip gate
+
+**File:** `manual_commit_hooks.go`, line 1948-1949
+
+The comment says `// NOTE: must stay in sync with the skip gate in CondenseSession.` But the two conditions are structurally different:
+
+- **Skip gate** (condensation.go:159): `len(sessionData.Transcript) == 0 && len(sessionData.FilesTouched) == 0` -- operates on *extracted* session data after transcript resolution.
+- **Fast path guard** (hooks.go:1949): `state.TranscriptPath == "" && len(state.FilesTouched) == 0 && state.StepCount == 0` -- operates on *raw state* before extraction, with an extra `StepCount == 0` condition.
+
+These are fundamentally different checks (one post-extraction, one pre-extraction). The sync comment creates an obligation that cannot actually be fulfilled because they operate at different abstraction levels. If someone adds a new condition to the skip gate (e.g., checking a new field on `ExtractedSessionData`), the sync comment would send them to a place where `ExtractedSessionData` doesn't exist. The comment should clarify the relationship more precisely -- the fast path is a *conservative approximation* of the skip gate, not a mirror of it.
+
+### 5. `writeTranscript` return type: `bool` is fine but consider a named return
+
+The `(bool, error)` return from `writeTranscript` is clear enough at the call site (`wroteTranscript, err := ...`). However, on error paths (`return false, fmt.Errorf(...)`) the `false` is meaningless -- the caller won't inspect the bool when err is non-nil. This is idiomatic Go though, so not a real issue. No action needed.
+
+### 6. Doc comment on `condensed` field -- WHAT vs WHY
+
+**File:** `manual_commit_hooks.go`, lines 636-638
+
+```go
+// condensed is true only when CondenseSession wrote data to the metadata branch.
+// Both failures and skips (no transcript/files) leave condensed=false, which
+// correctly preserves shadow branches and defers FullyCondensed marking.
+```
+
+This is actually a good comment -- it explains the *consequence* of the false value (preserves shadow branches, defers FullyCondensed), which is WHY-oriented. No issue here.
+
+### 7. No stringly-typed code concerns
+
+The `AgentType` is already a typed constant (`types.AgentType`), checkpoint IDs use `id.CheckpointID`, and phases use `session.Phase*` constants. The `Skipped bool` on `CondenseResult` is a reasonable choice over an enum/sentinel since there are only two outcomes (condensed or skipped), and the error case is already handled separately. No stringly-typed issues found.
+
+### 8. No redundant state
+
+The `Skipped` field on `CondenseResult` carries information that cannot be derived from other fields (a skipped result has zero-value `CheckpointsCount`, `TotalTranscriptLines`, etc., but so could a legitimate condensation of an empty-ish session). The field is necessary.
+
+---
+
+## Summary
+
+**One likely bug:** `CondenseSessionByID` returns nil on `Skipped` without clearing or marking the session, creating a potential infinite-retry loop for `entire doctor` (finding #2).
+
+**One stale comment/log message:** The `extractOrCreateSessionData` default case references "fallback resolution" that was removed in `ecd1e6ae0` (finding #1).
+
+**One misleading sync comment:** The fast path guard and skip gate operate at different abstraction levels; the "must stay in sync" comment overpromises (finding #4).
+
+Everything else is clean. The `writeTranscript` `(bool, error)` refactoring in `committed.go` is straightforward and correct. The `Skipped` field on `CondenseResult` is the right design choice. The parameter sprawl in `extractSessionData` predates this branch.</result>
+<usage><total_tokens>39667</total_tokens><tool_uses>21</tool_uses><duration_ms>91875</duration_ms></usage>
+</task-notification>
+
+---
+
+Commit
+
+---
+
+/review
+
+---
+
+Yes
+
+---
+
+Yes, address it.

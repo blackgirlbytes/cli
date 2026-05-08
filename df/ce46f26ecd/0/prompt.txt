@@ -1,0 +1,47 @@
+Implement Task 3 from docs/plans/2026-04-02-explanatory-insights.md using TDD. You own only these files: cmd/entire/cli/summarize/claude.go, cmd/entire/cli/summarize/claude_test.go, and cmd/entire/cli/summarize/summarize_test.go. You are not alone in the codebase; do not revert edits made by others, and accommodate existing changes.
+
+Task 3 requirements:
+- Upgrade the shared summarizer prompt/contract so summaries always produce the new fields:
+  - implementation_rationale
+  - tradeoffs
+  - codebase_patterns
+- Add tests first for:
+  - prompt contract requiring the new fields
+  - JSON parsing of a response containing the new fields
+  - generation working when transcript contains explicit insight-style content
+  - generation still succeeding when transcript contains no explicit insight markers
+- Update summarizer prompt to:
+  - preserve explicit explanatory content when present
+  - infer conservatively when explicit content is absent
+  - keep transcript fenced as untrusted data
+- Do not branch on live_injection anywhere in summarization code.
+- Follow red-green-refactor and run the targeted tests from the plan.
+- When done, report: files changed, tests run with outcomes, and any self-review notes. Do not commit.
+
+---
+
+Code quality review found concrete issues in Task 3. Please fix them within your existing file ownership only: cmd/entire/cli/summarize/claude.go, cmd/entire/cli/summarize/claude_test.go, cmd/entire/cli/summarize/summarize_test.go. You are not alone in the codebase; do not revert others' edits.
+
+Findings to address:
+1. High: prompt-injection boundary is not enforced because transcript is interpolated raw inside <transcript>...</transcript>. A transcript containing </transcript> can break out. Fix the prompt construction so untrusted transcript content cannot terminate the container.
+2. Medium: JSON parse error includes the full raw model response in the returned error. Replace with a safer error path that does not surface the raw response directly.
+3. Medium: TestClaudeGenerator_GitIsolation can pass if cmd.Env is nil and GIT_* is inherited. Make the test reliably prove isolation.
+4. Medium: The new explicit/implicit insight tests only prove JSON plumbing because the mock result is independent of transcript content. Strengthen them so they validate the new behavior or narrow/rename them honestly if that is the strongest valid claim.
+
+Keep TDD discipline for the fixes: add/adjust failing tests first, verify red, then minimal code. Re-run the relevant summarize tests. Report files changed, tests run, and any remaining residual risks. Do not commit.
+
+---
+
+One more Task 3 quality pass is needed within your existing summarize-file ownership only.
+
+Please fix these findings:
+1. summarize_test.go: TestGenerateFromTranscript_NilGenerator is nondeterministic because it can hit the real claude CLI. Replace it with a deterministic seam/fake so the test proves the nil-generator path without external calls.
+2. summarize_test.go explicit/implicit insight tests still assert only one explanatory bucket each. Strengthen them so they cover all three new explanatory fields under those prompt modes.
+3. Add t.Parallel() where safe in the touched summarize tests, following repo convention. Do not add it to tests that use t.Setenv or otherwise modify process-global state.
+
+Keep the scope to:
+- cmd/entire/cli/summarize/claude.go
+- cmd/entire/cli/summarize/claude_test.go
+- cmd/entire/cli/summarize/summarize_test.go
+
+Re-run the relevant summarize tests and report files changed, tests run, and any residual risk. Do not commit.

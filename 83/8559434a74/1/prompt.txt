@@ -1,0 +1,44 @@
+Implement the following plan:
+
+# Kiro Agent Integration Updates
+
+## Context
+
+The Kiro agent integration is complete (all 3 phases done). This plan addresses post-integration updates to align with recent changes on main and any additional user-requested modifications.
+
+## Update 1: Strip `ENTIRE_TEST_TTY` from E2E agent environment
+
+**Why:** PR #579 (`soph/do-not-use-entire-test-tty-for-agent-execution`) established a pattern where all E2E agent runners must strip `ENTIRE_TEST_TTY` from the environment when launching agent processes. This ensures agents exercise real TTY detection paths instead of test overrides. The Kiro runner was written before this PR landed on main and doesn't follow the pattern.
+
+**File:** `e2e/agents/kiro.go`
+
+**Changes:**
+
+1. **Line 81** — `RunPrompt`'s `NewTmuxSession` call:
+   - Change: `NewTmuxSession(name, dir, nil, k.Binary(), args...)`
+   - To: `NewTmuxSession(name, dir, []string{"ENTIRE_TEST_TTY"}, k.Binary(), args...)`
+
+2. **Line 120** — `StartSession`'s `NewTmuxSession` call:
+   - Change: `NewTmuxSession(name, dir, nil, k.Binary(), "chat", "-a", "--agent", "entire")`
+   - To: `NewTmuxSession(name, dir, []string{"ENTIRE_TEST_TTY"}, k.Binary(), "chat", "-a", "--agent", "entire")`
+
+No other env vars need stripping (unlike Claude which strips `CLAUDECODE`, or Gemini which strips `CI`/`GITHUB_ACTIONS`).
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+The E2E runner should compile with the new `unsetEnv` parameter. Behavior is only observable during actual E2E runs.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/e96bb4b7-cca4-459e-ae66-c95bec487b23.jsonl
+
+---
+
+run e2e tests adn fix any issues
+
+---
+
+commit

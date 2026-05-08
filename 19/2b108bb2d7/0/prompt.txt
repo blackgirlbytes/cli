@@ -1,0 +1,25 @@
+We got a bit of pull request feedback on the changes in this branch:
+
+readPromptFromMetadataTree hard-codes the metadata-branch directory layout (checkpoint subtree + numeric session dir + prompt.txt). That same layout is already defined by checkpoint.CheckpointSummary / SessionFilePaths (and similar logic exists in checkpoint.GitStore.ReadSessionContent). To reduce the chance of future divergence when the storage format evolves, consider moving this logic into a shared helper (e.g., in strategy or checkpoint) and using it from here (and any other callers that need prompt previews).
+
+The new list-view prompt path (metadataTree != nil -> readPromptFromMetadataTree(...)) isn’t covered by a unit/integration test for committed checkpoints on entire/checkpoints/v1. Given this PR is fixing a correctness/perf regression in getBranchCheckpoints, it would be good to add a test that writes a committed checkpoint (with prompt.txt in the latest session subdir) and asserts getBranchCheckpoints populates RewindPoint.SessionPrompt from prompt.txt (and does not require reading/parsing the transcript).
+
+hasAnyChanges introduces new filtering semantics for temporary checkpoints (tree-hash comparison vs the existing diff-based hasCodeChanges), but there are no tests exercising its behavior. Since explain_test.go already has detailed coverage for hasCodeChanges, consider adding analogous tests for hasAnyChanges (e.g., first commit, metadata-only change, and no-op tree change) to lock in the intended behavior and prevent accidental regressions.
+
+Can you help to address them?
+
+---
+
+commit this
+
+---
+
+When looking into this, I also saw some behavior where the process just "hung" and not just for a few seconds, but minutes. Stopping the process usinng `SIGINT` or `SIGQUIT` or even `SIGKILL` didn't work, either. Only a `kill -9` was able to stop the process. Will the changes in this branch also address this issue?
+
+---
+
+Would it make sense to add additional context checks while parsing files to be able to immediately react to a context cancelation? Or would this be too much overhead in this case?
+
+---
+
+convertTemporaryCheckpoint now filters via hasAnyChanges (tree hash comparison), which may keep metadata-only commits while only removing true no-op commits (same tree as parent). Please make sure the function/inline comments around this filter reflect the updated semantics so readers don’t assume code-only filtering still happens here.

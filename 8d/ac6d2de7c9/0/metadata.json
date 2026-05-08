@@ -1,0 +1,71 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "8dac6d2de7c9",
+  "session_id": "24965acf-0f7b-43bf-865e-b2ad1f67f30b",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T17:11:52.547491Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "dd00538a064b",
+  "token_usage": {
+    "input_tokens": 55,
+    "cache_creation_tokens": 65748,
+    "cache_read_tokens": 2396979,
+    "output_tokens": 12585,
+    "api_call_count": 43
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "summary": {
+    "intent": "Fix the injection tab in the memory loop TUI to (1) test against all active memories not just matched ones, and (2) show clear INJECT/SKIP labels with reasons instead of raw meaningless scores. Then remove skill, insights, improve, and permissions commands, keeping only summary and memory-loop.",
+    "outcome": "The injection tab was refactored to use PreviewSelection() instead of SelectRelevant(), showing INJECT/SKIP labels with skip reasons and a summary line. Two new tests were added and committed. The command removal task was planned but not yet executed — the session ended at the planning stage.",
+    "learnings": {
+      "repo": [
+        "PreviewSelection() returns a SelectionReport with both Matches and Skipped (with reasons), while SelectRelevant() only returns matches — PreviewSelection is the right call for UI that needs to show full injection decision context.",
+        "The memorylooptui package uses message types (testPromptResultMsg) passed through the root model to carry async results to tab views.",
+        "explanatory_insights.go is a hook handler, not a command — it must be preserved even when removing insight-related commands.",
+        "skilldb and skilltui are separate packages under cmd/entire/cli/ that would need removal as part of the skill command cleanup.",
+        "The unusedwrite lint check fires when a struct field is set in a test but the test calls the tab's view() method directly rather than going through the full model update path."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memorylooptui/messages.go",
+          "finding": "testPromptResultMsg was changed from carrying just matches to carrying a full SelectionReport (matches + skipped with reasons)."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/root.go",
+          "finding": "Switched from SelectRelevant() to PreviewSelection() to populate testPromptResultMsg with the full report."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_injection.go",
+          "finding": "View now renders a summary line ('N would inject, M skipped'), INJECT label for matched memories, and SKIP label with reason for skipped ones. Raw score numbers removed."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/render_test.go",
+          "finding": "Setting activeTab in tests was flagged by unusedwrite lint because tests call injectionTab.view() directly; fix was to remove the unused field assignments."
+        },
+        {
+          "path": "cmd/entire/cli/explanatory_insights.go",
+          "finding": "This file is a hook handler, not a command registration — it must be retained even when removing the insights command."
+        }
+      ],
+      "workflow": [
+        "The unusedwrite lint check catches struct field assignments that are never read — direct tab view() calls in tests bypass the model update path, making activeTab assignments dead writes.",
+        "When a UI shows raw numeric scores, users cannot determine actionability — always surface the decision (inject/skip) and the reason, not the underlying score.",
+        "The plan was written before implementation started, and the user interrupted plan mode twice before the assistant proceeded directly to implementation."
+      ]
+    },
+    "friction": [
+      "User had to interrupt the assistant twice when it entered plan mode before the assistant proceeded to implement directly.",
+      "The 'RECENT INJECTIONS' section contained 'Injection Detail' which has 'INJECT' as a substring, causing a false positive in the empty-state test assertion that needed fixing.",
+      "The unusedwrite lint warning required a follow-up edit to remove unused activeTab field assignments in tests — discovered only after running lint post-implementation."
+    ],
+    "open_items": [
+      "Remove skill, insights, improve, and permissions commands and all related code (skilldb, skilltui, permissions packages) — planned but not executed, session ended at planning stage."
+    ]
+  }
+}
