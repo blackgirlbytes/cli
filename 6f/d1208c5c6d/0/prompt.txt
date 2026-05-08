@@ -1,0 +1,24 @@
+Can we take a look at codex but potentially all agents, a customer reported 30s timeout on hooks, atfer a bit of investigation he has a few images in the prompt and this is our assumption:
+
+Main inefficiencies (not inherent to "18 MB")
+
+  1. Same transcript parsed 3–4 times per stop. The full JSONL is unmarshaled in ExtractAllModifiedFiles, CalculateTokenUsage, redact.JSONLBytes, and optionally ExtractPrompts. Each
+  pass rebuilds the same line index.
+  2. finalizeAllTurnCheckpoints re-blobs the entire transcript per checkpoint instead of once. The transcript content is identical across those N checkpoints; we're writing it N
+  times.
+  3. Pure-Go zlib on every stop. go-git doesn't reuse blobs across consecutive checkpoints even when content barely changed — each stop re-compresses the full transcript.
+  4. Double-copy of the transcript (step 2 → memory → .entire/metadata/<sid>/full.jsonl). The on-disk copy is then re-read later by redact/blob paths.
+
+Can you investigate?
+
+---
+
+is this a codex only thing?
+
+---
+
+ok, can we list the places to optimize and estimate the "effor, reward ratio"
+
+---
+
+ok let's do 1+2

@@ -1,0 +1,121 @@
+Implement the following plan:
+
+# Refactor `CalculateTokenUsage` to accept `[]byte` and use canonical interface
+
+## Context
+
+`TokenCalculator.CalculateTokenUsage` currently takes a file path (`sessionRef string`) and each agent reads the file internally. Meanwhile, the condensation code in the strategy package has its own `calculateTokenUsage` helper that dispatches by `agentType` to package-level functions, bypassing the interface entirely. This refactoring:
+
+1. Changes the interface to accept `data []byte` so callers that already have bytes (condensation) don't need file I/O
+2. Makes the strategy's helper use the canonical `TokenCalculator` interface via `agent.GetByAgentType`
+
+## Changes
+
+### 1. Interface signature (`cmd/entire/cli/agent/agent.go:169`)
+
+```go
+// Before
+CalculateTokenUsage(sessionRef string, fromOffset int) (*TokenUsage, error)
+// After
+CalculateTokenUsage(data []byte, fromOffset int) (*TokenUsage, error)
+```
+
+### 2. Claude Code implementation (`cmd/entire/cli/agent/claudecode/lifecycle.go:131-138`)
+
+Replace file-based delegation with bytes-based parsing:
+```go
+func (c *ClaudeCodeAgent) CalculateTokenUsage(data []byte, fromOffset int) (*agent.TokenUsage, error) {
+    lines, err := transcript.ParseFromBytes(data)
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse transcript: %w", err)
+    }
+    if fromOffset > 0 && fromOffset < len(lines) {
+        lines = lines[fromOffset:]
+    }
+    return CalculateTokenUsage(lines), nil
+}
+```
+
+Note: This does NOT include subagent tokens. The subagent-aware path is handled separately by `SubagentAwareExtractor.CalculateTotalTokenUsage` which lifecycle.go already prefers. That interface is not changed.
+
+### 3. Gemini CLI implementation (`cmd/entire/cli/agent/geminicli/lifecycle.go:99-102`)
+
+Delegate to the existing bytes-based package-level function:
+```go
+func (g *GeminiCLIAgent) CalculateTokenUsage(data []byte, fromOffset int) (*agent.TokenUsage, error) {
+    return CalculateTokenUsage(data, fromOffset), nil
+}
+```
+
+(The package-level `geminicli.CalculateTokenUsage(data []byte, startMessageIndex int)` already accepts bytes.)
+
+### 4. OpenCode implementation (`cmd/entire/cli/agent/opencode/transcript.go:295-322`)
+
+Delegate to the existing `CalculateTokenUsageFromBytes`:
+```go
+func (a *OpenCodeAgent) CalculateTokenUsage(data []byte, fromOffset int) (*agent.TokenUsage, error) {
+    return CalculateTokenUsageFromBytes(data, fromOffset), nil
+}
+```
+
+### 5. Lifecycle caller (`cmd/entire/cli/lifecycle.go:357-365`)
+
+Pass `transcriptData` (already loaded at line 193) instead of `transcriptRef`:
+```go
+usage, tokenErr := calculator.CalculateTokenUsage(transcriptData, transcriptLinesAtStart)
+```
+
+### 6. Condensation helper (`cmd/entire/cli/strategy/manual_commit_condensation.go:589-627`)
+
+Replace the switch-dispatch with the canonical interface:
+```go
+func calculateTokenUsage(agentType agent.AgentType, data []byte, startOffset int) *agent.TokenUsage {
+    if len(data) == 0 {
+        return &agent.TokenUsage{}
+    }
+    ag, err := agent.GetByAgentType(agentType)
+    if err != nil {
+        return &agent.TokenUsage{}
+    }
+    calculator, ok := ag.(agent.TokenCalculator)
+    if !ok {
+        return &agent.TokenUsage{}
+    }
+    usage, err := calculator.CalculateTokenUsage(data, startOffset)
+    if err != nil {
+        return &agent.TokenUsage{}
+    }
+    return usage
+}
+```
+
+This removes the direct calls to `claudecode.CalculateTokenUsage`, `geminicli.CalculateTokenUsage`, and `opencode.CalculateTokenUsageFromBytes` from condensation. The `transcript` import for `ParseFromBytes` also moves out (it's now inside the Claude Code agent method). The agent sub-package imports (`claudecode`, `geminicli`, `opencode`) remain needed for other functions in the file.
+
+### 7. Update tests
+
+- **`cmd/entire/cli/agent/opencode/transcript_test.go`**: Update `TestCalculateTokenUsage`, `TestCalculateTokenUsage_FromOffset`, and `TestCalculateTokenUsage_NonexistentFile` to pass `[]byte` instead of file paths
+- **`cmd/entire/cli/agent/claudecode/transcript_test.go`** and **`cmd/entire/cli/agent/geminicli/transcript_test.go`**: Package-level function tests don't change (they already test the core logic). No new method-level tests needed since the methods are thin wrappers.
+
+## Not changed
+
+- `SubagentAwareExtractor.CalculateTotalTokenUsage` - still file-path-based (needs to discover and read subagent files from disk)
+- `claudecode.CalculateTokenUsageFromFile` / `claudecode.CalculateTotalTokenUsage` - kept for the `SubagentAwareExtractor` path
+- `geminicli.CalculateTokenUsageFromFile` - kept as convenience helper
+- Package-level `CalculateTokenUsage` functions in each agent - kept as the core logic
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/robin/.claude/projects/-Users-robin-Developer-cli/b1f148f7-fe06-42ab-bda9-a8ab977397db.jsonl
+
+---
+
+in manual_commit_condensation.go, if the agent does not implement agent.TokenCalculator we should return nil, not &agent.TokenUsage{}
+
+---
+
+how do the new changes affect subagent token usage calculation, especially for claude?

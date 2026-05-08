@@ -1,0 +1,41 @@
+Implement the following plan:
+
+# Move checkpoint bench tests to benchutil package
+
+## Context
+The `checkpoint` directory has two files (`bench_test.go`, `parse_tree_bench_test.go`) using `package checkpoint_test` — the only files using that package name. They need the external test package because they import `benchutil`, which imports `checkpoint` (circular dependency otherwise). Moving them into `benchutil` eliminates the `checkpoint_test` package entirely.
+
+## Changes
+
+### 1. Move files
+- `cmd/entire/cli/checkpoint/bench_test.go` → `cmd/entire/cli/benchutil/bench_test.go`
+- `cmd/entire/cli/checkpoint/parse_tree_bench_test.go` → `cmd/entire/cli/benchutil/parse_tree_bench_test.go`
+
+### 2. Update package declarations
+- Change `package checkpoint_test` → `package benchutil` in both files
+
+### 3. Fix imports
+- Remove `"github.com/entireio/cli/cmd/entire/cli/checkpoint"` self-import (no longer needed since benchutil already imports it)
+- Actually keep it — these files are moving INTO benchutil, so they need `checkpoint.` prefixed calls to stay. The import is still needed since they're calling checkpoint functions.
+- No import changes needed — both files already import checkpoint explicitly.
+
+### 4. No code changes needed
+- All `checkpoint.` prefixes remain correct since the files are in `benchutil`, not `checkpoint`
+- Helper functions like `benchInitBareRepo`, `benchCreateBlob`, `buildShardedMetadataTree`, `buildFlatFileTree` in `parse_tree_bench_test.go` move with the file
+
+### 5. Handle naming conflicts
+- `benchutil` already has a `benchutil_test.go` — check for function name conflicts with the moved files
+- `benchutil_test.go` uses `BenchmarkNewBenchRepo`, `BenchmarkSeedShadowBranch`, etc. — no conflicts with the moved benchmarks
+
+## Verification
+- `go build ./cmd/entire/cli/checkpoint/` — no more checkpoint_test package
+- `go build ./cmd/entire/cli/benchutil/` — compiles with moved files
+- `grep -r "package checkpoint_test" cmd/entire/cli/checkpoint/` — no results
+- `go test -bench=. ./cmd/entire/cli/benchutil/` — benchmarks still run
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/315cf457-a8d3-410d-8f96-7a7920bb3999.jsonl
+
+---
+
+commit and push

@@ -1,0 +1,22 @@
+/simplify
+
+---
+
+**Findings**
+
+1. High: v2 local overrides replace the entire `checkpoints` group, so a partial override can silently erase the primary backend and other required settings.  
+[load_v2.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/load_v2.go:167) explicitly does top-level wholesale replacement, and [load_v2.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/load_v2.go:194) unmarshals the whole `checkpoints` object into `base.Checkpoints`. But [schema_v2.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/schema_v2.go:66) models `Primary` as the authoritative required backend. A local file like:
+```json
+{"schema":2,"checkpoints":{"mirrors":[{"type":"gmeta"}]}}
+```
+would clear `Primary`, `Remote`, `PushSessions`, etc. There is no test covering nested partial override for `checkpoints`, `redaction`, or `summary_generation`; the only override test is a safe scalar case at [load_v2_test.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/load_v2_test.go:498).
+
+2. Medium: mixed legacy/v2 main+local files are hard-rejected, which makes incremental migration of the gitignored local override impossible.  
+[load_v2.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/load_v2.go:62) errors out whenever `settings.json` and `settings.local.json` are different shapes, and the new tests lock that behavior in at [load_v2_test.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/load_v2_test.go:515) and [load_v2_test.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/load_v2_test.go:529). For a “first step” settings-model branch, that is a rough migration path: users commonly update the tracked file first and leave local overrides alone. Unless `migrate-config` is guaranteed to rewrite both files together before any `LoadV2` caller lands, this will create unnecessary breakage.
+
+3. Medium: schema-v2 settings are decoded but not semantically validated, so invalid configs are accepted and surfaced only later.  
+[parseV2Bytes](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/load_v2.go:155) only does strict JSON decoding. There is no `Validate()` pass for required semantics like “`checkpoints.primary.type` must be known/non-empty”, even though the schema comments describe `Primary` as authoritative at [schema_v2.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/schema_v2.go:67). The suite currently treats an empty-primary default as acceptable at [load_v2_test.go](/Users/soph/Work/entire/devenv/cli_experiments/cmd/entire/cli/settings/load_v2_test.go:441), which is fine for “no files exist” but would also let malformed v2 files through with no direct error. Before wiring production callers, this needs a semantic validation step.
+
+Focused verification passed: `env GOCACHE=/tmp/go-build go test ./cmd/entire/cli/settings`.
+
+Overall, the direction is good, but I would not build more callers on top of `LoadV2` until the nested override semantics and v2 validation story are fixed.

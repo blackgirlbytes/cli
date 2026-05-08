@@ -1,0 +1,110 @@
+Implement the following plan:
+
+# Fix: Factory AI Droid TTY hang during git commit
+
+## Context
+
+When Factory AI Droid is told to commit code, `git commit -m "..."` triggers the `prepare-commit-msg` hook, which calls `hasTTY()` to decide whether to show an interactive y/n/a prompt. Droid's subprocess can open `/dev/tty` (so `hasTTY()` returns `true`), but Droid can't actually respond to the prompt — causing a hang/timeout.
+
+This is the **exact same issue** Gemini CLI had, fixed by checking `GEMINI_CLI=1` in `hasTTY()` (PR #430).
+
+## The Hang Flow
+
+1. User tells Droid "commit this code"
+2. Droid runs `git commit -m "message"`
+3. Git invokes `.git/hooks/prepare-commit-msg` → runs `entire hooks git prepare-commit-msg`
+4. Strategy calls `hasTTY()` → returns **true** (Droid subprocess can open `/dev/tty`)
+5. Fast path at line 346 is **skipped** (it requires `!hasTTY()`)
+6. At line 431, `askConfirmTTY()` opens `/dev/tty` and waits for input → **hangs forever**
+
+## Root Cause
+
+`manual_commit_hooks.go:hasTTY()` has a Gemini-specific check but no Factory AI Droid check.
+
+## Fix: Add `GIT_TERMINAL_PROMPT` check to `hasTTY()`
+
+Empirical testing shows Droid sets `GIT_TERMINAL_PROMPT=0` and `TERM=dumb` for shell commands, but has **no** Droid-specific env var (like Gemini's `GEMINI_CLI=1`). `FACTORY_PROJECT_DIR` is only set for hook invocations, not shell commands like `git commit`.
+
+`GIT_TERMINAL_PROMPT=0` is the right signal because:
+- It explicitly means "don't prompt for terminal input in git context"
+- Our code runs as a git hook — respecting this env var is semantically correct
+- It's already set by Droid for all shell subprocesses
+- It also helps with CI systems and other non-interactive environments
+
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks.go:40-59`
+
+Add after the Gemini check (line 51):
+
+```go
+// GIT_TERMINAL_PROMPT=0 disables git's own terminal prompts.
+// Factory AI Droid (and other non-interactive environments like CI) set this.
+// Since we run as a git hook, respect it — if the environment doesn't want
+// git prompting, our hook shouldn't prompt either.
+if os.Getenv("GIT_TERMINAL_PROMPT") == "0" {
+    return false
+}
+```
+
+## Why E2E tests don't catch this
+
+E2E tests set `ENTIRE_TEST_TTY=0` (lines 151 and 183 in `e2e/agents/droid.go`), which short-circuits `hasTTY()` to return `false` before reaching the `/dev/tty` check. This masks the production behavior.
+
+## Files to modify
+
+- `cmd/entire/cli/strategy/manual_commit_hooks.go` — add env var check in `hasTTY()`
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. Manual test: run Droid, tell it to commit, confirm no hang
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-factoryai-agent/cb5ff967-c1d8-492f-a6ea-784dae962d13.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   cmd/entire/cli/strategy/manual_commit_hooks.go
+
+no changes added to commit (use "git add" and/or "git commit -a")
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/strategy/manual_commit_hooks.go b/cmd/entire/cli/strategy/manual_commit_hooks.go
+index 185fa0d4..7df98af4 100644
+--- a/cmd/entire/cli/strategy/manual_commit_hooks.go
++++ b/cmd/entire/cli/strategy/manual_commit_hooks.go
+@@ -50,6 +50,14 @@ func hasTTY() bool {
+ 		return false
+ 	}
+ 
++	// GIT_TERMINAL_PROMPT=0 disables git's own terminal prompts.
++	// Factory AI Droid (and other non-interactive environments like CI) set this.
++	// Since we run as a git hook, respect it — if the environment doesn't want
++	// git prompting, our hook shouldn't prompt either.
++	if os.Getenv("GIT_TERMINAL_PROMPT") == "0" {
++		return false
++	}
++
+ 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+ 	if err != nil {
+ 		return false
+- Current branch: alisha/factoryai-agent
+- Recent commits: 20d623b2 Merge branch 'main' into alisha/factoryai-agent
+0153b070 Merge pull request #552 from entireio/soph/welcome-message-factory-ai
+8118d5ed handle factory ai welcome message, new HookResponseWriter interface
+0238f88a fix: lower factoryai-droid E2E concurrency limit to 1
+d9646945 fix: set factoryai-droid E2E concurrency limit to 3
+b8043455 fix: align e2e workflow agent names and add factoryai-droid concurrency limit
+6e8cfd5c Merge pull request #495 from entireio/soph/add-absolute-hook-path-option
+7f1cdc8c fix: use types.AgentName/AgentType from agent/types subpackage in factoryaidroid
+fa2c49c6 Merge branch 'main' into alisha/factoryai-agent
+3206f07c Merge pull request #543 from entireio/soph/improved-tty-readability
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

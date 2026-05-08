@@ -1,0 +1,108 @@
+Implement the following plan:
+
+# Plan: Implement Cursor as an External Agent Binary
+
+## Context
+
+The Cursor agent is currently a built-in agent compiled into the CLI (`cmd/entire/cli/agent/cursor/`). We want to extract it into a standalone external agent binary (`entire-agent-cursor`) that communicates with the CLI via the external agent protocol (subcommand-based JSON over stdin/stdout). This makes Cursor a plugin that can be distributed and updated independently.
+
+## Approach
+
+Create a self-contained binary at `cmd/entire-agent-cursor/` (single `main` package, no imports from the CLI), then remove the built-in cursor package and its registrations.
+
+## New Files: `cmd/entire-agent-cursor/`
+
+All files in `package main`. Uses `os.Args[1]` switch + `flag.NewFlagSet` for subcommand dispatch (same pattern as `cmd/entire-agent-test/main.go`).
+
+| File | Purpose |
+|------|---------|
+| `main.go` | Entrypoint, subcommand dispatch switch |
+| `info.go` | `info` (static metadata + capabilities) and `detect` (check `.cursor/` dir) |
+| `session.go` | `get-session-id`, `get-session-dir`, `resolve-session-file`, `read-session`, `write-session`, `format-resume-command` |
+| `transcript.go` | `read-transcript`, `chunk-transcript`, `reassemble-transcript` |
+| `hooks.go` | `parse-hook`, `install-hooks`, `uninstall-hooks`, `are-hooks-installed` |
+| `analyzer.go` | `get-transcript-position`, `extract-modified-files`, `extract-prompts`, `extract-summary` |
+| `types.go` | Cursor hook input structs (sessionStartRaw, stopHookInputRaw, etc.) + event type constants |
+| `helpers.go` | `writeJSON`, `fatal`, `repoRoot()`, `marshalIndentWithNewline`, `stripIDEContextTags`, `chunkJSONL`, `reassembleJSONL`, `readJSON[T]` |
+| `transcript_parse.go` | JSONL transcript parsing (Line, ParseFromBytes, ParseFromFileAtLine, ExtractUserContent) |
+
+### Key Implementation Details
+
+**`info` declares these capabilities:**
+```json
+{
+  "hooks": true,
+  "transcript_analyzer": true,
+  "transcript_preparer": false,
+  "token_calculator": false,
+  "text_generator": false,
+  "hook_response_writer": false,
+  "subagent_aware_extractor": false
+}
+```
+
+**Reimplemented dependencies (~200 lines total):**
+- `repoRoot()` -> reads `ENTIRE_REPO_ROOT` env var, falls back to `git rev-parse --show-toplevel`
+- `chunkJSONL`/`reassembleJSONL` -> copy from `cmd/entire/cli/agent/chunking.go:73-118`
+- `stripIDEContextTags` -> copy regex logic from `cmd/entire/cli/textutil/ide_tags.go`
+- Transcript parsing -> copy from `cmd/entire/cli/transcript/parse.go`
+- `marshalIndentWithNewline` -> copy from `cmd/entire/cli/jsonutil/json.go`
+- Logging -> simple `fmt.Fprintf(os.Stderr, ...)` instead of structured logging
+
+**`parse-hook` event mapping** (from `lifecycle.go`):
+- `session-start` -> type 1 (SessionStart)
+- `before-submit-prompt` -> type 2 (TurnStart), includes prompt/model
+- `stop` -> type 3 (TurnEnd)
+- `pre-compact` -> type 4 (Compaction)
+- `session-end` -> type 5 (SessionEnd)
+- `subagent-start` -> type 6 (SubagentStart), filtered on non-empty Task
+- `subagent-stop` -> type 7 (SubagentEnd), filtered on non-empty Task
+
+**`extract-modified-files`:** Returns `{"files": null, "current_position": 0}` (Cursor transcripts lack tool_use blocks).
+
+## Files to Remove
+
+- **Delete** `cmd/entire/cli/agent/cursor/` (entire directory - cursor.go, hooks.go, lifecycle.go, transcript.go, types.go, AGENT.md, and all test files)
+
+## Files to Modify
+
+1. **`cmd/entire/cli/hooks_cmd.go`**: Remove `_ "github.com/entireio/cli/cmd/entire/cli/agent/cursor"` import. The cursor agent will be discovered via `external.DiscoverAndRegister()` which already runs on line 29.
+
+2. **`cmd/entire/cli/strategy/manual_commit_condensation_test.go`**: Remove `_ "github.com/entireio/cli/cmd/entire/cli/agent/cursor"` import. Tests that call `agent.GetByAgentType(agent.AgentTypeCursor)` (lines 36, 186, 200) need to be updated to skip when cursor isn't registered (it won't be in unit tests since the external binary isn't on PATH):
+   ```go
+   ag, err := agent.GetByAgentType(agent.AgentTypeCursor)
+   if err != nil {
+       t.Skip("cursor agent not registered (external binary not on PATH)")
+   }
+   ```
+
+3. **`cmd/entire/cli/agent/registry.go`**: Keep `AgentNameCursor` and `AgentTypeCursor` constants (used across explain.go, summarize.go, condensation.go, etc.).
+
+## Tests
+
+- Port test logic from `cursor_test.go`, `hooks_test.go`, `lifecycle_test.go`, `transcript_test.go` into new test files in `cmd/entire-agent-cursor/`
+- Test each subcommand handler by invoking main or calling the handler functions directly
+- Test helper functions (chunkJSONL, stripIDEContextTags, transcript parsing, path sanitization)
+
+## Verification
+
+1. `go build ./cmd/entire-agent-cursor/` - binary compiles
+2. `./entire-agent-cursor info` - returns valid JSON with correct capabilities
+3. `mise run fmt && mise run lint` - passes
+4. `mise run test:ci` - all tests pass (condensation tests skip gracefully)
+5. Place binary on PATH, set `external_agents: true` in settings, verify `entire enable` discovers cursor
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/nodo/.claude/projects/-Users-nodo-work-cli/31acaad1-8153-4f2b-99b0-52ed107ac58a.jsonl
+
+---
+
+now I would like to manually test the new setup, can you setup `/Users/nodo/work/test-1` to use 1. the newly build entire cli 2. the new entire-agent-cursor 3. add the feature flag to the repo to use external agents
+
+---
+
+can you test that for me?
+
+---
+
+[Request interrupted by user]

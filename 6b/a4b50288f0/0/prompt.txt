@@ -1,0 +1,61 @@
+Implement the following plan:
+
+# Fix Droid CLI Args Passed as Prompt
+
+## Context
+
+Droid E2E tests intermittently time out because `StartSession` invokes droid with `exec`-only flags in interactive mode:
+
+```go
+// Current (broken) — e2e/agents/droid.go:190
+NewTmuxSession(name, dir, nil, "env", "ENTIRE_TEST_TTY=0", d.Binary(), "--model", defaultDroidModel, "--skip-permissions-unsafe")
+```
+
+From `droid --help`, interactive mode only accepts `-v`, `-r`, `-h`. Everything else becomes part of `[prompt...]`:
+```
+droid "review app.tsx"    ← initial prompt
+droid --model foo         ← "--model foo" is treated as an initial prompt, NOT a flag
+```
+
+Both `--model` and `--skip-permissions-unsafe` are `exec`-only flags (`droid exec --help`). In interactive mode, the string `--model custom:claude-haiku-4-5-20251001 --skip-permissions-unsafe` is sent to the agent as a user message — visible in every pane dump as `>  --model custom:...`. This wastes an agent turn on garbage input and can cause hangs when the agent gets confused.
+
+## Fix
+
+### File: `e2e/agents/droid.go`
+
+**Remove both flags from `StartSession`** (line 190). They're exec-only and become prompt text in interactive mode:
+
+```go
+// Before
+s, err = NewTmuxSession(name, dir, nil, "env", "ENTIRE_TEST_TTY=0", d.Binary(), "--model", defaultDroidModel, "--skip-permissions-unsafe")
+
+// After
+s, err = NewTmuxSession(name, dir, nil, "env", "ENTIRE_TEST_TTY=0", d.Binary())
+```
+
+**Model selection**: The `Bootstrap()` method already writes the BYOK custom model to `~/.factory/settings.json`. If droid doesn't auto-select it, we may need to add a `defaultModel` field to the settings JSON written by Bootstrap. Verify by running tests — if the TUI status bar still shows "Haiku 4.5", BYOK config handles it.
+
+**Permissions**: Interactive mode uses a built-in autonomy system ("Auto (Med)" visible in TUI). Medium autonomy allows file creation, git operations, and reversible commands — sufficient for E2E tests. No equivalent of `--skip-permissions-unsafe` is needed.
+
+### File: `e2e/agents/droid.go` — PromptPattern
+
+No change to `PromptPattern()`. The current `⛬|│ >` works correctly with WaitFor's `stableAtSend` mechanism. After removing the flags-as-prompt, there will be one fewer false `>` line in the pane, making startup detection more reliable.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint
+mise run test:e2e --agent factoryai-droid   # Run twice for flakiness
+```
+
+Check that:
+1. No `>  --model custom:...` line appears in pane content
+2. TUI status bar still shows correct model (Haiku 4.5)
+3. Agent can create files and commit without permission prompts
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/eefebb77-efd9-4b8c-ad28-823b0dbb8ee8.jsonl
+
+---
+
+does this handle setting the model to the custom one for the tmux mode?

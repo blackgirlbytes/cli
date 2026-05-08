@@ -1,0 +1,97 @@
+Implement the following plan:
+
+# Add `RecordError()` to Perf Span API
+
+## Context
+
+The perf framework currently has no way to indicate that a span ended due to an error. Users see lower-than-expected latencies in perf logs without knowing a step failed early. Following OpenTelemetry's pattern of separating error recording from span completion, we add a `RecordError(err)` method that marks a span as errored. The root span's log output then includes boolean error flags for any errored span.
+
+**Important constraint:** Most call sites have sequential child spans within the same function. `defer span.End()` cannot be used for these (it would defer ALL End() calls to function exit, destroying per-step timing). We keep explicit `span.End()` calls and add `span.RecordError(err)` before each error-path `End()`.
+
+## Tasks
+
+### Task 1: Core API changes (`perf/span.go` + `perf/span_test.go`)
+
+**`perf/span.go`:**
+- Add `err error` field to `Span` struct
+- Add `RecordError(err error)` method — stores first non-nil error, subsequent calls are no-ops
+- Update `End()` log output:
+  - Root span with error: add `slog.Bool("error", true)`
+  - Child span with error: add `slog.Bool("steps.<name>_err", true)` alongside existing `steps.<name>_ms`
+  - Update capacity estimate for attrs slice
+
+**`perf/span_test.go`:**
+- `TestRecordError_MarksSpanAsErrored` — verify error is stored
+- `TestRecordError_NilIsNoOp` — verify nil error is ignored
+- `TestRecordError_FirstErrorWins` — verify second call is no-op
+- `TestRecordError_ChildErrorFlagInOutput` — verify root span log includes `steps.<name>_err: true`
+- `TestEnd_NoErrorFlagByDefault` — verify no error flag when no error recorded
+
+### Task 2: Update call sites (4 files, mechanical insertion)
+
+Add `span.RecordError(err)` before every `span.End()` on an error path. The three patterns:
+
+**Pattern A — error is returned:**
+```go
+// Before:
+if err := doWork(); err != nil {
+    span.End()
+    return err
+}
+
+// After:
+if err := doWork(); err != nil {
+    span.RecordError(err)
+    span.End()
+    return err
+}
+```
+
+**Pattern B — hook silent failure (returns nil but operation failed):**
+```go
+// Before:
+if err != nil {
+    span.End()
+    return nil // Hook must be silent
+
+// After:
+if err != nil {
+    span.RecordError(err)
+    span.End()
+    return nil // Hook must be silent
+```
+
+**Pattern C — error checked after span ends (no change needed):**
+```go
+span.End()
+if err != nil {
+    return err  // span already ended, no RecordError
+}
+```
+
+**Files and estimated insertions:**
+
+| File | Spans | RecordError insertions |
+|------|-------|----------------------|
+| `cmd/entire/cli/lifecycle.go` | 11 | ~12 |
+| `cmd/entire/cli/strategy/manual_commit_hooks.go` | 16 | ~10 |
+| `cmd/entire/cli/strategy/manual_commit_git.go` | 5 | ~5 |
+| `cmd/entire/cli/strategy/manual_commit_push.go` | 2 | ~2 |
+
+**Notable exceptions (no RecordError needed):**
+- `writeCheckpointSpan` in `manual_commit_git.go` — error is checked AFTER `span.End()`, not before
+- `postCommitProcessSession` spans — function doesn't return errors, failures are logged as warnings
+- `initSpan` in lifecycle.go `handleLifecycleTurnStart` — errors are logged as warnings, not returned
+
+### Task 3: Verification
+
+- `mise run fmt && mise run lint && mise run test:ci`
+
+## Execution Strategy
+
+- **Batch 1:** Task 1 (core API + tests) — must complete first
+- **Batch 2:** Task 2 call site updates — all 4 files can be dispatched in parallel as independent subagents
+- **Batch 3:** Task 3 verification
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/pfleidi/.claude/projects/-Users-pfleidi-entire-cli--worktrees-performance-logging-investigation/2d62938d-a5d3-4bac-9d0f-bf8056720e6d.jsonl

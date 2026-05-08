@@ -1,0 +1,639 @@
+/pr-review-toolkit:review-pr
+
+---
+
+/pr-review-toolkit:review-pr https://github.com/entireio/cli/pull/877/changes
+
+---
+
+<task-notification>
+<task-id>a49862d66e3acbec6</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/4d55b663-dd2c-4b14-8e57-9ac308f445b7/tasks/a49862d66e3acbec6.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review PR #877" completed</summary>
+<result>Now I have a thorough understanding of the PR. Let me compile my analysis.
+
+---
+
+Here is my test coverage analysis for PR #877.
+
+## Summary
+
+This PR introduces `CompactTranscriptStart` tracking to ensure v2 `/main` metadata stores checkpoint offsets in the compact transcript (transcript.jsonl) domain rather than the full transcript (full.jsonl) domain. The test coverage is solid for the happy path and the core dual-condensation scenario, but has meaningful gaps around the extracted helper functions and defensive edge cases.
+
+## Critical Gaps
+
+### 1. No unit tests for `computeCompactTranscriptStart` (Criticality: 8/10)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go` (lines 1228-1261)
+
+This function has four distinct code paths and is the primary logic that determines what offset goes into v2 metadata:
+- Returns `state.CompactTranscriptStart` when it is &gt; 0 (preferred path for non-legacy sessions)
+- Returns 0 when `state.CheckpointTranscriptStart == 0` or `ag == nil` or transcript/scopedCompact is empty
+- Recalculates from full compact vs scoped compact for legacy sessions (the fallback path)
+- Returns 0 on negative offset or compact failure
+
+The existing `TestCondenseSession_V2CompactTranscriptStart` test exercises this function indirectly through the full `CondenseSession` pipeline, but it only tests the "first condensation with 0 state" and "second condensation with accumulated state" paths. There is no test that exercises the **legacy fallback path** where `state.CompactTranscriptStart == 0` but `state.CheckpointTranscriptStart &gt; 0` (which triggers the recalculation from transcript bytes). This is the migration path that existing sessions would hit when upgrading to this code.
+
+**What it would catch:** If the recalculation logic is broken (e.g., wrong `compact.Compact` parameters, line counting off-by-one), legacy sessions would silently get `checkpoint_transcript_start=0` in v2 metadata, making all compact transcript scoping start from the beginning instead of the correct offset.
+
+### 2. No unit tests for `computeCompactOffset` in migrate.go (Criticality: 7/10)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/migrate.go` (lines 454-476)
+
+This function has five code paths:
+- Returns 0 when `startLine == 0`
+- Returns 0 when transcript is empty
+- Returns 0 when agent is empty
+- Returns 0 when compact fails or produces empty output
+- Returns 0 when offset is negative
+- Returns `fullLines - scopedLines` in the normal case
+
+The test `TestMigrateCheckpointsV2_UsesComputedCompactTranscriptStart` exercises the happy path indirectly through `migrateCheckpointsV2`, and it calls `computeCompactOffset` directly to compute the expected value -- but it only tests ONE scenario (4-line transcript with startLine=2, Claude Code agent). The edge cases (empty transcript, empty agent, startLine=0, negative offset) are untested.
+
+**What it would catch:** Silent failures during v1-to-v2 migration where checkpoints get `checkpoint_transcript_start=0` instead of the correct computed offset. This is particularly important because the migration function call `computeCompactOffset(content.Transcript, compacted, content.Metadata)` passes through real checkpoint metadata from v1, which may have unexpected combinations.
+
+## Important Improvements
+
+### 3. Missing negative `compactLines` guard in `CondenseResult` (Criticality: 6/10)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go` (lines 268-272)
+
+The calculation `compactLines = fullLines - writeOpts.CompactTranscriptStart` has no guard against negative results. While `computeCompactTranscriptStart` has a `if offset &lt; 0 { return 0 }` guard, the `CompactTranscriptStart` value flows through `writeOpts` and there is no guarantee it cannot exceed `fullLines`. If `compactLines` goes negative, `state.CompactTranscriptStart += result.CompactTranscriptLines` would decrease the start offset, causing subsequent checkpoints to have incorrect scoping.
+
+A test that deliberately sets `CompactTranscriptStart` higher than the actual compact line count would verify whether this edge case is handled. Even if the production code is deemed to need a `max(0, ...)` guard, a test documenting the expected behavior would be valuable.
+
+**What it would catch:** Accumulation bugs where `CompactTranscriptStart` drifts negative over multiple condensations, causing v2 metadata to have nonsensical offsets.
+
+### 4. No test for v2-disabled path returning `CompactTranscriptLines=0` (Criticality: 5/10)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_test.go`
+
+The existing `TestCondenseSession_V2Disabled_NoV2Refs` test (line 4216) does not check that `result.CompactTranscriptLines == 0` when v2 is disabled. This is important because the state update `state.CompactTranscriptStart += result.CompactTranscriptLines` should be a no-op when v2 is not enabled.
+
+**What it would catch:** If `buildCompactTranscript` accidentally populates `CompactTranscript` when v2 is disabled, `CompactTranscriptStart` would grow incorrectly in session state, which would then produce wrong offsets if v2 is later enabled for the same session.
+
+### 5. No test for `filterFilesTouched` with empty `sessionData.FilesTouched` and non-empty `committedFiles` (Criticality: 4/10)
+
+**File:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go` (lines 303-322)
+
+This was an extract-method refactoring. While the logic is unchanged, a direct unit test would serve as documentation and protect against future regression. The mid-turn commit fallback path (empty `FilesTouched`, non-empty `committedFiles`) is not directly tested.
+
+### 6. Second condensation does not verify v1 metadata offset diverges from v2 (Criticality: 4/10)
+
+In `TestCondenseSession_V2CompactTranscriptStart`, the second condensation verifies v2 metadata's `CheckpointTranscriptStart` equals `firstCompactLines`, but it does not verify that v1 metadata's `CheckpointTranscriptStart` equals `result.TotalTranscriptLines` (which should be the full.jsonl line count, different from compact). Asserting both would confirm the dual-write produces correctly divergent values.
+
+## Test Quality Issues
+
+### 7. `TestMigrateCheckpointsV2_UsesComputedCompactTranscriptStart` uses `computeCompactOffset` for expected value (Minor concern)
+
+The migration test on line 361 computes `expectedOffset` by calling the function under test (`computeCompactOffset`), then asserts the migrated metadata matches. This is a tautological test pattern -- if `computeCompactOffset` has a bug, both the expected value and the actual value would be wrong in the same way. A stronger test would hardcode the expected offset or compute it independently.
+
+However, this test still has value: it verifies that the migration pipeline correctly *wires* `computeCompactOffset`'s result into the v2 metadata. It just does not independently verify the correctness of the offset calculation itself.
+
+## Positive Observations
+
+1. **The multi-condensation test is excellent.** `TestCondenseSession_V2CompactTranscriptStart` at 185 lines is a thorough integration test that exercises two condensation cycles, verifies accumulation of `CompactTranscriptStart` state, checks that the compact transcript is cumulative (second checkpoint includes first checkpoint's content as a prefix), and validates both v1 and v2 metadata for the first checkpoint.
+
+2. **Session state serialization is well-covered.** The `state_test.go` changes add proper round-trip tests for both legacy (missing `compact_transcript_start`) and new-format JSON, verifying that `NormalizeAfterLoad` correctly handles both cases.
+
+3. **The v2 store test is focused and clear.** `TestV2GitStore_WriteCommittedMain_UsesCompactTranscriptStart` directly verifies the critical behavioral change: that v2 /main uses `CompactTranscriptStart` (15) not `CheckpointTranscriptStart` (42), with both values provided to disambiguate.
+
+4. **Test patterns follow CLAUDE.md conventions.** Tests use `testutil.InitRepo`, `testutil.WriteFile`, `testutil.GitAdd`, `testutil.GitCommit` helpers. Tests that use `t.Chdir()` correctly omit `t.Parallel()`. Tests that don't need CWD correctly include `t.Parallel()`.
+
+5. **The `carryForwardToNewShadowBranch` update is consistent.** Setting `state.CompactTranscriptStart = 0` alongside `state.CheckpointTranscriptStart = 0` when carrying forward is correct and ensures the two fields stay in sync during branch migration.
+
+6. **All three state update sites are covered.** `CompactTranscriptStart += result.CompactTranscriptLines` appears in `condenseAndUpdateState` (hooks), `CondenseSessionByID`, and `CondenseAndMarkFullyCondensed`, ensuring consistency across all condensation paths.</result>
+<usage><total_tokens>62827</total_tokens><tool_uses>31</tool_uses><duration_ms>261264</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a96fefe196f2d8c67</task-id>
+<tool-use-id>toolu_013MkJ7HETe2vW9ZVZJDJbM2</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/4d55b663-dd2c-4b14-8e57-9ac308f445b7/tasks/a96fefe196f2d8c67.output</output-file>
+<status>completed</status>
+<summary>Agent "Error handling review PR #877" completed</summary>
+<result>Now I have all the context I need. Let me compile the full error handling audit.
+
+---
+
+## Error Handling Audit: PR #877 - Compact Transcript Offset Tracking
+
+### Overview
+
+This PR introduces `CompactTranscriptStart` tracking for v2 checkpoint metadata. It adds offset computation for compact (transcript.jsonl) transcripts that parallels the existing `CheckpointTranscriptStart` for full (full.jsonl) transcripts. The core risk is that these two offset tracking systems can silently diverge, producing corrupted checkpoint metadata that is extremely difficult to debug after the fact.
+
+---
+
+### Issue 1: `computeCompactOffset` in `cmd/entire/cli/migrate.go` -- Silent fail-open to 0 with no logging
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/migrate.go`, lines 454-476
+
+**Severity:** HIGH
+
+**Issue Description:**
+This function returns 0 on five distinct failure paths, none of which produce any log output:
+1. `startLine == 0` (legitimate first checkpoint -- this is correct)
+2. `len(fullTranscript) == 0` (empty transcript -- could indicate data corruption during migration)
+3. `m.Agent == ""` (missing agent -- could indicate incomplete v1 metadata)
+4. `compact.Compact` returns an error or empty output (compaction engine failure)
+5. `offset &lt; 0` (mathematical impossibility indicating a bug in the compaction logic)
+
+The function's sibling `computeCompactTranscriptStart` in the condensation file logs a warning on the `compact.Compact` failure path and on the negative offset path. This function does neither.
+
+**Hidden Errors:**
+- Data corruption in v1 checkpoint transcripts that produce empty bytes
+- A compaction engine bug that produces more scoped lines than full lines (negative offset)
+- Metadata corruption where `Agent` field was lost
+
+**User Impact:**
+During migration (`entire migrate v2`), a non-zero offset checkpoint will silently receive `CompactTranscriptStart = 0` in its v2 metadata. When a consumer later reads this checkpoint and uses the offset to slice the compact transcript, they will read from the beginning instead of the correct position, producing duplicate or incorrect data. The user will see incorrect checkpoint content with no indication that migration produced an incorrect offset. This is especially insidious because migration is a one-time operation -- the bad offset is baked into permanent storage on `entire/checkpoints/v1`.
+
+**Recommendation:**
+Add `logging.Warn` calls on the non-trivial failure paths (compact error, empty output, negative offset). The `startLine == 0` early return is correct and needs no warning. The `m.Agent == ""` case is already warned in `tryCompactTranscript` upstream, so it could arguably be skipped here, but the compact failure and negative offset paths have no other warning coverage.
+
+**Example fix:**
+```go
+func computeCompactOffset(fullTranscript, scopedCompact []byte, m checkpoint.CommittedMetadata) int {
+    startLine := m.GetTranscriptStart()
+    if startLine == 0 || len(fullTranscript) == 0 || m.Agent == "" {
+        return 0
+    }
+
+    fullCompacted, err := compact.Compact(fullTranscript, compact.MetadataFields{
+        Agent:      string(m.Agent),
+        CLIVersion: versioninfo.Version,
+        StartLine:  0,
+    })
+    if err != nil || len(fullCompacted) == 0 {
+        logging.Warn(ctx, "failed to compute compact offset during migration, using 0",
+            slog.String("checkpoint_id", string(m.CheckpointID)),
+            slog.String("error", fmt.Sprintf("%v", err)),
+        )
+        return 0
+    }
+
+    fullLines := bytes.Count(fullCompacted, []byte{'\n'})
+    scopedLines := bytes.Count(scopedCompact, []byte{'\n'})
+    offset := fullLines - scopedLines
+    if offset &lt; 0 {
+        logging.Warn(ctx, "compact offset computation produced negative value, using 0",
+            slog.String("checkpoint_id", string(m.CheckpointID)),
+            slog.Int("full_lines", fullLines),
+            slog.Int("scoped_lines", scopedLines),
+        )
+        return 0
+    }
+    return offset
+}
+```
+
+Note: this function currently does not accept `ctx context.Context` as a parameter. Adding it would be required to enable logging, which is a small signature change. The caller `migrateOneCheckpoint` already has `ctx` available.
+
+---
+
+### Issue 2: `computeCompactTranscriptStart` in `cmd/entire/cli/strategy/manual_commit_condensation.go` -- Negative offset silently returns 0 without logging
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go`, lines 1234-1261
+
+**Severity:** MEDIUM
+
+**Issue Description:**
+This function is better than `computeCompactOffset` -- it logs a warning when `compact.Compact` fails (line 1248). However, the negative offset check at line 1256 returns 0 silently with no logging. A negative offset (`fullLines - scopedLines &lt; 0`) would mean the scoped compact has more lines than the full compact, which is a logical impossibility. If this ever occurs, it signals a serious bug in the compaction engine or a data integrity issue that deserves at least a `logging.Warn`.
+
+**Hidden Errors:**
+- Compaction engine producing inconsistent output between `startLine=0` and `startLine=N` for the same input
+- Race condition or data mutation between the two `compact.Compact` calls
+
+**User Impact:**
+If a negative offset occurs, the compact transcript start is silently set to 0. All subsequent checkpoints for this session will use incorrect offsets. The accumulation pattern (`state.CompactTranscriptStart += result.CompactTranscriptLines`) means the error compounds: not just this checkpoint is wrong, but every future checkpoint in the session.
+
+**Recommendation:**
+Add a warning log on the negative offset path with diagnostic context.
+
+**Example fix (line 1256):**
+```go
+if offset &lt; 0 {
+    logging.Warn(ctx, "compact transcript start recalculation produced negative offset, using 0",
+        slog.String("session_id", state.SessionID),
+        slog.Int("full_lines", fullLines),
+        slog.Int("scoped_lines", scopedLines),
+    )
+    return 0
+}
+```
+
+---
+
+### Issue 3: `buildCompactTranscript` -- Redaction failure sets `redacted = nil`, then `compactTranscriptForV2` is called with nil transcript
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go`, lines 326-358
+
+**Severity:** HIGH
+
+**Issue Description:**
+When `redact.JSONLBytes` fails (line 332), the code sets `redacted = nil` and continues. Then on lines 348-354, both `compactTranscriptForV2` calls receive `nil` as the `transcript` parameter. Looking at `compactTranscriptForV2` (line 1200), it checks `len(transcript) == 0` and returns `nil` when the transcript is nil/empty. So both `scopedCompact` and `writeOpts.CompactTranscript` will be `nil`.
+
+Then `computeCompactTranscriptStart` is called with `nil` for both `transcript` and `scopedCompact`. Looking at line 1238, both `len(transcript) == 0` and `len(scopedCompact) == 0` trigger the early return of 0. So `writeOpts.CompactTranscriptStart` = 0.
+
+The net effect: when redaction fails, `CompactTranscript = nil` and `CompactTranscriptStart = 0`. Then back in `CondenseSession` (line 268-271), `compactLines = 0` because `writeOpts.CompactTranscript` is nil. So `CompactTranscriptLines = 0` is returned in the result.
+
+Then at the accumulation sites (lines 1028, 1137, 1317):
+```go
+state.CompactTranscriptStart += result.CompactTranscriptLines // += 0, no progress
+```
+
+This means: **if redaction fails for one checkpoint, the compact offset stops advancing, and every subsequent checkpoint in the session will have a stale/wrong `CompactTranscriptStart`**. The warning log at line 335 says "skipping transcript.jsonl on /main", which is accurate for the current checkpoint, but there is no indication that this has permanently corrupted the offset tracking for all future checkpoints in this session.
+
+**Hidden Errors:**
+- Any `redact.JSONLBytes` failure (malformed JSON, unexpected structure) poisons the entire session's compact offset chain
+- The user sees a single warning about one checkpoint but has no idea that all subsequent checkpoints are also affected
+
+**User Impact:**
+A transient redaction failure (e.g., one malformed JSON line in the transcript) permanently corrupts the compact offset for the rest of the session. All subsequent checkpoints will have `CompactTranscriptStart` pointing to the wrong position. When a consumer reads these checkpoints and tries to slice the compact transcript, they will get wrong content.
+
+**Recommendation:**
+This is an architectural issue with the accumulation pattern. When `CompactTranscriptLines` is 0 due to a failure (not because there genuinely are 0 lines), the accumulation should be handled differently. Options:
+
+1. **Best option:** When redaction fails, attempt to compute what `CompactTranscriptLines` *would have been* from the un-redacted transcript. The compact offset is about line counts, not about whether the transcript was actually written to storage.
+
+2. **Minimum fix:** Log a warning at ERROR level (not WARN) that explicitly states the session's compact offset tracking is now broken and will produce incorrect metadata for subsequent checkpoints. This at least makes the failure debuggable.
+
+3. **Consider propagating the error** instead of swallowing it. If compact transcript generation is important enough to track offsets for, a redaction failure should perhaps prevent the v2 write rather than silently producing corrupt metadata.
+
+---
+
+### Issue 4: `buildCompactTranscript` -- If scoped compact succeeds but full compact fails (or vice versa), inconsistent state is produced
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go`, lines 347-354
+
+**Severity:** MEDIUM
+
+**Issue Description:**
+Lines 348-353 make two independent calls to `compactTranscriptForV2`:
+```go
+scopedCompact := compactTranscriptForV2(compactCtx, ag, redacted, state.CheckpointTranscriptStart)
+writeOpts.CompactTranscript = compactTranscriptForV2(compactCtx, ag, redacted, 0)
+```
+
+These call `compact.Compact` with different `StartLine` values. If one succeeds and the other fails (returns nil), you get inconsistent state:
+
+- **Scoped succeeds, full fails:** `scopedCompact` is non-nil but `writeOpts.CompactTranscript` is nil. Then `computeCompactTranscriptStart` gets a valid `scopedCompact` and computes an offset. But `writeOpts.CompactTranscript` is nil, so `compactLines = 0` in the result (line 268-271). The offset was computed but the transcript was not written. The `CompactTranscriptStart` in metadata is non-zero, but there is no transcript.jsonl to slice.
+
+- **Full succeeds, scoped fails:** `scopedCompact` is nil, `writeOpts.CompactTranscript` is non-nil. `computeCompactTranscriptStart` gets `len(scopedCompact) == 0`, returns 0. The full compact transcript is written with `CompactTranscriptStart = 0`. Meanwhile `compactLines = fullLines - 0 = fullLines`, which would be the entire cumulative line count, not just the new lines. This would cause `CompactTranscriptLines` to be inflated, and the next checkpoint's `CompactTranscriptStart` would jump forward incorrectly.
+
+**Hidden Errors:**
+- `compact.Compact` could fail for `StartLine=N` but succeed for `StartLine=0` (e.g., truncation produces invalid JSONL for some agent formats)
+- Or vice versa: `StartLine=0` might hit an error in a later portion of the transcript that `StartLine=N` skips
+
+**User Impact:**
+Inconsistent compact offset metadata. In the "full succeeds, scoped fails" case, the inflated `CompactTranscriptLines` causes every subsequent checkpoint to have an offset that is too large, pointing past the end of the actual compact content.
+
+**Recommendation:**
+Add a consistency check: if either compact call returns nil, treat both as nil. This prevents partial/inconsistent state.
+
+**Example fix:**
+```go
+scopedCompact := compactTranscriptForV2(compactCtx, ag, redacted, state.CheckpointTranscriptStart)
+fullCompact := compactTranscriptForV2(compactCtx, ag, redacted, 0)
+
+// Both must succeed for consistent offset tracking. If either fails,
+// skip compact transcript entirely for this checkpoint.
+if scopedCompact != nil &amp;&amp; fullCompact != nil {
+    writeOpts.CompactTranscript = fullCompact
+    writeOpts.CompactTranscriptStart = computeCompactTranscriptStart(compactCtx, ag, state, redacted, scopedCompact)
+} else if scopedCompact != nil || fullCompact != nil {
+    logging.Warn(ctx, "partial compact transcript success, skipping to avoid inconsistent offsets",
+        slog.String("session_id", state.SessionID),
+        slog.Bool("scoped_ok", scopedCompact != nil),
+        slog.Bool("full_ok", fullCompact != nil),
+    )
+}
+```
+
+---
+
+### Issue 5: State accumulation `CompactTranscriptStart += CompactTranscriptLines` appears in 3 places with no validation
+
+**Location:**
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go`, line 1028
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go`, line 1137
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_hooks.go`, line 1317
+
+**Severity:** HIGH
+
+**Issue Description:**
+The pattern `state.CompactTranscriptStart += result.CompactTranscriptLines` appears in 3 separate locations. This is the same additive accumulation pattern used for `CheckpointTranscriptStart`, but with a critical difference: `CheckpointTranscriptStart` is assigned (`=`), not accumulated (`+=`):
+
+```go
+state.CheckpointTranscriptStart = result.TotalTranscriptLines   // absolute assignment
+state.CompactTranscriptStart += result.CompactTranscriptLines    // relative accumulation
+```
+
+This asymmetry is dangerous. `CheckpointTranscriptStart` is self-correcting -- if one condensation produces the wrong total, the next condensation's `TotalTranscriptLines` will still be correct because it counts the full transcript. But `CompactTranscriptStart` is an accumulator -- if `CompactTranscriptLines` is 0 due to a silent failure (Issues 3 and 4 above), the offset stops advancing permanently and never recovers.
+
+Additionally, there is no validation that `CompactTranscriptLines` is non-negative or reasonable. If the `compactLines` calculation at lines 268-271 produces a negative value (possible if `writeOpts.CompactTranscriptStart` is somehow larger than the full compact line count), then `CompactTranscriptStart` would decrease, which makes no sense for a monotonically increasing offset.
+
+**Hidden Errors:**
+- Any silent failure in `buildCompactTranscript` that sets `CompactTranscriptLines = 0` permanently breaks the accumulation chain
+- `compactLines` could be negative if `writeOpts.CompactTranscriptStart` exceeds `fullLines` (no guard)
+
+**User Impact:**
+Once the accumulation goes wrong, every subsequent checkpoint in the session has an incorrect compact offset. The full-transcript offset (`CheckpointTranscriptStart`) continues to be correct, creating a confusing situation where v1 metadata is right but v2 metadata is wrong.
+
+**Recommendation:**
+1. Add a guard to ensure `compactLines` at lines 268-271 is never negative:
+```go
+compactLines := 0
+if writeOpts.CompactTranscript != nil {
+    fullLines := countCompactLines(writeOpts.CompactTranscript)
+    compactLines = fullLines - writeOpts.CompactTranscriptStart
+    if compactLines &lt; 0 {
+        logging.Warn(ctx, "compact lines calculation produced negative value",
+            slog.String("session_id", state.SessionID),
+            slog.Int("full_lines", fullLines),
+            slog.Int("compact_start", writeOpts.CompactTranscriptStart),
+        )
+        compactLines = 0
+    }
+}
+```
+
+2. Consider whether the accumulation pattern is the right design. An alternative is to compute `CompactTranscriptStart` from the total compact line count (like `CheckpointTranscriptStart` does for the full transcript), making it self-correcting rather than dependent on perfect accumulation.
+
+---
+
+### Issue 6: `repairPartialV2Checkpoint` in `migrate.go` does not set `CompactTranscriptStart` during repair
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/migrate.go`, lines 250-269
+
+**Severity:** MEDIUM
+
+**Issue Description:**
+The `repairPartialV2Checkpoint` function uses `UpdateCommittedOptions` (not `WriteCommittedOptions`). Looking at the `UpdateCommittedOptions` struct (checkpoint.go line 315), it does not have a `CompactTranscriptStart` field. So when repairing a partially-migrated v2 checkpoint, the compact transcript is written but the compact offset metadata in the session metadata.json is not updated.
+
+This means: `migrateOneCheckpoint` correctly sets `CompactTranscriptStart` via `WriteCommittedOptions`, but `repairPartialV2Checkpoint` does not. If a checkpoint was partially migrated (some sessions present, some missing), the repaired sessions will have compact transcripts with no offset metadata. Whether this matters depends on whether `UpdateCommitted` touches the session metadata's `checkpoint_transcript_start` field -- if it only replaces file content and not metadata, the existing (possibly stale) metadata persists.
+
+**User Impact:**
+Repaired checkpoints may have inconsistent compact offset metadata compared to fully-migrated checkpoints.
+
+**Recommendation:**
+Verify whether `UpdateCommitted` preserves the existing session metadata `checkpoint_transcript_start` or overwrites it. If it overwrites, the repair path needs to compute and include the compact offset.
+
+---
+
+### Issue 7: `carryForwardToNewShadowBranch` resets `CompactTranscriptStart` to 0 -- correct but undocumented interaction
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 2714-2716
+
+**Severity:** LOW (informational)
+
+**Issue Description:**
+When carrying forward to a new shadow branch (after stash/pull/rebase), both offsets are reset to 0:
+```go
+state.CheckpointTranscriptStart = 0
+state.CompactTranscriptStart = 0
+```
+
+This is correct behavior since the transcript starts fresh for the new shadow branch. However, there is no comment explaining why `CompactTranscriptStart` is reset in parallel with `CheckpointTranscriptStart`. The existing comment on line 2712 only mentions "checkpoint retrieval" in general terms. Given the complexity of the dual-offset tracking system, explicit documentation of this coupling would help maintainability.
+
+---
+
+### Issue 8: `compactTranscriptForV2` logs at WARN level for compaction failure -- should this be ERROR?
+
+**Location:** `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go`, lines 1213-1217
+
+**Severity:** MEDIUM
+
+**Issue Description:**
+When `compact.Compact` fails, this function logs at WARN level. However, per the project's CLAUDE.md, this is a production code path (not a test or migration), and the failure has cascading effects on offset tracking (as described in Issues 3 and 5). A compaction engine error during a live session indicates either a bug in the compaction code or corrupted transcript data -- both warrant `logging.Error` level, not `logging.Warn`.
+
+The same issue applies to the redaction failure log in `buildCompactTranscript` at line 335.
+
+**User Impact:**
+WARN-level logs may not surface in monitoring/alerting systems configured to only alert on ERROR. The cascading impact (corrupted offsets for all subsequent checkpoints) deserves higher visibility.
+
+**Recommendation:**
+Upgrade to `logging.Error` for compaction failures during live sessions. Migration failures can remain at WARN since migration is advisory/best-effort.
+
+---
+
+### Summary of Findings
+
+| # | File | Severity | Issue |
+|---|------|----------|-------|
+| 1 | `cmd/entire/cli/migrate.go:454-476` | HIGH | `computeCompactOffset` returns 0 on all failure paths with zero logging |
+| 2 | `cmd/entire/cli/strategy/manual_commit_condensation.go:1256` | MEDIUM | Negative offset in `computeCompactTranscriptStart` returns 0 without logging |
+| 3 | `cmd/entire/cli/strategy/manual_commit_condensation.go:326-358` | HIGH | Redaction failure poisons session's compact offset chain permanently |
+| 4 | `cmd/entire/cli/strategy/manual_commit_condensation.go:347-354` | MEDIUM | Partial compact success (scoped vs full) produces inconsistent offset state |
+| 5 | `condensation.go:268-271`, `condensation.go:1028`, `condensation.go:1137`, `hooks.go:1317` | HIGH | Accumulation pattern (`+=`) is non-self-correcting and has no negative guard |
+| 6 | `cmd/entire/cli/migrate.go:250-269` | MEDIUM | Repair path omits `CompactTranscriptStart` from update options |
+| 7 | `cmd/entire/cli/strategy/manual_commit_hooks.go:2714-2716` | LOW | Reset to 0 is correct but lacks explanatory comment |
+| 8 | `cmd/entire/cli/strategy/manual_commit_condensation.go:1213-1217` | MEDIUM | Compaction failure logged at WARN instead of ERROR for live sessions |
+
+The most concerning pattern is the interaction between Issues 3, 4, and 5: the `CompactTranscriptStart` accumulation is fragile because it depends on every single condensation producing the correct `CompactTranscriptLines` value. Any single failure in the chain (redaction error, partial compact success, compaction engine bug) permanently corrupts the offset for all remaining checkpoints in the session. The full-transcript counterpart (`CheckpointTranscriptStart`) avoids this problem by using absolute assignment rather than relative accumulation. The asymmetry between these two tracking mechanisms is the root architectural concern in this PR.</result>
+<usage><total_tokens>58685</total_tokens><tool_uses>28</tool_uses><duration_ms>273744</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>acbba643893e9f6ce</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/4d55b663-dd2c-4b14-8e57-9ac308f445b7/tasks/acbba643893e9f6ce.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review for PR #877" completed</summary>
+<result>The `NormalizeAfterLoad` does not attempt to migrate or set `CompactTranscriptStart` for legacy states, which is correct -- the field is left at its zero value for legacy sessions, and the `computeCompactTranscriptStart` function handles the recalculation on-the-fly when needed.
+
+I've now completed my thorough review. Let me summarize my findings.
+
+---
+
+## Review: PR #877 - Support `checkpoint_transcript_start` for compact transcript.jsonl files
+
+### Files Reviewed
+
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/checkpoint.go` - New `CompactTranscriptStart` field
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/v2_committed.go` - V2 /main uses compact offset
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/v2_store_test.go` - New test + test repo init refactor
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/migrate.go` - `computeCompactOffset` for migration
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/migrate_test.go` - Migration test
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go` - New `CompactTranscriptStart` state field
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state_test.go` - Normalization tests
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go` - Core logic: extracted helpers, offset computation, cumulative compact transcript
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_hooks.go` - State updates in condense and carry-forward paths
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_test.go` - Comprehensive multi-condensation test
+- `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_types.go` - `CompactTranscriptLines` in `CondenseResult`
+
+### Analysis Summary
+
+**No high-confidence issues found (confidence &gt;= 80).** The PR is well-designed and correctly implemented.
+
+Here is the detailed analysis of the key design decisions and correctness checks:
+
+**1. Offset computation correctness (verified)**
+
+The offset arithmetic is sound. For the compact transcript start calculation:
+- `fullLines = countCompactLines(fullCompact)` counts total lines in full cumulative compact
+- `scopedLines = countCompactLines(scopedCompact)` counts lines in the new-only compact
+- `offset = fullLines - scopedLines` gives the number of compact lines before this checkpoint's data
+- Negative offset is guarded with `if offset &lt; 0 { return 0 }` (fail-open)
+
+The `CompactTranscriptLines` in `CondenseResult` is computed as `fullLines - writeOpts.CompactTranscriptStart`, which correctly represents only the new compact lines added by this condensation. The accumulation `state.CompactTranscriptStart += result.CompactTranscriptLines` maintains the running total correctly.
+
+**2. V1 backward compatibility (verified)**
+
+V1 (`committed.go`) continues to use `opts.CheckpointTranscriptStart` (full.jsonl domain) at line 383. Only V2 (`v2_committed.go`) was changed to use `opts.CompactTranscriptStart` at line 385. The two fields are independent on `WriteCommittedOptions` and do not interfere.
+
+**3. Cumulative compact transcript approach (verified)**
+
+The design stores cumulative (startLine=0) compact transcripts on v2 /main, with `checkpoint_transcript_start` indicating where the new content begins. This is consistent with how v2 /main replaces the session's transcript.jsonl on each write. The test at line 4212 verifies the first checkpoint's content is a prefix of the second.
+
+**4. All state update paths covered (verified)**
+
+`CompactTranscriptStart` is updated in all 4 code paths that modify session state after condensation:
+- `condenseAndUpdateState` (hooks.go:1317) -- `+= result.CompactTranscriptLines`
+- `CondenseSessionByID` (condensation.go:1028) -- `+= result.CompactTranscriptLines`
+- `CondenseAndMarkFullyCondensed` (condensation.go:1137) -- `+= result.CompactTranscriptLines`
+- `carryForwardToNewShadowBranch` (hooks.go:2716) -- `= 0` (reset, matching `CheckpointTranscriptStart = 0`)
+
+Session initialization (`manual_commit_session.go:259`) correctly leaves `CompactTranscriptStart` at its zero value.
+
+**5. Legacy session handling (verified)**
+
+`computeCompactTranscriptStart` handles legacy sessions (where `state.CompactTranscriptStart == 0` but `state.CheckpointTranscriptStart &gt; 0`) by re-deriving the compact offset from the full vs. scoped compaction difference. This is the same approach used in `computeCompactOffset` in the migration path.
+
+**6. Failure modes (verified)**
+
+All failure modes are fail-open (return 0), which is safe -- the worst case is that the compact transcript metadata indicates "start from beginning", which means slightly more content is associated with a checkpoint but no data loss.
+
+**7. Test quality (verified)**
+
+The new tests are comprehensive:
+- `TestV2GitStore_WriteCommittedMain_UsesCompactTranscriptStart` verifies the v2 store correctly uses compact offset
+- `TestMigrateCheckpointsV2_UsesComputedCompactTranscriptStart` verifies migration computes correct offsets
+- `TestCondenseSession_V2CompactTranscriptStart` verifies the full multi-condensation flow end-to-end
+- Session state normalization tests verify `CompactTranscriptStart` is preserved/defaulted correctly
+
+Tests correctly follow CLAUDE.md conventions: `t.Parallel()` is used where appropriate, and omitted (correctly) where `t.Chdir()` is used.
+
+**8. Code quality (verified)**
+
+The refactoring extracts clean, well-named helper functions (`resolveShadowRef`, `filterFilesTouched`, `buildCompactTranscript`, `countCompactLines`, `computeCompactTranscriptStart`). Each has a clear single responsibility and good documentation. The `buildCompactTranscript` function correctly gates on `settings.IsCheckpointsV2Enabled` to avoid unnecessary work when v2 is disabled.
+
+The PR is clean, well-tested, and ready to merge.</result>
+<usage><total_tokens>97516</total_tokens><tool_uses>49</tool_uses><duration_ms>326712</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a1806deefbdace34c</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-502/-Users-ninawork-entire-devenv-cli/4d55b663-dd2c-4b14-8e57-9ac308f445b7/tasks/a1806deefbdace34c.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment accuracy review PR #877" completed</summary>
+<result>So `countTranscriptItems` counts lines in the JSONL format (for Claude Code and similar), or messages for Gemini/OpenCode. This count refers to the full transcript content, which is stored as `full.jsonl` on the checkpoint branches. The comment "Total lines in full.jsonl after this condensation" is accurate.
+
+However, there is a subtle precision concern: for Gemini and OpenCode agents, `countTranscriptItems` counts messages, not JSONL lines. The comment "Total lines in full.jsonl" is technically inaccurate for those agents since they don't use JSONL format. But since this field is used for `CheckpointTranscriptStart` (which scopes transcripts), the "lines" here refers to the agent-specific unit. This is a pre-existing imprecision, not introduced by this PR.
+
+Let me now compile all findings. Let me check one final thing -- whether `CompactTranscriptLines` really represents "Lines in the compact transcript written for this checkpoint" and not "total compact lines".
+
+Looking at the computation again (line 268-272):
+```go
+compactLines := 0
+if writeOpts.CompactTranscript != nil {
+    fullLines := countCompactLines(writeOpts.CompactTranscript)
+    compactLines = fullLines - writeOpts.CompactTranscriptStart
+}
+```
+
+`writeOpts.CompactTranscript` is the full cumulative compact (startLine=0). `countCompactLines` counts all newlines in it. `writeOpts.CompactTranscriptStart` is the compact offset (lines before this checkpoint). So `compactLines = total_cumulative_lines - lines_before_checkpoint = lines_for_this_checkpoint`. The comment "Lines in the compact transcript written for this checkpoint" is accurate.
+
+But wait -- the comment says "written for this checkpoint." Technically, what's written to storage is the full cumulative compact (all lines, including prior ones), not just this checkpoint's lines. The compact data "written for this checkpoint" is the full cumulative, but the `CompactTranscriptLines` field counts only the new/scoped lines. The word "written" could be misleading -- it's the number of new lines contributed by this checkpoint, not the total bytes written. Let me consider whether this is genuinely confusing.
+
+The field name `CompactTranscriptLines` and comment "Lines in the compact transcript written for this checkpoint (0 if v2 disabled)" -- a reader might interpret "written for this checkpoint" as "the total number of compact lines in the file written for this checkpoint," which would be the full cumulative count. But the actual value is the delta (new lines only). This could be a source of confusion.
+
+Here is my complete analysis:
+
+---
+
+**Summary**
+
+I reviewed 14 comments across 5 files in PR #877, which introduces `CompactTranscriptStart` tracking for v2 checkpoint metadata. The PR adds a parallel line-offset tracking system for compact transcripts (transcript.jsonl) alongside the existing full-transcript offset tracking (full.jsonl). The comments are generally well-written and accurately describe the code. I found one potentially misleading comment, one minor precision issue, and several comments that serve as good examples of documentation done right.
+
+---
+
+**Critical Issues**
+
+None found. All comments verified as factually correct against the code implementation.
+
+---
+
+**Improvement Opportunities**
+
+**1. `CompactTranscriptLines` comment is slightly ambiguous about "written"**
+
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_types.go:57`
+- Current: `CompactTranscriptLines int // Lines in the compact transcript written for this checkpoint (0 if v2 disabled)`
+- Issue: The word "written" could mislead a reader into thinking this is the total number of compact lines in the file that was written to storage for this checkpoint. In reality, it is the **delta** -- the number of new compact lines contributed by this checkpoint alone. The file actually written to `/main` is the full cumulative compact transcript (which includes all prior checkpoint content), but this field counts only the new portion. This distinction matters because consumers do `state.CompactTranscriptStart += result.CompactTranscriptLines`, which only works correctly if this is the delta.
+- Suggestion: `CompactTranscriptLines int // New compact transcript lines added by this checkpoint (0 if v2 disabled); used to increment CompactTranscriptStart`
+
+**2. "Generate scoped compact (only new content) for line counting and offset calculation" is slightly imprecise**
+
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go:348`
+- Current: `// Generate scoped compact (only new content) for line counting and offset calculation.`
+- Issue: The scoped compact is not used directly for "line counting" in the caller. It is passed to `computeCompactTranscriptStart`, which internally counts its lines as part of an offset calculation. The phrase "line counting and offset calculation" suggests two distinct uses, when there is really only one use: offset calculation (which happens to involve counting lines internally).
+- Suggestion: `// Generate scoped compact (only new content) for offset calculation in computeCompactTranscriptStart.`
+
+**3. `TotalTranscriptLines` comment says "full.jsonl" but non-JSONL agents exist**
+
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_types.go:56`
+- Current: `TotalTranscriptLines int // Total lines in full.jsonl after this condensation`
+- Issue: The PR changed the comment from "Total lines in transcript" to "Total lines in full.jsonl." While this usefully disambiguates from the compact transcript, it is technically inaccurate for Gemini (which uses a JSON object with a messages array) and OpenCode (which uses an export JSON format). For those agents, `countTranscriptItems` counts messages, not JSONL lines. This is a pre-existing imprecision that was made slightly worse by the more specific wording.
+- Suggestion: `TotalTranscriptLines int // Total items in the full transcript after this condensation (JSONL line count for most agents, message count for Gemini/OpenCode)`
+- Alternative (simpler): `TotalTranscriptLines int // Total transcript items in full.jsonl after this condensation (sets CheckpointTranscriptStart for next cycle)`
+
+---
+
+**Recommended Removals**
+
+None. All comments reviewed provide genuine value by explaining the dual v1/v2 write model, distinguishing between compact and full transcript offsets, or clarifying fallback behavior for legacy sessions.
+
+---
+
+**Positive Findings**
+
+**1. `computeCompactTranscriptStart` doc comment is excellent.**
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go:1228-1233`
+- This comment clearly explains the priority chain (preferred source, legacy fallback, fail-open default), making the function's behavior predictable without reading the implementation. The "fail-open" framing is particularly good for a function with error-handling semantics.
+
+**2. `CompactTranscriptStart` comment in `checkpoint.go` accurately describes the v1/v2 split.**
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/checkpoint/checkpoint.go:276-278`
+- The comment concisely explains which write path uses this field and how it differs from `CheckpointTranscriptStart`. I verified this against the actual code: `committed.go` (v1) uses `opts.CheckpointTranscriptStart` at line 383, while `v2_committed.go` uses `opts.CompactTranscriptStart` at line 385.
+
+**3. `filterFilesTouched` doc comment correctly documents both code paths.**
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go:300-302`
+- The comment covers both the normal narrowing case and the empty-FilesTouched fallback case in a single sentence pair, matching the if/else structure of the implementation.
+
+**4. The inline comment at line 266-267 explaining why scoped lines are counted is valuable.**
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go:266-267`
+- `// Count scoped (new-only) compact lines, not full compact lines, so state.CompactTranscriptStart accumulates correctly.`
+- This "why" comment prevents a future maintainer from mistakenly switching to full compact line counting, which would break the accumulation pattern used across three call sites.
+
+**5. The "Generate full compact (cumulative) for storage" comment explains a non-obvious design decision.**
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/strategy/manual_commit_condensation.go:350-352`
+- The explanation that "v2 /main replaces the session's transcript.jsonl on each write, so we must include all prior content" gives the architectural rationale that would otherwise require reading the v2 write implementation to understand.
+
+**6. `computeCompactOffset` in `migrate.go` accurately describes the subtraction-based algorithm.**
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/migrate.go:451-453`
+- The comment makes the mathematical relationship explicit: offset = fullCompactLines - scopedCompactLines = lines before this checkpoint's data. This matches the implementation exactly.
+
+**7. `CompactTranscriptStart` comment in `session/state.go` correctly documents the parallel tracking.**
+- Location: `/Users/ninawork/entire/devenv/cli/cmd/entire/cli/session/state.go:112-114`
+- The comment explicitly calls out that this "parallels CheckpointTranscriptStart (full.jsonl)" and "is updated after each condensation," both of which are verifiable in the code (the `+=` pattern at three call sites and the reset to 0 in `carryForwardToNewShadowBranch`).</result>
+<usage><total_tokens>63733</total_tokens><tool_uses>42</tool_uses><duration_ms>344387</duration_ms></usage>
+</task-notification>

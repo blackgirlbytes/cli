@@ -1,0 +1,200 @@
+Implement the following plan:
+
+# Plan: Detect and repair disconnected metadata branches during CLI commands
+
+## Context
+
+PR #511 prevents the empty-orphan bug going forward, but users who already hit the bug and continued working have a local `entire/checkpoints/v1` with real checkpoint data on a completely disconnected history from remote (no common ancestor). Currently PR #518 handles this in `EnsureMetadataBranch` during `entire enable`, but this is the wrong place — detection should happen during the CLI commands that actually need the metadata branch (explain, rewind, resume, etc.).
+
+**Diverged is fine** — local and remote share a common ancestor but each has unique commits. This is normal multi-dev flow, handled by the push path's tree merge. **Disconnected is the bug state** — no common ancestor, only caused by the empty-orphan bug. This needs detection and repair.
+
+## Approach
+
+### Detection
+
+Check if local and remote `entire/checkpoints/v1` are disconnected using `git merge-base`:
+
+```
+git merge-base <local-hash> <remote-hash>
+```
+- Exit 0 → shares ancestry (diverged or one is ancestor of other) → no action
+- Exit non-zero, no output → disconnected → repair needed
+
+### Repair: cherry-pick local commits onto remote tip
+
+1. Walk local branch from tip to root, collect commits (oldest-first)
+2. Skip the initial empty orphan commit (empty tree, no useful data)
+3. Reset local branch to remote tip
+4. For each local commit:
+   - Compute new entries: flatten commit's tree, subtract parent's tree entries
+   - Apply new entries onto current tip's tree
+   - Create new commit preserving original message/author
+5. Update local branch ref
+
+This works because checkpoint shards are unique paths (`<id[:2]>/<id[2:]>/`) — cherry-picks always apply cleanly. Preserves linear commit history and individual commit messages.
+
+### Where detection runs
+
+**Once per process**, triggered at the strategy layer when the checkpoint store is first accessed. Uses `sync.Once` to avoid redundant `git merge-base` calls.
+
+**Call sites:**
+1. `ManualCommitStrategy.getCheckpointStore()` (`manual_commit.go:47`) — covers all strategy-mediated reads and writes (explain, rewind, resume, clean, condensation)
+2. `getBranchCheckpoints()` (`explain.go:888`) — bypasses strategy, creates own GitStore
+3. `ListCheckpoints()` (`strategy/common.go:112`) — opens own repo, reads branch directly
+
+### User-facing output
+
+```
+[entire] Detected disconnected session metadata (local and remote share no common ancestor)
+[entire] Cherry-picking 3 local checkpoint(s) onto remote...
+[entire] Done — all local and remote checkpoints preserved
+```
+
+## Files to modify
+
+### New file: `cmd/entire/cli/strategy/metadata_reconcile.go`
+
+Detection + cherry-pick repair:
+
+- `ReconcileDisconnectedMetadataBranch(repo *git.Repository) error` — main function
+- `isDisconnected(repoPath, hashA, hashB string) bool` — uses `git merge-base` (not `--is-ancestor`)
+- `collectCommitChain(repo, ref) []*object.Commit` — walks parents to root, returns oldest-first
+- `cherryPickOnto(repo, base plumbing.Hash, commits []*object.Commit) (plumbing.Hash, error)` — applies each commit's new entries onto base
+
+Reuses: `checkpoint.FlattenTree()`, `checkpoint.BuildTreeFromEntries()`, `GetGitAuthorFromRepo()`
+
+### New file: `cmd/entire/cli/strategy/metadata_reconcile_test.go`
+
+Tests using existing `initBareWithMetadataBranch` and `cloneWithConfig` helpers:
+
+- `TestReconcileDisconnected_NoRemote` — no-op
+- `TestReconcileDisconnected_NoLocal` — no-op
+- `TestReconcileDisconnected_SameHash` — no-op
+- `TestReconcileDisconnected_SharedAncestry` — no-op (diverged, not disconnected)
+- `TestReconcileDisconnected_Disconnected` — creates disconnected orphan with local checkpoint, verifies after repair: linear history on top of remote, both local and remote data present
+- `TestReconcileDisconnected_MultipleLocalCheckpoints` — 3 local commits, all cherry-picked
+
+### Modify: `cmd/entire/cli/strategy/common.go`
+
+- Add package-level `sync.Once` gate: `ensureMetadataReconciled(repo)`
+- Export: `EnsureMetadataReconciled(repo *git.Repository) error` — for callers outside strategy package
+- Remove `syncMetadataBranch` call from `EnsureMetadataBranch` (move that logic to the new reconcile function)
+- Keep `isAncestorCLI` — still useful for the fast-forward case
+- Add reconciliation call to `ListCheckpoints()`
+
+### Modify: `cmd/entire/cli/strategy/manual_commit.go`
+
+In `getCheckpointStore()`, add after `OpenRepository`:
+```go
+if err := ensureMetadataReconciled(repo); err != nil {
+    fmt.Fprintf(os.Stderr, "[entire] Warning: %v\n", err)
+}
+```
+
+### Modify: `cmd/entire/cli/explain.go`
+
+In `getBranchCheckpoints()`, add before `checkpoint.NewGitStore(repo)`:
+```go
+if err := strategy.EnsureMetadataReconciled(repo); err != nil {
+    // Log but don't fail — reads may still work
+}
+```
+
+## What happens in `EnsureMetadataBranch` after this change
+
+`EnsureMetadataBranch` (called during `enable`) keeps only:
+- Create local from remote when local doesn't exist (PR #511)
+- Replace empty orphan with remote (PR #516)
+- Create empty orphan when neither exists
+- Error handling for non-ref-not-found errors
+
+The disconnected/diverged reconciliation logic (`syncMetadataBranch`) is removed — that responsibility moves to `ReconcileDisconnectedMetadataBranch`.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Specific tests:
+```bash
+go test ./cmd/entire/cli/strategy/ -run TestReconcileDisconnected -v
+```
+
+Manual verification:
+1. Clone repo with remote checkpoints
+2. Create disconnected local branch (orphan with different data)
+3. Run `go run ./cmd/entire explain --no-pager --commit <hash>`
+4. Verify reconciliation message appears and explain succeeds
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dvydra/.claude/projects/-Users-dvydra-src-cli/229c0af5-5604-44a0-a6ae-795bdcb0d95b.jsonl
+
+---
+
+create the PR
+
+---
+
+wait - are there aother commits from before now on this branhc? do you still need them? e2aa1739c0e366d5826805223537082a270b28c3 and e2aa1739c0e366d5826805223537082a270b28c3
+
+---
+
+make sure the active logic is all capture in the PR Text
+
+---
+
+can you review this 
+
+https://github.com/entireio/cli/pull/533#discussion_r2861704417
+
+Is that a new problem or something where you should be checking the error type
+
+---
+
+cool. now let's do this one
+
+isDisconnected returns true for any non-zero exit from git merge-base, but git merge-base uses exit code 1 for "no common ancestor" and exit code 128+ for actual errors (corrupt repo, invalid hash, context timeout). Since the function has a 10-second timeout, a slow git merge-base invocation or any other transient error will be misinterpreted as "disconnected," which triggers the cherry-pick branch rewrite in ReconcileDisconnectedMetadataBranch. Distinguishing exit code 1 from other non-zero codes would prevent spurious reconciliation.
+
+---
+
+this is comment a problem for the Entire usecase?
+
+This “new entries only” diff (paths present in commit but not in parent) drops modifications and deletions. Metadata commits can replace existing blobs and delete old chunk files (e.g., UpdateCommitted/Finalize transcript), so reconciliation would lose updates and/or leave stale files. Compute/apply a full diff vs parent (adds + modifies + deletes) instead of additions-only.
+
+---
+
+does this complicate the cherry-picking and mean it might fail in some conditions?
+
+---
+
+If isEmptyMetadataBranch fails, EnsureMetadataBranch silently skips updating the empty orphan from remote. That can leave the repo in a broken state and hide corruption/missing objects. If checkErr != nil, return a wrapped error so callers can surface/handle it.
+
+---
+
+is this a problem?
+
+EnsureMetadataReconciled declares reconcileErr as a local variable on each invocation. On the first call, sync.Once executes the closure and sets it. On subsequent calls, reconcileOnce.Do is a no-op, so reconcileErr stays at its zero value (nil). This means if reconciliation fails, only the first caller sees the error — all later callers silently receive nil, and reconciliation is never retried.
+
+---
+
+did we already fix this
+
+If isEmptyMetadataBranch fails, EnsureMetadataBranch silently skips updating the empty orphan from remote. That can leave the repo in a broken state and hide corruption/missing objects. If checkErr != nil, return a wrapped error so callers can surface/handle it.
+
+---
+
+and this one? 
+
+ReconcileDisconnectedMetadataBranch treats any error reading the local metadata ref as “no local branch” and returns nil. This can silently ignore real repository/ref store errors. Only treat plumbing.ErrReferenceNotFound as the expected no-branch case; otherwise return a wrapped error.
+
+---
+
+Okay, do a holistic review of the whole PR. And paste the results here.
+
+---
+
+1. [metadata_reconcile_test.go:405-414] Fragile file-creation logic uses error as control flow
+
+  The test tries to write a file, catches the error to create the directory, then retries.
+  Should just be os.MkdirAll then os.WriteFile.

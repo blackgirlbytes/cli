@@ -1,0 +1,413 @@
+<git_diff_from_branch_to_main>
+  Relevant Diff: The following is the git diff from the current branch to the main/default branch:
+
+diff --git a/cmd/entire/cli/checkpoint/checkpoint.go b/cmd/entire/cli/checkpoint/checkpoint.go
+index a2a102415..3728c8d66 100644
+--- a/cmd/entire/cli/checkpoint/checkpoint.go
++++ b/cmd/entire/cli/checkpoint/checkpoint.go
+@@ -273,6 +273,11 @@ type WriteCommittedOptions struct {
+ 	// CheckpointTranscriptStart is written to both CommittedMetadata.CheckpointTranscriptStart
+ 	// and the deprecated CommittedMetadata.TranscriptLinesAtStart for backward compatibility.
+ 
++	// CompactTranscriptStart is the transcript.jsonl line offset at checkpoint start.
++	// V2 /main writes this to checkpoint_transcript_start; v1 continues to use
++	// CheckpointTranscriptStart (full.jsonl).
++	CompactTranscriptStart int
++
+ 	// TokenUsage contains the token usage for this checkpoint
+ 	TokenUsage *agent.TokenUsage
+ 
+diff --git a/cmd/entire/cli/checkpoint/v2_committed.go b/cmd/entire/cli/checkpoint/v2_committed.go
+index 823504462..4384ed2a2 100644
+--- a/cmd/entire/cli/checkpoint/v2_committed.go
++++ b/cmd/entire/cli/checkpoint/v2_committed.go
+@@ -381,7 +381,7 @@ func (s *V2GitStore) writeMainSessionToSubdirectory(opts WriteCommittedOptions,
+ 		IsTask:                      opts.IsTask,
+ 		ToolUseID:                   opts.ToolUseID,
+ 		TranscriptIdentifierAtStart: opts.TranscriptIdentifierAtStart,
+-		CheckpointTranscriptStart:   opts.CheckpointTranscriptStart,
++		CheckpointTranscriptStart:   opts.CompactTranscriptStart,
+ 		TokenUsage:                  opts.TokenUsage,
+ 		SessionMetrics:              opts.SessionMetrics,
+ 		InitialAttribution:          opts.InitialAttribution,
+diff --git a/cmd/entire/cli/checkpoint/v2_store_test.go b/cmd/entire/cli/checkpoint/v2_store_test.go
+index 3e4887713..41971a8d7 100644
+--- a/cmd/entire/cli/checkpoint/v2_store_test.go
++++ b/cmd/entire/cli/checkpoint/v2_store_test.go
+@@ -379,6 +379,42 @@ func TestV2GitStore_WriteCommittedMain_NoCompactTranscript_SkipsGracefully(t *te
+ 	assert.Error(t, err, "transcript.jsonl should not exist when CompactTranscript is nil")
+ }
+ 
++func TestV2GitStore_WriteCommittedMain_UsesCompactTranscriptStart(t *testing.T) {
++	t.Parallel()
++	repo := initTestRepo(t)
++	store := NewV2GitStore(repo, "origin")
++	ctx := context.Background()
++
++	cpID := id.MustCheckpointID("a1b2c3d4e5f7")
++	compactData := []byte("{\"v\":1,\"type\":\"user\",\"content\":\"hello\"}\n{\"v\":1,\"type\":\"assistant\",\"content\":\"hi\"}\n")
++
++	_, err := store.writeCommittedMain(ctx, WriteCommittedOptions{
++		CheckpointID:              cpID,
++		SessionID:                 "test-session-compact-start",
++		Strategy:                  "manual-commit",
++		Transcript:                []byte(`{"type":"human","message":"hello"}`),
++		CompactTranscript:         compactData,
++		Prompts:                   []string{"hello"},
++		AuthorName:                "Test",
++		AuthorEmail:               "test@test.com",
++		CheckpointTranscriptStart: 42, // full.jsonl offset (must not be used in v2 metadata)
++		CompactTranscriptStart:    15, // transcript.jsonl offset (must be used in v2 metadata)
++	})
++	require.NoError(t, err)
++
++	tree := v2MainTree(t, repo)
++	cpPath := cpID.Path()
++
++	// Read session metadata from /main
++	metadataContent := v2ReadFile(t, tree, cpPath+"/0/"+paths.MetadataFileName)
++	var metadata CommittedMetadata
++	require.NoError(t, json.Unmarshal([]byte(metadataContent), &metadata))
++
++	// v2 should store the compact offset, not the full transcript offset.
++	assert.Equal(t, 15, metadata.CheckpointTranscriptStart,
++		"v2 /main metadata should use CompactTranscriptStart for checkpoint_transcript_start")
++}
++
+ func TestV2GitStore_UpdateCommitted_WritesCompactTranscript(t *testing.T) {
+ 	t.Parallel()
+ 	repo := initTestRepo(t)
+diff --git a/cmd/entire/cli/session/state.go b/cmd/entire/cli/session/state.go
+index 79e01eb05..a83c493f3 100644
+--- a/cmd/entire/cli/session/state.go
++++ b/cmd/entire/cli/session/state.go
+@@ -109,6 +109,11 @@ type State struct {
+ 	// against this value without reading the full transcript content.
+ 	CheckpointTranscriptSize int64 `json:"checkpoint_transcript_size,omitempty"`
+ 
++	// CompactTranscriptStart is the transcript.jsonl line offset where the current
++	// checkpoint cycle began. It parallels CheckpointTranscriptStart (full.jsonl)
++	// and is updated after each condensation.
++	CompactTranscriptStart int `json:"compact_transcript_start,omitempty"`
++
+ 	// Deprecated: CondensedTranscriptLines is replaced by CheckpointTranscriptStart.
+ 	// Kept for backward compatibility with existing state files.
+ 	// Use NormalizeAfterLoad() to migrate.
+@@ -234,6 +239,12 @@ func (s *State) NormalizeAfterLoad(ctx context.Context) {
+ 			s.CheckpointTranscriptStart = s.TranscriptLinesAtStart
+ 		}
+ 	}
++	// Backfill CompactTranscriptStart for legacy sessions so v2 incremental scoping
++	// does not regress to zero on first post-upgrade condensation.
++	// Legacy state has no compact-specific offset, so we reuse checkpoint start.
++	if s.CompactTranscriptStart == 0 && s.CheckpointTranscriptStart > 0 {
++		s.CompactTranscriptStart = s.CheckpointTranscriptStart
++	}
+ 	// Clear deprecated fields so they aren't re-persisted.
+ 	// Note: this is a one-way migration. If the state is re-saved, older CLI versions
+ 	// will see 0 for these fields and fall back to scoping from the transcript start.
+diff --git a/cmd/entire/cli/session/state_test.go b/cmd/entire/cli/session/state_test.go
+index b4742c96b..7fee6e7cf 100644
+--- a/cmd/entire/cli/session/state_test.go
++++ b/cmd/entire/cli/session/state_test.go
+@@ -77,6 +77,25 @@ func TestState_NormalizeAfterLoad(t *testing.T) {
+ 		assert.Equal(t, 200, state.CheckpointTranscriptStart)
+ 		assert.Equal(t, 0, state.TranscriptLinesAtStart)
+ 	})
++
++	t.Run("backfills_CompactTranscriptStart_from_CheckpointTranscriptStart", func(t *testing.T) {
++		t.Parallel()
++		state := &State{
++			CheckpointTranscriptStart: 120,
++		}
++		state.NormalizeAfterLoad(context.Background())
++		assert.Equal(t, 120, state.CompactTranscriptStart)
++	})
++
++	t.Run("preserves_existing_CompactTranscriptStart", func(t *testing.T) {
++		t.Parallel()
++		state := &State{
++			CheckpointTranscriptStart: 120,
++			CompactTranscriptStart:    45,
++		}
++		state.NormalizeAfterLoad(context.Background())
++		assert.Equal(t, 45, state.CompactTranscriptStart)
++	})
+ }
+ 
+ func TestState_NormalizeAfterLoad_JSONRoundTrip(t *testing.T) {
+@@ -84,30 +103,41 @@ func TestState_NormalizeAfterLoad_JSONRoundTrip(t *testing.T) {
+ 		name        string
+ 		json        string
+ 		wantCTS     int // CheckpointTranscriptStart
++		wantCompact int // CompactTranscriptStart
+ 		wantStep    int // StepCount
+ 	}{
+ 		{
+ 			name:     "migrates old condensed_transcript_lines",
+ 			json:     `{"session_id":"s1","condensed_transcript_lines":42,"checkpoint_count":5}`,
+ 			wantCTS:  42,
++			wantCompact: 42,
+ 			wantStep: 5,
+ 		},
+ 		{
+ 			name:        "migrates old transcript_lines_at_start",
+ 			json:        `{"session_id":"s1","transcript_lines_at_start":75}`,
+ 			wantCTS:     75,
++			wantCompact: 75,
+ 		},
+ 		{
+ 			name:        "preserves new field over old",
+ 			json:        `{"session_id":"s1","condensed_transcript_lines":10,"checkpoint_transcript_start":50}`,
+ 			wantCTS:     50,
++			wantCompact: 50,
+ 		},
+ 		{
+ 			name:        "handles clean new format",
+ 			json:        `{"session_id":"s1","checkpoint_transcript_start":25,"checkpoint_count":3}`,
+ 			wantCTS:     25,
++			wantCompact: 25,
+ 			wantStep:    3,
+ 		},
++		{
++			name:        "preserves explicit compact_transcript_start",
++			json:        `{"session_id":"s1","checkpoint_transcript_start":25,"compact_transcript_start":9}`,
++			wantCTS:     25,
++			wantCompact: 9,
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+@@ -117,6 +147,7 @@ func TestState_NormalizeAfterLoad_JSONRoundTrip(t *testing.T) {
+ 			state.NormalizeAfterLoad(context.Background())
+ 
+ 			assert.Equal(t, tt.wantCTS, state.CheckpointTranscriptStart)
++			assert.Equal(t, tt.wantCompact, state.CompactTranscriptStart)
+ 			assert.Equal(t, tt.wantStep, state.StepCount)
+ 			assert.Equal(t, 0, state.CondensedTranscriptLines, "deprecated field should be cleared")
+ 			assert.Equal(t, 0, state.TranscriptLinesAtStart, "deprecated field should be cleared")
+diff --git a/cmd/entire/cli/strategy/manual_commit_condensation.go b/cmd/entire/cli/strategy/manual_commit_condensation.go
+index 20dcf55c8..9dadef6eb 100644
+--- a/cmd/entire/cli/strategy/manual_commit_condensation.go
++++ b/cmd/entire/cli/strategy/manual_commit_condensation.go
+@@ -1,6 +1,7 @@
+ package strategy
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+@@ -248,6 +249,7 @@ func (s *ManualCommitStrategy) CondenseSession(ctx context.Context, repo *git.Re
+ 		redactedForCompact = nil
+ 	}
+ 	writeOpts.CompactTranscript = compactTranscriptForV2(ctx, ag, redactedForCompact, state.CheckpointTranscriptStart)
++	writeOpts.CompactTranscriptStart = state.CompactTranscriptStart
+ 
+ 	// Write checkpoint metadata to v1 branch
+ 	if err := store.WriteCommitted(ctx, writeOpts); err != nil {
+@@ -256,6 +258,11 @@ func (s *ManualCommitStrategy) CondenseSession(ctx context.Context, repo *git.Re
+ 
+ 	writeCommittedV2IfEnabled(ctx, repo, writeOpts)
+ 
++	compactLines := 0
++	if writeOpts.CompactTranscript != nil {
++		compactLines = countCompactLines(writeOpts.CompactTranscript)
++	}
++
+ 	return &CondenseResult{
+ 		CheckpointID:           checkpointID,
+ 		SessionID:              state.SessionID,
+@@ -263,6 +270,7 @@ func (s *ManualCommitStrategy) CondenseSession(ctx context.Context, repo *git.Re
+ 		FilesTouched:           sessionData.FilesTouched,
+ 		Prompts:                sessionData.Prompts,
+ 		TotalTranscriptLines:   sessionData.FullTranscriptLines,
++		CompactTranscriptLines: compactLines,
+ 		Transcript:             sessionData.Transcript,
+ 	}, nil
+ }
+@@ -926,6 +934,7 @@ func (s *ManualCommitStrategy) CondenseSessionByID(ctx context.Context, sessionI
+ 	// Update session state: reset step count and transition to idle
+ 	state.StepCount = 0
+ 	state.CheckpointTranscriptStart = result.TotalTranscriptLines
++	state.CompactTranscriptStart += result.CompactTranscriptLines
+ 	state.CheckpointTranscriptSize = int64(len(result.Transcript))
+ 	state.Phase = session.PhaseIdle
+ 	state.LastCheckpointID = checkpointID
+@@ -1034,6 +1043,7 @@ func (s *ManualCommitStrategy) CondenseAndMarkFullyCondensed(ctx context.Context
+ 	// Update state — keep Phase = ENDED (unlike CondenseSessionByID which sets IDLE)
+ 	state.StepCount = 0
+ 	state.CheckpointTranscriptStart = result.TotalTranscriptLines
++	state.CompactTranscriptStart += result.CompactTranscriptLines
+ 	state.LastCheckpointID = checkpointID
+ 	state.AttributionBaseCommit = state.BaseCommit
+ 	state.PromptAttributions = nil
+@@ -1119,6 +1129,11 @@ func compactTranscriptForV2(ctx context.Context, ag agent.Agent, transcript []by
+ 	return compacted
+ }
+ 
++// countCompactLines returns line count for compact transcript JSONL.
++func countCompactLines(compactTranscript []byte) int {
++	return bytes.Count(compactTranscript, []byte{'\n'})
++}
++
+ // writeCommittedV2IfEnabled writes checkpoint data to v2 refs when checkpoints_v2
+ // is enabled in settings. Failures are logged as warnings — v2 writes are
+ // best-effort during the dual-write period and must not block the v1 path.
+diff --git a/cmd/entire/cli/strategy/manual_commit_hooks.go b/cmd/entire/cli/strategy/manual_commit_hooks.go
+index e28bdce10..fbe78f8f3 100644
+--- a/cmd/entire/cli/strategy/manual_commit_hooks.go
++++ b/cmd/entire/cli/strategy/manual_commit_hooks.go
+@@ -1289,6 +1289,7 @@ func (s *ManualCommitStrategy) condenseAndUpdateState(
+ 	state.AttributionBaseCommit = newHead
+ 	state.StepCount = 0
+ 	state.CheckpointTranscriptStart = result.TotalTranscriptLines
++	state.CompactTranscriptStart += result.CompactTranscriptLines
+ 	state.CheckpointTranscriptSize = int64(len(result.Transcript))
+ 
+ 	// Clear attribution tracking — condensation already used these values
+@@ -2649,6 +2650,7 @@ func (s *ManualCommitStrategy) carryForwardToNewShadowBranch(
+ 	// but this would complicate checkpoint retrieval and require careful tracking of dependencies.
+ 	state.StepCount = 1
+ 	state.CheckpointTranscriptStart = 0
++	state.CompactTranscriptStart = 0
+ 	state.CheckpointTranscriptSize = 0
+ 	state.LastCheckpointID = ""
+ 	// NOTE: TurnCheckpointIDs is intentionally NOT cleared here. Those checkpoint
+diff --git a/cmd/entire/cli/strategy/manual_commit_test.go b/cmd/entire/cli/strategy/manual_commit_test.go
+index b5e5c8a5c..24443dff1 100644
+--- a/cmd/entire/cli/strategy/manual_commit_test.go
++++ b/cmd/entire/cli/strategy/manual_commit_test.go
+@@ -4028,6 +4028,114 @@ func TestCondenseSession_V2DualWrite(t *testing.T) {
+ 	require.NoError(t, err, "full.jsonl should exist on /full/current")
+ }
+ 
++// TestCondenseSession_V2CompactTranscriptStart verifies v2 /main writes
++// checkpoint_transcript_start from compact transcript offset, not full.jsonl offset.
++func TestCondenseSession_V2CompactTranscriptStart(t *testing.T) {
++	dir := t.TempDir()
++	repo, err := git.PlainInit(dir, false)
++	require.NoError(t, err)
++
++	worktree, err := repo.Worktree()
++	require.NoError(t, err)
++
++	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main"), 0o644))
++	_, err = worktree.Add("main.go")
++	require.NoError(t, err)
++	commitHash, err := worktree.Commit("Initial commit", &git.CommitOptions{
++		Author: &object.Signature{Name: "Test", Email: "test@test.com", When: time.Now()},
++	})
++	require.NoError(t, err)
++
++	t.Chdir(dir)
++
++	// Enable checkpoints_v2 via settings
++	entireDir := filepath.Join(dir, ".entire")
++	require.NoError(t, os.MkdirAll(entireDir, 0o755))
++	settingsJSON := `{"enabled": true, "strategy": "manual-commit", "strategy_options": {"checkpoints_v2": true}}`
++	require.NoError(t, os.WriteFile(filepath.Join(entireDir, "settings.json"), []byte(settingsJSON), 0o644))
++
++	s := &ManualCommitStrategy{}
++	sessionID := "2025-01-15-test-v2-compact-start"
++
++	// Create metadata directory with transcript
++	metadataDir := ".entire/metadata/" + sessionID
++	metadataDirAbs := filepath.Join(dir, metadataDir)
++	require.NoError(t, os.MkdirAll(metadataDirAbs, 0o755))
++
++	transcript := `{"type":"human","message":{"content":"hello"}}
++{"type":"assistant","message":{"content":"hi there"}}
++`
++	require.NoError(t, os.WriteFile(filepath.Join(metadataDirAbs, paths.TranscriptFileName), []byte(transcript), 0o644))
++
++	// SaveStep to create shadow branch
++	err = s.SaveStep(context.Background(), StepContext{
++		SessionID:      sessionID,
++		ModifiedFiles:  []string{"main.go"},
++		MetadataDir:    metadataDir,
++		MetadataDirAbs: metadataDirAbs,
++		CommitMessage:  "Checkpoint 1",
++		AuthorName:     "Test",
++		AuthorEmail:    "test@test.com",
++	})
++	require.NoError(t, err)
++
++	state, err := s.loadSessionState(context.Background(), sessionID)
++	require.NoError(t, err)
++	state.TranscriptPath = filepath.Join(metadataDirAbs, paths.TranscriptFileName)
++	state.BaseCommit = commitHash.String()[:7]
++	state.AgentType = agent.AgentTypeClaudeCode
++
++	// First condensation starts at compact offset 0.
++	checkpointID := id.MustCheckpointID("cc11dd22ee33")
++	result, err := s.CondenseSession(context.Background(), repo, checkpointID, state, nil)
++	require.NoError(t, err)
++	require.NotNil(t, result)
++
++	// v2 /main should have checkpoint_transcript_start = 0 for first checkpoint.
++	v2MainRef, err := repo.Reference(plumbing.ReferenceName(paths.V2MainRefName), true)
++	require.NoError(t, err)
++	v2MainCommit, err := repo.CommitObject(v2MainRef.Hash())
++	require.NoError(t, err)
++	v2MainTree, err := v2MainCommit.Tree()
++	require.NoError(t, err)
++
++	cpPath := checkpointID.Path()
++	sessionTree, err := v2MainTree.Tree(cpPath + "/0")
++	require.NoError(t, err)
++	metadataFile, err := sessionTree.File(paths.MetadataFileName)
++	require.NoError(t, err)
++	metadataContent, err := metadataFile.Contents()
++	require.NoError(t, err)
++
++	var v2Metadata checkpoint.CommittedMetadata
++	require.NoError(t, json.Unmarshal([]byte(metadataContent), &v2Metadata))
++	require.Equal(t, 0, v2Metadata.CheckpointTranscriptStart,
++		"first checkpoint v2 metadata should have checkpoint_transcript_start=0")
++
++	// Read v1 metadata for comparison.
++	v1Ref, err := repo.Reference(plumbing.NewBranchReferenceName(paths.MetadataBranchName), true)
++	require.NoError(t, err)
++	v1Commit, err := repo.CommitObject(v1Ref.Hash())
++	require.NoError(t, err)
++	v1Tree, err := v1Commit.Tree()
++	require.NoError(t, err)
++	v1SessionTree, err := v1Tree.Tree(cpPath + "/0")
++	require.NoError(t, err)
++	v1MetadataFile, err := v1SessionTree.File(paths.MetadataFileName)
++	require.NoError(t, err)
++	v1MetadataContent, err := v1MetadataFile.Contents()
++	require.NoError(t, err)
++
++	var v1Metadata checkpoint.CommittedMetadata
++	require.NoError(t, json.Unmarshal([]byte(v1MetadataContent), &v1Metadata))
++	require.Equal(t, 0, v1Metadata.CheckpointTranscriptStart,
++		"first checkpoint v1 metadata should also have checkpoint_transcript_start=0")
++
++	// Verify compact transcript lines were counted in the result
++	require.Positive(t, result.CompactTranscriptLines,
++		"CondenseResult should report compact transcript lines")
++}
++
+ // TestCondenseSession_V2Disabled_NoV2Refs verifies that when checkpoints_v2 is
+ // not enabled, CondenseSession only writes to v1 and does not create v2 refs.
+ func TestCondenseSession_V2Disabled_NoV2Refs(t *testing.T) {
+diff --git a/cmd/entire/cli/strategy/manual_commit_types.go b/cmd/entire/cli/strategy/manual_commit_types.go
+index 65d490157..96d92e36f 100644
+--- a/cmd/entire/cli/strategy/manual_commit_types.go
++++ b/cmd/entire/cli/strategy/manual_commit_types.go
+@@ -53,7 +53,8 @@ type CondenseResult struct {
+ 	CheckpointsCount       int
+ 	FilesTouched           []string
+ 	Prompts                []string // User prompts from the condensed session
+-	TotalTranscriptLines int      // Total lines in transcript after this condensation
++	TotalTranscriptLines   int      // Total lines in full.jsonl after this condensation
++	CompactTranscriptLines int      // Lines in the compact transcript written for this checkpoint (0 if v2 disabled)
+ 	Transcript             []byte   // Raw transcript bytes for downstream consumers (trail title generation)
+ }
+ 
+
+  </git_diff_from_branch_to_main>
+
+make incremental commits for the changes

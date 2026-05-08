@@ -1,0 +1,117 @@
+Implement the following plan:
+
+# Plan: Add `entire trail enable` / `entire trail disable`
+
+## Context
+
+The `entire trail` command was just implemented but lacks enable/disable subcommands. Users need a way to opt out of trail auto-creation and pushing. The feature should be enabled by default but togglable via settings.
+
+## Approach
+
+Store a `trails` boolean in `StrategyOptions` (same pattern as `push_sessions`). Default: enabled (true). When disabled, skip auto-create on session start and skip pushing the trails branch.
+
+## Implementation Steps
+
+### 1. Add settings convenience functions
+**File**: `cmd/entire/cli/settings/settings.go`
+
+Add `IsTrailsDisabled()` method on `*EntireSettings` — follows the `IsPushSessionsDisabled()` pattern exactly:
+```go
+func (s *EntireSettings) IsTrailsDisabled() bool {
+    // Check StrategyOptions["trails"] — false means disabled
+    // Missing/nil means enabled (default)
+}
+```
+
+Add package-level convenience:
+```go
+func IsTrailsDisabled() bool {
+    s, err := Load()
+    if err != nil { return false }
+    return s.IsTrailsDisabled()
+}
+```
+
+### 2. Add `enable` and `disable` subcommands
+**File**: `cmd/entire/cli/trail_cmd.go`
+
+Add to `newTrailCmd()`:
+```
+cmd.AddCommand(newTrailEnableCmd())
+cmd.AddCommand(newTrailDisableCmd())
+```
+
+`entire trail enable` — sets `strategy_options.trails = true` (or removes the key since true is default). Saves to project settings.
+
+`entire trail disable` — sets `strategy_options.trails = false`. Saves to local settings by default, `--project` flag for project settings.
+
+Follow the pattern from `setup.go` `runEnable`/`runDisable` — load settings, modify `StrategyOptions`, save.
+
+### 3. Guard auto-create with settings check
+**File**: `cmd/entire/cli/lifecycle.go` — `autoCreateTrailOnTurnStart()`
+
+Add at the top:
+```go
+if settings.IsTrailsDisabled() {
+    return
+}
+```
+
+### 4. Guard push with settings check
+**File**: `cmd/entire/cli/strategy/push_common.go` — `PushTrailsBranch()`
+
+Add check:
+```go
+func PushTrailsBranch(remote string) error {
+    if isTrailsDisabled() { return nil }
+    return pushSessionsBranchCommon(remote, paths.TrailsBranchName)
+}
+```
+
+Where `isTrailsDisabled()` loads settings (same pattern as `isPushSessionsDisabled()`).
+
+### 5. Update CLAUDE.md
+Document the enable/disable commands and settings key.
+
+## Files Summary
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/settings/settings.go` | Add `IsTrailsDisabled()` method + package-level function |
+| `cmd/entire/cli/trail_cmd.go` | Add `newTrailEnableCmd()`, `newTrailDisableCmd()` |
+| `cmd/entire/cli/lifecycle.go` | Guard `autoCreateTrailOnTurnStart()` with settings check |
+| `cmd/entire/cli/strategy/push_common.go` | Guard `PushTrailsBranch()` with settings check |
+| `CLAUDE.md` | Document enable/disable |
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Manual: `entire trail disable` then verify no trail auto-created on session start.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dip/.REDACTED.jsonl
+
+---
+
+Why not list all sub-commands here? dip@dip cli % entire trail
+No trails found.
+Create one with: entire trail create
+
+---
+
+Document for me the logic that creates a trail automatically for "trail enable" does it work for existing branches?
+
+---
+
+Few things. I'm missing a checkpoints.json like docoumented here https://github.com/entirehq/entire.io/pull/738 then the generated Trail titles are beyond shit. Should be something semantic, explaining the Task/trail! Dipree/blacksmith agent integration or 20260220 public repo viewing don't say shit.
+
+---
+
+Added now, check again
+
+---
+
+[Request interrupted by user for tool use]

@@ -1,0 +1,484 @@
+Implement the following plan:
+
+# Plan: Remove Strategy Abstraction & Add `commit_linking` Setting
+
+## Context
+
+The CLI has a `Strategy` interface abstraction (`strategy.go`) designed to support multiple session strategies, but only one implementation (`ManualCommitStrategy`) has ever existed. The current behavior prompts users on every commit to link/unlink the session. Per RFD-003 decisions, we need to:
+
+1. Remove the `Strategy` interface (inline the single implementation)
+2. Add a `commit_linking` setting (`always` / `prompt`)
+3. Default new users to `always` (auto-link), existing users to `prompt` (preserve current behavior)
+4. No user migration action required
+
+## Implementation Steps
+
+### Step 1: Add `commit_linking` setting to `EntireSettings`
+
+**Files:**
+- `cmd/entire/cli/settings/settings.go`
+
+**Changes:**
+- Add `CommitLinking string` field to `EntireSettings` struct with `json:"commit_linking,omitempty"`
+- Add `GetCommitLinking() string` resolver method:
+  - If `CommitLinking` is explicitly set → return it
+  - Otherwise → return `"prompt"` (safe default, preserves existing user behavior)
+- Add validation constant `CommitLinkingAlways = "always"`, `CommitLinkingPrompt = "prompt"`
+- Update `mergeJSON()` to handle the `commit_linking` field override
+
+### Step 2: Set `commit_linking: "always"` for new installations
+
+**Files:**
+- `cmd/entire/cli/setup.go`
+
+**Changes:**
+- In the `entire enable` setup flow, set `settings.CommitLinking = "always"` before writing settings
+- This means new users get auto-linking by default
+- Existing users who don't have the field keep getting `"prompt"` via the `GetCommitLinking()` default
+
+### Step 3: Modify `PrepareCommitMsg` to respect `commit_linking`
+
+**Files:**
+- `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+**Changes:**
+- Load settings via `settings.Load(ctx)` at the start of `PrepareCommitMsg`
+- Call `settings.GetCommitLinking()` to determine mode
+- When `"always"`:
+  - For `source="message"` (-m flag): skip `askConfirmTTY()`, just add the trailer directly
+  - For `source=""` or `"template"` (editor flow): add trailer with comment (user can still remove it) — same as current behavior for this case
+- When `"prompt"`:
+  - Current behavior unchanged (prompt for `source="message"`, add with comment for editor)
+- The no-TTY fast path (agent committing) stays unchanged — always adds trailer regardless of setting
+
+### Step 4: Remove `Strategy` interface
+
+**Files:**
+- `cmd/entire/cli/strategy/strategy.go` — remove `Strategy` interface definition
+- `cmd/entire/cli/strategy/manual_commit.go` — change `NewManualCommitStrategy()` return type from `Strategy` to `*ManualCommitStrategy`, remove compile-time interface check
+- `cmd/entire/cli/config.go` — change `GetStrategy()` return type from `strategy.Strategy` to `*strategy.ManualCommitStrategy`
+
+**Changes:**
+- Delete the `Strategy` interface (~140 lines of interface definition)
+- Keep all method implementations on `ManualCommitStrategy` unchanged
+- Remove `Name()` and `Description()` methods from `ManualCommitStrategy` (no longer needed for polymorphism)
+- Keep `StrategyNameManualCommit` constant in `common.go` (still used in commit trailers/metadata)
+
+### Step 5: Update all call sites
+
+**Files that call `GetStrategy()`** (all in `cmd/entire/cli/`):
+- `hook_registry.go:113` — uses `.Name()` for logging → replace with `StrategyNameManualCommit` constant
+- `hooks_git_cmd.go:38` — stores `strategy.Strategy` in struct → change type to `*strategy.ManualCommitStrategy`
+- `lifecycle.go` (lines 80, 136, 343, 567, 673) — calls methods on strategy → no signature changes needed
+- `hooks_claudecode_posttodo.go:85` — calls `SaveTaskStep` → no change needed
+- `reset.go:48` — calls `Reset`/`ResetSession` → no change needed
+- `rewind.go` (lines 83, 334, 385) — calls rewind methods → no change needed
+- `resume.go:407` — calls `RestoreLogsOnly` → no change needed
+- `doctor.go:102` — calls `CondenseSessionByID` → no change needed
+
+**Specific changes:**
+- `hooks_git_cmd.go`: Change `gitHookContext.strategy` field type from `strategy.Strategy` to `*strategy.ManualCommitStrategy`
+- `hooks_git_cmd.go`: Remove `strategyName` field, use constant directly or inline `strategy.StrategyNameManualCommit`
+- `hook_registry.go:113`: Replace `GetStrategy(ctx).Name()` with `strategy.StrategyNameManualCommit`
+
+### Step 6: Clean up deprecated strategy references
+
+**Files:**
+- `cmd/entire/cli/settings/settings.go` — remove `FilesWithDeprecatedStrategy()` and `WriteDeprecatedStrategyWarnings()`
+- `cmd/entire/cli/strategy/manual_commit.go` — remove `Description()` method
+- `cmd/entire/cli/strategy/session.go` — update `Session.Strategy` field comments (or remove if unused)
+- `cmd/entire/cli/strategy/strategy.go` — update package doc, remove interface-related comments
+- `cmd/entire/cli/setup.go` — remove any `settings.Strategy` assignment if present
+
+### Step 7: Update tests
+
+**Files:**
+- `cmd/entire/cli/strategy/session_test.go` — remove `TestManualCommitStrategyImplementsSessionSource` (interface gone)
+- `cmd/entire/cli/explain_test.go` — remove `TestStrategySessionSourceInterface` (interface gone)
+- `cmd/entire/cli/settings/settings_test.go` — add tests for `GetCommitLinking()` default behavior
+- `cmd/entire/cli/strategy/manual_commit_hooks_test.go` — add tests for `commit_linking: "always"` vs `"prompt"` behavior in `PrepareCommitMsg`
+
+### Step 8: Update CLAUDE.md and docs
+
+**Files:**
+- `CLAUDE.md` — update strategy section to reflect new structure, document `commit_linking` setting
+- `docs/architecture/` — update relevant architecture docs
+
+## Migration Behavior (no user action required)
+
+| User type | Settings file state | `GetCommitLinking()` returns | Behavior |
+|-----------|-------------------|------------------------------|----------|
+| New user (runs `entire enable`) | `commit_linking: "always"` written | `"always"` | Auto-link, no prompt |
+| Existing user (no upgrade action) | No `commit_linking` field | `"prompt"` (default) | Same as before |
+| Existing user who sets preference | `commit_linking: "always"` or `"prompt"` | Explicit value | User's choice |
+
+## What doesn't change
+
+- All `ManualCommitStrategy` method implementations stay the same
+- Shadow branch behavior, condensation, rewind — all unchanged
+- `strategy_options` (push_sessions, summarize) — left as-is
+- `Strategy` field in settings struct — kept for backward compat (`json:"strategy,omitempty"`)
+- Commit trailer format, metadata structure — unchanged
+
+## Verification
+
+1. `mise run fmt && mise run lint` — passes
+2. `mise run test:ci` — all unit + integration tests pass
+3. Manual testing:
+   - Fresh `entire enable` → verify `commit_linking: "always"` in settings
+   - `git commit -m "test"` with active session → trailer auto-added (no prompt)
+   - Edit settings to `"prompt"` → `git commit -m "test"` → interactive prompt appears
+   - Existing settings file without `commit_linking` → prompt behavior preserved
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/429f455c-f7c6-43a4-8c81-444aba0cd42e.jsonl
+
+---
+
+commit and push this to a new PR
+
+---
+
+look at the omments on the PR by cursor and copilot and address them. If you have any questions ask me. Remember that we should maintain existing settings as "prompt" while setting "always" for only brand new repos where entire is not enabled or being enabled for the first time.
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user provided a detailed implementation plan to remove the Strategy interface abstraction and add a `commit_linking` setting.
+
+2. I read key files to understand the codebase:
+   - `settings/settings.go` - settings struct and loading
+   - `strategy/strategy.go` - the Strategy interface (~140 lines)
+   - `strategy/manual_commit.go` - the only implementation
+   - `strategy/manual_commit_hooks.go` - PrepareCommitMsg with TTY prompting
+   - `config.go` - GetStrategy() returning Strategy interface
+   - `hooks_git_cmd.go` - gitHookContext using Strategy type
+   - `hook_registry.go` - using GetStrategy().Name()
+   - `setup.go` - enable flow
+   - `session.go`, `session_test.go`, `explain_test.go`, `settings_test.go`
+
+3. Implementation steps:
+   - Step 1: Added `CommitLinking` field, constants, `GetCommitLinking()`, mergeJSON support, removed `FilesWithDeprecatedStrategy`/`WriteDeprecatedStrategyWarnings`
+   - Step 2: Set `commit_linking: "always"` in both setup paths
+   - Step 3: Modified PrepareCommitMsg to check commit_linking setting
+   - Step 4: Removed Strategy interface, updated return types and call sites
+   - Step 5: Updated tests
+   - Step 6: Ran fmt/lint/tests
+
+4. Errors encountered:
+   - manual_commit_test.go had type assertions `s.(*ManualCommitStrategy)` that broke after interface removal
+   - `unparam` lint errors on methods that previously satisfied the interface
+   - Tests for deprecated strategy warnings failed after removing the feature
+   - doctor_test.go had unused imports after removing test
+
+5. User asked to commit and push to PR. PR #531 already existed. Updated it.
+
+6. User asked to look at PR comments from Cursor and Copilot:
+   - Copilot: validate commit_linking values (reject typos)
+   - Cursor: BUG - existing users re-running `entire enable` would get switched from "prompt" to "always" because `CommitLinking == ""` can't distinguish new vs existing users
+
+7. User clarified: "we should maintain existing settings as 'prompt' while setting 'always' for only brand new repos where entire is not enabled or being enabled for the first time"
+
+8. I started fixing both issues:
+   - Added validation in mergeJSON() and loadFromFile()
+   - Fixed setup.go's runEnableInteractive to check `settings.IsSetUp(ctx)` before setting "always"
+   - Was in the middle of fixing setupAgentHooksNonInteractive (the second setup path)
+
+The summary request came while I was mid-fix on the second setup path in setup.go.
+
+Summary:
+1. Primary Request and Intent:
+   The user provided a detailed multi-step plan to:
+   - Remove the `Strategy` interface abstraction from the CLI codebase (only one implementation `ManualCommitStrategy` ever existed)
+   - Add a `commit_linking` setting (`"always"` / `"prompt"`) to control whether commits are auto-linked to agent sessions
+   - Default new users to `"always"`, existing users to `"prompt"` (no migration required)
+   - After implementation, commit and push to PR #531
+   - Address PR review comments from Cursor bot and Copilot bot
+
+2. Key Technical Concepts:
+   - Go interface removal and concrete type inlining
+   - Settings loading with JSON merge (base `settings.json` + local `settings.local.json` override)
+   - Git hook system (`prepare-commit-msg`) with TTY-based interactive prompting
+   - Shadow branch strategy for session checkpoints (`entire/<hash>-<worktreeHash>`)
+   - `commit_linking` setting: `"always"` auto-links, `"prompt"` asks interactively via `/dev/tty`
+   - First-time setup detection via `settings.IsSetUp(ctx)` (checks if `.entire/settings.json` exists)
+   - `//nolint:unparam` needed when interface removal exposes "always nil" return values
+
+3. Files and Code Sections:
+
+   - `cmd/entire/cli/settings/settings.go`
+     - Core settings file — added `CommitLinking` field, constants, `GetCommitLinking()` method, mergeJSON support, validation
+     - Removed `FilesWithDeprecatedStrategy()` and `WriteDeprecatedStrategyWarnings()` (and unused `io` import)
+     - Added validation in `loadFromFile()` and `mergeJSON()` for invalid commit_linking values
+     ```go
+     const (
+         CommitLinkingAlways = "always"
+         CommitLinkingPrompt = "prompt"
+     )
+     
+     // CommitLinking field in EntireSettings:
+     CommitLinking string `json:"commit_linking,omitempty"`
+     
+     func (s *EntireSettings) GetCommitLinking() string {
+         if s.CommitLinking != "" {
+             return s.CommitLinking
+         }
+         return CommitLinkingPrompt
+     }
+     ```
+     - Validation in loadFromFile:
+     ```go
+     if settings.CommitLinking != "" && settings.CommitLinking != CommitLinkingAlways && settings.CommitLinking != CommitLinkingPrompt {
+         return nil, fmt.Errorf("invalid commit_linking value %q: must be %q or %q", settings.CommitLinking, CommitLinkingAlways, CommitLinkingPrompt)
+     }
+     ```
+     - Validation in mergeJSON:
+     ```go
+     switch cl {
+     case CommitLinkingAlways, CommitLinkingPrompt:
+         settings.CommitLinking = cl
+     default:
+         return fmt.Errorf("invalid commit_linking value %q: must be %q or %q", cl, CommitLinkingAlways, CommitLinkingPrompt)
+     }
+     ```
+
+   - `cmd/entire/cli/settings/settings_test.go`
+     - Removed `TestFilesWithDeprecatedStrategy` test
+     - Added `TestGetCommitLinking_DefaultsToPrompt`, `TestGetCommitLinking_ReturnsExplicitValue`, `TestLoad_CommitLinkingField`, `TestMergeJSON_CommitLinking`
+
+   - `cmd/entire/cli/setup.go`
+     - Two setup paths: `runEnableInteractive` and `setupAgentHooksNonInteractive`
+     - BUG FIX (from Cursor review): Added `isFirstSetup` check using `settings.IsSetUp(ctx)` to only set `"always"` for brand-new installations
+     - `runEnableInteractive` fixed:
+     ```go
+     isFirstSetup := !settings.IsSetUp(ctx)
+     // ... later ...
+     if isFirstSetup && settings.CommitLinking == "" {
+         settings.CommitLinking = "always"
+     }
+     ```
+     - `setupAgentHooksNonInteractive` — STILL NEEDS THE SAME FIX (was being worked on when summary requested)
+
+   - `cmd/entire/cli/strategy/strategy.go`
+     - Removed the entire `Strategy` interface definition (~140 lines)
+     - Removed unused imports (`context`, `session`)
+     - Updated package doc comment
+     - Kept all type definitions (RewindPoint, StepContext, TaskStepContext, etc.) and error vars
+
+   - `cmd/entire/cli/strategy/manual_commit.go`
+     - Changed `NewManualCommitStrategy()` return type from `Strategy` to `*ManualCommitStrategy`
+     - Removed `Name()` and `Description()` methods
+     - Removed compile-time interface check `var _ Strategy = (*ManualCommitStrategy)(nil)`
+
+   - `cmd/entire/cli/strategy/manual_commit_hooks.go`
+     - Added `settings` import
+     - Modified `PrepareCommitMsg` to load `commit_linking` setting and skip `askConfirmTTY` when `"always"`:
+     ```go
+     commitLinking := settings.CommitLinkingPrompt
+     if stngs, loadErr := settings.Load(ctx); loadErr == nil {
+         commitLinking = stngs.GetCommitLinking()
+     }
+     switch source {
+     case "message":
+         if commitLinking == settings.CommitLinkingAlways {
+             message = addCheckpointTrailer(message, checkpointID)
+         } else {
+             // ... existing prompt logic ...
+         }
+     ```
+     - Added `//nolint:unparam` to `CommitMsg`, `PostCommit`, `HandleTurnEnd`
+
+   - `cmd/entire/cli/strategy/manual_commit_logs.go`
+     - Added `//nolint:unparam` to `GetCheckpointLog`
+
+   - `cmd/entire/cli/config.go`
+     - Changed `GetStrategy()` return type from `strategy.Strategy` to `*strategy.ManualCommitStrategy`
+
+   - `cmd/entire/cli/hooks_git_cmd.go`
+     - Changed `gitHookContext.strategy` field type from `strategy.Strategy` to `*strategy.ManualCommitStrategy`
+     - Removed `strategyName` field, replaced with `strategy.StrategyNameManualCommit` constant
+     - Removed `unknownStrategyName` constant
+
+   - `cmd/entire/cli/hook_registry.go`
+     - Added `strategy` import
+     - Replaced `GetStrategy(ctx).Name()` with `strategy.StrategyNameManualCommit`
+
+   - `cmd/entire/cli/rewind.go` — replaced all `strategy.Strategy` type refs with `*strategy.ManualCommitStrategy`
+   - `cmd/entire/cli/reset.go` — replaced all `strategy.Strategy` type refs with `*strategy.ManualCommitStrategy`
+   - `cmd/entire/cli/doctor.go` — removed deprecated strategy warning call, removed unused `w` variable and `settings` import
+   - `cmd/entire/cli/status.go` — removed two `WriteDeprecatedStrategyWarnings` calls
+   - `cmd/entire/cli/doctor_test.go` — removed `TestRunSessionsFix_DeprecatedStrategyWarning` test and unused imports
+   - `cmd/entire/cli/status_test.go` — removed three deprecated strategy warning tests
+   - `cmd/entire/cli/strategy/session_test.go` — renamed test from `TestManualCommitStrategyImplementsSessionSource` to `TestManualCommitStrategyGetAdditionalSessions`
+   - `cmd/entire/cli/explain_test.go` — renamed test from `TestStrategySessionSourceInterface` to `TestManualCommitStrategyCallable`
+   - `cmd/entire/cli/strategy/manual_commit_test.go` — removed type assertions `s.(*ManualCommitStrategy)` that were no longer needed
+
+4. Errors and fixes:
+   - **Type assertion error**: After removing `Strategy` interface, `manual_commit_test.go` had `s.(*ManualCommitStrategy)` which fails because `s` is already `*ManualCommitStrategy`. Fixed by removing type assertions and using `s` directly.
+   - **unparam lint errors**: Methods like `CommitMsg`, `PostCommit`, `HandleTurnEnd`, `GetCheckpointLog` had return values that were always nil/unused — previously hidden by interface satisfaction. Fixed with `//nolint:unparam` comments.
+   - **Deprecated strategy warning test failures**: Three tests (`TestRunSessionsFix_DeprecatedStrategyWarning`, `TestRunStatus_DeprecatedStrategyWarning`, `TestRunStatus_DeprecatedStrategyWarning_Detailed`) failed after removing the warning functions. Fixed by removing those tests.
+   - **Unused imports**: After removing deprecated functions/tests, several files had unused imports (`io` in settings.go, `bytes`/`context`/`strings`/`cobra` in doctor_test.go, `settings` in doctor.go). Fixed by removing them.
+   - **Cursor PR review bug**: `if settings.CommitLinking == ""` in setup.go couldn't distinguish new users from existing users re-running `entire enable`. Both would get `"always"`. User confirmed: "we should maintain existing settings as 'prompt' while setting 'always' for only brand new repos where entire is not enabled or being enabled for the first time." Fixed by adding `isFirstSetup := !settings.IsSetUp(ctx)` check before setting directories up, and gating the assignment with `if isFirstSetup && settings.CommitLinking == ""`.
+
+5. Problem Solving:
+   - Successfully removed the Strategy interface abstraction while keeping all method implementations intact
+   - Added commit_linking setting with proper defaults (new users: "always", existing: "prompt")
+   - All tests pass (`mise run test:ci`), lint clean (`mise run lint`), formatted (`mise run fmt`)
+   - PR #531 created and pushed
+   - Currently addressing PR review feedback (Copilot validation + Cursor first-setup bug)
+
+6. All user messages:
+   - "Implement the following plan: [detailed multi-step plan for removing Strategy abstraction and adding commit_linking setting]"
+   - "commit and push this to a new PR"
+   - "look at the omments on the PR by cursor and copilot and address them. If you have any questions ask me. Remember that we should maintain existing settings as 'prompt' while setting 'always' for only brand new repos where entire is not enabled or being enabled for the first time."
+
+7. Pending Tasks:
+   - Fix `setupAgentHooksNonInteractive` in `setup.go` with the same `isFirstSetup` pattern (second setup path — same bug as Cursor identified)
+   - Run `mise run fmt && mise run lint && mise run test:ci` to verify fixes
+   - Commit and push the review-feedback fixes to PR #531
+   - Potentially add a test for the validation behavior (invalid commit_linking value rejection)
+
+8. Current Work:
+   Addressing PR review comments. Two fixes in progress:
+   1. **Copilot's validation** — DONE: Added validation in both `loadFromFile()` and `mergeJSON()` in `settings/settings.go`
+   2. **Cursor's first-setup bug** — PARTIALLY DONE: Fixed `runEnableInteractive` in `setup.go` with `isFirstSetup` check. Still need to apply the same fix to `setupAgentHooksNonInteractive` (the second setup path at ~line 592-610 of `setup.go`).
+
+9. Optional Next Step:
+   Apply the same `isFirstSetup` fix to `setupAgentHooksNonInteractive` in `setup.go`. The current code at that location is:
+   ```go
+   // Default new users to auto-linking (existing users without the field get "prompt" via GetCommitLinking())
+   if settings.CommitLinking == "" {
+       settings.CommitLinking = "always"
+   }
+   ```
+   This needs to be changed to check `settings.IsSetUp(ctx)` before `setupEntireDirectory` is called, matching the pattern already applied to `runEnableInteractive`. Then run fmt/lint/tests and push to PR #531.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/258a514e-cd22-4513-94b6-49095182e3fa.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+update this comment:
+
+The value "always" is hardcoded instead of using the settings.CommitLinkingAlways constant because the settings package import is shadowed by the local variable settings, err := LoadEntireSettings(ctx). The codebase already has an established pattern for this exact problem in config.go, which defines package-level aliases (like EntireSettingsFile) specifically "to avoid shadowing the settings package with local variables named 'settings'." The new CommitLinkingAlways constant wasn't given an alias, forcing the use of a raw string literal that won't track if the constant value changes.
+
+---
+
+rebase this on main and then force push with lease
+
+---
+
+in my manual testing, i noticed that when there already is an .entire/settings file and then entire is enabled, that we don't overwrite the strategy field to call it "commit_linking". But we do when it's a brand new repo. 
+
+I think we should rename the setting in the file? What do you think?
+
+---
+
+i was thinking that we would swap out the old field and replace with the commit_linking field and then set it "prompt" so it's up to date with the new spec. What od you think?
+
+---
+
+i just trid it manually with this json:
+
+{
+  "enabled": true,
+  "telemetry": true,
+  "strategy": "manual-commit"
+}
+
+and when i ran entire enable, it didn't update that field
+
+---
+
+i tried manual testing this with ane xisting repo. I ran entire enable and it updated my settings to:
+
+{
+  "enabled": true,
+  "telemetry": true,
+  "commit_linking": "prompt"
+}
+
+
+
+then i updated prompt to "always" and creaed a commit and it still asked me to link?
+
+
+here are the temrinal logs:
+
+[2026-02-26 15:49] ~/code/gemini-test (main)% git add .
+[2026-02-26 15:49] ~/code/gemini-test (main)% git commit -m 'updates'
+You have an active Claude Code session.
+Last Prompt: make a small change
+Link this commit to Claude Code session context? [Y/n] Y^[
+[main d2f6680] updates
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+[2026-02-26 15:49] ~/code/gemini-test (main)% git add .
+[2026-02-26 15:50] ~/code/gemini-test (main)% git commit -m 'another small change'
+You have an active Claude Code session.
+Last Prompt: make another small change
+Link this commit to Claude Code session context? [Y/n] Y
+[main 35b7336] another small change
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+[2026-02-26 15:50] ~/code/gemini-test (main)% which entire
+entire: aliased to (cd ~/code/entire/devenv/cli && git checkout updateCLIStrategies && mise run --quiet build) && ~/code/entire/devenv/cli/entire
+
+---
+
+its still qasking me to link? if you look at the screenshot and the terminal
+
+---
+
+the settings.local.json is messing it up i think.
+
+here are teh steps:
+
+1. in a new repo without entire, i run entire enable. it creats this settings.json file:
+
+{
+  "enabled": true,
+  "telemetry": true,
+  "commit_linking": "always"
+}
+
+
+i then manually add in this line:   "local_dev": true
+
+and then run entire enable again
+
+when i do that, it creates asettings.local.json file that looks like this:
+
+{
+  "enabled": true,
+  "telemetry": true
+}
+
+
+2. i have the agent do something. then i go to commit and i get the prompt to link:
+
+[2026-02-26 16:22] ~/code/gemini-test (main)% git add .
+[2026-02-26 16:22] ~/code/gemini-test (main)% git commit -m 'small change'
+You have an active Claude Code session.
+Last Prompt: make a small change
+Link this commit to Claude Code session context? [Y/n]
+
+---
+
+how can i update the path for the hooks, this doesn't work:
+
+[2026-02-26 16:28] ~/code/gemini-test (main)% git commit -m 'updates'
+stat ./cmd/entire/main.go: no such file or directory
+
+since im running it from a separate repo
+
+---
+
+Let’s make an update here at implement these two points when the user gets prompted if they are commit linking strategy is prompt to link their session to the commit they should also have a third option for always, and if they select always, that should update the settings and then we can reduce the complexity on that implementation with point number two. I remember we discussed having an "always" option on the commit prompt itself — did that get dropped for a reason? A [Y/n/a] where a writes commit_linking: "always" to settings.local.json feels like the natural place for this. Users discover it when they're actually committing, and since it's a personal preference (one dev likes prompts, another doesn't), local settings is the right home.
+If we go that route, commit_linking can just be a normal setting — no need for migrateProjectSettings, the struct-copy-and-strip, or the duplicated save blocks. determineSettingsTarget and settings.Load() already handle the merge.
+
+---
+
+[Request interrupted by user for tool use]

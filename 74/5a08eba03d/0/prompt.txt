@@ -1,0 +1,678 @@
+Q: I don't believe that we store subagent logs in our checkpoints. Is this true?
+
+How might we handle these properly?
+/superpowers:brainstorm
+
+---
+
+Base directory for this skill: /Users/alex/.claude/plugins/cache/claude-plugins-official/superpowers/4.3.1/skills/brainstorming
+
+# Brainstorming Ideas Into Designs
+
+## Overview
+
+Help turn ideas into fully formed designs and specs through natural collaborative dialogue.
+
+Start by understanding the current project context, then ask questions one at a time to refine the idea. Once you understand what you're building, present the design and get user approval.
+
+<HARD-GATE>
+Do NOT invoke any implementation skill, write any code, scaffold any project, or take any implementation action until you have presented a design and the user has approved it. This applies to EVERY project regardless of perceived simplicity.
+</HARD-GATE>
+
+## Anti-Pattern: "This Is Too Simple To Need A Design"
+
+Every project goes through this process. A todo list, a single-function utility, a config change — all of them. "Simple" projects are where unexamined assumptions cause the most wasted work. The design can be short (a few sentences for truly simple projects), but you MUST present it and get approval.
+
+## Checklist
+
+You MUST create a task for each of these items and complete them in order:
+
+1. **Explore project context** — check files, docs, recent commits
+2. **Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria
+3. **Propose 2-3 approaches** — with trade-offs and your recommendation
+4. **Present design** — in sections scaled to their complexity, get user approval after each section
+5. **Write design doc** — save to `docs/plans/YYYY-MM-DD-<topic>-design.md` and commit
+6. **Transition to implementation** — invoke writing-plans skill to create implementation plan
+
+## Process Flow
+
+```dot
+digraph brainstorming {
+    "Explore project context" [shape=box];
+    "Ask clarifying questions" [shape=box];
+    "Propose 2-3 approaches" [shape=box];
+    "Present design sections" [shape=box];
+    "User approves design?" [shape=diamond];
+    "Write design doc" [shape=box];
+    "Invoke writing-plans skill" [shape=doublecircle];
+
+    "Explore project context" -> "Ask clarifying questions";
+    "Ask clarifying questions" -> "Propose 2-3 approaches";
+    "Propose 2-3 approaches" -> "Present design sections";
+    "Present design sections" -> "User approves design?";
+    "User approves design?" -> "Present design sections" [label="no, revise"];
+    "User approves design?" -> "Write design doc" [label="yes"];
+    "Write design doc" -> "Invoke writing-plans skill";
+}
+```
+
+**The terminal state is invoking writing-plans.** Do NOT invoke frontend-design, mcp-builder, or any other implementation skill. The ONLY skill you invoke after brainstorming is writing-plans.
+
+## The Process
+
+**Understanding the idea:**
+- Check out the current project state first (files, docs, recent commits)
+- Ask questions one at a time to refine the idea
+- Prefer multiple choice questions when possible, but open-ended is fine too
+- Only one question per message - if a topic needs more exploration, break it into multiple questions
+- Focus on understanding: purpose, constraints, success criteria
+
+**Exploring approaches:**
+- Propose 2-3 different approaches with trade-offs
+- Present options conversationally with your recommendation and reasoning
+- Lead with your recommended option and explain why
+
+**Presenting the design:**
+- Once you believe you understand what you're building, present the design
+- Scale each section to its complexity: a few sentences if straightforward, up to 200-300 words if nuanced
+- Ask after each section whether it looks right so far
+- Cover: architecture, components, data flow, error handling, testing
+- Be ready to go back and clarify if something doesn't make sense
+
+## After the Design
+
+**Documentation:**
+- Write the validated design to `docs/plans/YYYY-MM-DD-<topic>-design.md`
+- Use elements-of-style:writing-clearly-and-concisely skill if available
+- Commit the design document to git
+
+**Implementation:**
+- Invoke the writing-plans skill to create a detailed implementation plan
+- Do NOT invoke any other skill. writing-plans is the next step.
+
+## Key Principles
+
+- **One question at a time** - Don't overwhelm with multiple questions
+- **Multiple choice preferred** - Easier to answer than open-ended when possible
+- **YAGNI ruthlessly** - Remove unnecessary features from all designs
+- **Explore alternatives** - Always propose 2-3 approaches before settling
+- **Incremental validation** - Present design, get approval before moving on
+- **Be flexible** - Go back and clarify when something doesn't make sense
+
+---
+
+Base directory for this skill: /Users/alex/.claude/plugins/cache/claude-plugins-official/superpowers/4.3.1/skills/writing-plans
+
+# Writing Plans
+
+## Overview
+
+Write comprehensive implementation plans assuming the engineer has zero context for our codebase and questionable taste. Document everything they need to know: which files to touch for each task, code, testing, docs they might need to check, how to test it. Give them the whole plan as bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
+
+Assume they are a skilled developer, but know almost nothing about our toolset or problem domain. Assume they don't know good test design very well.
+
+**Announce at start:** "I'm using the writing-plans skill to create the implementation plan."
+
+**Context:** This should be run in a dedicated worktree (created by brainstorming skill).
+
+**Save plans to:** `docs/plans/YYYY-MM-DD-<feature-name>.md`
+
+## Bite-Sized Task Granularity
+
+**Each step is one action (2-5 minutes):**
+- "Write the failing test" - step
+- "Run it to make sure it fails" - step
+- "Implement the minimal code to make the test pass" - step
+- "Run the tests and make sure they pass" - step
+- "Commit" - step
+
+## Plan Document Header
+
+**Every plan MUST start with this header:**
+
+```markdown
+# [Feature Name] Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** [One sentence describing what this builds]
+
+**Architecture:** [2-3 sentences about approach]
+
+**Tech Stack:** [Key technologies/libraries]
+
+---
+```
+
+## Task Structure
+
+````markdown
+### Task N: [Component Name]
+
+**Files:**
+- Create: `exact/path/to/file.py`
+- Modify: `exact/path/to/existing.py:123-145`
+- Test: `tests/exact/path/to/test.py`
+
+**Step 1: Write the failing test**
+
+```python
+def test_specific_behavior():
+    result = function(input)
+    assert result == expected
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: FAIL with "function not defined"
+
+**Step 3: Write minimal implementation**
+
+```python
+def function(input):
+    return expected
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add tests/path/test.py src/path/file.py
+git commit -m "feat: add specific feature"
+```
+````
+
+## Remember
+- Exact file paths always
+- Complete code in plan (not "add validation")
+- Exact commands with expected output
+- Reference relevant skills with @ syntax
+- DRY, YAGNI, TDD, frequent commits
+
+## Execution Handoff
+
+After saving the plan, offer execution choice:
+
+**"Plan complete and saved to `docs/plans/<filename>.md`. Two execution options:**
+
+**1. Subagent-Driven (this session)** - I dispatch fresh subagent per task, review between tasks, fast iteration
+
+**2. Parallel Session (separate)** - Open new session with executing-plans, batch execution with checkpoints
+
+**Which approach?"**
+
+**If Subagent-Driven chosen:**
+- **REQUIRED SUB-SKILL:** Use superpowers:subagent-driven-development
+- Stay in this session
+- Fresh subagent per task + code review
+
+**If Parallel Session chosen:**
+- Guide them to open new session in worktree
+- **REQUIRED SUB-SKILL:** New session uses superpowers:executing-plans
+
+---
+
+1
+
+---
+
+Base directory for this skill: /Users/alex/.claude/plugins/cache/claude-plugins-official/superpowers/4.3.1/skills/subagent-driven-development
+
+# Subagent-Driven Development
+
+Execute plan by dispatching fresh subagent per task, with two-stage review after each: spec compliance review first, then code quality review.
+
+**Core principle:** Fresh subagent per task + two-stage review (spec then quality) = high quality, fast iteration
+
+## When to Use
+
+```dot
+digraph when_to_use {
+    "Have implementation plan?" [shape=diamond];
+    "Tasks mostly independent?" [shape=diamond];
+    "Stay in this session?" [shape=diamond];
+    "subagent-driven-development" [shape=box];
+    "executing-plans" [shape=box];
+    "Manual execution or brainstorm first" [shape=box];
+
+    "Have implementation plan?" -> "Tasks mostly independent?" [label="yes"];
+    "Have implementation plan?" -> "Manual execution or brainstorm first" [label="no"];
+    "Tasks mostly independent?" -> "Stay in this session?" [label="yes"];
+    "Tasks mostly independent?" -> "Manual execution or brainstorm first" [label="no - tightly coupled"];
+    "Stay in this session?" -> "subagent-driven-development" [label="yes"];
+    "Stay in this session?" -> "executing-plans" [label="no - parallel session"];
+}
+```
+
+**vs. Executing Plans (parallel session):**
+- Same session (no context switch)
+- Fresh subagent per task (no context pollution)
+- Two-stage review after each task: spec compliance first, then code quality
+- Faster iteration (no human-in-loop between tasks)
+
+## The Process
+
+```dot
+digraph process {
+    rankdir=TB;
+
+    subgraph cluster_per_task {
+        label="Per Task";
+        "Dispatch implementer subagent (./implementer-prompt.md)" [shape=box];
+        "Implementer subagent asks questions?" [shape=diamond];
+        "Answer questions, provide context" [shape=box];
+        "Implementer subagent implements, tests, commits, self-reviews" [shape=box];
+        "Dispatch spec reviewer subagent (./spec-reviewer-prompt.md)" [shape=box];
+        "Spec reviewer subagent confirms code matches spec?" [shape=diamond];
+        "Implementer subagent fixes spec gaps" [shape=box];
+        "Dispatch code quality reviewer subagent (./code-quality-reviewer-prompt.md)" [shape=box];
+        "Code quality reviewer subagent approves?" [shape=diamond];
+        "Implementer subagent fixes quality issues" [shape=box];
+        "Mark task complete in TodoWrite" [shape=box];
+    }
+
+    "Read plan, extract all tasks with full text, note context, create TodoWrite" [shape=box];
+    "More tasks remain?" [shape=diamond];
+    "Dispatch final code reviewer subagent for entire implementation" [shape=box];
+    "Use superpowers:finishing-a-development-branch" [shape=box style=filled fillcolor=lightgreen];
+
+    "Read plan, extract all tasks with full text, note context, create TodoWrite" -> "Dispatch implementer subagent (./implementer-prompt.md)";
+    "Dispatch implementer subagent (./implementer-prompt.md)" -> "Implementer subagent asks questions?";
+    "Implementer subagent asks questions?" -> "Answer questions, provide context" [label="yes"];
+    "Answer questions, provide context" -> "Dispatch implementer subagent (./implementer-prompt.md)";
+    "Implementer subagent asks questions?" -> "Implementer subagent implements, tests, commits, self-reviews" [label="no"];
+    "Implementer subagent implements, tests, commits, self-reviews" -> "Dispatch spec reviewer subagent (./spec-reviewer-prompt.md)";
+    "Dispatch spec reviewer subagent (./spec-reviewer-prompt.md)" -> "Spec reviewer subagent confirms code matches spec?";
+    "Spec reviewer subagent confirms code matches spec?" -> "Implementer subagent fixes spec gaps" [label="no"];
+    "Implementer subagent fixes spec gaps" -> "Dispatch spec reviewer subagent (./spec-reviewer-prompt.md)" [label="re-review"];
+    "Spec reviewer subagent confirms code matches spec?" -> "Dispatch code quality reviewer subagent (./code-quality-reviewer-prompt.md)" [label="yes"];
+    "Dispatch code quality reviewer subagent (./code-quality-reviewer-prompt.md)" -> "Code quality reviewer subagent approves?";
+    "Code quality reviewer subagent approves?" -> "Implementer subagent fixes quality issues" [label="no"];
+    "Implementer subagent fixes quality issues" -> "Dispatch code quality reviewer subagent (./code-quality-reviewer-prompt.md)" [label="re-review"];
+    "Code quality reviewer subagent approves?" -> "Mark task complete in TodoWrite" [label="yes"];
+    "Mark task complete in TodoWrite" -> "More tasks remain?";
+    "More tasks remain?" -> "Dispatch implementer subagent (./implementer-prompt.md)" [label="yes"];
+    "More tasks remain?" -> "Dispatch final code reviewer subagent for entire implementation" [label="no"];
+    "Dispatch final code reviewer subagent for entire implementation" -> "Use superpowers:finishing-a-development-branch";
+}
+```
+
+## Prompt Templates
+
+- `./implementer-prompt.md` - Dispatch implementer subagent
+- `./spec-reviewer-prompt.md` - Dispatch spec compliance reviewer subagent
+- `./code-quality-reviewer-prompt.md` - Dispatch code quality reviewer subagent
+
+## Example Workflow
+
+```
+You: I'm using Subagent-Driven Development to execute this plan.
+
+[Read plan file once: docs/plans/feature-plan.md]
+[Extract all 5 tasks with full text and context]
+[Create TodoWrite with all tasks]
+
+Task 1: Hook installation script
+
+[Get Task 1 text and context (already extracted)]
+[Dispatch implementation subagent with full task text + context]
+
+Implementer: "Before I begin - should the hook be installed at user or system level?"
+
+You: "User level (~/.config/superpowers/hooks/)"
+
+Implementer: "Got it. Implementing now..."
+[Later] Implementer:
+  - Implemented install-hook command
+  - Added tests, 5/5 passing
+  - Self-review: Found I missed --force flag, added it
+  - Committed
+
+[Dispatch spec compliance reviewer]
+Spec reviewer: ✅ Spec compliant - all requirements met, nothing extra
+
+[Get git SHAs, dispatch code quality reviewer]
+Code reviewer: Strengths: Good test coverage, clean. Issues: None. Approved.
+
+[Mark Task 1 complete]
+
+Task 2: Recovery modes
+
+[Get Task 2 text and context (already extracted)]
+[Dispatch implementation subagent with full task text + context]
+
+Implementer: [No questions, proceeds]
+Implementer:
+  - Added verify/repair modes
+  - 8/8 tests passing
+  - Self-review: All good
+  - Committed
+
+[Dispatch spec compliance reviewer]
+Spec reviewer: ❌ Issues:
+  - Missing: Progress reporting (spec says "report every 100 items")
+  - Extra: Added --json flag (not requested)
+
+[Implementer fixes issues]
+Implementer: Removed --json flag, added progress reporting
+
+[Spec reviewer reviews again]
+Spec reviewer: ✅ Spec compliant now
+
+[Dispatch code quality reviewer]
+Code reviewer: Strengths: Solid. Issues (Important): Magic number (100)
+
+[Implementer fixes]
+Implementer: Extracted PROGRESS_INTERVAL constant
+
+[Code reviewer reviews again]
+Code reviewer: ✅ Approved
+
+[Mark Task 2 complete]
+
+...
+
+[After all tasks]
+[Dispatch final code-reviewer]
+Final reviewer: All requirements met, ready to merge
+
+Done!
+```
+
+## Advantages
+
+**vs. Manual execution:**
+- Subagents follow TDD naturally
+- Fresh context per task (no confusion)
+- Parallel-safe (subagents don't interfere)
+- Subagent can ask questions (before AND during work)
+
+**vs. Executing Plans:**
+- Same session (no handoff)
+- Continuous progress (no waiting)
+- Review checkpoints automatic
+
+**Efficiency gains:**
+- No file reading overhead (controller provides full text)
+- Controller curates exactly what context is needed
+- Subagent gets complete information upfront
+- Questions surfaced before work begins (not after)
+
+**Quality gates:**
+- Self-review catches issues before handoff
+- Two-stage review: spec compliance, then code quality
+- Review loops ensure fixes actually work
+- Spec compliance prevents over/under-building
+- Code quality ensures implementation is well-built
+
+**Cost:**
+- More subagent invocations (implementer + 2 reviewers per task)
+- Controller does more prep work (extracting all tasks upfront)
+- Review loops add iterations
+- But catches issues early (cheaper than debugging later)
+
+## Red Flags
+
+**Never:**
+- Start implementation on main/master branch without explicit user consent
+- Skip reviews (spec compliance OR code quality)
+- Proceed with unfixed issues
+- Dispatch multiple implementation subagents in parallel (conflicts)
+- Make subagent read plan file (provide full text instead)
+- Skip scene-setting context (subagent needs to understand where task fits)
+- Ignore subagent questions (answer before letting them proceed)
+- Accept "close enough" on spec compliance (spec reviewer found issues = not done)
+- Skip review loops (reviewer found issues = implementer fixes = review again)
+- Let implementer self-review replace actual review (both are needed)
+- **Start code quality review before spec compliance is ✅** (wrong order)
+- Move to next task while either review has open issues
+
+**If subagent asks questions:**
+- Answer clearly and completely
+- Provide additional context if needed
+- Don't rush them into implementation
+
+**If reviewer finds issues:**
+- Implementer (same subagent) fixes them
+- Reviewer reviews again
+- Repeat until approved
+- Don't skip the re-review
+
+**If subagent fails task:**
+- Dispatch fix subagent with specific instructions
+- Don't try to fix manually (context pollution)
+
+## Integration
+
+**Required workflow skills:**
+- **superpowers:using-git-worktrees** - REQUIRED: Set up isolated workspace before starting
+- **superpowers:writing-plans** - Creates the plan this skill executes
+- **superpowers:requesting-code-review** - Code review template for reviewer subagents
+- **superpowers:finishing-a-development-branch** - Complete development after all tasks
+
+**Subagents should use:**
+- **superpowers:test-driven-development** - Subagents follow TDD for each task
+
+**Alternative workflow:**
+- **superpowers:executing-plans** - Use for parallel session instead of same-session execution
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. User asks about whether subagent logs are stored in checkpoints, and invokes brainstorming skill.
+
+2. I explored the codebase thoroughly and found:
+   - Subagent transcripts ARE stored on shadow branches during SaveTaskStep
+   - During condensation to entire/checkpoints/v1, task metadata is NOT carried forward
+   - Token calculation passes empty subagentsDir, missing subagent tokens
+   - There's a TODO on line 499 of manual_commit_condensation.go confirming the gap
+
+3. User confirmed goal: Both replay + tokens (full preservation AND accurate token accounting)
+
+4. Design discussion:
+   - Initially proposed Approach A (filesystem MetadataDir) but discovered task files only exist in git tree, not filesystem
+   - Corrected to Approach A: Shadow tree blob copy (git-to-git)
+   - User asked about format on checkpoints branch
+   - Decided: tasks/<tool-use-id>/ structure but renamed to subagents/ on committed branch
+   - User asked about checkpoint.json - decided to exclude rewind-specific files, only copy agent-*.jsonl
+   - User asked about metadata pointers - added SubagentInfo to CommittedMetadata
+   - User confirmed tool_use_ids match full.jsonl for jump-off points
+   - User asked "is this too Claude specific?" - confirmed design is agent-agnostic
+   - User chose to rename directory from tasks/ to subagents/
+
+5. Design doc written to docs/plans/2026-03-04-subagent-logs-in-checkpoints-design.md (user said don't commit to git)
+
+6. Implementation plan written to docs/plans/2026-03-04-subagent-logs-in-checkpoints-plan.md with 7 tasks
+
+7. User chose subagent-driven development (option 1)
+
+8. Task execution:
+   - Tasks 1+2 (SubagentInfo type + session State field): Completed by subagent. Diagnostics were stale gopls - verified with go build and go test.
+   - Task 3 (SaveTaskStep accumulation): Completed by subagent. Had diagnostic about return value mismatch but was stale gopls - verified with go build and go test.
+   - Task 4 (WriteCommitted SubagentBlobs): Completed by subagent. Had diagnostic about unused imports and undefined object, but was stale gopls - verified with go build and go test.
+   - Task 5 (Extract subagent blobs from shadow tree during condensation): Was about to be dispatched.
+
+Key files modified:
+- cmd/entire/cli/checkpoint/checkpoint.go - Added SubagentInfo type and fields to CommittedMetadata and WriteCommittedOptions
+- cmd/entire/cli/checkpoint/committed.go - Wired SubagentBlobs into writeSessionToSubdirectory
+- cmd/entire/cli/checkpoint/committed_test.go - New test file with SubagentInfo and WriteCommitted tests
+- cmd/entire/cli/session/state.go - Added Subagents field to State struct
+- cmd/entire/cli/session/state_test.go - Added round-trip tests
+- cmd/entire/cli/strategy/manual_commit_git.go - Added subagent accumulation in SaveTaskStep
+- cmd/entire/cli/strategy/manual_commit_test.go - Added SaveTaskStep accumulation tests
+
+Current task list:
+- #6 completed: Task 1
+- #7 completed: Task 2  
+- #8 completed: Task 3
+- #9 completed: Task 4
+- #10 in_progress: Task 5 (Extract subagent blobs from shadow tree during condensation)
+- #11 pending: Task 6 (Fix subagent token calculation)
+- #12 pending: Task 7 (Full test suite, lint, duplication check)
+
+I was about to dispatch the implementer subagent for Task 5 when the summary was requested. I had just read the CondenseSession function and existing test patterns to provide context to the subagent.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked whether subagent logs are properly stored in checkpoints. After confirming they are NOT preserved during condensation (only exist temporarily on shadow branches), the user wanted to design and implement a solution for both **session replay** (preserving subagent transcripts permanently) and **accurate token accounting** (including subagent token usage in checkpoint metadata). The user chose subagent-driven development to execute the implementation plan task by task.
+
+2. Key Technical Concepts:
+   - **Shadow branches** (`entire/<hash>-<worktreeHash>`): Temporary branches where `SaveTaskStep` stores task metadata including subagent transcripts. These are ephemeral and cleaned up after condensation.
+   - **Condensation**: Process triggered by user git commit (PostCommit hook) that copies session data from shadow branch to permanent `entire/checkpoints/v1` branch. Currently does NOT copy task/subagent data.
+   - **`extractSessionData()`**: Has a TODO at line 499 of `manual_commit_condensation.go` passing empty `subagentsDir` to `CalculateTokenUsage`, causing subagent tokens to be missed.
+   - **Key insight**: Task metadata files (`checkpoint.json`, `agent-<id>.jsonl`, incremental checkpoints) exist ONLY in the shadow branch git tree — they are never written to the filesystem. This means `copyMetadataDir` (which walks the filesystem) cannot be used directly.
+   - **Solution**: Git-to-git blob copy — walk the shadow branch tree during condensation, extract `agent-*.jsonl` blob hashes, and insert them directly into the committed tree (no re-reading or re-redacting needed).
+   - **Directory rename**: Shadow branch uses `tasks/<tool-use-id>/`, committed branch uses `subagents/<tool-use-id>/` (more descriptive).
+   - **Excluded from committed branch**: `checkpoint.json` (rewind-specific), `checkpoints/` directory (incremental snapshots, rewind-specific). Only `agent-*.jsonl` transcripts are copied.
+   - **Token fix**: Pass `filepath.Dir(liveTranscriptPath)` as `subagentsDir` — the agent's session directory has live `agent-<id>.jsonl` files. For Claude Code, the hooks code uses `filepath.Join(filepath.Dir(state.TranscriptPath), state.SessionID, "subagents")` pattern.
+   - **Import cycle safety**: `session` can import `checkpoint` without a cycle (verified: session imports checkpoint/id but not checkpoint, and checkpoint does not import session).
+
+3. Files and Code Sections:
+
+   - **`docs/plans/2026-03-04-subagent-logs-in-checkpoints-design.md`** (created, NOT committed to git per user request)
+     - Full design document covering the problem, current state, committed checkpoint format, metadata pointers, accumulation strategy, blob copy approach, token fix, and backward compatibility.
+
+   - **`docs/plans/2026-03-04-subagent-logs-in-checkpoints-plan.md`** (created, NOT committed to git)
+     - 7-task implementation plan with TDD steps, exact code snippets, and test patterns.
+
+   - **`cmd/entire/cli/checkpoint/checkpoint.go`** (modified)
+     - Added `SubagentInfo` type after `CommittedMetadata`:
+       ```go
+       type SubagentInfo struct {
+           AgentID     string `json:"agent_id"`
+           Type        string `json:"type,omitempty"`
+           Description string `json:"description,omitempty"`
+       }
+       ```
+     - Added `Subagents` field to `CommittedMetadata`:
+       ```go
+       Subagents map[string]SubagentInfo `json:"subagents,omitempty"`
+       ```
+     - Added two fields to `WriteCommittedOptions`:
+       ```go
+       SubagentBlobs map[string]object.TreeEntry
+       Subagents map[string]SubagentInfo
+       ```
+
+   - **`cmd/entire/cli/checkpoint/committed.go`** (modified)
+     - In `writeSessionToSubdirectory`, after writing context entries, inserts subagent blob entries:
+       ```go
+       for relPath, entry := range opts.SubagentBlobs {
+           fullPath := sessionPath + relPath
+           entries[fullPath] = object.TreeEntry{
+               Name: fullPath,
+               Mode: entry.Mode,
+               Hash: entry.Hash,
+           }
+       }
+       ```
+     - `CommittedMetadata` struct literal now includes `Subagents: opts.Subagents`
+
+   - **`cmd/entire/cli/checkpoint/committed_test.go`** (created)
+     - `TestCommittedMetadata_SubagentsField` — round-trip JSON marshal/unmarshal
+     - `TestCommittedMetadata_SubagentsField_OmitsWhenEmpty` — verifies omitempty
+     - `TestSubagentInfo_JSONTags` — verifies optional field omission
+     - `TestWriteCommitted_SubagentBlobsAndMetadata` with 3 subtests (insert blobs, works without blobs, multiple blobs)
+
+   - **`cmd/entire/cli/session/state.go`** (modified)
+     - Added import: `"github.com/entireio/cli/cmd/entire/cli/checkpoint"`
+     - Added field to `State` struct:
+       ```go
+       Subagents map[string]checkpoint.SubagentInfo `json:"subagents,omitempty"`
+       ```
+
+   - **`cmd/entire/cli/session/state_test.go`** (modified)
+     - Added `TestState_SubagentsField_RoundTrip` with populated and nil subtests
+
+   - **`cmd/entire/cli/strategy/manual_commit_git.go`** (modified)
+     - In `SaveTaskStep()`, after `mergeFilesTouched` and before `saveSessionState`, added:
+       ```go
+       if !step.IsIncremental && step.AgentID != "" {
+           if state.Subagents == nil {
+               state.Subagents = make(map[string]checkpoint.SubagentInfo)
+           }
+           state.Subagents[step.ToolUseID] = checkpoint.SubagentInfo{
+               AgentID:     step.AgentID,
+               Type:        step.SubagentType,
+               Description: step.TaskDescription,
+           }
+       }
+       ```
+
+   - **`cmd/entire/cli/strategy/manual_commit_test.go`** (modified)
+     - Added `setupTaskStepTestEnv` helper and 4 test functions:
+       - `TestSaveTaskStep_FinalCheckpointAccumulatesSubagentInfo`
+       - `TestSaveTaskStep_IncrementalCheckpointSkipsAccumulation`
+       - `TestSaveTaskStep_EmptyAgentIDSkipsAccumulation`
+       - `TestSaveTaskStep_MultipleSubagentsAccumulate`
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation.go`** (key file for remaining work)
+     - Line 270-292: `WriteCommitted` call needs `SubagentBlobs` and `Subagents` fields added
+     - Line 499: TODO `//TODO: why do we not use here subagents dir?` — needs `subagentsDir` fix
+     - Line 543: Same TODO in `extractSessionDataFromLiveTranscript`
+     - New `extractSubagentBlobs` function needs to be added
+
+4. Errors and fixes:
+   - **Stale gopls diagnostics after subagent edits**: Every subagent completion triggered stale LSP diagnostics showing compilation errors (undefined types, missing fields) that didn't actually exist. Per CLAUDE.md: "After subagent completion, do not rely on LSP diagnostics to verify subagent work." Fixed by running `go build` and `go test` directly instead of trusting diagnostics.
+   - **Initial design flaw (Approach A)**: Originally proposed passing filesystem `MetadataDir` to `WriteCommitted` during condensation. Discovered that task metadata files are NEVER written to the filesystem in production — they only exist in the shadow branch git tree. Corrected to shadow tree blob copy approach.
+   - **User feedback on design**: User pushed back on several design choices:
+     - Asked "do we end up collecting a bunch of new files if we choose A?" — led to discovering the filesystem issue
+     - Asked "are those checkpoint.json files created by entire?" — clarified data ownership
+     - Asked "is this too claude specific?" — confirmed agent-agnostic design
+     - Suggested renaming `tasks/` to `subagents/` on committed branch
+     - Suggested excluding `checkpoint.json` (rewind-specific) from committed branch
+     - Suggested adding metadata pointers to `0/metadata.json`
+   - **User rejected git commit of design doc**: Said "don't add this to git" when I tried to commit the design document.
+
+5. Problem Solving:
+   - Identified the root cause: `CondenseSession()` does not pass `MetadataDir` field in `WriteCommittedOptions`, so task subdirectories are dropped during condensation
+   - Identified secondary issue: `extractSessionData()` passes empty `subagentsDir` to `CalculateTokenUsage`, causing subagent token usage to be omitted
+   - Discovered task metadata only exists in git tree (not filesystem) — required changing the implementation approach
+   - Verified no import cycles between `session` and `checkpoint` packages
+   - Identified correct `subagentsDir` path for token calculation: `filepath.Dir(state.TranscriptPath)` for the simple case, or `filepath.Join(filepath.Dir(state.TranscriptPath), state.SessionID, "subagents")` for Claude Code's hooks pattern
+
+6. All user messages:
+   - "I don't believe that we store subagent logs in our checkpoints. Is this true? How might we handle these properly? /superpowers:brainstorm"
+   - Selected "Both replay + tokens" for primary goal
+   - "do we end up collecting a bunch of new files if we choose A?"
+   - "are those checkpoint.json files created by entire?"
+   - "just a last validation - the tool use IDs match what is in the full.jsonl yes? so we can see the jump off point from there? do we want to attach the additional file pointers into the 0/metadata.json?"
+   - "is this too claude specific?"
+   - Selected "Rename to 'subagents/'" for directory naming
+   - Selected "Yes, write the design doc" (implicit from "do we even need to keep the checkpoint.json? we can retain the tasks folder structure...")
+   - Rejected git commit: "don't add this to git"
+   - Selected "1" (Subagent-Driven execution in this session)
+
+7. Pending Tasks:
+   - **Task 5 (in_progress)**: Extract subagent blobs from shadow tree during condensation — write `extractSubagentBlobs` helper, wire into `CondenseSession`, integration test
+   - **Task 6 (pending)**: Fix subagent token calculation in `extractSessionData` — replace empty `subagentsDir` with `filepath.Dir(liveTranscriptPath)`
+   - **Task 7 (pending)**: Run full test suite (`mise run fmt && mise run lint && mise run test:ci && mise run dup:staged`)
+   - After all tasks: Final code review, then use `superpowers:finishing-a-development-branch`
+
+8. Current Work:
+   I was executing the subagent-driven development workflow for the implementation plan. Tasks 1-4 are complete and verified. I was about to dispatch the implementer subagent for **Task 5: Extract subagent blobs from shadow tree during condensation**. I had just finished reading:
+   - The full `CondenseSession` function (lines 122-303 of `manual_commit_condensation.go`) to provide exact context
+   - The existing condensation test pattern from `TestShadowStrategy_CondenseSession_EphemeralBranchTrailer` (lines 1469-1562)
+   
+   Task 5 requires:
+   1. Writing `extractSubagentBlobs(repo, shadowRef, sessionID)` helper that walks shadow tree under `.entire/metadata/<session-id>/tasks/`, filters for `agent-*.jsonl` files, and remaps paths from `tasks/` to `subagents/`
+   2. Wiring it into `CondenseSession` before the `store.WriteCommitted()` call at line 270
+   3. Passing `SubagentBlobs` and `Subagents` (from `state.Subagents`) to `WriteCommittedOptions`
+   4. Writing an integration test for the full SaveTaskStep → CondenseSession → verify subagent transcripts on committed branch flow
+
+   Base SHA: `4698d3d4d13a56481f03bc5534f08b2b0295ff5c`
+
+9. Optional Next Step:
+   Dispatch the implementer subagent for Task 5 (Extract subagent blobs from shadow tree during condensation). This is the most complex remaining task — it connects the shadow branch data to the condensation pipeline. I had already read the `CondenseSession` function and existing test patterns to provide full context to the subagent.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-4/9ec1f9a9-b415-4205-abb7-830bfb5a3efe.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.

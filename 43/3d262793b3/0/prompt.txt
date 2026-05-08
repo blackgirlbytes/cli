@@ -1,0 +1,155 @@
+how do I set retention settings for checkpoints v2?
+
+---
+
+So the issue with `/Users/ninawork/entire/devenv/entiredb` is that the checkpoints in `v2/full/0000000000023` are already older than 14 days but we're still keeping them. I think the bug is that after migration, we're keeping them around despite how old they are, even though the checkpoints themselves are 14+ days old, which is the default retention if I'm not mistaken. It should be checking the checkpoint time, not the time it was written to the filesystem
+
+---
+
+The code default should be 14, not 60.
+
+---
+
+why is this the case? ` Also, v2/full/0000000000023 contains some transcript timestamps from 2026-04-30`
+
+---
+
+why is it all the way in 23?
+
+---
+
+ok, that makes sense.
+
+please generate reasonable commit messages with details and push up the changes to `update-rotation-generation-logic`
+
+---
+
+Summarize the changes in 5 bullet points or less
+
+---
+
+I built and ran clean but it seems it didn't clean up any of the older checkpoints. do I need to rerun the migration to see those changes?>
+
+```
+➜  entiredb git:(test) export PATH="/Users/ninawork/entire/devenv/cli:$PATH"
+mise WARN  missing: golangci-lint@2.11.2
+➜  entiredb git:(test) entire clean --all
+No items to clean up.
+```
+
+---
+
+but what about 01-22?
+
+---
+
+➜  entiredb git:(test) git ls-remote origin 'refs/entire/checkpoints/v2/*'
+72acb068390494b41347d6bf5ece8eabc8fe0c42	refs/entire/checkpoints/v2/full/0000000000001
+a3cd546876e97ebaf0ec7493b0cc06e31d73ea13	refs/entire/checkpoints/v2/full/0000000000002
+cd914f886cbe970f2cca173fd3257e745e62ee43	refs/entire/checkpoints/v2/full/0000000000003
+7be829e442365576562638dc4a2a949cbf6e1b17	refs/entire/checkpoints/v2/full/0000000000004
+61e56c9779a7037424151bb1e182b245790e1700	refs/entire/checkpoints/v2/full/0000000000005
+bfb63421469a735ebca8a6bcb5095c44adb072e3	refs/entire/checkpoints/v2/full/0000000000006
+4469abdaaa1d35096aef39c260509e66c96f79c8	refs/entire/checkpoints/v2/full/0000000000007
+b2ed275b2009228b8e293d08f0579bd406655961	refs/entire/checkpoints/v2/full/0000000000008
+93d383b12f5a9cd3fe23488bf5f08ab3d97d9368	refs/entire/checkpoints/v2/full/0000000000009
+f8329c505de44374e0e2b25967d6ccdc7c049dfc	refs/entire/checkpoints/v2/full/0000000000010
+97baf71255588065905cf5fc973f4ab8a5dda188	refs/entire/checkpoints/v2/full/0000000000011
+1def2c406075db200146abcaacf734e1926c63cb	refs/entire/checkpoints/v2/full/0000000000012
+70db8b2cfe44198818ee886a71e528aea4236454	refs/entire/checkpoints/v2/full/0000000000013
+d86a0d56de4a8f29d5c28a97ccda9b392f728212	refs/entire/checkpoints/v2/full/0000000000014
+729415743dae8475e67788dade94222029390cee	refs/entire/checkpoints/v2/full/0000000000015
+6e47d91ecec03f58907188c405fad91f7f9d6657	refs/entire/checkpoints/v2/full/0000000000016
+da26ab8ec25e8a93379bf75efc10e4bfbc68d1af	refs/entire/checkpoints/v2/full/0000000000017
+1dab257e6056fdaace03b44164eda331710ea531	refs/entire/checkpoints/v2/full/0000000000018
+0cf078e9b9a4058d807ced1b349d2191b9f11bbb	refs/entire/checkpoints/v2/full/0000000000019
+c0849664a8fb811927c6a450aced6642a08dc2ae	refs/entire/checkpoints/v2/full/0000000000020
+8ea9595af8f4d67ca8126b0f63d00748d90b8173	refs/entire/checkpoints/v2/full/0000000000021
+68985874c88a58d65a1f6e4ab1f56ff034ae4249	refs/entire/checkpoints/v2/full/0000000000022
+187520bee6d46c487dc99498255e7972560aef51	refs/entire/checkpoints/v2/full/0000000000023
+ad91db341ed9b1845af4426a87170a88776aa07a	refs/entire/checkpoints/v2/full/current
+0ef62af8de4c4b7c69c676ac505641156f04075b	refs/entire/checkpoints/v2/main
+
+---
+
+```
+➜  entiredb git:(test) entire clean --all
+
+Found 7 items to clean:
+
+Archived v2 generations (7):
+  0000000000008
+  0000000000009
+  0000000000010
+  0000000000011
+  0000000000012
+  0000000000013
+  0000000000014
+```
+
+why just 7?
+
+---
+
+to make sure the checkpoints have the correct creation time, should I rerun migration with force?
+
+---
+
+Review the PR comments in https://github.com/entireio/cli/pull/1088
+
+---
+
+Let's fix them up
+
+---
+
+oh push everything up
+
+---
+
+I'm still confused why it only had to clean these:
+Archived v2 generations (7):
+  0000000000008
+  0000000000009
+  0000000000010
+  0000000000011
+  0000000000012
+  0000000000013
+  0000000000014
+
+shouldn't they all have the same date due to the migration bug?
+
+---
+
+only 8-14 is weird though, why not 1-7?
+
+---
+
+also, shouldn't it be writing new ones to 01, not 23?
+
+---
+
+this should be true as of the latest code, yes?
+> we can make assumptions based on the generation number: e.g. higher numbers are always newer/younger than lower numbers
+
+---
+
+what about for the next repo to be migrated?
+
+---
+
+check the generation.json for /Users/ninawork/entire/devenv/entiredb please across these refs to make sure ther eare no checkpoints outside the timestamps of that generation metadata
+
+---
+
+ok how do I fix this for the repos that were already migrated?
+
+---
+
+why wouldn't force migration fix it? would new repos to be migrated still have this problem?
+
+---
+
+so should generation happen after the migration is complete as a final step so that the refs are created in the proper order?
+
+also, how do I fix this for existing repos that were already migrated?

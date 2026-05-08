@@ -1,0 +1,88 @@
+Here's a plan I extracted from another session:
+
+# Fix: Skip Sentinel Wait for ACTIVE Sessions in PostCommit
+
+## Problem
+
+The `entire` PostCommit hook takes ~3.3 seconds even when the actual work (condensation, carry-forward) takes ~18ms. The bottleneck is `waitForTranscriptFlush` in the Claude Code agent, which polls for up to 3 seconds looking for a stop sentinel that **can never exist** during ACTIVE sessions.
+
+### Why the sentinel can't exist for ACTIVE sessions
+
+`waitForTranscriptFlush` polls the transcript JSONL for the string `"hooks claude-code stop"`. This sentinel is written by Claude Code when its **stop hook** fires. During PostCommit with an ACTIVE session, the agent is still running — it hasn't stopped yet — so the sentinel is never present, and the function always hits the 3-second timeout.
+
+### Where the 3s wait happens
+
+PostCommit calls `resolveFilesTouched` for ACTIVE sessions, which calls `prepareTranscriptForState` → `prepareTranscriptIfNeeded` → `PrepareTranscript` → `waitForTranscriptFlush`. Additionally, `CondenseSession` calls `prepareTranscriptIfNeeded` for ACTIVE sessions (line 134-136 of `manual_commit_condensation.go`). The wait can be hit **twice** per PostCommit for ACTIVE sessions.
+
+### Impact
+
+Every commit made while the agent is running (ACTIVE session) adds ~3 seconds of unnecessary wall-clock time to the PostCommit hook. Visible via `entire perf --hook post-commit`.
+
+## Recommended Fix
+
+Skip the sentinel wait for ACTIVE sessions in PostCommit. The sentinel remains valuable for IDLE/ENDED sessions where the stop hook has already fired.
+
+### Why this is safe
+
+For ACTIVE sessions, without the wait we'd read whatever transcript data is already flushed to disk — potentially missing the last few lines written between the agent's most recent flush and the commit moment. The impact is minor:
+
+- **Slightly incomplete `files_touched`** — might miss files mentioned in the very tail of the transcript
+- **Slightly truncated `full.jsonl`** in the condensed checkpoint
+- **Slightly off token counts**
+
+All of this is **self-healing**: the next commit re-condenses with the updated (now more complete) transcript. Any data missed in this checkpoint gets captured in the next one. For IDLE/ENDED sessions, the sentinel wait remains important since that may be the only condensation.
+
+## Key Files
+
+### Sentinel implementation
+- **`cmd/entire/cli/agent/claudecode/lifecycle.go:187-238`** — `waitForTranscriptFlush` function. Polls transcript for `stopHookSentinel = "hooks claude-code stop"` every 50ms for up to 3s. Has fast paths for missing/stale files but no fast path for ACTIVE sessions.
+- **`cmd/entire/cli/agent/claudecode/lifecycle.go:85-90`** — `PrepareTranscript` method on `ClaudeCodeAgent`. This is the public entry point that calls `waitForTranscriptFlush`.
+
+### Call chain from PostCommit
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:946-974`** — `check_session_content` span in PostCommit. For ACTIVE sessions (line 968-969), calls `resolveFilesTouched`.
+- **`cmd/entire/cli/strategy/manual_commit_hooks.go:1455-1472`** — `resolveFilesTouched`. Falls back to transcript extraction, calling `prepareTranscriptForState` first.
+- **`cmd/entire/cli/strategy/common.go:1455-1469`** — `prepareTranscriptForState`. Only runs for ACTIVE sessions. Resolves agent, calls `prepareTranscriptIfNeeded`.
+- **`cmd/entire/cli/strategy/common.go:1475-1484`** — `prepareTranscriptIfNeeded`. Checks if agent implements `TranscriptPreparer`, calls `PrepareTranscript`.
+
+### Second call path (condensation)
+- **`cmd/entire/cli/strategy/manual_commit_condensation.go:134-136`** — `CondenseSession` also calls `prepareTranscriptIfNeeded` for ACTIVE sessions before extracting session data from the live transcript.
+
+### Agent interface
+- **`TranscriptPreparer`** interface — agents that write transcripts asynchronously implement this. Claude Code is the only agent that currently does (see `docs/architecture/agent-guide.md:818`).
+
+### Existing tests
+- **`cmd/entire/cli/agent/claudecode/lifecycle_test.go:489-525`** — Tests for `waitForTranscriptFlush`: stale file fast path, sentinel detection, missing file handling.
+- **`cmd/entire/cli/strategy/phase_postcommit_test.go:1970`** — Comment referencing this exact issue.
+
+## Implementation Options
+
+### Option A: Skip PrepareTranscript for ACTIVE sessions at the call sites (recommended)
+
+In `prepareTranscriptForState` (common.go:1455), the function already guards on `state.Phase.IsActive()`. The fix would be to **invert** that check — skip preparation for ACTIVE sessions entirely, since the sentinel can't exist and the transcript is being actively written to.
+
+Similarly, in `CondenseSession` (manual_commit_condensation.go:134), the `state.Phase.IsActive()` guard should skip `prepareTranscriptIfNeeded`.
+
+**Pros:** Minimal change, targeted, easy to reason about.
+**Cons:** Slightly less complete transcript on first condensation (self-healing on next commit).
+
+### Option B: Pass session phase into PrepareTranscript and return early
+
+Thread the phase information through to `waitForTranscriptFlush` itself so it can return immediately for ACTIVE sessions. This keeps the skip logic closer to the sentinel implementation.
+
+**Pros:** Self-documenting at the sentinel level.
+**Cons:** Requires changing the `TranscriptPreparer` interface or adding a new method, which affects all agent implementations.
+
+### Option C: Add a context-based signal
+
+Use `context.WithValue` to pass a "skip sentinel" flag from PostCommit through the call chain.
+
+**Pros:** No interface changes.
+**Cons:** Magic context values are harder to discover and test.
+
+## Verification
+
+After implementing, run `entire perf --hook post-commit` to verify PostCommit duration drops from ~3.3s to ~300ms or less. The existing tests in `lifecycle_test.go` and `phase_postcommit_test.go` should continue passing.
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```

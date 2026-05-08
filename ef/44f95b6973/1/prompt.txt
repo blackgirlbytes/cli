@@ -1,0 +1,176 @@
+Review the code in https://github.com/entireio/cli/pull/877
+
+---
+
+> If writeOpts.CompactTranscriptStart is ever greater than current fullLines (e.g. transcript truncation/rotation, format/compaction behavior change across versions, or stale state), compactLines becomes negative and the saved CompactTranscriptStart is reduced. That can make subsequent checkpoints re-scope incorrectly and re-include already-condensed compact content.
+
+why would that be the case
+
+---
+
+and it doesn't cause any regressions?
+
+---
+
+transcript is append-only and the compacting logic would only change if the agents start changing the logs we need to convert to transcript.jsonl but I think that would be another issue
+
+---
+
+what does this mean?
+"In the migration path, tryCompactTranscript produces a scoped compact (using StartLine: m.GetTranscriptStart()), and this scoped result is assigned to opts.CompactTranscript. But computeCompactOffset calculates a non-zero CompactTranscriptStart offset that represents a position within the cumulative compact. The live path (buildCompactTranscript) correctly generates a cumulative compact with startLine=0 for storage. Migration now writes a transcript.jsonl containing only new-since-checkpoint content, paired with metadata claiming the content starts at a non-zero offset — a mismatch that would confuse any reader expecting cumulative content matching the live-path format."
+
+is it an issue?
+
+---
+
+So the migration path is wrong but otherwise the logic is correct.
+
+The intention is that when we convert full.jsonl to transcript.jsonl, the migration should append if the session is a continuation of a previous checkpoint's session
+
+---
+
+Ok, let's fix migration path
+
+---
+
+Ok now vet this review:
+PR #877 Review Summary
+
+  Checkpoints V2: Support checkpoint_transcript_start for compact transcript.jsonl files
+
+  11 files changed, +520/-97
+
+  ---
+  Critical Issues (2 found)
+
+  1. Accumulation pattern (+=) is fragile and non-self-correcting
+
+  [silent-failure-hunter] manual_commit_condensation.go:268-271, condensation.go:1028, condensation.go:1137, hooks.go:1317
+
+  CheckpointTranscriptStart uses absolute assignment (=), making it self-correcting. CompactTranscriptStart uses relative accumulation (+=), meaning any
+  single failure in the chain permanently corrupts all subsequent checkpoints in the session. This is the root architectural concern:
+
+  state.CheckpointTranscriptStart = result.TotalTranscriptLines   // self-correcting
+  state.CompactTranscriptStart += result.CompactTranscriptLines    // fragile accumulator
+
+  If CompactTranscriptLines is ever 0 due to a silent failure (redaction error, partial compact success), the offset stops advancing and never recovers.
+
+  Additionally, compactLines at line 268-271 has no negative guard:
+  compactLines = fullLines - writeOpts.CompactTranscriptStart
+  If CompactTranscriptStart somehow exceeds fullLines, this goes negative and CompactTranscriptStart would decrease.
+
+  Recommendation: At minimum, add max(0, ...) guard and a warning log. Ideally, consider whether this can be made self-correcting like the full-transcript
+  counterpart.
+
+  2. Redaction failure permanently poisons the session's compact offset chain
+
+  [silent-failure-hunter] manual_commit_condensation.go:326-358
+
+  When redact.JSONLBytes fails, redacted is set to nil, both compactTranscriptForV2 calls return nil, and CompactTranscriptLines becomes 0. The
+  accumulation state.CompactTranscriptStart += 0 means the offset stops advancing -- not just for this checkpoint, but for every subsequent checkpoint in
+  the session. The current warning log says "skipping transcript.jsonl on /main" but doesn't indicate the cascading impact.
+
+  Recommendation: Either compute what CompactTranscriptLines would have been from un-redacted data, or log at ERROR level that the session's compact offset
+   tracking is now broken.
+
+  ---
+  Important Issues (4 found)
+
+  3. computeCompactOffset in migrate.go has zero logging on failure paths
+
+  [silent-failure-hunter] migrate.go:454-476
+
+  Returns 0 on 5 distinct failure paths (empty transcript, missing agent, compaction error, negative offset) with no logging at all. During migration, this
+   silently bakes incorrect offsets into permanent storage. Its sibling computeCompactTranscriptStart in condensation.go does log on some failures -- this
+  function should too.
+
+  Recommendation: Add logging.Warn calls (requires adding ctx parameter). At minimum, log compaction errors and negative offsets.
+
+  4. Partial compact success produces inconsistent state
+
+  [silent-failure-hunter] manual_commit_condensation.go:347-354
+
+  Two independent compactTranscriptForV2 calls (scoped and full) could have one succeed and one fail. If full succeeds but scoped fails,
+  CompactTranscriptStart = 0 and CompactTranscriptLines = entire cumulative count, inflating the next checkpoint's offset.
+
+  Recommendation: If either compact call returns nil, treat both as nil.
+
+  5. No unit tests for computeCompactTranscriptStart or computeCompactOffset
+
+  [test-analyzer]
+
+  These are the core offset computation functions with 4-5 distinct code paths each. They're only tested indirectly through integration tests. The legacy
+  fallback path (where state.CompactTranscriptStart == 0 but state.CheckpointTranscriptStart > 0) has no test coverage. The migration test also uses
+  computeCompactOffset to compute its own expected value (tautological pattern).
+
+  Recommendation: Add direct unit tests covering edge cases: empty transcript, missing agent, negative offset, legacy session recalculation.
+
+  6. Repair path in migrate.go doesn't set CompactTranscriptStart
+
+  [silent-failure-hunter] migrate.go:250-269
+
+  repairPartialV2Checkpoint uses UpdateCommittedOptions which has no CompactTranscriptStart field. Repaired checkpoints may have compact transcripts but no
+   corresponding offset metadata.
+
+  Recommendation: Verify whether UpdateCommitted preserves existing metadata or if the repair path needs the compact offset.
+
+  ---
+  Suggestions (4 found)
+
+  7. CompactTranscriptLines comment is ambiguous about "written"
+
+  [comment-analyzer] manual_commit_types.go:57
+
+  Current: Lines in the compact transcript written for this checkpoint (0 if v2 disabled)
+  Could be read as total lines in the file written, when it's actually the delta (new lines only).
+
+  Suggested: New compact transcript lines added by this checkpoint (0 if v2 disabled); used to increment CompactTranscriptStart
+
+  8. TotalTranscriptLines comment says "full.jsonl" but non-JSONL agents exist
+
+  [comment-analyzer] manual_commit_types.go:56
+
+  Gemini/OpenCode use message counts, not JSONL lines. The new wording is more precise than before but technically inaccurate for those agents.
+
+  9. Compaction failures logged at WARN; should consider ERROR for live sessions
+
+  [silent-failure-hunter] manual_commit_condensation.go:1213-1217
+
+  Given cascading impact on offset tracking, logging.Error would be more appropriate for compaction failures in live sessions.
+
+  10. Missing test: v2-disabled path should assert CompactTranscriptLines == 0
+
+  [test-analyzer]
+
+  TestCondenseSession_V2Disabled_NoV2Refs doesn't verify that CompactTranscriptLines is 0, which is important for ensuring the accumulator is a no-op.
+
+  ---
+  Strengths
+
+  - Clean refactoring -- extracted helpers (resolveShadowRef, filterFilesTouched, buildCompactTranscript, countCompactLines, computeCompactTranscriptStart)
+   are well-named with clear single responsibilities
+  - Comprehensive multi-condensation test -- TestCondenseSession_V2CompactTranscriptStart (185 lines) exercises two full condensation cycles, verifies
+  offset accumulation, confirms cumulative compact transcript, and checks prefix consistency
+  - V1 backward compatibility preserved -- v1 continues using CheckpointTranscriptStart (full.jsonl domain) untouched
+  - All 4 state update paths covered -- CompactTranscriptStart is updated in condenseAndUpdateState, CondenseSessionByID, CondenseAndMarkFullyCondensed,
+  and reset in carryForwardToNewShadowBranch
+  - Legacy session handling -- computeCompactTranscriptStart re-derives compact offset from transcript bytes for sessions without persisted compact state
+  - Excellent doc comments -- especially on computeCompactTranscriptStart (priority chain explanation) and buildCompactTranscript (cumulative storage
+  rationale)
+  - Test patterns follow CLAUDE.md -- testutil helpers, t.Parallel() used correctly, t.Chdir() tests correctly omit parallel
+
+  ---
+  Recommended Action
+
+  1. Fix critical issues 1-2 -- Add negative guard on compactLines, address the redaction failure cascading problem
+  2. Address important issues 3-5 -- Add logging to computeCompactOffset, handle partial compact success, add unit tests for offset computation functions
+  3. Verify issue 6 -- Check repair path metadata handling
+  4. Consider suggestions -- Comment precision improvements, log level upgrade
+
+  The overall design is sound and well-implemented. The main concern is the fragility of the += accumulation pattern compared to the self-correcting =
+  assignment used for the full-transcript counterpart. Addressing that (even if just with guards and better logging) would significantly improve the
+  robustness of this feature.
+
+---
+
+I think just address 3, 7, 8, 10 (if it's only impacting tests)
