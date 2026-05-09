@@ -1,0 +1,161 @@
+Implement the following plan:
+
+# Fix: Switch Kiro E2E to `--no-interactive` mode
+
+## Context
+
+Kiro E2E tests fail in CI with "You are not logged in" because kiro-cli's **interactive TUI doesn't support SIGV4 env-var auth**. The `setup-kiro-action` reference confirms SIGV4 is designed for `--no-interactive` only — all CI examples use it.
+
+**Verified:** `--no-interactive` **fires hooks** (the comment at `kiro.go:127` was wrong):
+```
+✓ 1 of 1 hooks finished in 0.09 s  (×3 hooks)
+```
+
+## Changes
+
+### File: `e2e/agents/kiro.go` (only file modified)
+
+#### 1. Rewrite `RunPrompt` — pipe-based `--no-interactive` (no tmux)
+
+Model after Claude's `RunPrompt` (`e2e/agents/claude.go:113-170`). Uses `exec.CommandContext` with stdout/stderr pipes. Env vars (SIGV4) propagate naturally — no `env` wrapper needed.
+
+```go
+func (k *Kiro) RunPrompt(ctx context.Context, dir string, prompt string, opts ...Option) (Output, error) {
+    // ...config setup...
+    args := []string{"chat", "--no-interactive", "--trust-all-tools", "--agent", "entire", prompt}
+    cmd := exec.CommandContext(cmdCtx, k.Binary(), args...)
+    cmd.Dir = dir
+    cmd.Stdout = &stdout
+    cmd.Stderr = &stderr
+    err := cmd.Run()
+    // ...collect exit code and return Output...
+}
+```
+
+**Open questions to verify during implementation:**
+- Exact flag: `--trust-all-tools` (from error message) — check `kiro-cli chat --help`
+- Prompt passing: positional arg (user's test) vs `-p` flag
+
+#### 2. Rewrite `StartSession` — sequential `--no-interactive` commands
+
+Since interactive mode doesn't work with SIGV4, implement `Session` as a wrapper that runs a new `--no-interactive` command per `Send()`. This is the same approach the `setup-kiro-action` uses (all examples are single-shot `--no-interactive` calls).
+
+```go
+type KiroSession struct {
+    kiro       *Kiro
+    dir        string
+    ctx        context.Context
+    lastOutput string  // captured output from most recent Send
+}
+
+func (k *Kiro) StartSession(ctx context.Context, dir string) (Session, error) {
+    return &KiroSession{kiro: k, dir: dir, ctx: ctx}, nil
+}
+
+func (s *KiroSession) Send(input string) error {
+    out, err := s.kiro.RunPrompt(s.ctx, s.dir, input)
+    s.lastOutput = out.Stdout + out.Stderr
+    return err
+}
+
+func (s *KiroSession) WaitFor(_ string, _ time.Duration) (string, error) {
+    return s.lastOutput, nil  // command already completed in Send
+}
+
+func (s *KiroSession) Capture() string { return s.lastOutput }
+func (s *KiroSession) Close() error    { return nil }
+```
+
+**Session interface** (`e2e/agents/agent.go:57-62`): `Send`, `WaitFor`, `Capture`, `Close`
+
+**Trade-off:** Each `Send` creates a separate kiro-cli process (separate agent-spawn/stop hooks). Multi-turn tests will exercise multiple single-turn sessions instead of one continuous session. This is acceptable because:
+- Hooks still fire correctly per prompt
+- File changes persist (same working directory)
+- The alternative (interactive TUI) doesn't work with SIGV4 at all
+- Single-turn is how `setup-kiro-action` uses kiro-cli in CI
+
+#### 3. Remove dead code
+- Delete `kiroAuthEnvArgs()` helper (no longer needed without tmux)
+- Delete incorrect comment about `--no-interactive` not firing hooks
+- Remove the old `KiroSession` struct that wrapped `TmuxSession`
+
+#### 4. Adjust imports
+- Keep: `context`, `encoding/json`, `errors`, `fmt`, `os`, `os/exec`, `strings`, `time`
+- Remove if no longer used: any tmux-only imports
+
+## What stays the same
+- `Bootstrap()` — validates SIGV4 env vars in CI (unchanged)
+- Hook installation (`cmd/entire/cli/agent/kiro/`) — unchanged
+- CI workflows (`.github/workflows/e2e.yml`) — unchanged
+- All other agent implementations — unchanged
+
+## Verification
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. CI E2E with `--agent kiro` should pass
+
+## Key files
+- `e2e/agents/kiro.go` — only file modified
+- `e2e/agents/claude.go:113-170` — reference for pipe-based `RunPrompt`
+- `e2e/agents/agent.go:57-62` — `Session` interface
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/a6375286-82fb-48a9-90fd-f8e611e47d1b.jsonl
+
+---
+
+commit and push
+
+---
+
+Run mkdir -p "$E2E_ARTIFACT_DIR"
+artifacts: /home/runner/work/cli/cli/e2e-artifacts
+[e2e/tests]✖✖
+=== Failed
+=== FAIL: e2e/tests TestAttributionOnAgentCommit/kiro (0.49s)
+    attribution_test.go:61: send failed: exit status 1
+
+=== FAIL: e2e/tests TestAttributionOnAgentCommit (0.49s)
+
+DONE 2 tests, 2 failures in 0.498s
+E2E Test Report
+═══════════════
+
+Total: 1  Passed: 0  Failed: 1  Skipped: 0
+
+✗ TestAttributionOnAgentCommit (0.5s)
+  ✗ kiro                 0.5s
+      attribution_test.go:61: send failed: exit status 1
+
+💥 FAILED (0/1 passed) 💥
+
+
+entire binary:  /usr/local/bin/entire
+entire version: Entire CLI dev (unknown)
+Go version: go1.26.0
+OS/Arch: linux/amd64
+
+artifacts: /home/runner/work/cli/cli/e2e-artifacts
+[test:e2e] ERROR task failed
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+-p isnt real should be  kiro-cli chat --agent entire "Create a file called test.txt with hello"
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+[?25l
+▰▱▱▱▱▱▱ Opening auth portal and logging in...
+
+ Opening auth portal and logging in... [?25herror: OAuth error: Failed to open browser: Failed to open URL
+
+---
+
+[Request interrupted by user for tool use]

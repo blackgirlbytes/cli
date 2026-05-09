@@ -1,0 +1,1460 @@
+can you run /code-simplifier on 964 please
+
+---
+
+<task-notification>
+<task-id>ac2cfb60f96ab5776</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/ac2cfb60f96ab5776.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review for PR 964" completed</summary>
+<result>I now have enough context to write a thorough review. Here is my analysis:
+
+---
+
+## Efficiency Review: PR 964 (Stream Progress for Explain)
+
+### 1. Triple `settings.Load()` on the summary path -- redundant I/O
+
+**Severity: Medium**
+
+`generateCheckpointAISummary` (explain.go:528) triggers up to **three** independent calls to `settings.Load()` that each read and parse the same JSON file from disk:
+
+1. **Line 533**: `summaryDeadlineResolver(errW)` -- calls `settings.Load()` (explain.go:47)
+2. **Line 538**: `settingsTimeoutUnset()` -- calls `settings.Load()` **again** (explain.go:576)
+3. **Line 494** (error path only): `summaryDeadlineResolver(errW)` inside `generateCheckpointSummary` re-resolves the deadline for the error message -- another `settings.Load()`.
+
+The first two fire unconditionally on every summary generation. Since `settings.Load` reads `.entire/settings.json` + `.entire/settings.local.json` from disk and parses both, this is redundant I/O. Consider having `generateCheckpointAISummary` resolve settings once and thread the result through, or caching inside the resolver so the second call in `settingsTimeoutUnset` does not re-read.
+
+### 2. `summaryProgressWriter.handle` -- `styles.render()` called unconditionally on every delta event
+
+**Severity: Low**
+
+In explain.go:2082-2101, `handle()` computes `arrow` and `check` via `s.styles.render(...)` on **every** call, including the high-frequency `PhaseGenerating` deltas. Looking at the stream fixture, a typical response has 5-10+ `content_block_delta` events. Each call to `handle` renders both `arrow` and `check` even though only one is used per invocation.
+
+This is a minor allocation concern. The styles could be precomputed once in the constructor, or the render calls could be hoisted into the relevant `case` branches so `check` is not computed on non-Done phases. Not a blocking issue given the event rate (dozens, not thousands), but it is wasted work on every delta.
+
+### 3. `streamClaudeResponse` 64 KB initial buffer -- appropriate and well-bounded
+
+**Severity: None (acceptable)**
+
+The scanner is created at response.go:59-60 with:
+```go
+scanner.Buffer(make([]byte, 64*1024), streamBufferMax)
+```
+
+The init event in the test fixture is ~2.7 KB. Real init events with many MCP tools could be larger but the 64 KB initial allocation is a single short-lived allocation per CLI invocation, and the 4 MiB max is documented and reasonable. The `bufio.Scanner` will reuse the buffer across lines. **No issue here.**
+
+### 4. `makeProgressDispatcher` -- `len(text)/4` token estimation on every delta
+
+**Severity: None (acceptable)**
+
+At generate.go:149, the dispatcher estimates output tokens via `len(text) / 4` on every `content_block_delta` event. This is an integer division -- essentially free. The closure also calls `progress()` which stores an `atomic.Int64` and builds a `fmt.Sprintf` string for the progress line, but since deltas arrive at ~10-50 Hz from a network stream (not a tight CPU loop), this is not hot-path in any meaningful sense. The dedup check in `updateLine` (explain.go:2113-2114) prevents redundant I/O when the token count rounds to the same display string. **No issue.**
+
+### 5. `startIdleWatchdog` goroutine lifecycle -- correctly bounded, no leak
+
+**Severity: None (no issue)**
+
+The watchdog goroutine (explain.go:2031-2054) exits on any of three channels: `ticker.C` triggering cancellation, `done` being closed (via `stop()`), or `parent.Done()`. The `stop` function is `func() { close(done); cancel() }` and is always deferred in the caller (explain.go:541-542). The ticker is stopped via `defer ticker.Stop()` inside the goroutine.
+
+The `fired` `atomic.Bool` returned alongside the context is never read in the current code (the `_` discard at explain.go:541), which means it is a dead allocation, but trivially cheap (one word).
+
+**No leak. The goroutine is properly cleaned up.**
+
+### 6. `newSummaryProgressWriter` -- seeding `lastActivity` before watchdog starts
+
+**Severity: None (no race)**
+
+At explain.go:2078, the constructor seeds `lastActivity.Store(time.Now().UnixNano())`. The watchdog goroutine is not started until `startIdleWatchdog` is called at explain.go:541, which happens **after** `newSummaryProgressWriter` returns. So there is no temporal race: the seed write completes before the goroutine that reads `lastActivity` even exists. The `atomic.Int64` provides the memory ordering guarantee that the goroutine's `Load()` will see the seeded value. **No issue.**
+
+### 7. `atomic.Store` on every progress event -- no contention concern
+
+**Severity: None**
+
+`s.lastActivity.Store(time.Now().UnixNano())` at explain.go:2083 is called from the same goroutine that reads the stream (the `onEvent` callback in `streamClaudeResponse` runs synchronously in the scanner loop). The watchdog goroutine only does `Load()`. This is a single-writer / single-reader atomic pattern -- zero contention. `time.Now()` is a vDSO call on modern OS, costing ~20ns. **No issue.**
+
+### 8. `StreamEvent` deserializes all fields for every NDJSON line
+
+**Severity: Low**
+
+Every line in the NDJSON stream is fully deserialized into a `StreamEvent` struct (response.go:67-68), including the `init` event which can be several KB and contains fields the code never inspects (tools list, MCP servers, session_id, etc.). The struct definition uses concrete types (not `json.RawMessage`), so `json.Unmarshal` must walk and allocate for all JSON keys, even those that are ignored.
+
+For the `init` event specifically, this means allocating and immediately discarding strings for every tool name in the tools array. A two-pass approach (parse `{"type":"..."}` first, then full unmarshal only for interesting types) would avoid this. However, this happens once per CLI invocation and the init event is ~3-5 KB in practice, so the waste is measured in microseconds. **Low priority, but worth noting if the stream protocol adds heavier events in the future.**
+
+### 9. `json.Unmarshal` on `scanner.Bytes()` -- safe but could avoid a copy
+
+**Severity: Low**
+
+At response.go:63-68, `scanner.Bytes()` returns a slice into the scanner's buffer, and the comment in `bufio.Scanner` says the slice is only valid until the next `Scan()` call. `json.Unmarshal` processes the bytes synchronously before `Scan()` is called again, so this is safe. However, `json.Unmarshal` does not modify the input, so no defensive copy is needed. The current code is correct.
+
+### 10. Double type-assertion for streaming path
+
+**Severity: Low**
+
+In `summarize/claude.go:100-104`, `AsStreamingTextGenerator(textGenerator)` is called to check if the generator supports streaming. But since `GenerateText` on `ClaudeCodeAgent` already delegates to `GenerateTextStreaming` (generate.go:19-21), the non-streaming fallback path is functionally identical for Claude Code. This means the `AsStreamingTextGenerator` check and dual path is only useful for non-Claude agents that implement `TextGenerator` but not `StreamingTextGenerator`. This is correct behavior but adds a branch that is currently dead code for the primary (Claude Code) path. Not an efficiency problem per se, but unnecessary complexity.
+
+### Summary of Actionable Items
+
+| # | Issue | Severity | File:Line |
+|---|-------|----------|-----------|
+| 1 | Triple `settings.Load()` per summary generation -- redundant filesystem reads | Medium | explain.go:533, 538, 494 |
+| 2 | `styles.render()` called for both arrow+check on every delta event | Low | explain.go:2083-2085 |
+| 8 | Full JSON deserialization of all stream events including large init | Low | response.go:67-68 |
+
+Items 3-7, 9-10 are either acceptable or have no actual issue upon close inspection. The idle watchdog goroutine and atomic operations are correctly implemented with proper cleanup semantics.</result>
+<usage><total_tokens>83137</total_tokens><tool_uses>23</tool_uses><duration_ms>124678</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a93f813be9a81ab98</task-id>
+<tool-use-id>toolu_01KN5YHeRtW71bUfTTbgeKGN</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/a93f813be9a81ab98.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review for PR 964" completed</summary>
+<result>I have now examined all the relevant source files. Here is my review.
+
+---
+
+## Code Quality Review: PR 964 (stream-progress delta from typed-errors)
+
+### 1. Redundant State: Double settings.Load in the deadline path
+
+**File:** `cmd/entire/cli/explain.go:533 and 538`
+
+`generateCheckpointAISummary` calls `summaryDeadlineResolver(errW)` at line 533, which internally calls `settings.Load()` and reads `SummaryTimeoutValue()`. Then immediately at line 538, it calls `settingsTimeoutUnset()`, which loads settings *again* to check the same value. Both functions are package-level vars that each independently call `settings.Load(context.Background())`.
+
+The same duplication happens a *third* time at line 494 in `generateCheckpointSummary`, where `summaryDeadlineResolver(errW)` is called again on error just to recover the deadline value for the error message -- even though `generateCheckpointAISummary` already computed and used this same value internally.
+
+The resolution policy would be cleaner if `resolveSummaryDeadlineInputs` also returned whether the settings timeout was explicitly set (it already knows this: `r.settings &gt; 0`), so the caller only needs one settings load. As-is, there are up to 3 `settings.Load()` calls per summary generation attempt.
+
+### 2. Leaky Abstraction: PhaseDone emitted outside the dispatcher
+
+**File:** `cmd/entire/cli/agent/claudecode/generate.go:86-91`
+
+`PhaseDone` is dispatched directly in `GenerateTextStreaming` (line 86-91), while all other phases are dispatched through `makeProgressDispatcher`. This splits the phase lifecycle across two locations, which means:
+
+- Future implementors of `StreamingTextGenerator` for other agents must remember to emit `PhaseDone` themselves in the success path
+- The dispatcher handles `PhaseConnecting`, `PhaseFirstToken`, and `PhaseGenerating` but silently does *not* handle `PhaseDone` -- there is no comment explaining this asymmetry
+
+The `PhaseDone` emission should either be inside the dispatcher (keyed on `ev.Type == "result" &amp;&amp; !ev.IsError`) or the split should be documented with a comment on `makeProgressDispatcher` explaining that `PhaseDone` is intentionally the caller's responsibility because it requires data from the parsed final envelope.
+
+### 3. Stringly-Typed Code: Raw string literals for Claude stream event types
+
+**File:** `cmd/entire/cli/agent/claudecode/generate.go:135-144` and `cmd/entire/cli/agent/claudecode/response.go:74`
+
+The event type/subtype matching uses raw string literals: `"system"`, `"status"`, `"requesting"`, `"stream_event"`, `"message_start"`, `"content_block_delta"`, `"result"`. These appear in `makeProgressDispatcher`, `streamClaudeResponse`, and across tests. There are no constants for these values. Since this is a new subsystem being introduced in this PR, now is the right time to define constants (e.g., `eventTypeSystem`, `eventTypeStreamEvent`, `eventTypeResult`, etc.) rather than accumulating string matches that will diverge.
+
+### 4. Leaky Abstraction: GenerateFromTranscript mutates caller-owned generator
+
+**File:** `cmd/entire/cli/summarize/summarize.go:56-57`
+
+```go
+} else if cg, ok := generator.(*ClaudeGenerator); ok &amp;&amp; cg.Progress == nil {
+    cg.Progress = progress
+}
+```
+
+When the caller passes an existing `*ClaudeGenerator` with `Progress == nil`, `GenerateFromTranscript` mutates the caller's struct to inject the progress callback. This is a side effect that survives the call: the caller's generator now has a non-nil `Progress` field that it did not set. If the caller reuses the generator across calls (e.g., with different progress callbacks or nil), the first call's mutation persists. Either clone the generator or accept that `Progress` on `ClaudeGenerator` is purely the caller's responsibility and remove this backfill.
+
+### 5. Parameter Sprawl: generateCheckpointAISummary growing parameters
+
+**File:** `cmd/entire/cli/explain.go:528`
+
+```go
+func generateCheckpointAISummary(ctx context.Context, errW io.Writer, scopedTranscript []byte, filesTouched []string, agentType types.AgentType) (*checkpoint.Summary, error)
+```
+
+This function now takes 5 parameters (up from 4 in the base). The `errW` parameter is used for three distinct purposes inside: (1) progress output writing, (2) TTY detection for deadline policy, (3) TTY detection for in-place rendering. This conflates "where to write progress" with "how to choose the timeout policy." A caller that wants to write progress to stderr but use non-interactive deadline policy cannot express that. This isn't urgent at 5 params, but the trajectory is worth noting since the function's responsibilities are expanding.
+
+### 6. Redundant State: summaryDeadlineResolver called twice on error path
+
+**File:** `cmd/entire/cli/explain.go:494`
+
+```go
+summary, err := generateCheckpointAISummary(ctx, errW, scopedTranscript, cpSummary.FilesTouched, content.Metadata.Agent)
+if err != nil {
+    deadline, _ := summaryDeadlineResolver(errW)
+    return formatCheckpointSummaryError(err, deadline)
+}
+```
+
+The caller re-resolves the deadline solely to pass it to the error formatter. `generateCheckpointAISummary` already computed this value internally but discards it. The deadline should either be included in the returned error (as a typed error wrapping the timeout value) or returned as a second value from `generateCheckpointAISummary`.
+
+### 7. Unnecessary Comments
+
+**File:** `cmd/entire/cli/agent/claudecode/generate.go:18`
+```go
+// Delegates to GenerateTextStreaming with no progress callback.
+```
+This comment on `GenerateText` describes *what* the one-liner does. The single line of implementation (`return c.GenerateTextStreaming(ctx, prompt, model, nil)`) is self-documenting.
+
+**File:** `cmd/entire/cli/summarize/claude.go:103`
+```go
+resultJSON, err = textGenerator.GenerateText(ctx, prompt, model)
+```
+The nolint comment on the error return at line 106 was updated from `// preserve *ClaudeError` to `// preserve typed *ClaudeError` -- adding "typed" is a cosmetic rewording in a comment that was already adequate.
+
+**File:** `cmd/entire/cli/explain.go:557`
+```go
+nil, // generator (use default)
+```
+This inline comment narrates what `nil` means for a parameter. It is fine for a function with many arguments, but the comment is duplicated verbatim. Minor.
+
+### 8. Copy-Paste with Slight Variation: equalPhases test helper
+
+**File:** `cmd/entire/cli/agent/claudecode/claude_test.go:135-141`
+
+```go
+func equalPhases(a, b []agent.ProgressPhase) bool {
+```
+
+Go 1.26 has `slices.Equal` in the standard library. This hand-rolled helper is unnecessary. Replace with `slices.Equal(phases, want)`.
+
+### Summary of Findings by Severity
+
+**Should fix before merge:**
+- **Finding 1 (Redundant state):** `settings.Load()` called 2-3 times per summary path. Consolidate into a single resolution that returns both the deadline and whether it was explicitly configured.
+- **Finding 2 (Leaky abstraction):** `PhaseDone` emitted in a different location than all other phases, with no documentation of the split. At minimum add a comment; ideally consolidate.
+- **Finding 4 (Leaky abstraction):** `GenerateFromTranscript` mutates caller-owned `*ClaudeGenerator`. Either clone or remove the backfill.
+
+**Consider fixing:**
+- **Finding 3 (Stringly-typed):** Define constants for stream event type strings to prevent silent typo divergence.
+- **Finding 6 (Redundant state):** Deadline re-resolved on error path; return it from the inner function instead.
+- **Finding 8 (Copy-paste):** Use `slices.Equal` instead of hand-rolled `equalPhases`.
+
+**Low priority:**
+- **Finding 5 (Parameter sprawl):** 5 params is manageable but worth noting the trajectory.
+- **Finding 7 (Unnecessary comments):** Minor comment noise.</result>
+<usage><total_tokens>88380</total_tokens><tool_uses>25</tool_uses><duration_ms>137345</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a5ef8f8bf4b379613</task-id>
+<tool-use-id>toolu_01EheViSsXPH1BZ9kPZ1QTSt</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/a5ef8f8bf4b379613.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review for PR 964" completed</summary>
+<result>I see the duplication issue: `summaryDeadlineResolver` (line 46-52) calls `settings.Load()` and checks `SummaryTimeoutValue()`, and then `settingsTimeoutUnset` (line 575-578) also calls `settings.Load()` and checks `SummaryTimeoutValue() == 0`. Both are called in the same code path (`generateCheckpointAISummary` at lines 533 and 538). So `settings.Load` is called twice for the same generation, and both check `SummaryTimeoutValue`.
+
+Now I have all the findings. Let me compile the report.
+
+---
+
+Here are the code reuse findings for PR 964:
+
+## 1. `humanizeBytes` in explain.go (line 1966) -- No existing duplicate found
+
+There is no existing byte-formatting utility elsewhere in the codebase. The only "humanize" function is `trail.HumanizeBranchName`, which is unrelated. `humanizeBytes` is new functionality. **No action needed.**
+
+## 2. `formatMs` in explain.go (line 2125-2130) -- No existing duplicate found
+
+There is no existing millisecond-to-human-string formatter in the codebase. The `trace.go` file renders durations as raw `"%dms"` strings inline (e.g., line 251, 283, 298), but there is no reusable function. `formatMs` is genuinely new. **No action needed**, though if the trace rendering is ever refactored, `formatMs` would be a good shared utility.
+
+## 3. `stripGitEnv` in generate.go (line 180) -- Pre-existing duplication, not introduced by this PR
+
+The comment at `generate.go:179` says "Duplicated from summarize/claude.go", but `summarize/claude.go` no longer contains a `stripGitEnv` function. The function was previously deleted from `summarize/claude.go`, leaving only an orphaned doc comment at `summarize/claude.go:126-127` (the `stripGitEnv` doc comment is now incorrectly attached to `extractJSONFromMarkdown`). **This is a pre-existing issue, not introduced by PR 964.** Worth noting for a separate cleanup:
+- `cmd/entire/cli/summarize/claude.go:126-127` -- orphaned doc comment from deleted `stripGitEnv` now misleadingly attached to `extractJSONFromMarkdown`
+- `cmd/entire/cli/agent/claudecode/generate.go:179` -- stale "Duplicated from" comment referring to a function that no longer exists in the referenced file
+
+## 4. `isExecError` in generate.go (line 162-175) -- No duplicate found
+
+This was renamed from `isExecNotFound` in the base branch. There is no other function in the codebase that performs this check. The only other reference to `exec.ErrNotFound` is an inline `errors.Is` in `setup_test.go:101`, which is a test-only one-off check. **No action needed.**
+
+## 5. `StreamEvent` types in response.go vs types.go -- Proper reuse, no overlap
+
+`StreamEvent`, `StreamInnerEvent`, `StreamDelta`, and `StreamMessage` are new types that replace the old `responseEnvelope`. The key shared type `messageUsage` (defined in `types.go:87-92`) is correctly reused by both `StreamEvent.Usage` and `StreamMessage.Usage`. The old `responseEnvelope` was cleanly removed. **No action needed.**
+
+## 6. Duplicate `settings.Load()` calls in the same code path (explain.go)
+
+`generateCheckpointAISummary` (line 528) calls both `summaryDeadlineResolver(errW)` at line 533 and `settingsTimeoutUnset()` at line 538. Both independently call `settings.Load(context.Background())` and check `s.SummaryTimeoutValue()`. This means the same settings file is loaded and parsed twice for every summary generation.
+
+**Suggestion:** Have `summaryDeadlineResolver` return the raw settings timeout value (or a richer result struct), and use that to determine the "unset" condition instead of calling `settingsTimeoutUnset()` separately. Alternatively, `resolveSummaryDeadlineInputs.resolve()` could return a third value indicating the timeout mode (none / idle-watchdog / hard-wall-clock) so the caller doesn't need to re-derive it.
+
+Affected lines:
+- `cmd/entire/cli/explain.go:46-52` (`summaryDeadlineResolver` calls `settings.Load`)
+- `cmd/entire/cli/explain.go:575-578` (`settingsTimeoutUnset` calls `settings.Load`)
+- `cmd/entire/cli/explain.go:533` and `538` (both called in sequence)
+
+## 7. `formatTokenCount` -- Properly reused from `status_style.go`
+
+The new `summaryProgressWriter.handle()` calls `formatTokenCount` (defined in `cmd/entire/cli/status_style.go:106`) to format token counts. It also properly uses `newStatusStyles` and `isTerminalWriter` from the same file. **Good reuse; no action needed.**
+
+## Summary of actionable items
+
+| # | Severity | File:Line | Issue |
+|---|----------|-----------|-------|
+| 1 | Low | `explain.go:533+538` | `settings.Load()` called twice in same code path -- `summaryDeadlineResolver` and `settingsTimeoutUnset` both load settings independently |
+| 2 | Cosmetic (pre-existing) | `summarize/claude.go:126-127` | Orphaned `stripGitEnv` doc comment now wrongly prefixes `extractJSONFromMarkdown` |
+| 3 | Cosmetic (pre-existing) | `generate.go:179` | "Duplicated from summarize/claude.go" comment is stale -- that function no longer exists there |
+
+Items 2 and 3 predate this PR. Item 1 is introduced by this PR and is the only genuine code-reuse opportunity worth addressing.</result>
+<usage><total_tokens>79820</total_tokens><tool_uses>47</tool_uses><duration_ms>160737</duration_ms></usage>
+</task-notification>
+
+---
+
+run /pr-review-toolkit:review-pr on this pr please
+
+---
+
+<task-notification>
+<task-id>a855d5a8fb4f11d50</task-id>
+<tool-use-id>toolu_01TCmeTBHm9mzzFJMWJ1H1UC</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/a855d5a8fb4f11d50.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review: PR 964" completed</summary>
+<result>Now I have a thorough understanding of the full change set and all test files. Here is my analysis.
+
+---
+
+## Test Coverage Analysis for PR 964: Stream Progress for Text Generation
+
+### Summary
+
+The PR introduces streaming text generation (`GenerateTextStreaming`), a progress reporting pipeline from the Claude CLI through to user-visible progress output, an idle-based watchdog timeout, and deadline resolution logic. The test coverage is generally solid -- the core streaming parser, capability detection, progress writer, watchdog, and deadline resolver all have direct unit tests. However, there are several meaningful gaps in coverage around error branching in the main orchestration function and some untested helper functions.
+
+### Critical Gaps
+
+**1. `generateCheckpointAISummary` with `deadlineModeIdle` is untested (Criticality: 8/10)**
+
+The four `TestGenerateCheckpointAISummary_*` tests cover `deadlineModeHardClock` and `deadlineModeNone`, but none test the `deadlineModeIdle` path at `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go` lines 562-566. This is the *default path for non-interactive usage* (the most common production scenario -- CI, piped output, scripts). The idle watchdog is the mechanism that prevents infinite hangs in automation. While `startIdleWatchdog` itself is unit-tested, the integration with `generateCheckpointAISummary` is not: there is no test verifying that (a) the watchdog's `lastActivity` pointer is wired to the progress writer, and (b) when the watchdog fires, the function produces the correct `DeadlineExceeded` error with the right `resolved.duration` value.
+
+A bug where the idle watchdog's `lastActivity` pointer is disconnected from the progress writer would mean the watchdog fires immediately (false timeout) or never fires (infinite hang in CI) -- both serious production failures.
+
+**2. `GenerateTextStreaming` -- `is_error:false` with `nil Result` path untested (Criticality: 7/10)**
+
+At `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go` line 95, when `final.IsError` is false but `final.Result` is nil, the code returns a `ClaudeErrorUnknown` with message "claude returned empty result". No test covers this. This guards against a real scenario where the Claude CLI returns a malformed success envelope. Without a test, a future refactor could accidentally drop this check or change the error classification, and the error would bubble up unclassified to the user.
+
+### Important Improvements
+
+**3. `humanizeBytes` has no unit test (Criticality: 6/10)**
+
+The function at `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go` lines 1982-1994 formats byte counts shown to users in the progress output ("transcript: 1.5 KB"). It contains a loop and array index that would panic on extremely large inputs (beyond TB). A simple table-driven test covering 0, sub-KB, KB, MB boundary values would catch formatting regressions and the potential out-of-bounds panic on very large transcripts.
+
+**4. `makeProgressDispatcher` -- thinking delta fallback untested (Criticality: 5/10)**
+
+In `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go` lines 149-152, when `ev.Event.Delta.Text` is empty, the dispatcher falls back to `ev.Event.Delta.Thinking` for the token estimate. The success fixture in `stream_success.jsonl` happens to include thinking deltas, but the test at `TestGenerateTextStreaming_SuccessEmitsPhases` only checks phase order, not that the output token estimate accumulates from thinking deltas. A targeted unit test of `makeProgressDispatcher` with a thinking-only delta event would verify this fallback explicitly. This matters because if the fallback breaks, the "Writing summary... (~Nk tokens)" progress line would always show 0 tokens during thinking-heavy generations, confusing users.
+
+**5. `formatMs` and `formatSummaryTimeout` have no direct unit tests (Criticality: 5/10)**
+
+These formatting helpers at `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go` lines 596-604 and 2135-2139 are exercised indirectly through the progress writer test (which checks "1.5s", "3.1s"), but `formatSummaryTimeout` has unique behavior for negative durations and sub-second rounding that no test exercises. The negative-duration guard at line 597-598 specifically is defensive code that would silently break without detection.
+
+**6. `GenerateTextStreaming` context cancellation path has incomplete coverage (Criticality: 5/10)**
+
+At `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go` lines 75-80, when `ctx.Err()` returns `context.DeadlineExceeded`, the function returns the raw sentinel. When it returns `context.Canceled`, same. Neither path is tested in `claude_test.go`. While these are simple pass-through paths, they are the contract that `generateCheckpointAISummary` depends on to classify errors. A test with a pre-canceled context would verify this contract cheaply.
+
+**7. Progress callback not called when `nil` in success path -- behavior is tested but the `nil Result` + `progress != nil` combination is not (Criticality: 4/10)**
+
+At line 87-93 of `generate.go`, the `PhaseDone` progress event is only emitted when `progress != nil`. The success test does verify progress is called, but there is no test verifying that passing `progress=nil` in a success path does not panic. The current implementation guards this, but it is a nil-dereference risk if refactored.
+
+### Test Quality Issues
+
+**1. `TestGenerateTextStreaming_SuccessEmitsPhases` verifies phase order but not phase data**
+
+The test at `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/claude_test.go` line 33 checks that `[PhaseConnecting, PhaseFirstToken, PhaseGenerating, PhaseDone]` are emitted in order, but does not verify the data within each phase (e.g., `TTFTms`, `InputTokens`, `CachedInputTokens`, `OutputTokens`, `DurationMs`). These fields are the values that flow into the progress writer and are shown to the user. If any field mapping breaks, this test would still pass but the user would see "TTFT 0ms" or "0 cached input tokens" instead of real values. Consider extending the test to spot-check at least `TTFTms` on `PhaseFirstToken` and `DurationMs` on `PhaseDone`.
+
+**2. `TestClaudeGenerator_FallsBackToTextGenerator` verifies indirectly**
+
+At `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/claude_test.go` line 350, the test comment says "We verify indirectly: the test succeeds with valid JSON from GenerateText." This is fragile -- if both `GenerateText` and `GenerateTextStreaming` happened to work, the test could not distinguish which path was taken. The streaming counterpart test (`TestClaudeGenerator_PrefersStreamingWhenAvailable`) correctly verifies `fake.streamingCalled`, but the fallback test does not assert that streaming was NOT called. Since `stubTextGenerator` does not implement `StreamingTextGenerator`, this is currently safe, but adding an explicit `// stubTextGenerator intentionally does NOT implement StreamingTextGenerator` comment or assertion would make the test's intent clearer.
+
+### Positive Observations
+
+1. **Progress writer tests are well-structured.** `TestSummaryProgressWriter_AllPhases` checks content in a style-agnostic way (substring matching ignoring ANSI codes), `TestSummaryProgressWriter_DedupsGenerating` verifies the deduplication optimization, and `TestSummaryProgressWriter_LastActivityTracked` verifies the atomic timestamp update. These test behavior, not implementation.
+
+2. **Idle watchdog tests are thorough.** The three watchdog tests cover the fire-on-staleness, keep-alive-on-bumps, and zero-idle-noop cases with reasonable timing tolerances. These directly test the concurrency behavior.
+
+3. **Deadline resolver is cleanly separated and tested.** Using `resolveSummaryDeadlineInputs` as a struct for pure-function testing avoids touching settings globals. All three priority levels (settings override, non-interactive default, interactive none) are covered.
+
+4. **Stream parser has good resilience testing.** `TestStreamClaudeResponse_SkipsMalformedLine` verifies that corrupted NDJSON lines do not break the stream, and `TestStreamClaudeResponse_ReaderError` verifies IO error propagation. The real-world fixtures (`stream_success.jsonl`, `stream_error_404.jsonl`) exercise the parser against actual Claude CLI output.
+
+5. **Capability detection tests follow an established pattern.** `TestAsStreamingTextGenerator` covers the not-implemented, built-in-agent, declared-true, and declared-false cases consistently with the existing capability tests.
+
+6. **The `summarize.GenerateFromTranscript` progress threading is tested for both nil generator and existing-generator-without-progress paths**, which are the two main injection points.
+
+7. **The condensation call site in `manual_commit_condensation.go`** correctly passes `nil` as the new progress parameter, matching the fact that condensation runs in a git hook where interactive progress is not useful.</result>
+<usage><total_tokens>90712</total_tokens><tool_uses>30</tool_uses><duration_ms>143432</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a1a40af6f65df531e</task-id>
+<tool-use-id>toolu_01Gc1NTdvztXh46ZbuhtfjQP</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/a1a40af6f65df531e.output</output-file>
+<status>completed</status>
+<summary>Agent "Error handling review: PR 964" completed</summary>
+<result>Now I have a thorough understanding of the code. Let me compile my findings.
+
+---
+
+Here is my error handling audit of PR 964.
+
+---
+
+## FINDING 1: Silent Swallowing of Malformed NDJSON Lines
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response.go`, lines 68-69
+
+**Severity:** HIGH
+
+**Issue Description:** When `json.Unmarshal` fails on a line from the Claude CLI stream, the line is silently skipped with `continue // best-effort: skip a malformed line, keep streaming`. There is no logging, no counter, no metric -- the malformed data vanishes into the void. The code comment acknowledges this is "best-effort" and the docstring says "Malformed lines are skipped silently," but that is a policy choice, not a justification.
+
+**Hidden Errors:**
+- Encoding corruption (broken UTF-8 from pipe buffering issues)
+- Claude CLI protocol version mismatches where the CLI sends a new event format the parser doesn't expect
+- Truncated JSON from buffer overflows (if a line exceeds `streamBufferMax`, the scanner returns an error, but if a line is merely partially truncated at exactly a newline boundary, it becomes malformed JSON that is silently dropped)
+- An entire result event with mangled JSON -- meaning the stream silently loses its final envelope
+
+**User Impact:** If the result event itself is the one that gets mangled, `streamClaudeResponse` returns `(nil, errors.New("claude stream ended without a result event"))`. The user sees "claude exited without producing a result" -- which is technically accurate but gives zero diagnostic information about what happened. The user has no idea that lines were being skipped. If non-result lines are skipped, the progress callback never fires for those events, making the progress display incomplete -- but the user has no way to know data was lost.
+
+**Recommendation:** At minimum, count the number of skipped lines and, if any were skipped, include that count in the error context when returning. Consider logging the first N bytes of the first malformed line for diagnostic purposes (truncated to avoid flooding). Here is a sketch:
+
+```go
+var malformedCount int
+for scanner.Scan() {
+    line := scanner.Bytes()
+    if len(line) == 0 {
+        continue
+    }
+    var ev StreamEvent
+    if err := json.Unmarshal(line, &amp;ev); err != nil {
+        malformedCount++
+        continue
+    }
+    // ...
+}
+if final == nil {
+    if malformedCount &gt; 0 {
+        return nil, fmt.Errorf("claude stream ended without a result event (%d malformed lines skipped)", malformedCount)
+    }
+    return nil, errors.New("claude stream ended without a result event")
+}
+```
+
+---
+
+## FINDING 2: Idle Watchdog Cancellation Misreported as "canceled" Instead of "timed out"
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, lines 562-586
+
+**Severity:** HIGH
+
+**Issue Description:** When `deadlineModeIdle` is active, the idle watchdog fires by calling `cancel()` on a `context.WithCancel` context. This produces `context.Canceled`, not `context.DeadlineExceeded`. However, the error handling in `generateCheckpointAISummary` (lines 583-590) checks for `context.Canceled` first:
+
+```go
+if errors.Is(err, context.Canceled) || errors.Is(runCtx.Err(), context.Canceled) {
+    return nil, resolved.duration, fmt.Errorf("summary generation canceled: %w", context.Canceled)
+}
+```
+
+This means an idle timeout is reported to the user as "summary generation canceled" -- which then maps in `formatCheckpointSummaryError` to the terse message "summary generation canceled". The user gets no indication that this was actually an idle timeout, no suggestion to check their network, no mention of `summary_timeout_seconds`, and no link to `status.anthropic.com`. The user thinks *they* canceled it (e.g., via Ctrl+C), when in reality the system detected no activity and killed it.
+
+**User Impact:** In a non-interactive CI/pipeline scenario (the exact scenario where idle watchdog fires), the user sees "summary generation canceled" and has no idea what went wrong or what to do about it. The detailed `DeadlineExceeded` error message with its three diagnostic suggestions is never shown for idle timeouts.
+
+**Recommendation:** The idle watchdog should either use `context.WithDeadline` (which produces `DeadlineExceeded`), or the error handler should check the `fired` boolean returned by `startIdleWatchdog` and treat it as a timeout, not a cancellation. The `fired` atomic.Bool is already returned but is never used -- it is discarded with `_` on line 565:
+
+```go
+runCtx, _, stop = startIdleWatchdog(ctx, resolved.duration, &amp;progressWriter.lastActivity)
+```
+
+The fix:
+```go
+var idleFired *atomic.Bool
+// ...
+case deadlineModeIdle:
+    var stop func()
+    runCtx, idleFired, stop = startIdleWatchdog(ctx, resolved.duration, &amp;progressWriter.lastActivity)
+    defer stop()
+```
+
+Then in the error handler:
+```go
+if idleFired != nil &amp;&amp; idleFired.Load() {
+    return nil, resolved.duration, fmt.Errorf("summary generation timed out after %s idle: %w", formatSummaryTimeout(resolved.duration), context.DeadlineExceeded)
+}
+if errors.Is(err, context.Canceled) || errors.Is(runCtx.Err(), context.Canceled) {
+    return nil, resolved.duration, fmt.Errorf("summary generation canceled: %w", context.Canceled)
+}
+```
+
+---
+
+## FINDING 3: `parseErr` Silently Discarded When `final` Envelope Exists
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go`, lines 82-106
+
+**Severity:** MEDIUM
+
+**Issue Description:** The logic at line 82 checks `if final != nil` and, if the final envelope exists, proceeds to handle it -- completely ignoring `parseErr`. The `parseErr` from `streamClaudeResponse` could be non-nil even when `final` is non-nil: `streamClaudeResponse` sets `final` when it encounters a `type=result` event, then continues scanning, and if the scanner later encounters a read error, it returns the error alongside the previously captured `final`.
+
+Wait -- actually, looking more carefully at `streamClaudeResponse`, if `scanner.Err() != nil`, the function returns `(nil, err)`, so `final` is only returned when `scanner.Err() == nil`. So `parseErr != nil &amp;&amp; final != nil` is actually not possible with the current implementation. The two are mutually exclusive. This is correct.
+
+**Revised Severity:** Not a real issue. The implementation correctly returns `(nil, error)` on scanner failure and `(final, nil)` on success. The ordering in `GenerateTextStreaming` that checks `final != nil` before `parseErr != nil` is logically sound because they are mutually exclusive.
+
+---
+
+## FINDING 4: Unused `deadlineUsed` Value After Error Check
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, line 523
+
+**Severity:** LOW (code cleanliness, not error handling)
+
+**Issue Description:** Line 523 has `_ = deadlineUsed` immediately after the error check on lines 520-522. The `deadlineUsed` is already consumed by `formatCheckpointSummaryError` on the error path. On the success path, the value is deliberately discarded. This is a no-op blank assignment to suppress an "unused variable" lint warning, but it suggests the value should be used for something (perhaps logging the deadline in the success case for operational diagnostics).
+
+This is not an error handling defect, just a code smell.
+
+---
+
+## FINDING 5: `settings.Load` Error Silently Ignored in Deadline Resolver
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, line 63
+
+**Severity:** MEDIUM
+
+**Issue Description:** The `summaryDeadlineResolver` function calls `settings.Load(context.Background())` and ignores the error with `//nolint:errcheck // empty settings on error is acceptable`. When `settings.Load` fails, the code falls back to a zero-valued `EntireSettings{}`, which means `SummaryTimeoutValue()` returns 0 (no override), and the deadline resolution proceeds as if there were no settings file.
+
+**Hidden Errors:**
+- Malformed JSON in `.entire/settings.json` or `.entire/settings.local.json` (the user's explicit configuration is ignored)
+- Filesystem permission errors (the settings file exists but cannot be read)
+- The user explicitly set `summary_timeout_seconds: 120` but a parse error silently ignores it
+
+**User Impact:** If a user has explicitly configured a summary timeout and the settings file has a syntax error, their timeout configuration is silently ignored. The user has no indication that their settings were not loaded. For interactive mode, this means no deadline at all (user can Ctrl+C). For non-interactive mode, it falls back to the 5-minute default instead of the user's configured value.
+
+**Recommendation:** The `//nolint:errcheck` comment claims "empty settings on error is acceptable." This is debatable. At minimum, when `settings.Load` fails, the error should be logged with `logging.Debug` so that it appears in `.entire/logs/` for post-hoc debugging. The fallback behavior itself is reasonable as a resilience measure, but the silent swallowing of the error is not.
+
+```go
+s, loadErr := settings.Load(context.Background())
+if loadErr != nil {
+    logging.Debug(context.Background(), "settings.Load failed in deadline resolver; using defaults",
+        slog.String("error", loadErr.Error()))
+}
+```
+
+However, this function is package-level `var` initialized at load time, and the `logging` package may not be available. The appropriate fix depends on whether this resolver is invoked at init time or lazily.
+
+---
+
+## FINDING 6: Progress Callback Not Threaded to Non-ClaudeGenerator Implementations
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize.go`, lines 54-61
+
+**Severity:** MEDIUM
+
+**Issue Description:** The `GenerateFromTranscript` function threads the `progress` callback into the generator only when `generator == nil` (new default ClaudeGenerator) or when `generator` is a `*ClaudeGenerator` with nil Progress. If someone passes a custom `Generator` implementation (not `*ClaudeGenerator`) that supports progress reporting, the `progress` parameter is silently ignored.
+
+```go
+if generator == nil {
+    generator = &amp;ClaudeGenerator{Progress: progress}
+} else if cg, ok := generator.(*ClaudeGenerator); ok &amp;&amp; cg.Progress == nil &amp;&amp; progress != nil {
+    clone := *cg
+    clone.Progress = progress
+    generator = &amp;clone
+}
+```
+
+**User Impact:** This is currently a theoretical concern since the only production `Generator` implementation is `ClaudeGenerator`. However, the function signature implies `progress` is generically applicable to any generator, which is misleading. A future implementer passing a custom generator and a progress callback will not get progress updates, with no error or warning.
+
+**Recommendation:** This is acceptable for now given the single-implementation constraint, but the docstring for the `progress` parameter should note that it only takes effect when the generator is nil or a `*ClaudeGenerator`. Alternatively, add a `ProgressAware` interface that generators can opt into.
+
+---
+
+## FINDING 7: `//nolint:wrapcheck` Suppressions Are Correct and Intentional
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/claude.go`, line 106; `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize.go`, line 65
+
+**Severity:** N/A -- CORRECT
+
+The `//nolint:wrapcheck` annotations on error returns in both `claude.go` (line 106) and `summarize.go` (line 65) are intentional and well-justified. These functions return errors unwrapped specifically so that callers can use `errors.As(err, &amp;claudeErr)` to recover the typed `*ClaudeError`. Wrapping the error would prevent this, since `fmt.Errorf("...: %w", err)` creates a new error type that wraps but doesn't directly match `*ClaudeError`. The nolint comments have been updated with better justification text ("preserve typed *ClaudeError for errors.As at the explain layer"). This is correct error handling.
+
+---
+
+## FINDING 8: Context Error Check in `GenerateTextStreaming` Conflates Cancellation Sources
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go`, lines 74-80
+
+**Severity:** MEDIUM
+
+**Issue Description:** After streaming and waiting, the code checks `ctx.Err()` -- but this is the *caller's* context, not any locally-derived context. This means the check correctly detects when the caller's deadline or cancellation fired. However, there is no distinction between:
+1. The caller explicitly canceled the context (user Ctrl+C)
+2. The caller's deadline expired (wall-clock timeout)
+3. The idle watchdog canceled the context (the watchdog cancels the context *derived from* the caller's context, but the original `ctx` will also show `Canceled` since the derived context's cancellation propagates)
+
+Wait -- actually, the idle watchdog in `explain.go` creates a new context via `context.WithCancel(ctx)`. When the watchdog fires, it cancels the *derived* context. The original parent `ctx` remains uncanceled. So in `GenerateTextStreaming`, `ctx.Err()` checks the *passed-in* context, which is the `runCtx` (the derived one). So `ctx.Err()` will correctly reflect the watchdog's cancellation. This is actually fine -- the context passed to `GenerateTextStreaming` is the `runCtx`, not the original parent.
+
+**Revised Assessment:** The context checking in `GenerateTextStreaming` is correct. The function correctly returns the sentinel `context.DeadlineExceeded` or `context.Canceled` based on the passed-in context's state. The problem (Finding 2) is at the *caller* level in `explain.go` where the watchdog's cancellation is misinterpreted as a user cancellation.
+
+---
+
+## FINDING 9: `waitErr` Potentially Lost When `final` Envelope Exists and Is an Error
+
+**Location:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go`, lines 96-105
+
+**Severity:** LOW
+
+**Issue Description:** When `final != nil &amp;&amp; final.IsError`, the code extracts the exit code from `waitErr` for classification, but the actual `waitErr` error value (which may contain OS-level failure details like signal numbers, core dump indicators, or resource exhaustion messages) is never logged or included in the returned `ClaudeError`. Only the exit code integer is preserved.
+
+**User Impact:** If the Claude CLI crashes with a segfault (SIGSEGV) while also managing to write a partial result event with `is_error: true`, the SIGSEGV signal information from `waitErr` is lost. The user only sees the envelope's error message. In practice this is an edge case -- a crashing process rarely produces a well-formed result event -- but the information loss is still worth noting.
+
+**Recommendation:** Consider setting `Cause: waitErr` on the `ClaudeError` returned by `classifyEnvelopeError` when `waitErr` is non-nil.
+
+---
+
+## Summary of Findings by Severity
+
+**HIGH (2):**
+1. **Finding 1** -- Malformed NDJSON lines silently skipped with no logging or counting in `streamClaudeResponse`
+2. **Finding 2** -- Idle watchdog cancellation misreported as "canceled" instead of "timed out," causing users to miss critical diagnostic information
+
+**MEDIUM (3):**
+3. **Finding 5** -- `settings.Load` error silently ignored in deadline resolver; user settings corruption goes undetected
+4. **Finding 6** -- `progress` callback silently ignored for non-ClaudeGenerator implementations (theoretical, but the API contract is misleading)
+5. **Finding 8/9** -- Minor information loss in error paths (exit error details dropped from envelope errors)
+
+**Correct Error Handling (acknowledged):**
+- `//nolint:wrapcheck` suppressions are well-justified for preserving typed errors
+- Context sentinel propagation in `GenerateTextStreaming` is correctly structured
+- `streamClaudeResponse` properly returns `scanner.Err()` for I/O failures
+- `classifyEnvelopeError` and `classifyStderrError` provide good error classification
+- The `formatCheckpointSummaryError` function produces genuinely actionable user messages for all classified error kinds
+
+The most actionable fix is **Finding 2** -- the idle watchdog's `fired` boolean is already computed and returned but then discarded. Using it to distinguish idle-timeout from user-cancellation is a small change with high user impact, especially in CI/non-interactive environments where the idle watchdog is the primary timeout mechanism.</result>
+<usage><total_tokens>84801</total_tokens><tool_uses>26</tool_uses><duration_ms>179757</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aa90bf3ae1c8f49e1</task-id>
+<tool-use-id>toolu_01RSRSmRTomQoPdeJy3PBr4o</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/aa90bf3ae1c8f49e1.output</output-file>
+<status>completed</status>
+<summary>Agent "Type design review: PR 964" completed</summary>
+<result>I now have a thorough understanding of all four type groups. Here is my analysis.
+
+---
+
+## Type 1: `agent.ProgressPhase` + `agent.GenerationProgress` + `agent.ProgressFn` + `agent.StreamingTextGenerator`
+
+**File:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/agent.go` (lines 190-231)
+
+### Invariants Identified
+
+- `ProgressPhase` must be one of four known string values: `"connecting"`, `"first-token"`, `"generating"`, `"done"`.
+- Each phase implies a subset of `GenerationProgress` fields that are "populated" (non-zero): `PhaseFirstToken` populates `InputTokens`, `CachedInputTokens`, `TTFTms`; `PhaseDone` populates `DurationMs` and final `OutputTokens`.
+- The lifecycle order is `connecting -&gt; first-token -&gt; generating* -&gt; done`, where `connecting` and `first-token` fire exactly once, `generating` fires repeatedly, and `done` fires once.
+- `ProgressFn` must not block (documented contract).
+- `StreamingTextGenerator` embeds `Agent`, so any implementor is a full agent.
+
+### Ratings
+
+- **Encapsulation**: 7/10
+  The types live at the correct abstraction level in the `agent` package. `ProgressPhase` is a named type preventing accidental string assignment from most contexts. `GenerationProgress` is a pure data struct -- fields are exported, but since this is a cross-package callback payload, that is appropriate. The `StreamingTextGenerator` interface is minimal: one method plus the `Agent` embed.
+
+- **Invariant Expression**: 5/10
+  The main weakness: `ProgressPhase` is a `string` type, which means any arbitrary string can be assigned to it without a compile error. Go does not enforce closed string enums. More importantly, the "which fields are populated per phase" invariant exists only in doc comments. A caller inspecting `GenerationProgress` after `PhaseConnecting` might mistakenly read `OutputTokens` (which is zero but semantically "not applicable") and cannot distinguish "not applicable" from "the value is genuinely zero." The lifecycle ordering (connecting before first-token before generating before done) is enforced entirely inside `makeProgressDispatcher` in the claudecode package, not by the type system.
+
+- **Invariant Usefulness**: 8/10
+  The phase-based progress model directly maps to what the UI needs (different rendering per phase). It prevents the alternative -- a single callback with ambiguous field semantics -- which would be harder to consume. The `StreamingTextGenerator` optional-interface pattern (with `AsStreamingTextGenerator` for detection) aligns perfectly with the existing capability pattern in this codebase.
+
+- **Invariant Enforcement**: 5/10
+  No constructor or validation. The struct is plain data with zero enforcement. The `ProgressFn` non-blocking contract is documentation-only. There is no sentinel or "unknown phase" handling in any consumer -- if an unexpected `ProgressPhase` value arrives, consumers silently ignore it (the `switch` in `summaryProgressWriter.handle` has no `default` case).
+
+### Strengths
+
+- Clean alignment with the existing capability-detection pattern (`AsStreamingTextGenerator` in `capabilities.go`).
+- The fallback path is clean: `GenerateText` delegates to `GenerateTextStreaming` with `nil` progress, so the two interfaces share a single implementation.
+- `ProgressFn` as a function type (not an interface) is the right choice -- it avoids forcing callers to implement an interface for a single callback.
+- Good doc comments explaining which fields are populated per phase.
+
+### Concerns
+
+1. **Phase field population is implicitly conditional.** A consumer must read comments to know that `TTFTms` is meaningless outside `PhaseFirstToken`. This is a latent source of bugs if someone adds a new consumer.
+
+2. **No exhaustiveness checking.** Because `ProgressPhase` is a string type, adding a new phase (say, `"thinking"`) would compile without touching any consumer. A `switch` over phases has no compiler-enforced exhaustiveness.
+
+3. **`OutputTokens` has dual semantics.** During `PhaseGenerating` it is a "running estimate based on delta sizes" (chars/4), while at `PhaseDone` it comes from the actual usage envelope. These are qualitatively different values sharing the same field. A consumer formatting output tokens has no way to know which estimate source it is looking at except by checking the phase.
+
+### Recommended Improvements
+
+- Consider adding a `default` case (even if it is a no-op log) in every `switch` over `ProgressPhase` to surface unexpected values during development. The `summaryProgressWriter.handle` method would benefit from this.
+- The dual-use of `OutputTokens` across phases is acceptable pragmatically, but the doc comment on the field could be slightly more explicit -- for example, noting the chars/4 heuristic so downstream formatters know the precision they are displaying.
+- No structural changes needed. The tradeoff of a flat struct vs per-phase typed variants is well calibrated for the number of consumers (currently one: `summaryProgressWriter`).
+
+---
+
+## Type 2: `claudecode.StreamEvent` + `StreamInnerEvent` + `StreamDelta` + `StreamMessage`
+
+**File:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response.go`
+
+### Invariants Identified
+
+- `StreamEvent.Type` determines which fields are populated: `"system"` populates `Status`/`Subtype`; `"stream_event"` populates `Event`; `"result"` populates `IsError`/`Result`/`APIErrorStatus`/`DurationMs`/`Usage`.
+- `StreamInnerEvent.Type` determines which nested fields are populated: `"message_start"` populates `Message`; `"content_block_delta"` populates `Delta`.
+- `StreamDelta.Type` determines whether `Text` or `Thinking` is populated.
+- The stream must end with exactly one `type=result` event; if absent, `streamClaudeResponse` returns an error.
+- Malformed NDJSON lines are skipped (resilience invariant).
+- The 4 MiB buffer limit bounds memory usage per line.
+
+### Ratings
+
+- **Encapsulation**: 6/10
+  All four types are exported with all fields exported. This is necessary because `json.Unmarshal` needs exported fields and the types are used in `generate.go`'s `makeProgressDispatcher`. However, the "which fields matter for which Type value" constraint is entirely implicit. The types are effectively a wire-format mirror with no behavioral encapsulation. `streamClaudeResponse` is unexported, which properly hides the parsing implementation.
+
+- **Invariant Expression**: 4/10
+  This is the weakest area. `StreamEvent` is a union type flattened into a single struct. Fields like `Result`, `Status`, `Event`, `DurationMs`, and `Usage` are all populated simultaneously in the Go struct, but only a subset is semantically valid depending on `Type`. This is a common Go pattern for JSON deserialization, but it means the type permits many structurally valid but semantically nonsensical states (e.g., a `type=system` event where `IsError` is `true` and `Result` is non-nil). The `string` type for `Type` fields also provides no compile-time constraint.
+
+- **Invariant Usefulness**: 7/10
+  The types faithfully model the Claude CLI's NDJSON protocol, which is externally defined. The invariants that do exist (buffer size limit, must-have-result-event) are operationally important. The resilience invariant (skip malformed lines) is well-motivated for subprocess communication.
+
+- **Invariant Enforcement**: 6/10
+  `streamClaudeResponse` enforces the "must end with a result event" invariant and propagates scanner errors. The 4 MiB buffer limit is enforced at construction. However, there is no validation after `json.Unmarshal` -- a line that decodes to a `StreamEvent` with `Type: ""` would pass through silently. The `onEvent` callback receives every decoded event regardless of validity.
+
+### Strengths
+
+- The decision to use a single flat struct for deserialization is pragmatic -- it avoids a complex discriminated-union encoding in Go, which would require custom `UnmarshalJSON` logic.
+- The `streamClaudeResponse` function cleanly separates stream parsing from semantic interpretation. `makeProgressDispatcher` in `generate.go` does the semantic work.
+- Skipping malformed lines is the right resilience choice for subprocess stdout parsing.
+- The 4 MiB buffer limit is well-documented and sized appropriately (init events carry the full tool list).
+
+### Concerns
+
+1. **Flat union is fragile for future event types.** If Claude CLI adds a new event type with new fields, the struct must grow. Every consumer of `StreamEvent` must be updated to handle the new type, but the compiler will not flag missing cases.
+
+2. **`StreamMessage` is thin.** It wraps a single `*messageUsage` pointer. If no other fields are ever needed, this indirection adds a layer without benefit. However, this mirrors the wire format, so it may be intentional future-proofing.
+
+3. **The `onEvent` callback receives raw events including malformed-but-decodable ones.** For example, a line like `{"type":""}` would be passed to the callback. The dispatcher in `makeProgressDispatcher` handles this gracefully (no case matches, so it is a no-op), but the contract is not explicit.
+
+### Recommended Improvements
+
+- Add a brief doc comment to `streamClaudeResponse` noting that `onEvent` may receive events with empty/unknown `Type` values and that callers should handle this gracefully (or explicitly noting the current behavior is by design).
+- No structural refactoring needed. The flat-union approach is the standard Go idiom for modeling external JSON protocols. Introducing a sum type here would add complexity disproportionate to the number of consumers.
+
+---
+
+## Type 3: `cli.deadlineMode` + `cli.summaryDeadlineResult` + `cli.resolveSummaryDeadlineInputs`
+
+**File:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go` (lines 44-79, 2011-2030)
+
+### Invariants Identified
+
+- `deadlineMode` is one of three values: `None`, `Idle`, or `HardClock`.
+- When `mode == deadlineModeNone`, `duration` must be zero (no deadline applies).
+- When `mode == deadlineModeIdle` or `deadlineModeHardClock`, `duration` must be positive.
+- Resolution precedence: explicit settings override &gt; non-interactive default (5min) &gt; none (interactive TTY).
+- The resolution inputs (`settings` duration, `interactive` bool) are pure value inputs with no side effects.
+
+### Ratings
+
+- **Encapsulation**: 8/10
+  All three types are unexported. The `resolveSummaryDeadlineInputs` struct and its `resolve()` method form a clean testable unit that isolates the decision logic from settings loading and TTY detection. The `summaryDeadlineResolver` package-level var allows test substitution without modifying global state. The `summaryDeadlineResult` fields are unexported, so only code within the `cli` package can construct or inspect them.
+
+- **Invariant Expression**: 7/10
+  Using `iota` for `deadlineMode` is the correct Go pattern and prevents arbitrary integer values from satisfying the type (in practice, though, any `int` can be cast to `deadlineMode`). The relationship between `mode` and `duration` (zero vs positive) is documented but not structurally enforced -- one could construct `summaryDeadlineResult{mode: deadlineModeNone, duration: 5 * time.Second}` and violate the invariant. However, the single construction site in `summaryDeadlineResolver` makes this low-risk.
+
+- **Invariant Usefulness**: 9/10
+  This is well-motivated. The previous code used a single `time.Duration` for timeout, which could not distinguish "no timeout" from "timeout of zero." The three-mode enum cleanly models the three distinct behaviors (no deadline / idle watchdog / hard clock) and drives the `switch` in `generateCheckpointAISummary` with no ambiguity. The separation of `resolveSummaryDeadlineInputs` from the resolver enables comprehensive unit testing of the precedence rules.
+
+- **Invariant Enforcement**: 6/10
+  The `resolve()` method enforces the precedence logic correctly and returns a `(Duration, bool)` tuple that the caller maps to the appropriate mode. However, `summaryDeadlineResult` has no constructor -- it is assembled in the `summaryDeadlineResolver` closure with direct struct literals. The mode/duration consistency is not validated at construction. Since there is exactly one construction site, this is acceptable but would become a concern if the type gained more callers.
+
+### Strengths
+
+- The `resolveSummaryDeadlineInputs` struct is an exemplary test seam. It decouples the pure decision logic from the impure inputs (settings file, TTY detection), making the precedence rules trivially testable. The three `TestResolveSummaryDeadline_*` tests are clean and comprehensive.
+- The `deadlineMode` enum makes `generateCheckpointAISummary`'s `switch` self-documenting -- each case clearly communicates the intent.
+- The package-level `summaryDeadlineResolver` var is a pragmatic alternative to dependency injection in a package that already uses this pattern (`generateTranscriptSummary`).
+
+### Concerns
+
+1. **The `mode`/`duration` consistency is trust-based.** There is no constructor enforcing that `deadlineModeNone` implies `duration == 0`. In `generateCheckpointAISummary`, the `deadlineModeNone` branch ignores `duration` entirely, so a stale non-zero value would be harmless but confusing during debugging.
+
+2. **`_ = deadlineUsed` on line 528 is a code smell.** The function returns `deadlineUsed` from `generateCheckpointAISummary`, which the caller in `generateCheckpointSummary` assigns and then immediately discards with a blank identifier assignment. If the intent is to pass it only to `formatCheckpointSummaryError`, the blank-identifier line suggests the return value shape might not be right.
+
+### Recommended Improvements
+
+- Remove the `_ = deadlineUsed` line in `generateCheckpointSummary` (line 528). Since `deadlineUsed` is already passed to `formatCheckpointSummaryError` on the error path, and the success path does not need it, this blank assignment is dead code that obscures intent. If the non-error path truly does not need the value, consider whether the function should return it at all on the success path (or accept that it does for uniformity with the error path, but do not assign it just to discard it).
+- No structural changes warranted. The type design is appropriately scoped for its single use site.
+
+---
+
+## Type 4: `cli.summaryProgressWriter`
+
+**File:** `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go` (lines 2078-2148)
+
+### Invariants Identified
+
+- `w` must be non-nil (no nil check in methods; `fmt.Fprint*` to nil panics).
+- `inplace` reflects whether the writer is a TTY and accessibility mode is off; set once at construction.
+- `lastActivity` is updated atomically on every `handle()` call and read by the idle watchdog goroutine.
+- `lastLine` tracks the previous rendered line for deduplication; only meaningful during `PhaseGenerating`.
+- `arrow` and `check` are precomputed styled strings; immutable after construction.
+- The writer is seeded with `time.Now().UnixNano()` at construction so the idle watchdog starts its clock immediately.
+
+### Ratings
+
+- **Encapsulation**: 8/10
+  The type is unexported. Construction goes through `newSummaryProgressWriter`, which handles all initialization including style computation and activity seeding. The only public entry point is `handle()`. However, tests directly mutate `w.inplace = false` after construction to force deterministic output, which means the field is not truly encapsulated from within-package code. The `lastActivity` field is accessed directly by `generateCheckpointAISummary` (passed to `startIdleWatchdog` as `&amp;progressWriter.lastActivity`), so the progress writer leaks its internal timing mechanism.
+
+- **Invariant Expression**: 6/10
+  The `lastActivity` field serving double duty (progress writer dedup + idle watchdog signaling) is an implicit coupling. Someone reading `summaryProgressWriter` must understand that the field is shared with an external goroutine. The `inplace` flag is a clean compile-time-resolved behavior switch. The `arrow`/`check` glyphs being precomputed avoids repeated style computation but makes the type slightly harder to reason about in isolation (the values depend on the writer's TTY state at construction time).
+
+- **Invariant Usefulness**: 8/10
+  The type solves a real problem: rendering streaming progress differently for TTY vs pipe, with deduplication to avoid flooding non-TTY consumers. The idle watchdog integration is important for the non-interactive timeout behavior. The precomputed glyphs avoid repeated lipgloss calls during hot-path rendering.
+
+- **Invariant Enforcement**: 7/10
+  `newSummaryProgressWriter` is the sole constructor and handles all initialization. The activity seeding ensures the watchdog does not wait forever for a first event. However, a nil writer passed to `newSummaryProgressWriter` would not be caught until `handle()` is called (and `fmt.Fprintln` to nil panics). The `inplace` determination at construction time means a writer that starts as non-TTY but is later redirected (unlikely but possible) would not adapt.
+
+### Strengths
+
+- The deduplication in `updateLine` is a thoughtful detail -- it prevents flooding non-TTY consumers with identical "generating" lines when token estimates do not change.
+- The `printLine`/`updateLine` split correctly models the two rendering modes: permanent (connecting, first-token, done) vs transient (generating).
+- The activity seeding comment explains _why_ the initial store is needed, not just that it happens.
+- Tests cover all phases, deduplication, and activity tracking independently.
+
+### Concerns
+
+1. **`lastActivity` is a shared mutable field accessed by two goroutines.** The `summaryProgressWriter` writes it in `handle()`, and the idle watchdog reads it. While `atomic.Int64` makes this race-free, the coupling is implicit -- the field lives on the progress writer but its reader is the watchdog goroutine. This makes the progress writer's responsibility boundary fuzzy.
+
+2. **No nil-writer guard.** `newSummaryProgressWriter(nil)` produces a writer that will panic on first use. The caller in `generateCheckpointAISummary` passes `errW` which may be nil (the function signature accepts `io.Writer`). However, checking the call site: `errW` comes from `generateCheckpointSummary` which guards `if errW != nil` before some prints but passes it unconditionally to `generateCheckpointAISummary`. If `errW` is nil, `newSummaryProgressWriter(nil)` will be called. The `isTerminalWriter(nil)` call inside would need to handle nil too.
+
+3. **Terminal escape sequences are emitted unconditionally in `printLine` when `inplace` is true.** If the writer is a TTY but does not support ANSI escapes (rare on modern systems, but possible), the output would be garbled.
+
+### Recommended Improvements
+
+- Add a nil guard at the top of `newSummaryProgressWriter`: if `w` is nil, set `w` to `io.Discard`. This prevents a panic chain from a nil `errW` propagating through the system. It also makes `inplace` resolve to `false` (since `io.Discard` is not a TTY), which is the correct behavior for a discarded writer.
+- Consider extracting `lastActivity` into a separate shared structure (or simply passing the `*atomic.Int64` into the constructor rather than embedding it). This would make the ownership clearer: the progress writer _writes_ to it, the watchdog _reads_ from it, and the caller _owns_ it. Currently the caller reaches into `&amp;progressWriter.lastActivity` which is an encapsulation breach even within the same package.
+
+---
+
+## Cross-cutting observations
+
+**The layering is clean.** The four type groups form a well-separated stack: `agent.ProgressPhase`/`GenerationProgress` define the abstract progress model; `claudecode.StreamEvent` et al define the wire format; `deadlineMode`/`summaryDeadlineResult` define the timeout policy; and `summaryProgressWriter` renders progress to the terminal. Each layer depends only on the layer below it. This is good architecture.
+
+**The weakest invariant in the system is the phase-to-field mapping in `GenerationProgress`.** This is the type that crosses the most boundaries (agent package to cli package, through the summarize package) and has the most implicit rules about which fields are valid when. If this system grows to have more consumers, this will be the first type to cause confusion.
+
+**The `_ = deadlineUsed` on line 528 of `explain.go` is the most concrete code smell.** It suggests the return signature of `generateCheckpointAISummary` may not be well-calibrated to its callers' needs. The deadline duration is only needed on error paths for formatting the error message, but it is returned unconditionally.</result>
+<usage><total_tokens>54426</total_tokens><tool_uses>20</tool_uses><duration_ms>165394</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ae168e09515eadace</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/ae168e09515eadace.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review: PR 964" completed</summary>
+<result>When `mode == deadlineModeNone`, `resolved.duration` is `0`. If a parent context deadline fires (from the caller), the timeout message on line 588 would say "timed out after 0s" which is slightly misleading. But this seems like a rare edge case -- if mode is `deadlineModeNone`, the deadline would come from the parent context, not from the resolver. The `formatSummaryTimeout(0)` returns "0s" which is odd but not incorrect. This is a very minor issue.
+
+---
+
+Here is my complete review.
+
+## Review: PR 964 -- `feat/explain-stream-progress`
+
+### Files reviewed
+
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/agent.go` (new types: `ProgressPhase`, `GenerationProgress`, `StreamingTextGenerator`)
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/capabilities.go` (`AsStreamingTextGenerator`)
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/capabilities_test.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go` (streaming implementation)
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response.go` (NDJSON stream parser)
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response_test.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/claude_test.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go` (deadline strategy, progress writer, idle watchdog)
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain_test.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/claude.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/claude_test.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize_test.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/strategy/manual_commit_condensation.go`
+
+---
+
+### Critical (90-100)
+
+**1. `ttft_ms` field is on the wrong struct -- TTFT will always be 0 in production (Confidence: 95)**
+
+File: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response.go`, line 37
+
+The real Claude CLI emits `ttft_ms` at the **outer envelope level** of a `stream_event` line (sibling to `"type"`, `"event"`, `"session_id"`), not inside the nested `"event"` object. This is confirmed by the actual fixture file `testdata/stream_success.jsonl`, line 4:
+
+```json
+{"type":"stream_event","event":{"type":"message_start","message":{...}},...,"ttft_ms":935}
+```
+
+However, `TTFTms` is declared only on `StreamInnerEvent` (which maps to the nested `"event"` object), not on `StreamEvent` (the outer envelope). Go's JSON decoder will silently drop the field. The unit test `TestGenerateTextStreaming_SuccessEmitsPhases` masks this bug by placing `ttft_ms` inside `event` in its fabricated JSON.
+
+**Fix:** Move `TTFTms` from `StreamInnerEvent` to `StreamEvent`, and update `makeProgressDispatcher` to read `ev.TTFTms` instead of `ev.Event.TTFTms`:
+
+In `response.go`:
+```go
+type StreamEvent struct {
+    // ... existing fields ...
+    TTFTms  int  `json:"ttft_ms,omitempty"` // ADD HERE
+}
+
+type StreamInnerEvent struct {
+    Type    string         `json:"type"`
+    Delta   *StreamDelta   `json:"delta,omitempty"`
+    Message *StreamMessage `json:"message,omitempty"`
+    // REMOVE TTFTms from here
+}
+```
+
+In `generate.go`, `makeProgressDispatcher`:
+```go
+case ev.Type == "stream_event" &amp;&amp; ev.Event.Type == "message_start":
+    p := agent.GenerationProgress{Phase: agent.PhaseFirstToken, TTFTms: ev.TTFTms}  // was ev.Event.TTFTms
+```
+
+---
+
+### Important (80-89)
+
+**2. Test calls `t.Parallel()` while mutating package-level variable -- data race (Confidence: 90)**
+
+File: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize_test.go`, line 697
+
+`TestGenerateFromTranscript_ProgressThreadedToNilGenerator` calls `t.Parallel()` on line 697 but then mutates the package-level `defaultTextGeneratorFactory` variable on lines 703-713. CLAUDE.md explicitly states: "Tests that modify process-global state cannot be parallelized."
+
+This will cause data races when run concurrently with `TestClaudeGenerator_UsesDefaultTextGenerator` (which has the same pattern -- pre-existing) or any other test that reads `defaultTextGeneratorFactory`.
+
+**Fix:** Remove the `t.Parallel()` call on line 697 and add a comment explaining why, similar to the tests in `explain_test.go`:
+
+```go
+func TestGenerateFromTranscript_ProgressThreadedToNilGenerator(t *testing.T) {
+    // Modifies package-level vars -- cannot be parallel.
+    originalFactory := defaultTextGeneratorFactory
+    ...
+```
+
+**3. Dead `_ = deadlineUsed` suppression on success path (Confidence: 82)**
+
+File: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, line 523
+
+After the error check on line 520-522, line 523 has `_ = deadlineUsed` which only serves to suppress the "unused variable" linter. The variable is already used on the error path (line 521). The blank-identifier suppression is unnecessary because Go considers the variable "used" by the assignment on line 521.
+
+Wait -- actually, `deadlineUsed` IS used on line 521 in the `if err != nil` branch. Go considers this sufficient usage, so `_ = deadlineUsed` is redundant dead code. The `errcheck` or `ineffassign` linters could flag this depending on configuration.
+
+**Fix:** Simply remove line 523:
+```go
+summary, deadlineUsed, err := generateCheckpointAISummary(ctx, errW, scopedTranscript, cpSummary.FilesTouched, content.Metadata.Agent)
+if err != nil {
+    return formatCheckpointSummaryError(err, deadlineUsed)
+}
+
+// Persist to both stores; at least one must succeed.
+```
+
+Actually, I need to re-check -- in Go, if a variable is used only inside one branch of an if/else, does the compiler consider it used? Let me reconsider. Go's compiler considers a variable used if it appears anywhere in any reachable expression. The `deadlineUsed` on line 521 counts as a use. So `_ = deadlineUsed` on line 523 is indeed redundant. It's a minor code cleanliness issue.
+
+**4. `newSummaryProgressWriter` will panic if `errW` is nil (Confidence: 80)**
+
+File: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, line 2087-2098
+
+`newSummaryProgressWriter(w)` stores `w` and later calls `fmt.Fprintln(s.w, line)`. If `w` is nil, this panics. The function `generateCheckpointAISummary` receives `errW` from `generateCheckpointSummary`, which checks `if errW != nil` before printing on line 515, implying nil is a valid value. While the current production call path always passes non-nil (`cmd.ErrOrStderr()`), the API contract allows nil.
+
+**Fix:** Guard against nil in `newSummaryProgressWriter`, or pass `io.Discard` when `errW` is nil in `generateCheckpointAISummary`:
+
+```go
+func generateCheckpointAISummary(ctx context.Context, errW io.Writer, ...) (...) {
+    if errW == nil {
+        errW = io.Discard
+    }
+    progressWriter := newSummaryProgressWriter(errW)
+    ...
+```
+
+---
+
+### Summary
+
+The PR is well-structured overall. The streaming abstraction, idle watchdog, and deadline strategy are cleanly implemented with good separation of concerns. The test coverage is thorough and the non-parallel tests in `explain_test.go` correctly document why they cannot be parallel.
+
+The critical issue (#1, TTFT field placement) will cause incorrect user-facing output in production -- the progress messages will always show "TTFT 0ms" instead of the real value. The data race in issue #2 could cause intermittent test failures or silent corruption under `go test -race`. Issues #3 and #4 are minor but worth addressing for code quality.</result>
+<usage><total_tokens>107933</total_tokens><tool_uses>59</tool_uses><duration_ms>287483</duration_ms></usage>
+</task-notification>
+
+---
+
+is there a reason you're not doing another commit
+
+---
+
+run /codex:review and /codex:adversarial-review and /pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>b7jbk4u0r</task-id>
+<tool-use-id>toolu_01UPPBKYo4UyM9n9Jqu2uAuW</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/b7jbk4u0r.output</output-file>
+<status>completed</status>
+<summary>Background command "Codex adversarial review" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>bgb3g65mo</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/bgb3g65mo.output</output-file>
+<status>completed</status>
+<summary>Background command "Codex review" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>aac5a96f9e73be46d</task-id>
+<tool-use-id>toolu_01MsHZdLg1TC7gQEZoWpNhMX</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/aac5a96f9e73be46d.output</output-file>
+<status>completed</status>
+<summary>Agent "PR review toolkit: error handling" completed</summary>
+<result>I now have a complete picture. Here is my thorough error handling audit.
+
+---
+
+## Error Handling Audit: PR 964 Review Fixes
+
+### Verification of Previously Reported Issues
+
+#### Issue 1: Idle watchdog cancellation misreported as "canceled" -- FIXED
+
+**Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, lines 586-598
+
+The fix correctly addresses this issue. The ordering is now:
+
+1. Check `idleFired` flag first (line 590)
+2. Check `context.DeadlineExceeded` (line 593)
+3. Check `context.Canceled` (line 596)
+
+This is correct because the idle watchdog cancels via `context.WithCancel`, which produces `context.Canceled` rather than `context.DeadlineExceeded`. Without the `idleFired` check taking priority, the `Canceled` branch would match first, producing the wrong diagnostic message. The `idleFired != nil` guard also properly handles the `deadlineModeHardClock` and `deadlineModeNone` cases where `idleFired` is never assigned.
+
+**Verdict**: Correctly fixed. The ordering is sound.
+
+#### Issue 2: Malformed NDJSON lines silently skipped -- FIXED
+
+**Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response.go`, lines 62, 69-71, 84-88
+
+The fix adds `malformedLines` counter and includes the count in the error message when no result event is found. This is adequate for the specific case reported.
+
+**Verdict**: Correctly fixed for the no-result case. See Issue A below for a remaining gap.
+
+#### Issue 3: Nil `errW` could panic -- FIXED
+
+**Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, lines 555-557
+
+The nil guard is now at the top of `generateCheckpointAISummary`: `if errW == nil { errW = io.Discard }`. This prevents any nil dereference when constructing the progress writer or passing to `summaryDeadlineResolver`. The `io.Discard` choice is correct because `isTerminalWriter(io.Discard)` returns false, which treats nil-errW as non-interactive (triggering the idle watchdog default), consistent with the expected behavior.
+
+**Verdict**: Correctly fixed.
+
+
+### New Issues Found
+
+#### Issue A: Malformed lines silently discarded on successful streams
+
+**Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response.go`, lines 69-71 and 84-90
+
+**Severity**: MEDIUM
+
+**Issue Description**: The `malformedLines` counter is only reported when `final == nil` (no result event). If the stream produces 50 malformed lines but still ends with a valid result event, the malformed count is silently discarded. The caller (`GenerateTextStreaming`) receives the result with no indication that half the stream was garbage.
+
+**Hidden Errors**: A corrupted stream where the malformed lines contained important error diagnostics or warning events would go completely unnoticed. For example, if Claude's stream format changes and starts emitting new event types that fail to decode into the current `StreamEvent` struct, the CLI would silently ignore them.
+
+**User Impact**: Minimal in normal operation since the result text is correct. However, if a stream delivers corrupted intermediate events, developers debugging stream-related issues would have no signal that lines were skipped.
+
+**Recommendation**: This is a design tradeoff (stream resilience vs. observability). The current approach is defensible for production resilience. To address the observability gap without changing behavior, `streamClaudeResponse` could return the `malformedLines` count as a third value, and the caller could log it when non-zero. That said, I would classify this as acceptable for now -- the fix correctly addresses the specific scenario the previous reviewer flagged (malformed lines contributing to a "no result" failure).
+
+#### Issue B: `parseErr` silently dropped when `final != nil`
+
+**Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go`, lines 70-71, 82-106
+
+**Severity**: LOW (effectively unreachable)
+
+**Issue Description**: Looking at `streamClaudeResponse`, when it returns both `final != nil` and `parseErr != nil`, that is actually impossible by the current implementation -- the function returns `(nil, error)` or `(*StreamEvent, nil)`, never both. So `parseErr` is nil whenever `final` is non-nil. However, if `streamClaudeResponse` were ever changed to return both (e.g., "here's the best result I got, but also there was an error"), `GenerateTextStreaming` would silently drop `parseErr` because the `if final != nil` branch at line 83 returns without checking `parseErr`.
+
+**User Impact**: None with the current code. This is a defensive observation about the implicit contract between `streamClaudeResponse` and `GenerateTextStreaming`.
+
+**Recommendation**: No action needed now. The implicit contract (returns are mutually exclusive) is enforced by the implementation. If `streamClaudeResponse` is ever refactored to return partial results alongside errors, the caller should be updated accordingly.
+
+#### Issue C: `settings.Load` error suppressed in `summaryDeadlineResolver`
+
+**Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, line 63
+
+**Severity**: LOW
+
+**Issue Description**: `s, _ := settings.Load(context.Background())` discards the error. The inline comment `//nolint:errcheck // empty settings on error is acceptable` justifies this: if settings cannot be loaded, `s` returns zero-value settings, and `SummaryTimeoutValue()` returns 0, which means "unset" -- causing the code to fall through to the default behavior (idle watchdog for non-interactive, no deadline for interactive).
+
+**User Impact**: If a user has explicitly configured `summary_timeout_seconds` but the settings file is corrupted, they would silently get the default behavior instead of their configured timeout. This is an existing pattern throughout the codebase.
+
+**Recommendation**: This is an acceptable tradeoff documented by the nolint comment. No change needed.
+
+#### Issue D: `humanizeBytes` panics on extremely large values
+
+**Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, lines 1991-2003
+
+**Severity**: LOW (practically unreachable)
+
+**Issue Description**: The `suffix` slice `[]string{"KB", "MB", "GB", "TB"}` has 4 entries (indices 0-3). If `n` exceeds ~1 PB, `exp` would be 4 and `suffix[exp]` would panic with an index-out-of-bounds. Given this function is formatting transcript byte counts, which are bounded by memory, this is practically unreachable.
+
+**User Impact**: None in practice. Transcript sizes are bounded by available memory, and even a 1 TB transcript is absurd.
+
+**Recommendation**: No action needed, but if one wanted to be defensive, a cap on `exp` or adding "PB" would make this fully safe.
+
+#### Issue E: Progress callback passed to `GenerateFromTranscript` not threaded to non-ClaudeGenerator implementations
+
+**Location**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize.go`, lines 54-61
+
+**Severity**: LOW
+
+**Issue Description**: The `progress` parameter is only wired into `ClaudeGenerator`. If a caller passes a non-nil `Generator` that is not `*ClaudeGenerator`, the progress callback is silently ignored. The code at lines 56-61 only checks for `*ClaudeGenerator` by type assertion. Any other `Generator` implementation would not receive progress events.
+
+**User Impact**: Currently all production callers pass `nil` for the generator (defaulting to `ClaudeGenerator`), so this is not a real issue today. If a new generator is added, progress would silently stop working.
+
+**Recommendation**: This is an acceptable limitation of the current design. The `Generator` interface deliberately does not include progress -- it was added as a `ClaudeGenerator`-specific field. If more generators need progress in the future, the `Generator` interface should be extended or a `StreamingGenerator` interface added. No action needed now.
+
+
+### Summary of Findings
+
+**Previously Reported Issues**: All three are correctly fixed.
+
+1. **Idle watchdog timeout misreport** -- Fixed. The `idleFired` flag is checked before `Canceled` and `DeadlineExceeded`, producing correct user messages.
+2. **Malformed NDJSON counting** -- Fixed. The counter is tracked and included in the error when the stream ends without a result.
+3. **Nil errW panic** -- Fixed. Guarded with `io.Discard` at the top of `generateCheckpointAISummary`.
+
+**New Issues**: Five observations, none critical:
+
+- **Issue A** (MEDIUM): Malformed line count dropped on successful streams. Acceptable tradeoff for resilience.
+- **Issue B** (LOW): `parseErr` silently dropped when `final` is present. Unreachable by current implementation.
+- **Issue C** (LOW): Settings load error suppressed. Documented and consistent with codebase patterns.
+- **Issue D** (LOW): `humanizeBytes` panics on PB+ inputs. Practically unreachable.
+- **Issue E** (LOW): Progress callback not threaded to non-Claude generators. No current impact.
+
+**Overall Assessment**: The review fixes are well-implemented. The error handling chain from `streamClaudeResponse` through `GenerateTextStreaming` through `summarize.Generate` through `generateCheckpointAISummary` through `formatCheckpointSummaryError` correctly preserves error types at each layer (unwrapped `*ClaudeError` for `errors.As`, wrapped `context.DeadlineExceeded`/`context.Canceled` sentinels for `errors.Is`). The idle watchdog's `idleFired` flag correctly disambiguates watchdog-caused cancellation from user-caused cancellation. No silent failures or critical error handling gaps remain.</result>
+<usage><total_tokens>96407</total_tokens><tool_uses>35</tool_uses><duration_ms>187800</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad949f6abd4ae7e0a</task-id>
+<tool-use-id>toolu_01XXcGHuHrpUE68c8cNLb77o</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/ad949f6abd4ae7e0a.output</output-file>
+<status>completed</status>
+<summary>Agent "PR review toolkit: code review" completed</summary>
+<result>Good -- the strategy call passes `nil` for both generator and progress, which is the correct no-progress behavior for the condensation path (which runs in hooks, not interactively).
+
+I've completed my thorough review. Let me summarize the findings.
+
+---
+
+## Review: PR 964 (`feat/explain-stream-progress`)
+
+### Files reviewed
+
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/agent.go` -- new types: `ProgressPhase`, `GenerationProgress`, `ProgressFn`, `StreamingTextGenerator`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/capabilities.go` -- new `AsStreamingTextGenerator` helper + `DeclaredCaps.StreamingTextGenerator` field
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/capabilities_test.go` -- tests for the new capability helper
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go` -- `GenerateTextStreaming` implementation, `makeProgressDispatcher`, `isExecError`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response.go` -- `StreamEvent`/`StreamInnerEvent`/`StreamDelta`/`StreamMessage` structs, NDJSON parser
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response_test.go` -- stream parser tests
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/claude_test.go` -- integration tests for streaming generation
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/testdata/stream_success.jsonl` -- captured fixture
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/testdata/stream_error_404.jsonl` -- captured fixture
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go` -- deadline resolution, idle watchdog, progress writer, `generateCheckpointAISummary`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain_test.go` -- tests for deadline resolution, idle watchdog, progress writer
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize.go` -- `GenerateFromTranscript` progress threading
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize_test.go` -- tests for progress threading
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/claude.go` -- `ClaudeGenerator.Generate` streaming dispatch
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/claude_test.go` -- tests for streaming preference and fallback
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/strategy/manual_commit_condensation.go` -- signature update to pass `nil` progress
+
+### Verification
+
+- All tests pass (claudecode, summarize, cli packages)
+- `mise run lint` reports 0 issues
+- `mise run fmt` reports no changes needed
+
+### Specific checks requested
+
+1. **`fired` flag idle-timeout fix**: Correct. The `startIdleWatchdog` goroutine sets `fired.Store(true)` before calling `cancel()`. In `generateCheckpointAISummary`, the check `if idleFired != nil &amp;&amp; idleFired.Load()` runs before the `context.Canceled` check, so idle timeout is correctly reported as `DeadlineExceeded` with the idle-specific message, not misclassified as "canceled". The ordering in the error handling block is critical and correct.
+
+2. **`ttft_ms` fix matches the real CLI output**: Confirmed. In `testdata/stream_success.jsonl` line 4, `"ttft_ms":935` appears on the outer `stream_event` envelope (sibling to `"type":"stream_event"`), not inside the inner `"event"` payload. The `StreamEvent` struct has `TTFTms int json:"ttft_ms,omitempty"` at the outer level, matching the fixture.
+
+3. **CLAUDE.md violations**: None found. Settings access goes through the `settings` package. Tests that modify package-level vars correctly omit `t.Parallel()` with explanatory comments. No user content is logged. Error handling follows the `SilentError` / `ClaudeError` patterns.
+
+### Result
+
+No issues with confidence &gt;= 80. The code is well-structured, the fixes from the previous review round are correctly applied, and the implementation adheres to project guidelines. The PR is clean.</result>
+<usage><total_tokens>95861</total_tokens><tool_uses>37</tool_uses><duration_ms>197858</duration_ms></usage>
+</task-notification>
+
+---
+
+yes let's fix
+
+---
+
+run all three review agents again please
+
+---
+
+<task-notification>
+<task-id>b0zzl831l</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/b0zzl831l.output</output-file>
+<status>completed</status>
+<summary>Background command "Codex adversarial review" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a431b909f7248f172</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/a431b909f7248f172.output</output-file>
+<status>completed</status>
+<summary>Agent "PR review toolkit: code review (round 3)" completed</summary>
+<result>Good, the tests that modify package-level vars correctly do NOT call `t.Parallel()` and include a comment explaining why.
+
+Now let me check one more detail about the `generateTextLegacy` fallback - whether the context passed to it could have already expired.
+
+Looking at lines 109-114 of `generate.go`:
+```go
+if waitErr != nil {
+    stderrStr := stderr.String()
+    if looksLikeUnrecognizedFlag(stderrStr) {
+        return c.generateTextLegacy(ctx, prompt, model)
+    }
+```
+
+The original `ctx` is passed to `generateTextLegacy`, not a stale context. This is correct because if the context was canceled/expired, `cmd.Run()` inside `generateTextLegacy` would fail quickly. Good.
+
+However, I notice that `generateTextLegacy` at line 200 doesn't check `ctx.Err()` before starting. If the streaming attempt had already consumed significant time and the context is near expiry, the legacy path might immediately time out. But this is acceptable behavior -- the context timeout applies to the overall operation.
+
+Let me also verify whether `--verbose` and `--include-partial-messages` would also be unrecognized by older CLIs. Looking at the streaming call at line 43-49:
+```go
+cmd := commandRunner(ctx, claudePath,
+    "--print",
+    "--output-format", "stream-json",
+    "--include-partial-messages",
+    "--verbose",
+    "--model", model,
+    "--setting-sources", "")
+```
+
+The flags `--include-partial-messages` and `--verbose` might also be unrecognized by older CLIs that don't support `stream-json`. But `looksLikeUnrecognizedFlag` will catch this since the error message pattern would be about any unrecognized flag. The legacy fallback doesn't include these flags (correctly):
+```go
+cmd := commandRunner(ctx, "claude",
+    "--print", "--output-format", "json",
+    "--model", model, "--setting-sources", "")
+```
+
+Good -- the legacy path strips all streaming-specific flags.
+
+Now I have a complete picture. Let me compose the review.
+
+---
+
+## Review: PR 964 `feat/explain-stream-progress` (Round 3)
+
+### Files reviewed
+
+Changes across 16 files in the diff from `feat/explain-typed-errors..HEAD` (3 commits):
+
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/agent.go` -- new `StreamingTextGenerator` interface, `ProgressPhase`, `GenerationProgress`, `ProgressFn`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/capabilities.go` -- `AsStreamingTextGenerator` helper
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/capabilities_test.go` -- tests for the new capability helper
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go` -- streaming generation, `generateTextLegacy` fallback, `looksLikeUnrecognizedFlag`, `makeProgressDispatcher`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response.go` -- `streamClaudeResponse`, `StreamEvent`, `parseGenerateTextResponse` (legacy)
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/response_test.go` -- stream parsing tests
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/claude_test.go` -- end-to-end agent tests
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go` -- idle watchdog, wall-clock cap, `summaryProgressWriter`, deadline resolution
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain_test.go` -- tests for deadline/watchdog/progress
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/claude.go` -- streaming preference in `ClaudeGenerator.Generate`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize.go` -- `progress` param added to `GenerateFromTranscript`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/claude_test.go` -- streaming preference tests
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/summarize/summarize_test.go` -- existing tests
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/strategy/manual_commit_condensation.go` -- pass `nil` progress to updated signature
+- Test data fixtures in `testdata/`
+
+---
+
+### Critical (90-100)
+
+**1. Wall-clock cap timeout reports wrong duration in error message** (Confidence: 95)
+
+File: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/explain.go`, lines 594-598
+
+When `deadlineModeIdle` is active (the non-interactive default), the code layers a 30-minute wall-clock cap (`wallCtx`) on top of the idle watchdog. If the wall-clock cap fires (chatty but never-completing Claude), the flow is:
+
+1. `wallCtx` expires with `DeadlineExceeded`
+2. `runCtx` (a `WithCancel` child of `wallCtx`) inherits `DeadlineExceeded`
+3. `idleFired.Load()` is false (the idle watchdog did not fire)
+4. Line 597 matches: `errors.Is(err, context.DeadlineExceeded)` or `errors.Is(runCtx.Err(), context.DeadlineExceeded)`
+5. Error message says: `"summary generation timed out after 5m0s"` (using `resolved.duration` = the idle timeout)
+
+But the actual timeout was 30 minutes (the wall-clock cap). The error message misleads users and the downstream `formatCheckpointSummaryError` advice ("increase summary_timeout_seconds") does not apply since the wall-clock cap is a hardcoded constant, not configurable.
+
+**Fix:** Distinguish between idle watchdog timeout and wall-clock cap timeout by checking whether it was the `wallCtx` that expired. For example:
+
+```go
+// After the idleFired check, before the general DeadlineExceeded check:
+if errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+    // Distinguish wall-clock cap from idle watchdog
+    duration := resolved.duration
+    if resolved.mode == deadlineModeIdle {
+        duration = maxWallClockSummaryDeadline
+    }
+    return nil, duration, fmt.Errorf("summary generation timed out after %s: %w", formatSummaryTimeout(duration), context.DeadlineExceeded)
+}
+```
+
+Or better: track whether the wall-clock cap fired specifically, and produce a different error message (since the advice about `summary_timeout_seconds` is wrong for this case).
+
+---
+
+### Important (80-89)
+
+**2. No unit tests for `looksLikeUnrecognizedFlag` or the legacy fallback path** (Confidence: 85)
+
+Files:
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go`, lines 187-257
+
+`looksLikeUnrecognizedFlag` is a pure function that should be trivially testable with a table-driven test covering each of its four pattern checks plus negative cases (e.g., a real auth error message, an API error message). Currently there are zero tests for this function.
+
+Similarly, `generateTextLegacy` has no test coverage. The streaming path has several tests (`TestGenerateTextStreaming_*`), but the legacy fallback -- which handles envelope errors, stderr fallback, CLI-missing detection, and context timeout -- has none. Since this is a backward-compatibility safety net that will only activate on older CLI versions (which are harder to test in CI), missing coverage is a real risk.
+
+**Fix:** Add at minimum:
+- A table-driven test for `looksLikeUnrecognizedFlag` with positive and negative cases
+- A test showing the legacy fallback activates and returns a correct result when stderr contains "unknown flag"
+- A test showing the legacy fallback correctly classifies envelope errors (e.g., auth error)
+
+**3. `looksLikeUnrecognizedFlag` may false-positive on legitimate error messages** (Confidence: 82)
+
+File: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-876/cmd/entire/cli/agent/claudecode/generate.go`, lines 189-195
+
+The function checks for substrings like "unknown option" and "invalid option" in the lowercased stderr. These are broad patterns. If a future Claude CLI version produces stderr like "unknown option in API response" or "invalid option: model 'x' is not valid", this could trigger a false fallback to legacy mode, silently degrading functionality.
+
+The detection would be more robust if it also required the presence of one of the streaming-specific flag names (e.g., `stream-json`, `--include-partial-messages`) in the stderr message. Typical CLI argument parsers include the offending flag name in the error.
+
+**Fix:** Consider tightening the heuristic:
+```go
+func looksLikeUnrecognizedFlag(stderr string) bool {
+    lower := strings.ToLower(stderr)
+    hasRejectPhrase := strings.Contains(lower, "unrecognized option") ||
+        strings.Contains(lower, "unknown flag") ||
+        strings.Contains(lower, "unknown option") ||
+        strings.Contains(lower, "invalid option")
+    if !hasRejectPhrase {
+        return false
+    }
+    // Require one of our streaming-specific flags to be mentioned
+    return strings.Contains(lower, "stream-json") ||
+        strings.Contains(lower, "--include-partial-messages") ||
+        strings.Contains(lower, "--verbose")
+}
+```
+
+---
+
+### Summary
+
+The overall architecture is well-structured: the `StreamingTextGenerator` interface, the progress phases, the idle watchdog, and the layered timeout all compose cleanly. The legacy fallback handles the key error paths (envelope errors, stderr fallback, CLI missing, context timeout). The `t.Parallel()` discipline is correct -- tests that mutate package-level vars omit it with explanatory comments, and all other tests include it. Settings access goes through the `settings` package as required.
+
+The one critical issue is that the wall-clock cap timeout (30 minutes) incorrectly reports the idle timeout duration (5 minutes) in the user-facing error message, which would also trigger incorrect advice about `summary_timeout_seconds`. The two important items are the lack of test coverage for the new fallback/detection code, and the broad stderr pattern matching that could false-positive.</result>
+<usage><total_tokens>117990</total_tokens><tool_uses>45</tool_uses><duration_ms>212661</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>brakcgs5n</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/brakcgs5n.output</output-file>
+<status>completed</status>
+<summary>Background command "Codex review" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+yes
+
+---
+
+wait, to confirm this is for 964, correct?
+
+---
+
+yes go ahead ten
+
+---
+
+okay now run full user simulation so we see fix from user persepctive now. pull latest from main and this branch
+
+---
+
+okay show me resutls
+
+---
+
+i see sorry, any other improvemnets we cna make? use /superpowers:brainstorming
+
+---
+
+a. why would we truncte transcripts? isn't the point of having the progress is so users have visbility? and wouldn't truncating reudce quality of summaru? b. no the flag is intentional design c. no cost
+
+---
+
+keep A, i dont wat to change anything about the summary generation process, just failure handling
+
+---
+
+do any of these effect the fix/enhancement we're trying to fix?
+
+---
+
+do any of these effect the fix/enhancement we're trying to fix?
+
+---
+
+do any of these effect the fix/enhancement we're trying to fix?
+
+---
+
+do any of these effect the fix/enhancement we're trying to fix?
+
+---
+
+okay so what is next step, shoudl we do another review again
+
+---
+
+yes please
+
+---
+
+proceed
+
+---
+
+just focus on 964 only, says there are still rebase errors
+
+---
+
+please go ahead
+
+---
+
+<task-notification>
+<task-id>bt3e4juc4</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-876/a41f4669-6677-41da-a864-dbef451ac8ff/tasks/bt3e4juc4.output</output-file>
+<status>failed</status>
+<summary>Background command "Push PR 2 via HTTPS" failed with exit code 1</summary>
+</task-notification>

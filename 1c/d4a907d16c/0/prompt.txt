@@ -1,0 +1,832 @@
+/pr-review-toolkit:review-pr
+
+---
+
+this is a stacked PR, you can keep the scope limited to the gemini part
+
+---
+
+<task-notification>
+<task-id>a729ee46dd77d7b66</task-id>
+<tool-use-id>toolu_01AKqCpK8ZUYZq1CQqGXaxy5</tool-use-id>
+<status>completed</status>
+<summary>Agent "Type design analysis" completed</summary>
+<result>I now have all the information needed for a comprehensive type design review. Let me compile my analysis.
+
+---
+
+## Type Design Analysis: `post-file-edit-gemini` branch
+
+This analysis covers new and modified types introduced in the PR, focusing on invariant quality, encapsulation, and practical value.
+
+---
+
+## Type: `EventType` (modified) -- `FileEdit` constant
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/event.go`
+
+### Invariants Identified
+- `EventType` is a closed set of lifecycle events (`iota + 1` through `FileEdit`)
+- Zero value is intentionally invalid (iota starts at 1)
+- Every `EventType` must have a corresponding `String()` case
+- Every `EventType` must have a corresponding dispatcher case in `DispatchLifecycleEvent`
+
+### Ratings
+- **Encapsulation**: 6/10
+  The type is `int`-based, meaning any int can be cast to `EventType`. This is standard Go practice for iota enums and is acceptable given that the `default` arm in `DispatchLifecycleEvent` returns an error for unknown types. The real enforcement boundary is the dispatcher, not the type itself.
+
+- **Invariant Expression**: 7/10
+  The new `FileEdit` constant is appended at the end of the iota sequence, preserving backward-compatible wire values for all existing constants. The `String()` method and dispatcher both handle it. The comment on the constant clearly explains its purpose and the framework's expected behavior (appending to tracking file).
+
+- **Invariant Usefulness**: 8/10
+  `FileEdit` fills a genuine gap: before this PR, file tracking required transcript parsing at commit time, which is expensive and error-prone. Making it an explicit lifecycle event allows real-time incremental tracking. The event type clearly distinguishes "file was modified" from all other lifecycle phases.
+
+- **Invariant Enforcement**: 6/10
+  No enforcement that `FileEdit` events must have a non-empty `FilePath`. The dispatcher in `handleLifecycleFileEdit` handles this gracefully (returns nil), but the type itself allows construction of `FileEdit` events with empty `FilePath`. This is a pragmatic tradeoff -- see Concerns below.
+
+### Strengths
+- Clean extension of the existing enum pattern
+- iota ordering is backward-compatible (new constant appended at the end)
+- String() method and dispatcher are both updated in lockstep
+
+### Concerns
+- The `Event` struct is a flat "god struct" with fields that are only relevant for specific event types (`FilePath` for `FileEdit`, `ToolUseID` for subagent events, `Prompt` for `TurnStart`, etc.). This is a pre-existing design issue that this PR does not worsen significantly by adding one more field.
+- There is no compile-time enforcement that a `FileEdit` event has a `FilePath`. A discriminated union or sealed interface would express this more strongly, but that would be a large architectural change inconsistent with the codebase's established patterns.
+
+### Recommended Improvements
+None for this PR. The flat-struct approach is a conscious tradeoff in this codebase, and adding one more field does not cross a complexity threshold that would justify refactoring the Event type.
+
+---
+
+## Type: `Event.FilePath` (new field)
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/event.go`, line 123-126
+
+### Invariants Identified
+- Should be populated only for `FileEdit` events
+- May be absolute or relative; the framework normalizes before persisting
+- Must not contain newline characters (enforced downstream in `AppendFileTouched`)
+
+### Ratings
+- **Encapsulation**: 5/10
+  The field is public and writable by anyone constructing an `Event`. No protection against setting `FilePath` on a non-`FileEdit` event. This matches the pattern of every other field on `Event`.
+
+- **Invariant Expression**: 7/10
+  The doc comment clearly states it is "for FileEdit events" and that it "may be absolute -- the framework normalizes to repo-relative before persisting." This is sufficient documentation given the codebase conventions.
+
+- **Invariant Usefulness**: 8/10
+  Carries exactly the information the framework needs for incremental file tracking. The single-file-per-event model aligns with how Write/Edit tools operate (one file per invocation).
+
+- **Invariant Enforcement**: 5/10
+  Normalization (absolute to repo-relative) and validation (no newlines, must be within repo) happen in `handleLifecycleFileEdit`, not at construction time. This is appropriate given the design: the `Event` is constructed in agent-specific code, and the framework is the consumer that does normalization.
+
+### Strengths
+- Clean separation: agents populate raw paths, framework normalizes
+- Comment explains the normalization contract explicitly
+- Single-file design correctly models the Write/Edit tool semantics
+
+### Concerns
+- None significant beyond the general flat-struct concern noted above.
+
+---
+
+## Type: `afterToolHookInputRaw` (new)
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/types.go`, lines 78-85
+
+### Invariants Identified
+- `SessionID` and `TranscriptPath` are required for lifecycle routing
+- `ToolName` identifies which tool executed
+- `ToolInput` is `json.RawMessage` to allow deferred parsing based on tool type
+
+### Ratings
+- **Encapsulation**: 6/10
+  Unexported type (lowercase `a`), which correctly restricts it to the `geminicli` package. Fields are public for JSON deserialization, which is a Go necessity.
+
+- **Invariant Expression**: 7/10
+  `json.RawMessage` for `ToolInput` is the right choice -- it defers parsing to the consumer, which knows the expected schema. This avoids coupling the hook input type to any specific tool's input format. The doc comment explains the provenance clearly.
+
+- **Invariant Usefulness**: 8/10
+  This type fills a real need. Previously there was no Gemini type for AfterTool hook payloads containing tool details. The `ToolName` and `ToolInput` fields enable the new file-edit parsing without modifying the existing `sessionInfoRaw` or `agentHookInputRaw` types (which don't carry tool information).
+
+- **Invariant Enforcement**: 5/10
+  No validation that required fields are non-empty. This is consistent with all other `*Raw` types in this package -- they are deserialization targets, and validation happens in the parsing functions that consume them. The `parseFileEdit` method handles empty/missing fields gracefully.
+
+### Strengths
+- Follows the established `*Raw` naming convention for deserialization-only types
+- Package-private visibility
+- `json.RawMessage` for polymorphic tool input is the standard Go approach
+- Clear doc comment connecting it to Gemini CLI's AfterTool hooks
+
+### Concerns
+- None. This is a well-crafted internal DTO.
+
+---
+
+## Type: `fileEditToolInput` (new, two versions)
+
+**Files:**
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/lifecycle.go`, lines 185-189
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle.go`, lines 191-193
+
+### Invariants Identified
+- Claude version: only `FilePath` field (Claude Write/Edit always use `file_path`)
+- Gemini version: three fields (`FilePath`, `Path`, `Filename`) with a priority order
+- The `filePath()` method on the Gemini version encodes the fallback chain
+
+### Ratings
+- **Encapsulation**: 6/10
+  Both are unexported types, correctly scoped to their packages. The Gemini version has a method that encapsulates the priority logic.
+
+- **Invariant Expression**: 7/10
+  The Gemini version's `filePath()` method clearly encodes the fallback chain: `file_path > path > filename`. The doc comment on the struct explains why three fields exist ("Gemini tools use file_path, path, or filename depending on the tool"). The Claude version is simpler because Claude consistently uses `file_path`.
+
+- **Invariant Usefulness**: 8/10
+  Both types solve the practical problem of extracting a file path from heterogeneous tool input JSON. The Gemini version handles real-world variance across four different tools.
+
+- **Invariant Enforcement**: 6/10
+  The `filePath()` method returns empty string when all fields are empty, and callers check for this. This is a clean, sufficient design.
+
+### Strengths
+- Appropriate divergence between Claude (simple) and Gemini (fallback chain)
+- The `filePath()` helper method encapsulates the resolution logic
+- Both types are package-private DTOs used only for JSON deserialization
+
+### Concerns
+- **Name collision**: Both packages define a type named `fileEditToolInput`. This is fine because they are in separate packages, but it creates a mild readability concern when reading the diff. Since they have genuinely different structures (one field vs. three), merging them into a shared type in the `agent` package would be wrong -- they model different agent contracts. The name collision is acceptable.
+- The Gemini `filePath()` method uses a value receiver, which is idiomatic for a small struct. No issue here.
+
+### Recommended Improvements
+None. The two types correctly model their respective agents' contracts and are appropriately scoped.
+
+---
+
+## Type: `PostFileEditInput` (new, integration test)
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/hooks.go`, lines 409-415
+
+### Invariants Identified
+- Test helper DTO for simulating post-file-edit hooks
+- Fields mirror the Claude Code PostToolUse hook payload structure
+
+### Ratings
+- **Encapsulation**: 6/10
+  Public fields for test construction. Appropriate for a test helper.
+
+- **Invariant Expression**: 6/10
+  Clear, simple struct. No validation needed for a test input type.
+
+- **Invariant Usefulness**: 7/10
+  Necessary to test the file-edit flow end-to-end. Follows the existing pattern of `PostTodoInput` and similar test input types.
+
+- **Invariant Enforcement**: N/A
+  Test infrastructure types do not need enforcement.
+
+### Strengths
+- Consistent with existing `PostTodoInput` pattern
+- Both `HookRunner.SimulatePostFileEdit` and `TestEnv.SimulatePostFileEdit` convenience methods provided
+
+### Concerns
+- None.
+
+---
+
+## Type: `StateStore` (modified) -- new `AppendFileTouched` / `ReadFilesTouched` / `ClearFilesTouched` methods
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go`, lines 412-502
+
+### Invariants Identified
+1. Session ID must pass `validation.ValidateSessionID` (prevents path traversal)
+2. File paths must not contain `\n` or `\r` (prevents line injection in the append-only format)
+3. The `.files` tracking file uses one-path-per-line format with newline delimiters
+4. `ReadFilesTouched` deduplicates and sorts
+5. `ClearFilesTouched` is idempotent (no error on non-existent file)
+6. `Clear()` already uses a glob (`sessionID+".*"`) to remove all session files, so `.files` is automatically cleaned up
+
+### Ratings
+- **Encapsulation**: 8/10
+  All file path manipulation is internal. The public API is `AppendFileTouched(ctx, sessionID, filePath)` -- callers don't know about the `.files` file format. The `filesTouchedPath` helper is private. The design is clean.
+
+- **Invariant Expression**: 8/10
+  The line-injection guard (`strings.ContainsAny(filePath, "\n\r")`) directly protects the file format invariant. Session ID validation prevents path traversal. The deduplicate-on-read contract is clearly documented.
+
+- **Invariant Usefulness**: 9/10
+  These methods solve a critical performance problem: the previous approach required parsing the full transcript at commit time to discover which files were modified. The new append-only tracking file makes this O(1) per tool invocation, with read being O(n) in files touched (which is always small). The design is intentionally lightweight -- no JSON parsing, no file locking, just `O_APPEND` writes.
+
+- **Invariant Enforcement**: 8/10
+  - Session ID validated on every operation (Append, Read, Clear)
+  - Newline injection prevented on write
+  - Directory created with restrictive permissions (0o750)
+  - File created with restrictive permissions (0o600)
+  - Idempotent clear (no error on non-existent)
+  - Existing `Clear()` method already cleans up `.files` via the `sessionID+".*"` glob pattern
+
+### Strengths
+- The append-only write / deduplicate-on-read pattern is a smart design for this use case. It avoids any need for file locking even with concurrent tool invocations within the same session.
+- `O_APPEND` is atomic on POSIX for writes smaller than `PIPE_BUF` (4096 bytes), so concurrent appends of file paths will not interleave.
+- The `Clear()` glob already covers `.files` -- no separate cleanup path needed.
+- Thorough test coverage including: deduplication, idempotent clear, session ID validation, newline injection rejection, and cleanup of `.files` alongside `.json` state.
+
+### Concerns
+1. **No file locking for concurrent sessions.** Two concurrent sessions with the same session ID could write to the same `.files` file. However, the CLAUDE.md documentation indicates this is the expected behavior ("both sessions can proceed -- their checkpoints interleave on the same shadow branch"). The `O_APPEND` mode ensures atomic appends.
+
+2. **Unbounded file growth within a session.** If an agent edits the same file 10,000 times, the `.files` file grows linearly. Deduplication only happens on read. For most sessions this is negligible, but pathological cases could produce large tracking files. The `clearFilesTracking` calls at condensation/commit time bound the actual lifetime.
+
+3. **`strings.SplitSeq` usage in `ReadFilesTouched`.** This uses Go 1.24's iterator-based split. The project uses Go 1.25.x per CLAUDE.md, so this is fine. Just noting this as a newer API that may surprise readers.
+
+### Recommended Improvements
+None for this PR. The append-only pattern is the right tradeoff for a hot path (called on every file edit). The unbounded growth concern is mitigated by the clearing at commit time.
+
+---
+
+## Type: `FileModificationTools` (modified, Gemini CLI)
+
+**File:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/types.go`, lines 98-104
+
+### Invariants Identified
+- Lists all Gemini CLI tool names that modify files
+- Used both for hook installation (AfterTool matchers) and for transcript analysis
+- Must be kept in sync with Gemini CLI's actual tool naming
+
+### Ratings
+- **Encapsulation**: 5/10
+  Public `var` (mutable slice). Any consumer could mutate it at runtime. This is a pre-existing issue -- the slice was exported before this PR.
+
+- **Invariant Expression**: 7/10
+  The associated `Tool*` constants (`ToolWriteFile`, `ToolEditFile`, `ToolSaveFile`, `ToolReplace`) clearly name each tool. The doc comment explains the naming inconsistency between internal and display names.
+
+- **Invariant Usefulness**: 8/10
+  Single source of truth for file-modifying tools, reused across hook installation, transcript analysis, and now hook-based file tracking.
+
+- **Invariant Enforcement**: 4/10
+  Being a mutable exported `var`, it can be modified at runtime. This is low-risk in practice since it is never mutated after initialization, but technically violates immutability principles.
+
+### Concerns
+- The mutable `var` export is a pre-existing pattern across all agents (Claude Code, OpenCode, FactoryAIDroid all export `FileModificationTools` the same way). This PR does not change the pattern.
+
+### Recommended Improvements
+This is outside the scope of this PR, but converting to a function (`func FileModificationTools() []string`) that returns a copy would prevent mutation. Not urgent.
+
+---
+
+## Cross-cutting Analysis
+
+### Backward Compatibility
+
+The changes are fully backward-compatible:
+- `EventType.FileEdit` is appended at the end of the iota sequence (value 9), so all existing constants retain their values.
+- `Event.FilePath` is a new optional field with zero value `""`. Existing code that constructs `Event` values will continue to work.
+- The `State.FilesTouched` field in session JSON is unchanged. The new `.files` tracking file is a complementary data source, and `resolveFilesTouched` merges both sources.
+- The `Clear()` method's glob (`sessionID+".*"`) already covers the new `.files` extension without code changes.
+
+### Naming Consistency
+
+- `HookNamePostFileEdit = "post-file-edit"` is defined identically in both `claudecode` and `geminicli` packages. The comment in `hook_registry.go` (line 83: "same value for all agents") correctly notes this. This is a reasonable approach that avoids a shared constant while documenting the coupling.
+- `fileEditToolInput` is defined in both packages with different structures. The name collision is acceptable because the types are package-private and model genuinely different contracts.
+- `PostFileEditInput` in integration tests follows the established `Post*Input` naming convention.
+- `AppendFileTouched` / `ReadFilesTouched` / `ClearFilesTouched` follow a clear CRUD naming pattern on `StateStore`.
+
+### Design Pattern Observations
+
+The `handleLifecycleFileEdit` handler intentionally swallows all errors (returns `nil` unconditionally), logging them as warnings. This is documented and deliberate: file tracking is an optimization over transcript parsing, not a correctness requirement. If tracking fails, the fallback in `resolveFilesTouched` will still extract file information from the transcript. This layered-fallback design is sound.
+
+The `resolveFilesTouched` changes in `manual_commit_hooks.go` merge three sources: `state.FilesTouched` (from the JSON session state, populated by agents that provide `ModifiedFiles` on SubagentEnd), the `.files` tracking file (from real-time hook tracking), and the transcript fallback. The merge logic deduplicates and sorts. This is a clean additive change that does not break the existing flow.
+
+### Summary
+
+The type design in this PR is pragmatic and well-executed. New types are appropriately scoped (package-private DTOs), the `Event` extension is backward-compatible, and the `StateStore` additions have strong invariant enforcement (session ID validation, newline injection prevention, idempotent cleanup). The only structural concern is the `Event` flat-struct pattern, which is a pre-existing codebase convention that this PR does not meaningfully worsen.</result>
+<usage><total_tokens>82043</total_tokens><tool_uses>22</tool_uses><duration_ms>185401</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-3/tasks/a729ee46dd77d7b66.output
+
+---
+
+<task-notification>
+<task-id>aa6b36b3d750a32e1</task-id>
+<tool-use-id>toolu_01N8nRGSkezUdrd2NEiZDoin</tool-use-id>
+<status>completed</status>
+<summary>Agent "Comment accuracy analysis" completed</summary>
+<result>Now I have all the data I need. Let me compile my analysis.
+
+---
+
+**Summary**
+
+This PR introduces a `post-file-edit` hook for Claude Code and Gemini CLI agents, adding a `FileEdit` event type, per-session file tracking via `.files` append-only log, and integration of that tracking data into the `resolveFilesTouched` resolution logic. Additionally, it includes a non-feature-related refactor of `ReadLatestSessionPromptFromCommittedTree` to fall back through earlier sessions. I analyzed all new and modified comments across the 7 key files and their surrounding context.
+
+---
+
+**Critical Issues**
+
+1. **Location**: `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/event.go`, line 124
+   - **Issue**: The `FilePath` field comment says "Populated by agents from tool_input.file_path" but the Gemini CLI agent also populates it from `tool_input.path` and `tool_input.filename` (via the `fileEditToolInput.filePath()` fallback chain in `geminicli/lifecycle.go` lines 192-200). A future maintainer reading this comment would incorrectly believe that only the `file_path` JSON key is relevant.
+   - **Suggestion**: Change to: `// Populated by agents from tool input (typically file_path, but agents may also use path or filename fields). May be absolute -- the framework normalizes to repo-relative before persisting.`
+
+2. **Location**: `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go`, line 356
+   - **Issue**: The inline comment on the `Clear` method's glob says "Remove all files for this session (state .json, .model hint, any future hint files)." This PR adds `.files` tracking files, which are also removed by this glob, but the comment was not updated to mention them. A developer looking at this comment to understand what `Clear` removes would miss that `.files` are included, leading to confusion about whether file tracking data survives a `Clear` call.
+   - **Suggestion**: Change to: `// Remove all files for this session (state .json, .model hint, .files tracking, and any future extensions).`
+
+---
+
+**Improvement Opportunities**
+
+1. **Location**: `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/event.go`, lines 44-45
+   - **Current state**: The `FileEdit` event type comment says "The framework appends the file path to the session's tracking file." This is accurate but couples the event type documentation to a specific implementation detail (the `.files` tracking file). Event type comments for other types describe the semantic meaning (e.g., "SubagentEnd indicates a subagent (task) has completed") rather than what the framework does with the event.
+   - **Suggestion**: Rewrite for consistency with other event type comments: `// FileEdit indicates the agent modified a file via a tool (e.g., Write, Edit). // The framework uses this for incremental file change tracking.`
+
+2. **Location**: `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 1460-1462
+   - **Current state**: The `resolveFilesTouched` doc comment still says "Prefers hook-populated state.FilesTouched, falls back to transcript extraction." The function now has three sources: `state.FilesTouched`, the `.files` tracking file, and transcript extraction. The comment omits the tracking file source entirely.
+   - **Suggestion**: Update to: `// Merges hook-populated state.FilesTouched with the session's .files tracking file, // falling back to transcript extraction when neither has data. // All call sites that need "what files did the agent touch?" should use this.`
+
+3. **Location**: `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/hook_registry.go`, line 83
+   - **Current state**: The inline comment `// same value for all agents: "post-file-edit"` is factually correct (both `claudecode.HookNamePostFileEdit` and `geminicli.HookNamePostFileEdit` equal `"post-file-edit"`). However, only `claudecode.HookNamePostFileEdit` is referenced in the switch case. A future developer adding a third agent might not realize they need to check whether the new agent uses the same constant value. Since `geminicli.HookNamePostFileEdit` also exists with the same value, the comment serves as a workaround for not listing both constants.
+   - **Suggestion**: Either reference both constants in the case: `case geminicli.HookNameBeforeTool, geminicli.HookNameAfterTool, claudecode.HookNamePostFileEdit, geminicli.HookNamePostFileEdit:` (redundant but explicit), or strengthen the comment: `// All agents use the same string "post-file-edit"; only one constant needed here.`
+
+4. **Location**: `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/hooks.go`, lines 411 and 419
+   - **Current state**: The comments say "PostToolUse[Write/Edit]" which is Claude Code's terminology. The same hook structure is used for Gemini CLI's AfterTool hooks too, and Gemini's tool names are `write_file`, `edit_file`, `save_file`, `replace` -- not `Write`/`Edit`. Since the integration test framework simulates hooks agent-agnostically, the comment is slightly misleading.
+   - **Suggestion**: Change to: `// PostFileEditInput contains the input for the post-file-edit hook.` and `// SimulatePostFileEdit simulates the post-file-edit hook (file-modifying tool completion).`
+
+5. **Location**: `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/lifecycle.go`, line 183
+   - **Current state**: The `fileEditToolInput` struct comment says "extracts file_path from Gemini CLI tool input" but the struct also handles `path` and `filename` fields. The comment undersells what it does. The second line of the comment ("Gemini tools use file_path, path, or filename depending on the tool") is accurate but reads as a separate piece of information rather than the struct's purpose.
+   - **Suggestion**: Combine into: `// fileEditToolInput extracts the edited file's path from Gemini CLI tool input. // Different tools use different field names: file_path, path, or filename.`
+
+---
+
+**Recommended Removals**
+
+None. All comments in this PR serve a purpose. The logging comments (e.g., "resolveFilesTouched: using hook-tracked files") provide operational debugging value. The nolint comments explain non-obvious lint suppression rationale.
+
+---
+
+**Positive Findings**
+
+1. **`handleLifecycleFileEdit` doc comment** (`/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, lines 176-178): Excellent comment. It explains three things concisely: what the function does, a design decision (intentionally lightweight/no JSON state loading), and the error-handling contract (returns nil unconditionally). All three are verified correct against the implementation.
+
+2. **`ReadLatestSessionPromptFromCommittedTree` updated comment** (`/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/common.go`, lines 584-590): The old comment claimed "This is an O(1) tree lookup" which was factually incorrect for the new implementation that iterates backward through sessions. The PR correctly replaced it with "Falls back through earlier sessions when the latest has no prompt. Avoids reading full transcripts -- only reads prompt.txt files." This accurately describes the new behavior without making false complexity claims.
+
+3. **`clearFilesTracking` comment** (`/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 1512-1513): Well-crafted -- "best-effort" and "Logs at Debug level on failure to aid debugging stale data accumulation" tells the reader both the error contract and the operational motivation for the debug logging.
+
+4. **Inline comments at `clearFilesTracking` call sites** (`manual_commit_hooks.go`, lines 1034 and 1123-1124): Both call sites have brief but valuable explanatory comments. Line 1034's `"Clear tracking file -- state.FilesTouched now has the authoritative carry-forward list"` explains the ownership transfer. Line 1123-1124's `"Clear the file tracking file alongside state.FilesTouched"` makes clear both are reset together.
+
+5. **`afterToolHookInputRaw` type comment** (`/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/types.go`, lines 78-79): Clean and accurate -- documents what the struct represents and what the agent provides, matching the JSON tags.</result>
+<usage><total_tokens>101016</total_tokens><tool_uses>38</tool_uses><duration_ms>191282</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-3/tasks/aa6b36b3d750a32e1.output
+
+---
+
+<task-notification>
+<task-id>a1e16485752db02ab</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Silent failure analysis" completed</summary>
+<result>Now I have everything I need for a thorough audit. Let me compile the findings.
+
+---
+
+# Error Handling Audit: `post-file-edit-gemini` PR
+
+## Summary
+
+This PR introduces a `FileEdit` lifecycle event to track files modified by agents (both Claude Code and Gemini CLI) via per-session `.files` tracking files. It also modifies `resolveFilesTouched` to merge state and tracking file data, and adds `clearFilesTracking` calls during condensation and carry-forward. Overall, the error handling quality is moderate to good -- most errors are logged and the design intent of "never block the agent" is clear. However, there are several issues ranging from medium to high severity.
+
+---
+
+## Issue 1: `handleLifecycleFileEdit` silently swallows all errors -- returns nil unconditionally
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, lines 179-219
+
+**Severity:** HIGH
+
+**Issue Description:** The function comment explicitly states "Returns nil unconditionally; errors are logged but not propagated to avoid blocking the agent." While the *intent* is defensible (a file-tracking failure should not block the agent), every error path returns `nil` after only a `Warn`-level log. This means callers (specifically `DispatchLifecycleEvent`) receive no indication that anything went wrong. The design choice to never propagate errors from this handler means:
+
+1. If `paths.WorktreeRoot` consistently fails (e.g., corrupted `.git`), every single file edit will silently fail tracking, and the user will discover at commit time that none of their session's files were tracked -- with no explanation.
+2. If `session.NewStateStore` fails (e.g., permissions issue on `.git/entire-sessions/`), the same silent failure pattern accumulates indefinitely.
+
+**User Impact:** Users will see stale or empty `FilesTouched` data at commit time with no explanation of why file tracking stopped working. The `resolveFilesTouched` function will fall back to transcript extraction (which is slower and less reliable), and the user will never know the tracking mechanism broke.
+
+**Recommendation:** This is a legitimate design decision (don't block the agent), but it should be documented more clearly in the function, and the logging should be at `Error` level for repeated failures, not just `Warn`. At minimum, consider returning the error wrapped in a non-fatal marker so callers can log appropriately. The current approach of `Warn` logging is adequate for individual failures but provides no mechanism to escalate when failures are persistent.
+
+---
+
+## Issue 2: `clearFilesTracking` silently returns on `getStateStore` failure without any logging
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 1514-1526
+
+**Severity:** HIGH
+
+**Issue Description:** When `getStateStore` fails, the function silently returns with zero logging:
+
+```go
+func (s *ManualCommitStrategy) clearFilesTracking(ctx context.Context, sessionID string) {
+	store, storeErr := s.getStateStore(ctx)
+	if storeErr != nil {
+		return  // <-- SILENT RETURN, NO LOGGING
+	}
+	...
+}
+```
+
+The `ClearFilesTouched` error path (line 1519-1525) at least logs at `Debug` level, but the `getStateStore` failure is completely silent. This means if the state store cannot be initialized (e.g., not in a git repo, disk permissions), the tracking file will accumulate indefinitely without cleanup, and there will be zero diagnostic evidence.
+
+This function is called from two critical paths:
+1. After `condenseAndUpdateState` (line 1124) -- tracking data from a completed condensation is not cleaned up
+2. After carry-forward (line 1031) -- stale entries remain in the tracking file
+
+**Hidden Errors:** Disk permission errors, git directory not found, filesystem errors.
+
+**User Impact:** Stale `.files` data accumulates silently. On next `resolveFilesTouched`, old file entries from previous condensations will be merged back in, causing `FilesTouched` to contain files that were already committed. This could cause redundant condensation or incorrect carry-forward calculations.
+
+**Recommendation:** Add at least `Debug`-level logging when `getStateStore` fails, consistent with the `ClearFilesTouched` error path:
+
+```go
+if storeErr != nil {
+    logCtx := logging.WithComponent(ctx, "checkpoint")
+    logging.Debug(logCtx, "clearFilesTracking: could not get state store (non-critical)",
+        slog.String("session_id", sessionID),
+        slog.String("error", storeErr.Error()),
+    )
+    return
+}
+```
+
+---
+
+## Issue 3: `resolveFilesTouched` downgrades state store and file read errors to Debug-level logging
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go`, lines 1464-1509
+
+**Severity:** MEDIUM
+
+**Issue Description:** When `getStateStore` or `ReadFilesTouched` fails, the function logs at `Debug` level and falls back to transcript extraction. Debug logs are typically not visible in production:
+
+```go
+if store, err := s.getStateStore(ctx); err != nil {
+    logging.Debug(logCtx, "resolveFilesTouched: could not get state store, falling back to transcript",
+        ...
+    )
+} else if files, readErr := store.ReadFilesTouched(ctx, state.SessionID); readErr != nil {
+    logging.Debug(logCtx, "resolveFilesTouched: could not read tracking file, falling back to transcript",
+        ...
+    )
+}
+```
+
+This is a fallback chain that silently degrades to a slower, less reliable code path (transcript extraction) without any user-visible indication. The fallback behavior is architecturally reasonable, but the logging severity is too low for production troubleshooting.
+
+**User Impact:** If the tracking file mechanism is broken (permissions, corrupted data), the system silently falls back to transcript parsing. Users may see inconsistent `FilesTouched` results between runs -- sometimes fast and accurate (tracking file works), sometimes slower and potentially incomplete (transcript fallback). Debugging this inconsistency would require enabling Debug-level logging.
+
+**Recommendation:** Use `Warn` level for these fallback paths, or at minimum `Info`, since they indicate the primary mechanism has failed and a degraded path is being used. The "falling back to transcript" message is operationally significant.
+
+---
+
+## Issue 4: `Gemini parseFileEdit` silently swallows JSON unmarshal errors with nil,nil return
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/lifecycle.go`, lines 208-211
+
+**Severity:** MEDIUM
+
+**Issue Description:**
+
+```go
+var toolInput fileEditToolInput
+if err := json.Unmarshal(raw.ToolInput, &toolInput); err != nil {
+    return nil, nil //nolint:nilnil,nilerr // tool_input doesn't match expected schema
+}
+```
+
+Unlike the Claude Code version (which logs the unmarshal failure at Debug level in `claudecode/lifecycle.go:204-208`), the Gemini version has zero logging when `tool_input` fails to unmarshal. The `nolint:nilerr` directive explicitly acknowledges that an error is being discarded.
+
+While a nil-nil return is the correct behavior for "skip this event," the lack of logging means if Gemini CLI changes its tool input format, every file edit will silently fail to track, with no diagnostic trail.
+
+**Hidden Errors:** Schema changes in Gemini CLI's AfterTool hook payload, unexpected tool_input formats from new tools.
+
+**User Impact:** If Gemini CLI updates its tool input schema, all file edit tracking silently stops. No logs, no errors, no indication.
+
+**Recommendation:** Add Debug-level logging consistent with the Claude Code implementation:
+
+```go
+if err := json.Unmarshal(raw.ToolInput, &toolInput); err != nil {
+    // Log at debug to aid diagnosis if Gemini CLI changes tool_input format
+    return nil, nil
+}
+```
+
+---
+
+## Issue 5: `AppendFileTouched` does not check `f.Close()` error on write-mode file
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go`, lines 434-443
+
+**Severity:** MEDIUM
+
+**Issue Description:** The file is opened with `O_APPEND|O_CREATE|O_WRONLY` and closed via `defer f.Close()`. The `Close()` return value is discarded. On certain filesystems (especially NFS, or when the filesystem is full), `Close()` can be the point where buffered write errors are surfaced. The `fmt.Fprintln` write may succeed in user-space buffers but fail to flush to disk, and the error would only be reported by `Close()`.
+
+The pattern is:
+```go
+f, err := os.OpenFile(...)
+defer f.Close()        // <-- error not checked
+_, err = fmt.Fprintln(f, filePath)
+return ...
+```
+
+**User Impact:** On filesystem edge cases, a write could appear to succeed but the data is lost. The tracking file would be missing entries, leading to incomplete `FilesTouched` data.
+
+**Recommendation:** Either check the `Close()` error explicitly, or use a pattern that flushes before returning:
+
+```go
+defer func() {
+    if closeErr := f.Close(); closeErr != nil && err == nil {
+        err = fmt.Errorf("failed to close files touched tracking file: %w", closeErr)
+    }
+}()
+```
+
+---
+
+## Issue 6: `handleLifecycleFileEdit` creates a new `StateStore` on every call instead of reusing
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, lines 200-208
+
+**Severity:** MEDIUM (architectural concern more than error handling)
+
+**Issue Description:** Every `FileEdit` event creates a new `session.NewStateStore(ctx)`, which calls `getGitCommonDir` (a `git rev-parse` subprocess). The `getGitCommonDir` result is cached per-CWD, so the subprocess only runs once. However, the `StateStore` struct is allocated fresh each time. For agents that make many file edits (e.g., a single turn editing 20+ files), this creates 20+ allocations where one would suffice.
+
+More importantly, if `NewStateStore` fails on the first call, it will fail on every subsequent call with the same error, generating 20+ identical `Warn` log entries for the same root cause. There is no deduplication or caching of this failure.
+
+**Recommendation:** Consider caching the `StateStore` or using the strategy's existing `getStateStore()` pattern (which uses `sync.Once`). Alternatively, accept the current approach but add rate-limiting to the warning log to avoid flooding logs during rapid file-edit sequences.
+
+---
+
+## Issue 7: `handleLifecycleFileEdit` returns nil when SessionID is empty -- silently drops events
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, lines 180-181
+
+**Severity:** MEDIUM
+
+**Issue Description:**
+
+```go
+if event.SessionID == "" || event.FilePath == "" {
+    return nil
+}
+```
+
+An empty `SessionID` on a `FileEdit` event would indicate a bug in the agent's `ParseHookEvent` implementation -- every file edit should have a session ID. Silently returning nil here masks potential bugs in the event parsing layer. Compare with `handleLifecycleTurnStart` (line 233-234) which returns an error when `SessionID` is empty.
+
+**User Impact:** If an agent has a bug that produces `FileEdit` events without a `SessionID`, file tracking silently fails with no indication.
+
+**Recommendation:** For `SessionID == ""`, log a warning before returning nil, since this condition should never happen in well-formed events:
+
+```go
+if event.SessionID == "" {
+    logging.Warn(logCtx, "file edit event missing session_id, skipping")
+    return nil
+}
+if event.FilePath == "" {
+    return nil // empty path is expected for some edge cases
+}
+```
+
+---
+
+## Issue 8: `ToRelativePath` returning empty string is indistinguishable from "path outside repo" vs "error"
+
+**Location:** `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go`, lines 196-199
+
+**Severity:** LOW
+
+**Issue Description:**
+
+```go
+relPath := paths.ToRelativePath(event.FilePath, repoRoot)
+if relPath == "" {
+    return nil // path outside repo, skip
+}
+```
+
+`ToRelativePath` returns `""` both when `filepath.Rel` errors AND when the path is outside the repo (starts with `..`). The comment says "path outside repo, skip" but it could also be a `filepath.Rel` error due to malformed paths. No logging at all for this case.
+
+**User Impact:** If an agent provides a malformed absolute path (e.g., with invalid characters on some filesystems), the file edit is silently dropped.
+
+**Recommendation:** This is low severity because `ToRelativePath` already filters appropriately. However, a Debug log here would help troubleshoot cases where files unexpectedly fail to track.
+
+---
+
+## Positive Observations
+
+Several things are done well in this PR:
+
+1. **Input validation in `AppendFileTouched`:** The newline character check (line 426) is a good defensive measure against injection into the line-based `.files` format.
+
+2. **Session ID validation:** Path traversal is prevented via `validation.ValidateSessionID` before any file operations.
+
+3. **Atomic state writes:** The existing `Save` method (lines 336-344) uses temp file + rename, which is correct for atomic writes. (Though `AppendFileTouched` uses direct append, which is appropriate for its append-only design.)
+
+4. **Deduplication in `ReadFilesTouched`:** The read side properly deduplicates entries, so the append-only write pattern doesn't cause problems.
+
+5. **Test coverage:** The PR includes thorough tests for the new functionality -- path traversal rejection, newline injection, deduplication, clearing, and the integration test exercises the full hook pipeline.
+
+6. **Clear separation of concerns:** The `Clear` method (line 357) uses `filepath.Glob` with `sessionID+".*"` pattern, which correctly catches both `.json` and `.files` files for cleanup. The test `TestClear_RemovesFilesTracking` validates this.
+
+---
+
+## Files Reviewed
+
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go` -- New `AppendFileTouched`, `ReadFilesTouched`, `ClearFilesTouched`, `filesTouchedPath` methods
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go` -- New `clearFilesTracking` method, modified `resolveFilesTouched`, carry-forward and condensation cleanup
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go` -- New `handleLifecycleFileEdit` handler and `FileEdit` case in dispatcher
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/event.go` -- New `FileEdit` event type
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle.go` -- New `parseFileEdit` method
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/hooks.go` -- New `PostFileEdit` hook constant and Write/Edit matcher registration
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/lifecycle.go` -- New `parseFileEdit` method and `fileEditToolInput` type
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/hooks.go` -- New `PostFileEdit` hook constant and file-modification tool matchers
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/types.go` -- New `afterToolHookInputRaw`, `FileModificationTools`, and tool constants
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/hook_registry.go` -- Updated `getHookType` for `post-file-edit`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/common.go` -- Modified `ReadLatestSessionPromptFromCommittedTree` fallback loop</result>
+<usage><total_tokens>107898</total_tokens><tool_uses>43</tool_uses><duration_ms>218328</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-3/tasks/a1e16485752db02ab.output
+
+---
+
+<task-notification>
+<task-id>a34231ec54a13820d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Code review for guidelines" completed</summary>
+<result>This change looks clean. The old version would try latestIndex, then fall back to 0, but wouldn't handle cases where 0 also had no prompt. The new version properly iterates backwards through all sessions until one with a non-empty prompt is found.
+
+Now let me compile my findings into the review.
+
+---
+
+## Code Review: `post-file-edit-gemini` branch
+
+### Files Reviewed
+
+**Core feature (file edit tracking):**
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/event.go` -- new `FileEdit` event type and `FilePath` field
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/hooks.go` -- post-file-edit hook installation for Claude Code (Write/Edit tools)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle.go` -- `parseFileEdit` parser
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/hooks.go` -- post-file-edit hook installation for Gemini CLI (4 file-modifying tools)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/lifecycle.go` -- `parseFileEdit` parser with multi-field fallback
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/types.go` -- new `afterToolHookInputRaw` type
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/hook_registry.go` -- `getHookType` updated for `post-file-edit`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go` -- `handleLifecycleFileEdit` dispatcher
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go` -- `AppendFileTouched`, `ReadFilesTouched`, `ClearFilesTouched`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go` -- `resolveFilesTouched` merging, `clearFilesTracking`
+
+**Tests:**
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/hooks_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/hooks_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/lifecycle_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/file_tracking_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/hooks.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/common_test.go`
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_test.go`
+
+**Unrelated/infra changes:**
+- `.ferrata/setup`, `.github/workflows/release.yml`, `.goreleaser.yaml`
+
+### Verification
+
+- `mise run test` -- all unit tests pass
+- `mise run lint` -- 0 issues
+- `mise run test:integration` -- all integration tests pass
+
+### Assessment
+
+**No high-confidence issues found (confidence >= 80).** The code is well-structured and meets project standards. Here is a summary of what I verified:
+
+**CLAUDE.md Compliance:**
+- Error handling follows the established patterns: errors in `handleLifecycleFileEdit` are logged via the `logging` package and swallowed (returns nil) to avoid blocking the agent. This is the right approach for a non-critical tracking feature.
+- Logging uses `logging.Debug`/`logging.Warn` with structured `slog` attributes -- no `fmt.Print*` for operational messages.
+- Git path normalization correctly uses `paths.WorktreeRoot()` (not `os.Getwd()`) for computing repo-relative paths, consistent with CLAUDE.md guidance.
+- Tests use `t.Parallel()`, `t.TempDir()`, and `testutil` helpers. Integration tests use `NewFeatureBranchEnv`. Session state tests use `NewStateStoreWithDir` for isolation.
+- `AppendFileTouched` validates session IDs via `validation.ValidateSessionID` to prevent path traversal. Newline injection is rejected.
+
+**Bug Detection:**
+- `O_APPEND|O_CREATE|O_WRONLY` is correct for concurrent appends from separate hook processes (POSIX guarantees atomicity for small writes).
+- `ToRelativePath` correctly handles both absolute paths (from Claude Code's `file_path`) and already-relative paths (from Gemini tools) -- the function returns relative paths as-is.
+- The `Clear` method uses `filepath.Glob(sessionID+".*")` which already covers `.files` in addition to `.json` and `.model` files. The `TestClear_RemovesFilesTracking` test verifies this.
+- No double-tracking: Gemini's `*` AfterTool matcher fires `after-tool` (a lifecycle no-op), while the specific tool matchers fire `post-file-edit` (which tracks files). These are different commands with different hook names.
+- `ReadLatestSessionPromptFromCommittedTree` refactoring properly iterates backwards through all sessions instead of only trying the latest and index 0.
+
+**Code Quality:**
+- The `fileEditToolInput` type is defined separately in both Claude Code and Gemini packages, which is appropriate since they have different field sets (Gemini supports `path` and `filename` fallbacks).
+- The `resolveFilesTouched` merge logic correctly deduplicates and sorts the union of `state.FilesTouched` and the tracking file contents.
+- `clearFilesTracking` is called at both clear points: after carry-forward decisions and after full condensation.
+
+**Minor observations (below confidence threshold, not reported as issues):**
+- `getHookType` uses `claudecode.HookNamePostFileEdit` to match both agents' hooks. This works because both constants are `"post-file-edit"`, and the comment documents this. A compile-time assertion like `var _ = [1]struct{}{{}}[len(claudecode.HookNamePostFileEdit)-len(geminicli.HookNamePostFileEdit)]` would make this safer, but the current approach is acceptable.
+- The Gemini `parseFileEdit` does not use `ctx` (unlike Claude Code's) -- this is fine since there is no logging on graceful skip paths.</result>
+<usage><total_tokens>70186</total_tokens><tool_uses>34</tool_uses><duration_ms>271543</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-3/tasks/a34231ec54a13820d.output
+
+---
+
+<task-notification>
+<task-id>adaa6ce7a8c0e7bf5</task-id>
+<tool-use-id>toolu_01Gtec33f3FTXxGoxbQf1k3r</tool-use-id>
+<status>completed</status>
+<summary>Agent "Test coverage analysis" completed</summary>
+<result>Now I have a comprehensive picture of the PR. Let me compile my analysis.
+
+---
+
+## Test Coverage Analysis for PR: `post-file-edit-gemini`
+
+### 1. Summary
+
+This PR adds a **FileEdit event type** and wires the **post-file-edit** hook for both Claude Code and Gemini CLI, introducing an append-only file tracking mechanism (`<session-id>.files`) that runs alongside the existing `state.FilesTouched` field. The overall test coverage is **good**, with tests at multiple levels (unit, strategy, integration) covering the core functionality. There are a few meaningful gaps, primarily around the lifecycle dispatcher's `handleLifecycleFileEdit` function which is only tested indirectly through integration tests.
+
+### 2. Critical Gaps
+
+**2a. No unit test for `handleLifecycleFileEdit` in lifecycle_test.go -- Criticality: 7/10**
+
+The `handleLifecycleFileEdit` function in `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go` (lines 179-219) performs several important operations:
+- Guards on empty `SessionID` or `FilePath`
+- Normalizes absolute paths to repo-relative via `paths.ToRelativePath`
+- Silently drops paths outside the repo
+- Creates a `StateStore` and appends to the tracking file
+- Intentionally swallows all errors to avoid blocking the agent
+
+The existing routing test `TestDispatchLifecycleEvent_RoutesToCorrectHandler` in `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle_test.go` does NOT include `agent.FileEdit` in its test cases (the test cases end at `ModelUpdate`). This means there's no unit-level test verifying that:
+- The `FileEdit` event type is correctly routed by `DispatchLifecycleEvent`
+- An empty `SessionID` or `FilePath` is a silent no-op (returns nil, doesn't append)
+- Absolute paths are normalized correctly to repo-relative
+- Paths outside the repo are silently dropped
+
+The integration test at `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/file_tracking_test.go` covers the happy path end-to-end, but if the path normalization logic regresses, the integration test would surface it late in the test pipeline. A unit test directly on `handleLifecycleFileEdit` (or at least a routing test entry for `FileEdit`) would catch regressions faster.
+
+**Specific regressions it would catch**: If someone accidentally changes the guard from `event.FilePath == ""` to something else, or changes the error suppression behavior (returning error instead of nil), the agent would be blocked. If `ToRelativePath` normalization is removed, files would be stored with absolute paths, breaking cross-machine portability.
+
+**2b. No test for Gemini CLI's `filename` field fallback in `fileEditToolInput.filePath()` -- Criticality: 6/10**
+
+The `fileEditToolInput` struct in `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/lifecycle.go` (lines 185-200) has a three-level fallback chain: `file_path` -> `path` -> `filename`. Tests cover `file_path` and `path`, but the `filename` fallback is not tested. The `filePath()` method's third branch is untested.
+
+The Gemini tool landscape could produce payloads using `filename`, and without a test, a refactor that breaks the `filename` fallback would not be caught.
+
+### 3. Important Improvements
+
+**3a. Missing test for `resolveFilesTouched` logging behavior when tracking file read fails -- Criticality: 4/10**
+
+In `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go` (line 1466), `resolveFilesTouched` has error handling for `getStateStore` failure and `ReadFilesTouched` failure (lines 1469-1481). These paths log debug messages and fall through. The existing tests in `TestResolveFilesTouched_FromTrackingFile` and `TestResolveFilesTouched_MergesBothSources` cover the success paths, but not the error fallback (e.g., when the state store can't be created). This is minor since the fallback gracefully degrades to transcript extraction.
+
+**3b. Missing edge case: duplicate file edit from same tool for same path -- Criticality: 3/10**
+
+The `AppendFileTouched` function appends every file edit unconditionally. The `ReadFilesTouched` function deduplicates on read. The test in `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state_test.go` (line 459, `TestAppendFileTouched`) does cover duplicate append + dedup on read. This is well covered.
+
+**3c. Integration test only covers Claude Code hook path, not Gemini -- Criticality: 5/10**
+
+The integration test `TestPostFileEdit_TracksEditedFiles` at `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/file_tracking_test.go` uses the Claude Code hook path (as seen from the `SimulatePostFileEdit` helper which calls `runHookWithInput("post-file-edit", ...)` routed through Claude Code's hook infrastructure). There is no equivalent integration test for Gemini CLI's post-file-edit hook, which uses `afterToolHookInputRaw` (a different JSON schema with `tool_name` and `tool_input` fields). The Gemini lifecycle_test.go covers parsing well at the unit level, but the end-to-end integration from "Gemini AfterTool hook fires -> lifecycle dispatcher -> file tracked in .files" is not exercised.
+
+### 4. Test Quality Issues
+
+**No significant issues found.** The tests follow good practices:
+
+- Tests are properly parallel where appropriate
+- Edge cases are covered: empty input, malformed JSON, missing fields, path traversal attempts, newline injection
+- The `TestAppendFileTouched_RejectsNewlines` test is a good security-oriented test preventing line injection
+- The `TestAppendFileTouched_InvalidSessionID` test covers path traversal protection
+- The `TestClear_RemovesFilesTracking` test verifies that `Clear()` removes `.files` alongside `.json`, which is important for cleanup correctness
+- The `ClearFilesTouched` idempotency test is well-designed
+- The `resolveFilesTouched` tests cover the merge/dedup/sort contract and verify that returned slices are copies (not references to state internals)
+
+### 5. Positive Observations
+
+**Well-structured multi-layer testing.** The PR demonstrates good test layering:
+- **Unit tests** for parsing (`lifecycle_test.go` in both claudecode and geminicli) cover all event types, edge cases (no file_path, malformed tool_input), and the fallback path field (`TestParseHookEvent_FileEdit_FallbackPath`)
+- **State store tests** (`state_test.go`) thoroughly cover append-only file tracking: basic CRUD, deduplication, sorting, path traversal rejection, newline injection, idempotent clear, and cleanup integration with `Clear()`
+- **Strategy tests** cover the `resolveFilesTouched` merge logic: state preference, transcript fallback, tracking file integration, copy semantics, and nil-when-empty behavior
+- **Integration test** exercises the full hook -> lifecycle dispatcher -> file tracking flow end-to-end
+- **Hook installation tests** were correctly updated (counts changed from 7->9 for Claude Code, 12->16 for Gemini CLI) to reflect the new hooks
+
+**Good defensive design choices that are tested:**
+- `handleLifecycleFileEdit` returns nil on all errors (never blocks the agent), and the state store operations have their own error-path tests
+- The append-only `.files` approach avoids JSON read-modify-write race conditions, which is the right design for a hook that fires on every file edit
+- The `clearFilesTracking` calls at condensation and new-prompt boundaries are correctly placed (tested indirectly through the existing `TestCondenseSession_*` and `TestShadowStrategy_FilesTouched_OnlyModifiedFiles` tests)
+
+**Key files relevant to this analysis:**
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/event.go` -- FileEdit event type definition
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle.go` -- `handleLifecycleFileEdit` (lines 176-219)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/lifecycle_test.go` -- Missing FileEdit routing test
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state.go` -- `AppendFileTouched`, `ReadFilesTouched`, `ClearFilesTouched` (lines 412-502)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/session/state_test.go` -- State store tests (lines 459-572)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle.go` -- `parseFileEdit` (lines 195-221)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/claudecode/lifecycle_test.go` -- Claude parseFileEdit tests (lines 273-329)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/lifecycle.go` -- `parseFileEdit` with fallback path chain (lines 185-224)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/agent/geminicli/lifecycle_test.go` -- Gemini parseFileEdit tests (lines 200-274)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/strategy/manual_commit_hooks.go` -- `resolveFilesTouched` with tracking file merge (lines 1460-1510)
+- `/Users/alex/workspace/cli/.worktrees/3/cmd/entire/cli/integration_test/file_tracking_test.go` -- E2E integration test</result>
+<usage><total_tokens>124236</total_tokens><tool_uses>47</tool_uses><duration_ms>272188</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli--worktrees-3/tasks/adaa6ce7a8c0e7bf5.output
+
+---
+
+yeah they all seem good

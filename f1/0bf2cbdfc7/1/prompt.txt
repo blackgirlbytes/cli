@@ -1,0 +1,20 @@
+Address these reviews:
+Possibly dead code: pushRefIfNeeded (and possibly doPushRef) have no production callers after this PR. Their existing tests (TestPushRefIfNeeded_*) test dead code. Confirm and remove,
+  or document why they remain. (tryPushRef is still used by handleRotationConflict.)
+
+
+  1. Recovery triggered on auth/network failures, not just non-fast-forward — push_v2.go:200-209
+  pushErrorFromOutput and pushStatusError only substring-check "non-fast-forward"/"rejected". If git stderr contains "rejected" anywhere (auth message, server hook output, fatal:), recovery
+  enters fetchAndMergeRef for unrelated refs. The fetch will likely also fail, two cycles of futile work, and the user sees "non-fast-forward" instead of the real cause. Use a typed sentinel
+  and route through the existing classifyPushOutput (push_common.go:310-319) which already handles protected-ref rejection (GH013) too.
+  2. Original pushErr is dropped, losing diagnostic info — push_v2.go:141-144
+  When remote.PushWithOptions returns a non-nil error with empty/malformed output, the wrapped exec error (exit status 128, context deadline exceeded, etc.) is discarded — fallback becomes
+  the literal string "push failed: ". Thread pushErr into the fallback (fmt.Errorf("push failed: %w", pushErr)) and add a logging.Debug capturing the raw output.
+  3. Successful-but-unparsed refs could be marked failed — push_v2.go:132-157
+  When pushErr != nil and parsePushRefStatusLine fails to parse a line for any reason (format drift, locale, future git versions), that ref gets the global fallbackErr even if it actually
+  succeeded. Suggested fix: when any refs parsed successfully, treat unparsed ones as "status missing for <ref>" and log raw output, instead of attributing the global failure.
+
+  Important Issues
+
+  4. Duplicated push-output classification (CLAUDE.md "Code Duplication Prevention") — push_v2.go:53-57, 195-203, 205-210 vs push_common.go:310-319
+  non-fast-forward/rejected substring check is now in 4 places. Collapse into a single classifier (or reuse classifyPushOutput).

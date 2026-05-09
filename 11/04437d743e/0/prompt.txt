@@ -1,0 +1,371 @@
+Implement the following plan:
+
+# Plan: Remove `context.md` and simplify `prompt.txt` to first prompt only
+
+## Context
+
+Investigation revealed that `context.md` is dead code (written but never consumed) and `prompt.txt` stores all session prompts but every consumer only uses the first one. This is unnecessary complexity and wasted storage.
+
+**Goal:**
+1. Remove `context.md` entirely (dead code)
+2. Simplify `prompt.txt` to store only the first prompt (the one that triggered the checkpoint)
+
+## How `prompt.txt` flows today
+
+Two independent write paths:
+
+1. **Filesystem → shadow branches:** `handleLifecycleTurnEnd()` (`lifecycle.go:266`) writes all prompts joined by `\n\n---\n\n` to `.entire/metadata/{sessionID}/prompt.txt`. Then `copyMetadataDir()` copies it to the shadow branch.
+
+2. **Condensation → committed branch:** `extractSessionData()` (`manual_commit_condensation.go:487`) extracts prompts from transcript. `CondenseSession()` passes `[]string` to `WriteCommitted()` which joins them with `\n\n---\n\n` and writes `prompt.txt` blob in `writeSessionToSubdirectory()`.
+
+## Changes
+
+### 1. Remove `context.md` generation and writing
+
+**`cmd/entire/cli/strategy/manual_commit_condensation.go`:**
+- Remove `generateContextFromPrompts()` function (lines 695-716)
+- Remove `data.Context = generateContextFromPrompts(data.Prompts)` (line 488)
+- Remove `data.Context` from the struct / stop passing `Context` to `WriteCommittedOptions`
+
+**`cmd/entire/cli/checkpoint/checkpoint.go`:**
+- Remove `Context []byte` from `WriteCommittedOptions` (line 221)
+- Remove `Context string` from `SessionContent` (line 360)
+- Remove `Context string` from `SessionFilePaths` (line 419)
+- Remove `context.md` from `CheckpointSummary` structure comment (lines 430-440)
+
+**`cmd/entire/cli/checkpoint/committed.go`:**
+- `writeSessionToSubdirectory()`: Remove context.md blob creation (lines 367-379)
+- `UpdateCommitted()`: Remove context.md replacement (lines 1222-1233)
+- `ReadSessionContent()`: Remove context.md file read (lines 837-842)
+- `writeStandardCheckpointEntries()` comment: Remove `context.md` from structure doc
+
+**`cmd/entire/cli/paths/paths.go`:**
+- Remove `ContextFileName = "context.md"` constant (line 24)
+
+### 2. Remove `context.md` consumers
+
+**`cmd/entire/cli/strategy/manual_commit_logs.go`:**
+- Remove `GetSessionContext()` (line 99) — dead code, zero callers
+
+**`cmd/entire/cli/strategy/common.go`:**
+- `getSessionDescriptionFromTree()` (line 1255): Remove `context.md` fallback (lines ~1289-1293 and ~1312 where it searches for `ContextFileName`)
+
+### 3. Scope `prompt.txt` to checkpoint-only prompts
+
+Today `prompt.txt` stores ALL prompts from the entire session. Change it to store only the prompts from the current checkpoint.
+
+**Two write paths need updating:**
+
+**A. Condensation path (`cmd/entire/cli/strategy/manual_commit_condensation.go`):**
+- `extractSessionData()` (line 487): Currently calls `extractUserPrompts(agentType, fullTranscript)` on the **full** transcript. Change to extract only prompts after `checkpointTranscriptStart` (already a parameter on line 439).
+- For JSONL agents (Claude Code): pass only lines from `checkpointTranscriptStart` onward to `extractUserPromptsFromLines()`
+- For JSON agents (Gemini/OpenCode): need to slice messages after the start offset
+- `extractSessionDataFromLiveTranscript()` (line 502): Same change — use `state.CheckpointTranscriptStart` to scope prompts
+
+**B. Filesystem path (`cmd/entire/cli/lifecycle.go`):**
+- Line 231: `analyzer.ExtractPrompts(transcriptRef, transcriptOffset)` — this already uses offset, so prompts from `lifecycle.go` are **already checkpoint-scoped**. No change needed here.
+
+**Write path (`cmd/entire/cli/checkpoint/committed.go`):**
+- No structural changes needed — `writeSessionToSubdirectory()` and `UpdateCommitted()` still join and write prompts the same way. The content is just scoped differently now.
+
+### 4. No changes to consumers
+
+Since `prompt.txt` still contains prompts joined by `\n\n---\n\n` (just fewer of them), all consumers work as-is:
+- `ExtractFirstPrompt()` — still splits and takes first
+- `extractLastPrompt()` — still splits and takes last
+- `getLastPrompt()` — still reads from shadow branch
+- Rewind display — still uses `ExtractFirstPrompt(content.Prompts)`
+
+### 5. Update callers of `WriteCommittedOptions`
+
+No changes needed — `Prompts []string` stays the same type, just with fewer entries.
+
+### 6. Update tests
+
+- `cmd/entire/cli/checkpoint/checkpoint_test.go` — Remove `content.Context` assertions, remove `Context` from `WriteCommittedOptions`
+- `cmd/entire/cli/checkpoint/committed_update_test.go` — Same
+- `cmd/entire/cli/strategy/phase_postcommit_test.go` — Remove `content.Context` references
+- `cmd/entire/cli/strategy/common_test.go` — Remove context.md fallback tests in `getSessionDescriptionFromTree` tests
+- `cmd/entire/cli/strategy/session_test.go` — Remove context.md references
+
+### 7. Update documentation
+
+- `CLAUDE.md` — Remove `context.md` from metadata structure, note `prompt.txt` contains checkpoint-scoped prompts
+- `docs/architecture/sessions-and-checkpoints.md` — Same
+
+## Backward compatibility
+
+- Old `context.md` files on `entire/checkpoints/v1` are simply ignored (no reader anymore)
+- Old `prompt.txt` files with all-session prompts still work — consumers use `ExtractFirstPrompt()` / `extractLastPrompt()` which handle both formats
+- `ReadSessionContent()` still reads `prompt.txt` the same way
+
+## Verification
+
+1. `mise run fmt && mise run lint`
+2. `mise run test:ci`
+3. Manual: `entire explain` on a repo with existing checkpoints (backward compat)
+4. Manual: Create a new session, commit, verify no `context.md` on committed branch and `prompt.txt` contains only checkpoint-scoped prompts
+5. Manual: `entire rewind` to verify session labels display correctly
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-cli/1bca8fc0-5540-4a2b-a452-117ecd9cfefe.jsonl
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user provided a detailed plan to implement two changes:
+   - Remove `context.md` entirely (dead code - written but never consumed)
+   - Simplify `prompt.txt` to store only checkpoint-scoped prompts (not all session prompts)
+
+2. I created 6 tasks to track progress:
+   - Task 1: Remove context.md generation and writing
+   - Task 2: Remove context.md consumers
+   - Task 3: Scope prompt.txt to checkpoint-only prompts
+   - Task 4: Update tests
+   - Task 5: Update documentation
+   - Task 6: Run fmt, lint, and tests
+
+3. I read many files to understand the codebase, then made changes systematically.
+
+Let me trace all the changes made:
+
+**Task 1 - Remove context.md generation and writing:**
+- `manual_commit_types.go`: Removed `Context []byte` field from `ExtractedSessionData`
+- `manual_commit_condensation.go`: 
+  - Removed `data.Context = generateContextFromPrompts(data.Prompts)` in two places
+  - Removed `Context: sessionData.Context` from WriteCommittedOptions
+  - Removed `generateContextFromPrompts()` function entirely
+  - Removed unused `stringutil` import
+  - Also removed now-unused `getCheckpointsForSession()` method (was only used by removed `GetSessionContext`)
+- `manual_commit_hooks.go`:
+  - Removed `contextBytes := generateContextFromPrompts(prompts)` and `contextBytes = redact.Bytes(contextBytes)`
+  - Removed `Context: contextBytes` from UpdateCommittedOptions
+- `checkpoint.go`:
+  - Removed `Context []byte` from `WriteCommittedOptions`
+  - Removed `Context []byte` from `UpdateCommittedOptions`
+  - Removed `Context string` from `SessionContent`
+  - Removed `Context string` from `SessionFilePaths`
+  - Removed `context.md` from `CheckpointSummary` structure comment
+  - Updated various doc comments
+- `committed.go`:
+  - Removed context.md blob creation in `writeSessionToSubdirectory()`
+  - Removed context.md replacement in `UpdateCommitted()`
+  - Removed context.md file read in `ReadSessionContent()`
+  - Updated `writeStandardCheckpointEntries` comment to remove context.md
+  - Updated stale file comment
+- `paths.go`: Removed `ContextFileName = "context.md"` constant
+
+**Task 2 - Remove context.md consumers:**
+- `manual_commit_logs.go`: Removed entire `GetSessionContext()` function, removed unused imports (`encoding/json`, `sort`, `checkpoint`)
+- `common.go`: Rewrote `getSessionDescriptionFromTree()` to remove all context.md fallbacks
+- `lifecycle.go`: 
+  - Removed `createContextFile()` call from `handleLifecycleTurnEnd`
+  - Removed `createContextFile()` function definition
+  - Cleaned up leftover comment
+
+**Task 3 - Scope prompt.txt to checkpoint-only prompts:**
+- `manual_commit_condensation.go`:
+  - Changed `extractSessionData()` to use `extractCheckpointPrompts()` instead of `extractUserPrompts()`
+  - Changed `extractSessionDataFromLiveTranscript()` similarly
+  - Added new `extractCheckpointPrompts()` function that scopes transcript before extracting prompts
+
+**Task 4 - Update tests:**
+- `manual_commit_condensation_test.go`: Removed all 4 `TestGenerateContextFromPrompts_*` tests, removed unused `unicode/utf8` import
+- `checkpoint_test.go`: Subagent removed Context fields from WriteCommittedOptions literals and Context assertions from SessionContent reads (verified clean)
+- `committed_update_test.go`: Removed `Context` from setupRepoForUpdate, removed entire `TestUpdateCommitted_ReplacesContext`, removed Context from `TestUpdateCommitted_ReplacesAllFieldsTogether` and multi-checkpoint test
+- `lifecycle_test.go`: Removed `TestCreateContextFile_Format` and `TestCreateContextFile_EmptyPrompts` tests
+- `manual_commit_workflow_test.go` (integration): Removed context.md assertions, updated test description, updated prompt assertions for checkpoint-scoped behavior
+- `benchutil/parse_tree_bench_test.go`: Updated comment and count to remove context.md reference
+
+**Task 5 - Update documentation:**
+- `CLAUDE.md`: Removed context.md from all metadata structure examples, updated prompt.txt descriptions to "Checkpoint-scoped user prompts"
+- `docs/architecture/sessions-and-checkpoints.md`: Same updates, removed context.md from tree diagrams, JSON examples, ASCII art
+- `docs/architecture/claude-hooks-integration.md`: Removed context.md from hook metadata description
+
+**Task 6 - Not yet started (fmt, lint, tests)**
+
+The last thing I did was remove the now-unused `getCheckpointsForSession()` method which was only called by the removed `GetSessionContext()`. Then I was about to run fmt, lint, and tests.
+
+The user's second message just contained diagnostic info about remaining issues - they didn't give any explicit feedback or new instructions, it was a system reminder about new diagnostics.
+
+Let me list all user messages:
+1. "Implement the following plan: [detailed plan for removing context.md and simplifying prompt.txt]"
+2. (system-reminder with new-diagnostics about checkpoint_test.go still having Context references after the subagent ran)
+
+The pending task is Task 6: Run fmt, lint, and tests.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to implement a detailed plan with two goals:
+   - **Remove `context.md` entirely** — it was dead code (written but never consumed by any reader)
+   - **Simplify `prompt.txt` to store only checkpoint-scoped prompts** — previously it stored ALL session prompts, but every consumer only used the first one. Change it to only store prompts from the current checkpoint portion.
+
+   The plan specified exact files, functions, and line numbers to change across two write paths (filesystem→shadow branches and condensation→committed branch), plus tests and documentation updates.
+
+2. Key Technical Concepts:
+   - **Shadow branches** (`entire/<commit-hash>-<worktreeHash>`): temporary checkpoint storage with full worktree snapshots
+   - **Metadata branch** (`entire/checkpoints/v1`): permanent checkpoint storage with sharded directory structure
+   - **Condensation**: process of copying session data from shadow branches to the metadata branch on user commit
+   - **CheckpointTranscriptStart**: line offset (JSONL agents) or message index (JSON agents) marking where the current checkpoint's transcript portion begins
+   - **Two write paths for prompt.txt**: (A) filesystem path via `handleLifecycleTurnEnd()` in lifecycle.go (already checkpoint-scoped), and (B) condensation path via `extractSessionData()` / `extractSessionDataFromLiveTranscript()` (needed scoping)
+   - **Agent type handling**: Different transcript formats — JSONL for Claude Code/Cursor, JSON for Gemini/OpenCode — require different slicing methods (`transcript.SliceFromLine` vs `geminicli.SliceFromMessage` vs `opencode.SliceFromMessage`)
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/strategy/manual_commit_types.go`**
+     - Removed `Context []byte` field from `ExtractedSessionData` struct
+     - Updated comment from "All user prompts from this portion" to "User prompts from the current checkpoint portion"
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation.go`**
+     - Core file for condensation logic
+     - Removed `generateContextFromPrompts()` function (lines 695-716)
+     - Removed two `data.Context = generateContextFromPrompts(data.Prompts)` calls
+     - Removed `Context: sessionData.Context` from `WriteCommittedOptions` in `CondenseSession()`
+     - Removed unused `stringutil` import
+     - Removed now-dead `getCheckpointsForSession()` method (only caller was removed `GetSessionContext`)
+     - Changed `extractSessionData()` and `extractSessionDataFromLiveTranscript()` to use new `extractCheckpointPrompts()` instead of `extractUserPrompts()`
+     - Added new function:
+     ```go
+     func extractCheckpointPrompts(agentType types.AgentType, fullTranscript []byte, checkpointStart int) []string {
+         if len(fullTranscript) == 0 {
+             return nil
+         }
+         var scoped []byte
+         switch agentType {
+         case agent.AgentTypeGemini:
+             var err error
+             scoped, err = geminicli.SliceFromMessage(fullTranscript, checkpointStart)
+             if err != nil {
+                 scoped = fullTranscript
+             }
+         case agent.AgentTypeOpenCode:
+             var err error
+             scoped, err = opencode.SliceFromMessage(fullTranscript, checkpointStart)
+             if err != nil {
+                 scoped = fullTranscript
+             }
+         default:
+             scoped = transcript.SliceFromLine(fullTranscript, checkpointStart)
+             if scoped == nil {
+                 scoped = fullTranscript
+             }
+         }
+         return extractUserPrompts(agentType, string(scoped))
+     }
+     ```
+
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`**
+     - Removed `contextBytes := generateContextFromPrompts(prompts)` and `contextBytes = redact.Bytes(contextBytes)` from finalize logic
+     - Removed `Context: contextBytes` from `UpdateCommittedOptions` struct literal
+
+   - **`cmd/entire/cli/strategy/manual_commit_logs.go`**
+     - Removed entire `GetSessionContext()` method (~85 lines) — dead code with zero callers
+     - Removed unused imports: `encoding/json`, `sort`, `checkpoint`
+
+   - **`cmd/entire/cli/strategy/common.go`**
+     - Rewrote `getSessionDescriptionFromTree()` to remove all context.md fallbacks
+     - Now only searches for `prompt.txt` (not `context.md` as fallback)
+     - Removed `"# "` prefix stripping (was only relevant for context.md markdown headers)
+
+   - **`cmd/entire/cli/lifecycle.go`**
+     - Removed `createContextFile()` call and its context file creation block
+     - Removed `createContextFile()` function definition entirely
+     - Cleaned up leftover comment fragment
+
+   - **`cmd/entire/cli/checkpoint/checkpoint.go`**
+     - Removed `Context []byte` from `WriteCommittedOptions`
+     - Removed `Context []byte` from `UpdateCommittedOptions`
+     - Removed `Context string` from `SessionContent`
+     - Removed `Context string` from `SessionFilePaths`
+     - Removed `context.md` from `CheckpointSummary` structure doc comment
+     - Updated interface doc comments to remove "context" references
+
+   - **`cmd/entire/cli/checkpoint/committed.go`**
+     - Removed context.md blob creation in `writeSessionToSubdirectory()` (lines 367-379)
+     - Removed context.md replacement in `UpdateCommitted()` (lines 1222-1233)
+     - Removed context.md file read in `ReadSessionContent()` (lines 837-842)
+     - Updated `writeStandardCheckpointEntries` structure comment
+     - Updated stale file cleanup comment
+
+   - **`cmd/entire/cli/paths/paths.go`**
+     - Removed `ContextFileName = "context.md"` constant
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation_test.go`**
+     - Removed 4 test functions: `TestGenerateContextFromPrompts_CJKTruncation`, `_EmojiTruncation`, `_ASCIITruncation`, `_ShortCJKNotTruncated`
+     - Removed unused `unicode/utf8` import
+
+   - **`cmd/entire/cli/checkpoint/checkpoint_test.go`**
+     - Subagent removed all `Context` field references from `WriteCommittedOptions` literals and `SessionContent` assertions
+     - Removed `TestWriteCommitted_SessionWithNoContext` and `TestWriteCommitted_RedactsContextSecrets` test functions
+
+   - **`cmd/entire/cli/checkpoint/committed_update_test.go`**
+     - Removed `Context` from `setupRepoForUpdate` WriteCommittedOptions
+     - Removed entire `TestUpdateCommitted_ReplacesContext` test
+     - Removed `Context` from `TestUpdateCommitted_ReplacesAllFieldsTogether` and multi-checkpoint update test
+     - Removed `content.Context` assertion
+
+   - **`cmd/entire/cli/lifecycle_test.go`**
+     - Removed `TestCreateContextFile_Format` and `TestCreateContextFile_EmptyPrompts` tests
+
+   - **`cmd/entire/cli/integration_test/manual_commit_workflow_test.go`**
+     - Updated `TestShadow_FullTranscriptContext` description to reflect checkpoint-scoped prompts
+     - Removed first context.md assertion block
+     - Changed second prompt.txt assertion from "should contain all prompts" to "should contain only the checkpoint-scoped prompt"
+     - Removed second context.md assertion block
+     - Removed context.md assertion from `TestShadow_RewindAndCondensation`
+
+   - **`cmd/entire/cli/benchutil/parse_tree_bench_test.go`**
+     - Updated comment from "5 files" to "4 files", removed context.md mention
+     - Updated entries count from `checkpointCount*5` to `checkpointCount*4`
+
+   - **`CLAUDE.md`**
+     - Removed `context.md` from all metadata structure examples
+     - Changed `prompt.txt` descriptions to "Checkpoint-scoped user prompts"
+
+   - **`docs/architecture/sessions-and-checkpoints.md`**
+     - Removed context.md from shadow branch tree, committed tree, JSON example, and ASCII diagram
+
+   - **`docs/architecture/claude-hooks-integration.md`**
+     - Removed context.md from hook metadata file list
+
+4. Errors and fixes:
+   - **Compiler errors after removing `Context` field from `ExtractedSessionData`**: Three `data.Context undefined` errors appeared. Fixed by removing the `data.Context = generateContextFromPrompts(data.Prompts)` lines and the `Context: sessionData.Context` from the WriteCommittedOptions literal.
+   - **Unused import `stringutil`**: After removing `generateContextFromPrompts()` which used `stringutil.TruncateRunes`, the import became unused. Fixed by removing it.
+   - **`generateContextFromPrompts` undefined in `manual_commit_hooks.go`**: After removing the function from condensation.go, the hooks file still called it. Fixed by removing the call and the `contextBytes` variable entirely.
+   - **`ContextFileName` undefined errors**: After removing the constant from `paths.go`, references in `common.go`, `lifecycle.go` still used it. Fixed by removing all context.md fallback logic from those files.
+   - **Unused imports in `manual_commit_logs.go`**: After removing `GetSessionContext()`, `encoding/json`, `sort`, and `checkpoint` imports became unused. Fixed by removing them.
+   - **Subagent incomplete work on `checkpoint_test.go`**: The dev subagent reported completing the work but diagnostics showed remaining `Context` field references. Upon inspection, the file was actually clean — the diagnostics were stale/cached. No fix needed.
+   - **`committed_update_test.go` remaining Context references**: After initial fix, discovered more `Context` references at lines 126, 143, 220. Fixed by removing `Context` from all remaining `UpdateCommittedOptions` literals and assertions.
+   - **Leftover `createContextFile` comment in `lifecycle.go`**: After removing the function, the preceding comment was incorrectly merged with the next function's comment. Fixed by removing the orphaned comment lines.
+   - **`getCheckpointsForSession` became unused**: After removing `GetSessionContext()` (its only caller), this method became dead code flagged by diagnostics. Fixed by removing the method entirely.
+
+5. Problem Solving:
+   - Successfully identified and removed all `context.md` generation, writing, reading, and testing code across ~15 files
+   - Created `extractCheckpointPrompts()` helper that properly scopes transcripts by agent type before extracting prompts, reusing existing slicing utilities (`transcript.SliceFromLine`, `geminicli.SliceFromMessage`, `opencode.SliceFromMessage`)
+   - Maintained backward compatibility: old `context.md` files on `entire/checkpoints/v1` are simply ignored (no reader), old `prompt.txt` with all-session prompts still works with `ExtractFirstPrompt()`/`extractLastPrompt()`
+   - Verified the lifecycle.go filesystem path already scoped prompts via `analyzer.ExtractPrompts(transcriptRef, transcriptOffset)` — no change needed there
+
+6. All user messages:
+   - Message 1: "Implement the following plan: [detailed multi-section plan for removing context.md and simplifying prompt.txt to checkpoint-scoped prompts only]" — included a full implementation plan with file names, line numbers, function names, and backward compatibility notes
+   - Message 2: (system-reminder only with new-diagnostics showing remaining `checkpoint_test.go` compilation errors after subagent ran — no explicit user text)
+
+7. Pending Tasks:
+   - **Task 6: Run fmt, lint, and tests** — `mise run fmt && mise run lint && mise run test:ci` to verify everything compiles and passes
+   - The `scripts/migrate-sessions.sh` still references `context.md` but this is a migration script for existing data and should likely be left as-is (not mentioned in the plan)
+
+8. Current Work:
+   I had just completed removing the now-dead `getCheckpointsForSession()` method from `manual_commit_condensation.go` (it was only called by the removed `GetSessionContext()`). All code changes and test updates from the plan are complete. Task 6 (run fmt, lint, and tests) is marked as in_progress but hasn't been executed yet.
+
+9. Optional Next Step:
+   Run the verification commands as specified in the plan: `mise run fmt && mise run lint && mise run test:ci`. This is the final step before the implementation is complete. The plan states under "Verification": "1. `mise run fmt && mise run lint` 2. `mise run test:ci`"
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-cli/fed731da-f6c2-4597-8913-6f415974c950.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+commit it

@@ -1,0 +1,269 @@
+Implement the following plan:
+
+# Plan: LLM-Generated Trail Titles & Descriptions (Agent-Aware)
+
+## Context
+
+Parts A (checkpoints.json) and B (prompt-based titles) are already implemented and passing CI. However, `titleFromPrompt()` just truncates the first line of the user's prompt, producing mediocre titles. The user wants an LLM to generate proper trail titles and descriptions from the session transcript.
+
+This happens **at first condensation** (PostCommit) because:
+- Rich context available (prompts + transcript + files touched)
+- Only once per trail (first commit)
+- No concurrency issues (synchronous in hook process)
+
+**Agent-aware**: Not all agents have non-interactive CLI modes. Claude Code has `claude --print`, but Gemini CLI and OpenCode don't. We add an optional `TextGenerator` interface that agents implement when capable, and skip title generation for agents that can't.
+
+## Implementation
+
+### C1. Add `TextGenerator` optional interface to agent package
+
+**File**: `cmd/entire/cli/agent/agent.go`
+
+Add alongside other optional interfaces (`TranscriptAnalyzer`, `HookSupport`, etc.):
+
+```go
+// TextGenerator is an optional interface for agents whose CLI supports
+// non-interactive text generation (e.g., claude --print).
+// Used for AI-powered metadata generation (trail titles, summaries).
+type TextGenerator interface {
+    // GenerateText sends a prompt to the agent's CLI and returns the raw text response.
+    // model is a hint (e.g., "haiku", "sonnet"). Implementations may ignore if not applicable.
+    GenerateText(ctx context.Context, prompt string, model string) (string, error)
+}
+```
+
+### C2. Implement `TextGenerator` for Claude Code
+
+**File**: `cmd/entire/cli/agent/claudecode/generate.go` (new file)
+
+```go
+package claudecode
+
+func (c *ClaudeCodeAgent) GenerateText(ctx context.Context, prompt string, model string) (string, error) {
+    claudePath := "claude"
+    if model == "" {
+        model = "haiku"
+    }
+    cmd := exec.CommandContext(ctx, claudePath,
+        "--print", "--output-format", "json",
+        "--model", model, "--setting-sources", "")
+    cmd.Dir = os.TempDir()
+    cmd.Env = stripGitEnv(os.Environ())
+    cmd.Stdin = strings.NewReader(prompt)
+    // Execute, parse {"result": "..."} envelope, return result string
+}
+```
+
+Includes a local `stripGitEnv()` helper (same 7-line function as in `summarize/claude.go` — simple filter of `GIT_*` env vars; not worth extracting to a shared package for this).
+
+### C3. Refactor existing `ClaudeGenerator` to use `TextGenerator`
+
+**File**: `cmd/entire/cli/summarize/claude.go`
+
+Update `ClaudeGenerator.Generate()` to use `TextGenerator` interface when available, preserving the existing `CommandRunner` injection for tests:
+
+```go
+func (g *ClaudeGenerator) Generate(ctx context.Context, input Input) (*checkpoint.Summary, error) {
+    transcriptText := FormatCondensedTranscript(input)
+    prompt := buildSummarizationPrompt(transcriptText)
+
+    // Use TextGenerator if available (allows agent-aware generation)
+    if g.TextGen != nil {
+        rawResult, err := g.TextGen.GenerateText(ctx, prompt, g.Model)
+        // parse rawResult as checkpoint.Summary JSON
+    }
+
+    // Fallback to direct CLI invocation (for tests with CommandRunner)
+    // ... existing implementation ...
+}
+```
+
+Actually, this refactor adds complexity for marginal benefit. **Simpler approach**: Leave `ClaudeGenerator` as-is (it works, tests pass). The new trail title code directly uses the `TextGenerator` interface from the agent. The two code paths (summarize `ClaudeGenerator` for checkpoint summaries, `TextGenerator` for trail titles) share the same underlying Claude CLI but through different layers.
+
+**Decision**: Skip this refactor. Keep `ClaudeGenerator` unchanged. Trail title generation uses `TextGenerator` directly.
+
+### C4. New file: `cmd/entire/cli/summarize/trail_title.go`
+
+Trail title/description generation, agent-aware:
+
+```go
+package summarize
+
+const trailTitlePromptTemplate = `Analyze this development session transcript and generate a title and description.
+
+<transcript>
+%s
+</transcript>
+
+Return a JSON object:
+{
+  "title": "Short imperative title (max 80 chars)",
+  "description": "1-3 sentence description of what was accomplished and why"
+}
+
+Guidelines:
+- Title: imperative mood, captures core intent (e.g. "Add user authentication flow")
+- Description: explain the "what" and "why", not the "how"
+- Return ONLY the JSON object`
+
+const trailTitleModel = "haiku"
+
+type TrailTitleResult struct {
+    Title       string `json:"title"`
+    Description string `json:"description"`
+}
+
+func GenerateTrailTitle(ctx context.Context, transcriptBytes []byte, filesTouched []string, agentType agent.AgentType) (*TrailTitleResult, error) {
+    // 1. Get the active agent and check if it implements TextGenerator
+    ag, err := agent.GetByAgentType(agentType)
+    if err != nil {
+        return nil, fmt.Errorf("agent not found: %w", err)
+    }
+    gen, ok := ag.(agent.TextGenerator)
+    if !ok {
+        return nil, fmt.Errorf("agent %s does not support text generation", agentType)
+    }
+
+    // 2. Build condensed transcript (reuse existing infrastructure)
+    condensed, err := BuildCondensedTranscriptFromBytes(transcriptBytes, agentType)
+    if err != nil {
+        return nil, err
+    }
+    input := Input{Transcript: condensed, FilesTouched: filesTouched}
+    transcriptText := FormatCondensedTranscript(input)
+
+    // 3. Build prompt and call agent's TextGenerator
+    prompt := fmt.Sprintf(trailTitlePromptTemplate, transcriptText)
+    rawResult, err := gen.GenerateText(ctx, prompt, trailTitleModel)
+    if err != nil {
+        return nil, err
+    }
+
+    // 4. Parse JSON response
+    cleaned := extractJSONFromMarkdown(rawResult)
+    var result TrailTitleResult
+    if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
+        return nil, fmt.Errorf("failed to parse trail title JSON: %w", err)
+    }
+    return &result, nil
+}
+```
+
+### C5. Add `Transcript` field to `CondenseResult`
+
+**File**: `cmd/entire/cli/strategy/manual_commit_types.go`
+
+```go
+type CondenseResult struct {
+    ...existing fields...
+    Transcript []byte // Raw transcript bytes for downstream consumers
+}
+```
+
+**File**: `cmd/entire/cli/strategy/manual_commit_condensation.go`
+
+In `CondenseSession()` return (~line 250), add: `Transcript: sessionData.Transcript,`
+
+### C6. Add `generateTrailTitleFromTranscript` helper
+
+**File**: `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+```go
+func generateTrailTitleFromTranscript(repo *git.Repository, branchName string, transcript []byte, filesTouched []string, agentType agent.AgentType) {
+    if !settings.IsSummarizeEnabled() {
+        return
+    }
+    store := trail.NewStore(repo)
+    existing, err := store.FindByBranch(branchName)
+    if err != nil || existing == nil {
+        return
+    }
+    // Only generate once: skip if description already set
+    if existing.Description != "" {
+        return
+    }
+    logCtx := logging.WithComponent(context.Background(), "trail-title")
+    result, err := summarize.GenerateTrailTitle(logCtx, transcript, filesTouched, agentType)
+    if err != nil {
+        logging.Debug(logCtx, "trail title generation skipped",
+            slog.String("error", err.Error()))
+        return
+    }
+    //nolint:errcheck // best-effort: trail title generation is non-critical
+    store.Update(existing.TrailID, func(m *trail.Metadata) {
+        if result.Title != "" {
+            m.Title = result.Title
+        }
+        if result.Description != "" {
+            m.Description = result.Description
+        }
+    })
+}
+```
+
+### C7. Wire into `condenseAndUpdateState` (manual-commit)
+
+**File**: `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+In `condenseAndUpdateState()`, after the existing `appendCheckpointToTrail()` call (~line 825):
+
+```go
+// Generate trail title/description from transcript (best-effort, first condensation only)
+branchName := GetCurrentBranchName(repo)
+if branchName != "" && branchName != GetDefaultBranchName(repo) {
+    generateTrailTitleFromTranscript(repo, branchName, result.Transcript, result.FilesTouched, state.AgentType)
+}
+```
+
+### C8. Wire into `SaveStep` (auto-commit)
+
+**File**: `cmd/entire/cli/strategy/auto_commit.go`
+
+In `SaveStep()`, after the existing `appendCheckpointToTrail()` call (~line 166):
+
+```go
+// Generate trail title/description (best-effort, first condensation only)
+branchName := GetCurrentBranchName(repo)
+if branchName != "" && branchName != GetDefaultBranchName(repo) && ctx.TranscriptPath != "" {
+    if transcriptData, readErr := os.ReadFile(ctx.TranscriptPath); readErr == nil {
+        filesTouched := mergeFilesTouched(nil, ctx.ModifiedFiles, ctx.NewFiles, ctx.DeletedFiles)
+        generateTrailTitleFromTranscript(repo, branchName, transcriptData, filesTouched, ctx.AgentType)
+    }
+}
+```
+
+## Files Summary
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/agent/agent.go` | Add `TextGenerator` optional interface |
+| `cmd/entire/cli/agent/claudecode/generate.go` | **New**: Implement `TextGenerator` for Claude Code |
+| `cmd/entire/cli/summarize/trail_title.go` | **New**: `GenerateTrailTitle()`, prompt template, `TrailTitleResult` |
+| `cmd/entire/cli/strategy/manual_commit_types.go` | Add `Transcript []byte` to `CondenseResult` |
+| `cmd/entire/cli/strategy/manual_commit_condensation.go` | Populate `Transcript` in `CondenseResult` |
+| `cmd/entire/cli/strategy/manual_commit_hooks.go` | Add `generateTrailTitleFromTranscript()`, wire after condensation |
+| `cmd/entire/cli/strategy/auto_commit.go` | Wire `generateTrailTitleFromTranscript()` after save |
+
+## Design Decisions
+
+1. **`TextGenerator` optional interface** — follows existing pattern (like `TranscriptAnalyzer`, `HookSupport`). Agents opt in when their CLI supports non-interactive generation. Claude Code implements it today; Gemini/OpenCode can add it later.
+2. **Haiku model** — trail titles are simple; haiku is fast (~1-2s) and cheap
+3. **One-time gate** — `Description != ""` ensures LLM is only called on first condensation per trail
+4. **Settings gate** — reuses `settings.IsSummarizeEnabled()`; no new setting
+5. **Graceful skip** — if agent doesn't implement `TextGenerator`, title stays as prompt-derived; no error shown to user
+6. **No `ClaudeGenerator` refactor** — existing summarize code works; trail titles use `TextGenerator` directly
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Manual test:
+1. Create a branch, enable entire with `summarize.enabled: true`
+2. Run a Claude Code session, make a commit
+3. Check `entire trail` output — should show LLM-generated title and description
+4. Make a second commit — title should NOT be regenerated (description already set)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/dip/.claude/projects/-Users-dip-Repositories-cli/6edd18ba-782c-4019-88d9-018079feea08.jsonl

@@ -1,0 +1,88 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "46637301d27e",
+  "session_id": "6a706fa3-4ed9-4098-bdb4-3aa3a2bf639d",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-14T18:02:49.087419Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 9,
+  "files_touched": [
+    "docs/superpowers/specs/2026-04-07-memory-loop-rollout-design.md"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "52f28c0052bd",
+  "token_usage": {
+    "input_tokens": 5750,
+    "cache_creation_tokens": 416878,
+    "cache_read_tokens": 10947402,
+    "output_tokens": 50139,
+    "api_call_count": 111
+  },
+  "session_metrics": {
+    "turn_count": 9
+  },
+  "summary": {
+    "intent": "Design a production-ready rollout plan for a memory loop system, starting from a PoC that demonstrated the concept but used throwaway architecture (JSON storage, broken outcome tracking). The goal was a clean-slate spec with incremental PR-sized delivery path.",
+    "outcome": "A comprehensive design spec was written at `docs/superpowers/specs/2026-04-07-memory-loop-rollout-design.md` with 8 vertical-slice PRs, multiple mermaid diagrams, open architecture questions for code owners, and enriched scoring design informed by the agent-memory reference project. The spec treats all PoC code as throwaway.",
+    "learnings": {
+      "repo": [
+        "The PoC memory loop tasks 1-3 (state model, reconciliation, mode/policy) are production-quality with passing tests and should not be discarded; only the storage backend and outcome tracking need replacing",
+        "The PoC's DeriveOutcomes at memoryloop.go:1091-1138 uses bag-of-words overlap (overlap > 0 at line 1120) — a single shared programming term marks a memory ineffective, making outcome tracking actively harmful",
+        "The PoC stored memories as a JSON file which won't scale for concurrent access or querying",
+        "insightsdb uses CREATE TABLE IF NOT EXISTS without a versioned migration strategy, which is a pattern to avoid in the rewrite",
+        "EntireDB exists as a potential remote sync target for repo-scope memory sharing"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "line": 1091,
+          "end_line": 1138,
+          "finding": "DeriveOutcomes uses bag-of-words token overlap. Any single shared token (including common programming words like 'test', 'run', 'error') between memory text and post-injection session text marks the memory ineffective. The claimed '3+ injection cycles' safeguard checks InjectCount > 0, not >= 3 — the safeguard does not exist."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "line": 1120,
+          "end_line": 1120,
+          "finding": "Outcome flip condition is `overlap > 0` — single token match causes incorrect ineffective verdict"
+        },
+        {
+          "path": "cmd/entire/cli/insightsdb/db.go",
+          "finding": "Uses CREATE TABLE IF NOT EXISTS without versioned migration — schema evolution requires ALTER TABLE additions; no migration framework in place"
+        }
+      ],
+      "workflow": [
+        "Adversarial review is valuable for design docs, not just code — it surfaced fundamental broken assumptions (outcome tracking, leading questions, straw-man comparisons) that a standard review would miss",
+        "When designing a multi-PR rollout, vertical slices (each PR delivers one working end-to-end feature) are preferable to horizontal layers (storage → model → injection → ...) because each PR is demoable",
+        "Referencing similar open-source projects during design phase yields concrete scoring algorithm improvements that would otherwise require months of iteration",
+        "For clean-slate rewrites, explicitly stating 'no migrations, no backwards compatibility' in the spec prevents scope creep and over-engineering early PRs"
+      ]
+    },
+    "friction": [
+      "Codex adversarial review companion script (codex-companion.mjs) crashed with ENOBUFS on every attempt because the worktree had 32 untracked files causing git spawnSync buffer overflow — the script cannot target a specific file, it always diffs the full working tree",
+      "Multiple API 500 errors from Anthropic at session end blocked the user from getting an explanation of structured memory fields",
+      "The Codex review had to be replaced with a self-review agent, which worked but added latency and broke the intended tooling flow",
+      "The first version of the spec needed substantial rework after adversarial review (migration handling, straw-man Option C comparison, broken outcome tracking, made-up size estimates) — the initial design passed through without catching these issues"
+    ],
+    "open_items": [
+      "Code owners need to decide storage architecture: Option A (SQLite local only for beta) vs Option B (SQLite + checkpoint git branch) vs Option C (SQLite + EntireDB) for repo memory sharing in Phase 2",
+      "Auto-refresh trigger mechanism is unresolved: after N sessions, on commit hook, on session end, or time-based — listed as Q15 in spec with no recommendation",
+      "Embedding-based semantic similarity scoring deferred to Phase 2/3 — schema should include nullable embedding column so memories don't need regeneration when added",
+      "Outcome tracking redesign (signal-based, not bag-of-words) is specified but disabled for Phase 1 — needs implementation validation before enabling",
+      "Repo memory sharing design (Phase 2) depends on code owner storage decision — sync protocol, conflict resolution, and manifest format are hand-waved in the spec",
+      "Hard questions about schema migration failure handling, concurrent write contention, and beta telemetry mechanism are listed as open questions (Q24-Q27) without answers",
+      "Multi-signal scoring (file overlap + semantic + error signature + recency + importance with quality gate) from agent-memory project not yet incorporated into spec — identified as high-value but needs spec update"
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-14T18:01:58.055698Z",
+    "agent_lines": 103,
+    "agent_removed": 0,
+    "human_added": 384,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 487,
+    "total_lines_changed": 0,
+    "agent_percentage": 21.149897330595483
+  }
+}

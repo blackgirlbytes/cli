@@ -1,0 +1,199 @@
+Implement Task 3: Enrich Blame Blocks With Local Entire Metadata
+
+## Task Description
+
+**Files:**
+- Modify: `cmd/entire/cli/why_model.go`
+- Modify: `cmd/entire/cli/why.go`
+- Test: `cmd/entire/cli/why_test.go`
+
+Requirements:
+1. Add a test that stubs commit lookup and checkpoint lookup, then verifies checkpoint ID, agent, and summary fallback appear on the block.
+2. Run `go test ./cmd/entire/cli -run TestEnrichWhyBlocks_AddsEntireMetadata` and verify it fails first.
+3. Implement the local enrichment path in `cmd/entire/cli/why.go`.
+4. Add `resolveWhyCommitMetadata = func(ctx context.Context, hash string) (whyCommitInfo, *whyEntireInfo, error)` that:
+   - opens the local repo
+   - resolves the commit by hash
+   - populates `whyCommitInfo`
+   - parses `Entire-Checkpoint` trailer from the commit message
+   - if present, loads local checkpoint/session metadata
+5. Add `enrichWhyBlocks(ctx, blocks)` to loop over unique commit hashes.
+6. Add `loadWhyEntireInfo` to read local checkpoint metadata using existing checkpoint readers.
+7. Summary selection rules:
+   - use saved generated summary first
+   - else fallback to intent when available
+   - else fallback to commit subject
+8. Add a Git-only fallback test that verifies blocks remain unlinked when no checkpoint trailer exists.
+9. Run the targeted enrichment tests and ensure they pass.
+10. Do not implement rendering, command wiring, or TUI behavior yet.
+
+Planned tests:
+
+```go
+func TestEnrichWhyBlocks_AddsEntireMetadata(t *testing.T) {
+	t.Parallel()
+
+	blocks := []whyBlock{{
+		StartLine: 23,
+		EndLine:   24,
+		Commit: whyCommitInfo{
+			Hash: "b550507521111111111111111111111111111111",
+		},
+	}}
+
+	origResolve := resolveWhyCommitMetadata
+	t.Cleanup(func() { resolveWhyCommitMetadata = origResolve })
+
+	resolveWhyCommitMetadata = func(_ context.Context, hash string) (whyCommitInfo, *whyEntireInfo, error) {
+		return whyCommitInfo{
+				Hash:      hash,
+				ShortHash: "b550507521",
+				Author:    "Victor Gutierrez",
+				Subject:   "Handle interrupt signals",
+			}, &whyEntireInfo{
+				CheckpointID: "a3b2c4d5e6f7",
+				Agent:        "Claude Code",
+				Summary:      "Add signal handling for graceful CLI shutdown.",
+				IsFallback:   false,
+			}, nil
+	}
+
+	got, err := enrichWhyBlocks(context.Background(), blocks)
+	if err != nil {
+		t.Fatalf("enrich error: %v", err)
+	}
+	if got[0].Entire == nil {
+		t.Fatal("expected Entire enrichment")
+	}
+	if got[0].Entire.Agent != "Claude Code" {
+		t.Fatalf("agent = %q, want %q", got[0].Entire.Agent, "Claude Code")
+	}
+}
+```
+
+```go
+func TestEnrichWhyBlocks_LeavesGitOnlyRowsBlank(t *testing.T) {
+	t.Parallel()
+
+	origResolve := resolveWhyCommitMetadata
+	t.Cleanup(func() { resolveWhyCommitMetadata = origResolve })
+
+	resolveWhyCommitMetadata = func(_ context.Context, hash string) (whyCommitInfo, *whyEntireInfo, error) {
+		return whyCommitInfo{
+			Hash:      hash,
+			ShortHash: "7f93a963e3",
+			Author:    "Stefan Haubold",
+			Subject:   "Improve CLI error handling",
+		}, nil, nil
+	}
+
+	got, err := enrichWhyBlocks(context.Background(), []whyBlock{{Commit: whyCommitInfo{Hash: "7f93a963e3222222222222222222222222222222"}}})
+	if err != nil {
+		t.Fatalf("enrich error: %v", err)
+	}
+	if got[0].Entire != nil {
+		t.Fatal("expected no Entire enrichment")
+	}
+}
+```
+
+## Context
+
+This is Task 3 of the approved `entire why` prototype plan. Tasks 1 and 2 are already completed and committed. Task 3 should only enrich blame blocks with local Entire metadata and summary/fallback text. Do not implement static rendering, command registration, or TUI behavior.
+
+Work from: `/Users/pfleidi/entire/cli/.worktrees/feat/entire-why`
+
+## Important Constraints
+
+- You are not alone in the codebase. Do not revert edits you did not make.
+- Implement exactly Task 3 and nothing from later tasks.
+- Do not create any commits. The user wants review between steps.
+- Use `apply_patch` for edits.
+- Run only the targeted tests needed by Task 3.
+- Follow existing `explain` and checkpoint reader patterns where useful.
+
+## Before You Begin
+
+If anything is unclear, ask now.
+
+## Report Format
+
+When done, report:
+- **Status:** DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
+- What you implemented
+- What you tested and test results
+- Files changed
+- Self-review findings
+- Any issues or concerns
+
+---
+
+Proceed with option 2.
+
+Create a new `cmd/entire/cli/why.go` for the enrichment/orchestration layer and leave blame parsing isolated in `why_blame.go`.
+
+That matches the plan's file responsibilities better:
+- `why_blame.go` stays focused on blame parsing and the git seam
+- `why.go` becomes the place for local commit resolution, trailer parsing, checkpoint/session lookup, and `enrichWhyBlocks`
+
+Implement the full Task 3 scope with that structure. Do not commit. Run the targeted enrichment tests, self-review, and report back with changed files and test results.
+
+---
+
+Spec review found three Task 3 issues to fix:
+
+1. In `cmd/entire/cli/why.go`, do not read enrichment through `ReadSessionContent` if the requirement is only metadata enrichment. Switch to the metadata-only read path so enrichment does not unnecessarily depend on transcript availability.
+
+2. Update `cmd/entire/cli/why_test.go` so the enrichment coverage matches the task more closely:
+- the tests should exercise the summary fallback behavior explicitly (`generated summary -> intent -> commit subject`)
+- do not only assert a fixed summary string from a fully stubbed resolver
+
+3. The Git-only fallback test should actually exercise the no-trailer path rather than just stubbing the resolver to return nil metadata. Adjust the seams so the test can prove that a commit without `Entire-Checkpoint` remains unlinked.
+
+Please fix only these Task 3 issues, rerun the targeted Task 3 tests, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+Two Task 3 spec issues still need fixing:
+
+1. In `cmd/entire/cli/why_test.go`, the main enrichment test must not treat `resolveWhyCommitMetadata` as one black box. Reshape the seams so the test can stub the commit lookup and checkpoint lookup layers independently, then assert the enriched block gets the exact `CheckpointID`, `Agent`, and fallback summary value you expect.
+
+2. In `cmd/entire/cli/why.go`, `loadWhyEntireInfo` should use the existing checkpoint reader abstraction rather than reopening refs/trees and reading `metadata.json` manually. Avoid duplicating storage-layout traversal in the CLI layer.
+
+Please fix only these Task 3 issues, rerun the targeted Task 3 tests, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+Code quality review found two issues to address before Task 3 is done:
+
+1. In `cmd/entire/cli/why.go`, do not reread the checkpoint summary after `ResolveCommittedReaderForCheckpoint` already returned it. Thread the returned `CheckpointSummary` through `loadWhyEntireInfoImpl` and use it directly.
+
+2. In `cmd/entire/cli/why_test.go`, `TestWhyBlock_PreservesEntireMetadata` is currently too fixture-like. Please make it less misleading while preserving the original Task 1 intent. The safest path is:
+- keep it as a small model-contract test if needed
+- trim redundant literal self-check assertions that do not validate behavior
+- ensure the more important behavioral coverage lives in the parser/enrichment tests
+
+Please fix only these issues, rerun the targeted Task 3 tests plus any focused test you adjust in `why_test.go`, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+One important Task 3 fix is still required:
+
+1. In `cmd/entire/cli/why.go`, guard against `readWhySessionMetadata` returning nil. `loadWhyEntireInfoImpl` should not dereference nil metadata; it should fall back safely to the commit subject path.
+
+Please also do this minor cleanup if it stays local and does not broaden scope:
+2. Avoid reopening the repository unnecessarily during checkpoint lookup if you can thread the repo handle through the existing path cleanly.
+
+Do not spend more time on `TestWhyBlock_PreservesEntireMetadata`; leave it as-is unless the nil-guard work forces a nearby adjustment.
+
+Please fix only this Task 3 issue (and the repo-handle cleanup if straightforward), rerun the targeted Task 3 tests, self-review, and report back. Do not widen scope and do not commit.
+
+---
+
+One remaining Task 3 quality issue is worth fixing:
+
+1. Strengthen the enrichment test so it actually proves the repo-threading behavior. Return a sentinel `*git.Repository` from the commit lookup stub and assert the same pointer is received by the checkpoint lookup stub, or add a focused test around `resolveWhyCommitMetadata` that proves the repo handle is passed through.
+
+Do NOT change `why_model.go` or remove `itoa()`. That helper was explicitly required by Task 1, so ignore that minor suggestion.
+
+Please fix only this Task 3 test gap, rerun the targeted Task 3 tests, self-review, and report back. Do not widen scope and do not commit.

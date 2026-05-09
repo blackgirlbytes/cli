@@ -1,0 +1,82 @@
+Implement the following plan:
+
+# Fix: `claude -p` prompt not received due to variadic `--allowedTools` flag
+
+## Context
+The "Run triage" step in the e2e-triage workflow fails with:
+```
+Error: Input must be provided either through stdin or as a prompt argument when using --print
+```
+
+**Root cause:** The `--allowedTools` flag accepts variadic arguments (`<tools...>`). When the prompt string follows it as a positional argument, the CLI parser consumes the prompt as another tool name instead of recognizing it as the positional `prompt` argument. So Claude CLI sees no prompt.
+
+## Changes
+
+**File: `.github/workflows/e2e-triage.yml`** (lines 81-95)
+
+### Pipe the prompt via stdin instead of passing as positional arg
+
+Change the `run:` block from:
+```yaml
+run: |
+  ARTIFACT_DIR="e2e/artifacts/ci-${WORKFLOW_RUN_ID}"
+  claude -p \
+    --model claude-opus-4-6 \
+    --allowedTools "Bash(mise run *),Bash(gh *),Bash(git *),Read,Write,Edit,Glob,Grep" \
+    "You are triaging E2E test failures..."
+```
+
+To:
+```yaml
+run: |
+  ARTIFACT_DIR="e2e/artifacts/ci-${WORKFLOW_RUN_ID}"
+  cat <<PROMPT | claude -p \
+    --model claude-opus-4-6 \
+    --allowedTools "Bash(mise run *),Bash(gh *),Bash(git *),Read,Write,Edit,Glob,Grep"
+  You are triaging E2E test failures from CI run ${WORKFLOW_RUN_ID}.
+  Follow the /e2e-triage skill instructions in .claude/skills/e2e-triage/SKILL.md.
+  You are in CI mode (WORKFLOW_RUN_ID is set). Use the CI mode steps.
+  Artifact directory: ${ARTIFACT_DIR}
+  CI run URL: ${WORKFLOW_RUN_URL}
+  Re-run failing tests using the e2e-isolated.yml workflow via gh workflow run.
+  Do NOT ask questions — act autonomously.
+  For flaky fixes: create a PR.
+  For real bugs: create or comment on GitHub issues.
+  Print a summary table at the end.
+  PROMPT
+```
+
+This pipes the prompt via stdin, which `claude -p` reads when no positional prompt is given. The heredoc also avoids quoting issues with the multi-line string.
+
+## Verification
+```bash
+git push
+gh workflow run e2e-triage.yml --ref alisha/e2e-triage -f run_id=22772950740
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/a1b934a8-baa4-40e5-927d-8b78fbb38d5a.jsonl
+
+---
+
+Tool loaded.
+
+---
+
+Tool loaded.
+
+---
+
+good but can allowed tools be more specific to the least permissions needed? like mostly read and some writes for pr or issue creation
+
+---
+
+Tool loaded.
+
+---
+
+Tool loaded.
+
+---
+
+[Request interrupted by user for tool use]

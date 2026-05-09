@@ -1,0 +1,109 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "1907582e4c93",
+  "session_id": "534a3173-7fa5-4d7a-81d1-10dd04328282",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T19:16:13.851369Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "cmd/entire/cli/memory_loop_cmd.go",
+    "cmd/entire/cli/memoryloop/generator.go",
+    "cmd/entire/cli/memoryloop/generator_test.go",
+    "cmd/entire/cli/memoryloop/memoryloop.go",
+    "cmd/entire/cli/memoryloop/memoryloop_test.go",
+    "cmd/entire/cli/memorylooptui/detail_page.go",
+    "cmd/entire/cli/memorylooptui/keys.go",
+    "cmd/entire/cli/memorylooptui/messages.go",
+    "cmd/entire/cli/memorylooptui/root.go",
+    "cmd/entire/cli/memorylooptui/tab_settings.go",
+    "cmd/entire/cli/memorylooptui/wizard.go",
+    "cmd/entire/cli/memorylooptui/wizard_test.go",
+    "cmd/entire/cli/settings/settings.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "e9d988859755",
+  "token_usage": {
+    "input_tokens": 341,
+    "cache_creation_tokens": 577336,
+    "cache_read_tokens": 32800465,
+    "output_tokens": 91432,
+    "api_call_count": 216
+  },
+  "session_metrics": {
+    "turn_count": 17
+  },
+  "summary": {
+    "intent": "Design and implement three related memory-loop features: memory editing (title/body/keywords), keyword-based injection boosting, and a configurable generation threshold system with named presets.",
+    "outcome": "A fully implemented and committed feature set across 14 tasks covering CLI subcommands, TUI wizard edits, injection scoring, generator filtering, and settings persistence — all tests passing including canary E2E.",
+    "learnings": {
+      "repo": [
+        "MemoryRecord reconciliation preserves user keywords by omission — fields not explicitly copied during ReconcileGeneratedRecords are naturally preserved.",
+        "Mode and ActivationPolicy are stored on the memoryloop Store (memory-loop.json), not settings.json — threshold was added to Store for consistency so TUI can read from one source.",
+        "The wrapcheck linter requires fmt.Errorf wrapping on errors returned from CLI command functions in memory_loop_cmd.go.",
+        "confidenceRank already returns ordered integers (low=1, medium=2, high=3) in generator.go, enabling threshold comparison via < instead of == equality checks.",
+        "The memorylooptui settings tab reads from m.state.Store, not settings.json directly — threshold fields needed to be added to the Store struct to be accessible in the TUI.",
+        "mise lint gates on errcheck, gosec, goconst, wrapcheck, ireturn, and revive — must run after every substantive change."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 186,
+          "end_line": 186,
+          "finding": "confidenceLow rejection gate uses == equality; the new threshold system converts this to confidenceRank comparison for configurable minimum confidence."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 224,
+          "end_line": 224,
+          "finding": "confidenceRank function returns low=1, medium=2, high=3 — used to implement ordered threshold comparisons."
+        },
+        {
+          "path": "cmd/entire/cli/memory_loop_cmd.go",
+          "line": 356,
+          "end_line": 361,
+          "finding": "GenerateInput is constructed here during refresh; threshold config is injected at this point from resolved settings."
+        },
+        {
+          "path": "cmd/entire/cli/memory_loop_cmd.go",
+          "line": 390,
+          "end_line": 390,
+          "finding": "memoryCfg was declared twice after threshold wiring — caused a redeclaration compile error that required removing the duplicate."
+        }
+      ],
+      "workflow": [
+        "Adversarial/Codex review run twice on the spec surfaced real design flaws (multi-word keyword tokenization, missing $EDITOR failure modes, singleton policy bool vs tri-state) before implementation began.",
+        "The Codex companion script hit ENOBUFS buffer overflow when run against a large working tree with binary/DB files — falling back to a subagent review was an effective workaround.",
+        "Running mise lint after Task 14 (not after each task) resulted in 3 wrapcheck lint failures that needed fixing in a separate pass — per feedback, lint should run after each task.",
+        "Subagents leave changes staged/unstaged; only the orchestrator commits — confirmed by user correction mid-session.",
+        "Self-review checklist (placeholder scan, internal consistency, spec coverage) caught a missing parseKeywords() helper in the Files Changed table before the plan was finalized."
+      ]
+    },
+    "friction": [
+      "Codex companion script (codex-companion.mjs) failed with ENOBUFS when run against a large working tree containing binary files (insights.db) — had to fall back to a subagent-based adversarial review.",
+      "Three wrapcheck lint errors in memory_loop_cmd.go appeared only after Task 14's lint pass — should have been caught per-task.",
+      "memoryCfg redeclaration compile error introduced during Task 13 threshold wiring required a manual fix.",
+      "The TUI settings tab reads from Store not settings.json, which created an architectural mismatch since the spec placed threshold in settings.json — resolved by adding threshold fields to Store.",
+      "The user repeated 'spec written to docs/...' twice without providing feedback, causing a brief ambiguous exchange before moving on."
+    ],
+    "open_items": [
+      "Keywords on generated memories create a reconciliation trap when a user edits a generated memory (changing its fingerprint) and the generator later produces an updated version — both versions can coexist; spec documents this but no automated resolution.",
+      "SIGINT during $EDITOR session can leave a stale temp file — spec notes this as a known pattern (same as git commit) but no cleanup code was specified.",
+      "CLI edit subcommand interactive mode (no flags = huh prompts) is standalone huh forms, not the full TUI app — this divergence in UX is intentional but may confuse users.",
+      "Score visibility in the injection prompt tester (showing per-memory keyword match counts) was noted as a spec gap but handled implicitly via the existing reason field — no explicit score breakdown UI was added.",
+      "Overlapping phrase keywords (e.g., 'go' and 'go test' both present) each match independently — cumulative boosting behavior is documented but not capped."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-03T19:15:15.727176Z",
+    "agent_lines": 911,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 911,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

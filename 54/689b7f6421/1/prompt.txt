@@ -1,0 +1,35 @@
+the switch for "/api/v1/auth/me" is not trivial, let's not do that now. Can we just check with `auth status` that we can access the list endpoint and show "logged in" ?
+
+---
+
+continue: check the result of the `mise run check` background task and report the result
+
+---
+
+can we add some styling to `auth list` maybe in line with `entire activity` commit list
+
+---
+
+make the id yellow and the rest of the values also white, contrast is to bad
+
+---
+
+/simplify
+
+---
+
+/insights
+
+---
+
+**Findings**
+
+1. High: the new authenticated commands bypass the repo’s insecure-HTTP guard and will send bearer tokens over plain `http://` without any opt-in. `login` explicitly blocks this unless `--insecure-http-auth` is set ([login.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/login.go:46), [base_url.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/api/base_url.go:57)), but `auth status`, `auth list`, `auth revoke`, and the updated `logout` all call the API directly with `api.BaseURL()` and no `RequireSecureURL` check ([auth.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/auth.go:58), [auth.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/auth.go:103), [auth.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/auth.go:367), [logout.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/logout.go:29)). Anyone using `ENTIRE_API_BASE_URL=http://localhost:...` now transmits their stored token in cleartext.
+
+2. Medium: `entire auth revoke <id>` leaves a stale local credential behind if `<id>` is the token currently used by this CLI session. The `--current` path correctly delegates to `runLogout()` and deletes the keychain entry, but the by-ID path only calls `revokeByID()` and prints success ([auth.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/auth.go:397), [auth.go](/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/auth.go:403)). After that, the server-side token is gone but the local keychain still contains it, so the CLI appears logged in until future commands start failing with 401s.
+
+I did not find other clear correctness issues in the diff. I also attempted a focused `go test` run, but it failed in this environment because dependency/module-cache setup is incomplete, so I couldn’t use test execution as additional validation.
+
+---
+
+can you take a look at the comments on the PR?

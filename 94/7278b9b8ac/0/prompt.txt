@@ -1,0 +1,475 @@
+Implement the following plan:
+
+# Test Audit: Kiro Agent Integration Branch
+
+**Branch:** `alisha/kiro-oneshot` (27 files changed, diff against `main`)
+**Scope:** All source files changed on this branch and their corresponding tests.
+
+---
+
+## Existing Test Ratings
+
+### `cmd/entire/cli/agent/kiro/kiro_test.go` (25 tests)
+
+| Test | Rating | Reason |
+|------|--------|--------|
+| `TestNewKiroAgent` | KEEP | Verifies constructor returns correct concrete type. Matches project convention. |
+| `TestName` | KEEP | Project convention — all agents test identity accessors (cursor, gemini do the same). |
+| `TestType` | KEEP | Same convention. |
+| `TestDescription` | KEEP | Same convention. |
+| `TestIsPreview` | KEEP | Same convention. |
+| `TestProtectedDirs` | KEEP | Same convention. |
+| `TestDetectPresence_WithKiroDir` | **REMOVE** | **Empty test body** — sets up a temp dir with `.kiro` but never calls `DetectPresence()`. Dead test. |
+| `TestDetectPresence_WithoutKiroDir` | **REWRITE** | Calls `DetectPresence()` but discards the result (`_ = found`). Should assert `found == false` using a proper temp dir setup or acknowledge the limitation. |
+| `TestGetSessionID` | KEEP | Convention. |
+| `TestGetSessionDir` | KEEP | Convention. |
+| `TestResolveSessionFile` | KEEP | Convention. |
+| `TestFormatResumeCommand` | KEEP | Convention. |
+| `TestGetHookConfigPath` | KEEP | Convention. |
+| `TestHookNames` | KEEP | Verifies hook names match expected strings — important for CLI subcommand routing. |
+| `TestGetSupportedHooks` | KEEP | Verifies hook type enums — different return type from HookNames. |
+| `TestReadTranscript` | KEEP | Real file I/O, verifies content roundtrip. |
+| `TestReadTranscript_FileNotFound` | KEEP | Error path. |
+| `TestChunkTranscript_SmallContent` | KEEP | Happy path for small content. |
+| `TestReassembleTranscript_SingleChunk` | KEEP | Single chunk passthrough. |
+| `TestReadSession` | KEEP | Real I/O, verifies all AgentSession fields. |
+| `TestReadSession_EmptySessionRef` | KEEP | Error path. |
+| `TestWriteSession` | KEEP | Real I/O, verifies file written correctly. |
+| `TestWriteSession_NilSession` | KEEP | Error path. |
+| `TestWriteSession_WrongAgent` | KEEP | Error path. |
+| `TestWriteSession_EmptySessionRef` | KEEP | Error path. |
+| `TestWriteSession_EmptyNativeData` | KEEP | Error path. |
+
+### `cmd/entire/cli/agent/kiro/hooks_test.go` (20 tests)
+
+| Test | Rating | Reason |
+|------|--------|--------|
+| `TestInstallHooks_FreshInstall` | KEEP | Real file I/O, verifies hook count and file structure. |
+| `TestInstallHooks_LocalDevMode` | KEEP | Tests command prefix switching. |
+| `TestInstallHooks_Idempotent` | KEEP | Second call returns 0 (no-op detection). |
+| `TestInstallHooks_ForceReinstall` | KEEP | Force flag behavior. |
+| `TestInstallHooks_IncludesAllDefaultTools` | KEEP | Verifies tools list completeness. |
+| `TestInstallHooks_CreatesDirectoryStructure` | KEEP | Verifies mkdir behavior. |
+| `TestInstallHooks_FilePermissions` | KEEP | Checks 0o600 permissions. |
+| `TestInstallHooks_ProducesValidJSON` | KEEP | JSON validity + trailing newline. |
+| `TestInstallHooks_SwitchFromLocalDevToProduction` | KEEP | Realistic mode transition. |
+| `TestUninstallHooks` | KEEP | File removal. |
+| `TestUninstallHooks_NoFileExists` | KEEP | Graceful no-op. |
+| `TestAreHooksInstalled_AfterInstall` | KEEP | State after install. |
+| `TestAreHooksInstalled_AfterUninstall` | KEEP | State after uninstall. |
+| `TestAreHooksInstalled_InvalidJSON` | KEEP | Handles malformed file. |
+| `TestAreHooksInstalled_EmptyHooks` | KEEP | False for empty hooks struct. |
+| `TestAreHooksInstalled_OnlyEntireHooksDetected` | KEEP | Distinguishes Entire hooks from others. |
+| `TestAreHooksInstalled_DetectsLocalDevHooks` | KEEP | Detects localDev prefix. |
+| `TestIsEntireHook` | KEEP | Table-driven, good edge cases. |
+| `TestHasEntireHook` | KEEP | Table-driven, good edge cases. |
+| `TestAllHooksPresent` | KEEP | Comprehensive table-driven. |
+
+### `cmd/entire/cli/agent/kiro/lifecycle_test.go` (21 tests)
+
+| Test | Rating | Reason |
+|------|--------|--------|
+| `TestParseHookEvent_AgentSpawn` | KEEP | Event parsing + session ID generation. |
+| `TestParseHookEvent_UserPromptSubmit` | KEEP | Event parsing + prompt extraction. |
+| `TestParseHookEvent_UserPromptSubmit_EmptyPrompt` | KEEP | Edge case. |
+| `TestParseHookEvent_Stop` | KEEP | TurnEnd event with mock DB. |
+| `TestParseHookEvent_PreToolUse_ReturnsNil` | KEEP | Pass-through hook verification. |
+| `TestParseHookEvent_PostToolUse_ReturnsNil` | KEEP | Pass-through hook verification. |
+| `TestParseHookEvent_UnknownHook_ReturnsNil` | KEEP | Unknown hook returns nil. |
+| `TestParseHookEvent_EmptyInput` | KEEP | Error on empty stdin. |
+| `TestParseHookEvent_MalformedJSON` | KEEP | Error on invalid JSON. |
+| `TestParseHookEvent_EmptyInput_UserPromptSubmit` | KEEP | Error path per hook. |
+| `TestParseHookEvent_EmptyInput_Stop` | KEEP | Error path per hook. |
+| `REDACTED` | KEEP | Error path per hook. |
+| `TestParseHookEvent_MalformedJSON_Stop` | KEEP | Error path per hook. |
+| `TestParseHookEvent_AllHookTypes` | KEEP | Comprehensive table-driven. |
+| `TestSessionIDCaching_AgentSpawnCachesID` | KEEP | Verifies cache file written. |
+| `TestSessionIDCaching_UserPromptSubmitReadsCache` | KEEP | Cache read consistency. |
+| `TestSessionIDCaching_StopReadsCache` | KEEP | Cache read consistency. |
+| `TestSessionIDCaching_UserPromptSubmitGeneratesNewIDWhenCacheMissing` | KEEP | Fallback behavior. |
+| `REDACTED` | KEEP | Fallback to "unknown". |
+| `TestGenerateSessionID_Format` | KEEP | Format validation. |
+| `TestGenerateSessionID_Unique` | KEEP | Randomness check. |
+
+### `cmd/entire/cli/agent/kiro/types_test.go` (14 tests)
+
+All **KEEP** — good JSON parsing/serialization tests with realistic payloads, edge cases, and round-trip verification.
+
+### `cmd/entire/cli/agent/registry_test.go`
+
+| Test | Rating | Reason |
+|------|--------|--------|
+| `TestAgentNameConstants` | **REWRITE** | Only checks `AgentNameClaudeCode` and `AgentNameGemini`. Missing `AgentNameKiro`, `AgentTypeKiro`, and other agents added since. |
+| All other tests | KEEP | Generic registry behavior, agent-independent. |
+
+### Strategy tests (`cmd/entire/cli/strategy/*_test.go`)
+
+All changed strategy functions (`PrepareCommitMsg` fast path, condensation deferred transcript, SaveStep backfill, rewind cleanup) have **partial coverage** through existing tests but no tests for the specific new Kiro-related code paths. Existing tests are all KEEP.
+
+### Lifecycle tests (`cmd/entire/cli/lifecycle_test.go`)
+
+Existing tests are KEEP. No tests cover the new `transitionSessionTurnEnd(...transcriptPath)` backfill parameter.
+
+---
+
+**Summary:** 1 REMOVE, 2 REWRITE, rest KEEP
+
+---
+
+## Missing Coverage
+
+| Changed Code | File | Risk | What's Missing |
+|---|---|------|----------------|
+| `escapeSQLString()` | `kiro.go:167` | HIGH | New helper with no unit test. SQL escaping is security-relevant. |
+| `DetectPresence()` with `.kiro` dir | `kiro.go:46` | MEDIUM | `TestDetectPresence_WithKiroDir` has empty body — no actual assertion. |
+| `ChunkTranscript()` large content | `kiro.go:71` | MEDIUM | Only small (single-chunk) path tested. Multi-chunk path untested. |
+| `ReassembleTranscript()` multi-chunk | `kiro.go:84` | MEDIUM | Only single-chunk path tested. |
+| `agentUsesTerminal()` | `manual_commit_hooks.go:61` | MEDIUM | New function, no test. Used in PrepareCommitMsg fast path for Kiro TTY agents. |
+| `transitionSessionTurnEnd` backfill | `lifecycle.go:690` | MEDIUM | New `transcriptPath` variadic param for deferred transcript backfill — untested. |
+| Condensation with empty TranscriptPath | `manual_commit_condensation.go:158` | MEDIUM | Changed from error to graceful empty `ExtractedSessionData` — no test for this path. |
+| SaveStep TranscriptPath backfill | `manual_commit_git.go:124` | MEDIUM | Backfill when `state.TranscriptPath==""` and step provides path — untested. |
+| Rewind clears TranscriptPath | `manual_commit_rewind.go:453` | LOW | Post-rewind TranscriptPath clearing — untested but low risk. |
+| `TestAgentNameConstants` missing Kiro | `registry_test.go:137` | LOW | Constants exist and compile, but test doesn't validate them. |
+
+---
+
+## Proposed Actions
+
+### 1. Remove 1 test
+- `TestDetectPresence_WithKiroDir` — empty body, dead test
+
+### 2. Rewrite 2 tests
+- `TestDetectPresence_WithoutKiroDir` — make it actually assert `found == false` using `t.Chdir` to a temp dir (non-parallel)
+- `TestAgentNameConstants` — add Kiro constants (and other missing agents for completeness)
+
+### 3. Add 5 new tests
+
+**In `kiro_test.go`:**
+- `TestEscapeSQLString` — table-driven: empty string, no quotes, single quote, multiple quotes, already-escaped
+
+**In `kiro_test.go`:**
+- `TestChunkTranscript_LargeContent` — content exceeding maxSize, verify multiple chunks
+- `TestReassembleTranscript_MultipleChunks` — reassemble 2+ chunks, verify roundtrip
+
+**In `hooks_test.go`:**
+- `TestInstallHooks_CountMatchesHookNames` — verify `InstallHooks()` return count equals `len(HookNames())`
+
+**In `lifecycle_test.go`:**
+- `TestParseHookEvent_Stop_TranscriptRef` — verify the Stop event's `SessionRef` points to the cached transcript path (exercises `ensureCachedTranscript` mock path)
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/49dede87-06c8-4391-be46-4932c943b188.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/kiro-oneshot
+Your branch is ahead of 'origin/alisha/kiro-oneshot' by 1 commit.
+  (use "git push" to publish your local commits)
+
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   cmd/entire/cli/agent/kiro/hooks_test.go
+	modified:   cmd/entire/cli/agent/kiro/kiro_test.go
+	modified:   cmd/entire/cli/agent/kiro/lifecycle_test.go
+	modified:   cmd/entire/cli/agent/registry_test.go
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/kiro/hooks_test.go b/cmd/entire/cli/agent/kiro/hooks_test.go
+index ed0f2df4..a214f048 100644
+--- a/cmd/entire/cli/agent/kiro/hooks_test.go
++++ b/cmd/entire/cli/agent/kiro/hooks_test.go
+@@ -134,6 +134,22 @@ func TestInstallHooks_IncludesAllDefaultTools(t *testing.T) {
+ 	}
+ }
+ 
++func TestInstallHooks_CountMatchesHookNames(t *testing.T) {
++	tempDir := t.TempDir()
++	t.Chdir(tempDir)
++
++	ag := &KiroAgent{}
++	count, err := ag.InstallHooks(context.Background(), false, false)
++	if err != nil {
++		t.Fatalf("InstallHooks() error = %v", err)
++	}
++
++	expectedCount := len(ag.HookNames())
++	if count != expectedCount {
++		t.Errorf("InstallHooks() count = %d, want %d (len(HookNames()))", count, expectedCount)
++	}
++}
++
+ func TestInstallHooks_CreatesDirectoryStructure(t *testing.T) {
+ 	tempDir := t.TempDir()
+ 	t.Chdir(tempDir)
+diff --git a/cmd/entire/cli/agent/kiro/kiro_test.go b/cmd/entire/cli/agent/kiro/kiro_test.go
+index 374d0095..f92b227b 100644
+--- a/cmd/entire/cli/agent/kiro/kiro_test.go
++++ b/cmd/entire/cli/agent/kiro/kiro_test.go
+@@ -2,8 +2,10 @@ package kiro
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
+@@ -75,33 +77,40 @@ func TestProtectedDirs(t *testing.T) {
+ 	}
+ }
+ 
+-func TestDetectPresence_WithKiroDir(t *testing.T) {
+-	t.Parallel()
++func TestDetectPresence_WithoutKiroDir(t *testing.T) {
++	// t.Chdir prevents t.Parallel() — DetectPresence falls back to "." when
++	// WorktreeRoot fails (temp dir is not a git repo).
++	tempDir := t.TempDir()
++	t.Chdir(tempDir)
++
++	ag := &KiroAgent{}
++	found, err := ag.DetectPresence(context.Background())
++	if err != nil {
++		t.Fatalf("DetectPresence() error = %v", err)
++	}
++	if found {
++		t.Error("DetectPresence() = true, want false (no .kiro directory)")
++	}
++}
+ 
++func TestDetectPresence_WithKiroDir(t *testing.T) {
++	// t.Chdir prevents t.Parallel() — DetectPresence falls back to "." when
++	// WorktreeRoot fails (temp dir is not a git repo).
+ 	tempDir := t.TempDir()
++	t.Chdir(tempDir)
++
+ 	if err := os.MkdirAll(filepath.Join(tempDir, ".kiro"), 0o750); err != nil {
+ 		t.Fatalf("failed to create .kiro dir: %v", err)
+ 	}
+ 
+-	// DetectPresence uses paths.WorktreeRoot which won't resolve in a temp dir,
+-	// so it falls back to ".". We chdir to make it find .kiro.
+-	// Since t.Chdir is not parallelizable, we test a separate scenario below.
+-}
+-
+-func TestDetectPresence_WithoutKiroDir(t *testing.T) {
+-	t.Parallel()
+-
+ 	ag := &KiroAgent{}
+-	// In a temp dir without .kiro, presence should be false.
+-	// paths.WorktreeRoot will fail in temp dir (not a git repo), falls back to ".".
+-	// Since "." doesn't have .kiro, this should return false.
+ 	found, err := ag.DetectPresence(context.Background())
+ 	if err != nil {
+ 		t.Fatalf("DetectPresence() error = %v", err)
+ 	}
+-	// We can't guarantee false in CI since the working dir might have .kiro,
+-	// but we can at least verify no error.
+-	_ = found
++	if !found {
++		t.Error("DetectPresence() = false, want true (.kiro directory exists)")
++	}
+ }
+ 
+ func TestGetSessionID(t *testing.T) {
+@@ -212,6 +221,82 @@ func TestGetSupportedHooks(t *testing.T) {
+ 	}
+ }
+ 
++func TestEscapeSQLString(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name  string
++		input string
++		want  string
++	}{
++		{"empty string", "", ""},
++		{"no quotes", "/home/user/project", "/home/user/project"},
++		{"single quote", "O'Brien", "O''Brien"},
++		{"multiple quotes", "it's a 'test'", "it''s a ''test''"},
++		{"already doubled", "it''s fine", "it''''s fine"},
++		{"only quotes", "'''", "''''''"},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			got := escapeSQLString(tc.input)
++			if got != tc.want {
++				t.Errorf("escapeSQLString(%q) = %q, want %q", tc.input, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestChunkTranscript_LargeContent(t *testing.T) {
++	t.Parallel()
++
++	ag := &KiroAgent{}
++
++	// Build content larger than maxSize (100 bytes), using newline-separated lines.
++	// Each line is ~20 bytes, so 10 lines ≈ 200 bytes → should produce >1 chunk at maxSize=100.
++	var lines []string
++	for i := range 10 {
++		lines = append(lines, fmt.Sprintf(`{"line":%d,"data":"x"}`, i))
++	}
++	content := []byte(strings.Join(lines, "\n"))
++
++	chunks, err := ag.ChunkTranscript(context.Background(), content, 100)
++	if err != nil {
++		t.Fatalf("ChunkTranscript() error = %v", err)
++	}
++	if len(chunks) < 2 {
++		t.Errorf("ChunkTranscript() returned %d chunks, want >= 2 for large content", len(chunks))
++	}
++
++	// Verify all original content is represented across chunks.
++	reassembled, err := ag.ReassembleTranscript(chunks)
++	if err != nil {
++		t.Fatalf("ReassembleTranscript() error = %v", err)
++	}
++	if string(reassembled) != string(content) {
++		t.Errorf("roundtrip mismatch: got %d bytes, want %d bytes", len(reassembled), len(content))
++	}
++}
++
++func TestReassembleTranscript_MultipleChunks(t *testing.T) {
++	t.Parallel()
++
++	ag := &KiroAgent{}
++	chunk1 := []byte(`{"line":1}` + "\n" + `{"line":2}`)
++	chunk2 := []byte(`{"line":3}` + "\n" + `{"line":4}`)
++
++	result, err := ag.ReassembleTranscript([][]byte{chunk1, chunk2})
++	if err != nil {
++		t.Fatalf("ReassembleTranscript() error = %v", err)
++	}
++
++	expected := string(chunk1) + "\n" + string(chunk2)
++	if string(result) != expected {
++		t.Errorf("ReassembleTranscript() = %q, want %q", string(result), expected)
++	}
++}
++
+ func TestReadTranscript(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/cmd/entire/cli/agent/kiro/lifecycle_test.go b/cmd/entire/cli/agent/kiro/lifecycle_test.go
+index 3a816309..f9f33e3e 100644
+--- a/cmd/entire/cli/agent/kiro/lifecycle_test.go
++++ b/cmd/entire/cli/agent/kiro/lifecycle_test.go
+@@ -123,6 +123,40 @@ func TestParseHookEvent_Stop(t *testing.T) {
+ 	}
+ }
+ 
++func TestParseHookEvent_Stop_TranscriptRef(t *testing.T) {
++	tempDir := t.TempDir()
++	t.Chdir(tempDir)
++	t.Setenv("ENTIRE_TEST_KIRO_MOCK_DB", "1")
++
++	ag := &KiroAgent{}
++
++	// First, agent-spawn to generate and cache a session ID.
++	spawnInput := `{"hook_event_name":"agentSpawn","cwd":"` + tempDir + `"}`
++	spawnEvent, err := ag.ParseHookEvent(context.Background(), HookNameAgentSpawn, strings.NewReader(spawnInput))
++	if err != nil {
++		t.Fatalf("agent-spawn error: %v", err)
++	}
++
++	// Then stop — should set SessionRef to cached transcript path.
++	stopInput := `{"hook_event_name":"stop","cwd":"` + tempDir + `"}`
++	stopEvent, err := ag.ParseHookEvent(context.Background(), HookNameStop, strings.NewReader(stopInput))
++	if err != nil {
++		t.Fatalf("stop error: %v", err)
++	}
++
++	if stopEvent.SessionRef == "" {
++		t.Fatal("stop event SessionRef should not be empty when mock DB is enabled")
++	}
++
++	// Verify the path contains the session ID and ends with .json.
++	if !strings.Contains(stopEvent.SessionRef, spawnEvent.SessionID) {
++		t.Errorf("SessionRef %q does not contain session ID %q", stopEvent.SessionRef, spawnEvent.SessionID)
++	}
++	if !strings.HasSuffix(stopEvent.SessionRef, ".json") {
++		t.Errorf("SessionRef %q does not end with .json", stopEvent.SessionRef)
++	}
++}
++
+ // --- ParseHookEvent: pass-through hooks ---
+ 
+ func TestParseHookEvent_PreToolUse_ReturnsNil(t *testing.T) {
+diff --git a/cmd/entire/cli/agent/registry_test.go b/cmd/entire/cli/agent/registry_test.go
+index c456e428..33000f50 100644
+--- a/cmd/entire/cli/agent/registry_test.go
++++ b/cmd/entire/cli/agent/registry_test.go
+@@ -135,11 +135,41 @@ func (d *detectableAgent) DetectPresence(_ context.Context) (bool, error) {
+ }
+ 
+ func TestAgentNameConstants(t *testing.T) {
+-	if AgentNameClaudeCode != "claude-code" {
+-		t.Errorf("expected AgentNameClaudeCode %q, got %q", "claude-code", AgentNameClaudeCode)
++	t.Parallel()
++
++	nameTests := []struct {
++		got  types.AgentName
++		want types.AgentName
++		desc string
++	}{
++		{AgentNameClaudeCode, "claude-code", "AgentNameClaudeCode"},
++		{AgentNameCursor, "cursor", "AgentNameCursor"},
++		{AgentNameGemini, "gemini", "AgentNameGemini"},
++		{AgentNameKiro, "kiro", "AgentNameKiro"},
++		{AgentNameOpenCode, "opencode", "AgentNameOpenCode"},
+ 	}
+-	if AgentNameGemini != "gemini" {
+-		t.Errorf("expected AgentNameGemini %q, got %q", "gemini", AgentNameGemini)
++	for _, tc := range nameTests {
++		if tc.got != tc.want {
++			t.Errorf("%s = %q, want %q", tc.desc, tc.got, tc.want)
++		}
++	}
++
++	typeTests := []struct {
++		got  types.AgentType
++		want types.AgentType
++		desc string
++	}{
++		{AgentTypeClaudeCode, "Claude Code", "AgentTypeClaudeCode"},
++		{AgentTypeCursor, "Cursor", "AgentTypeCursor"},
++		{AgentTypeGemini, "Gemini CLI", "AgentTypeGemini"},
++		{AgentTypeKiro, "Kiro", "AgentTypeKiro"},
++		{AgentTypeOpenCode, "OpenCode", "AgentTypeOpenCode"},
++		{AgentTypeUnknown, "Agent", "AgentTypeUnknown"},
++	}
++	for _, tc := range typeTests {
++		if tc.got != tc.want {
++			t.Errorf("%s = %q, want %q", tc.desc, tc.got, tc.want)
++		}
+ 	}
+ }
+- Current branch: alisha/kiro-oneshot
+- Recent commits: bf4dac1e Simplify Kiro agent code: remove dead branch, magic number, and duplication
+237ba90d Add commit steps to agent-integration skill phases
+09d30063 Add Kiro agent integration with E2E-first TDD
+526070a9 revert kiro code
+19acfef9 Restructure agent-integration skill for E2E-first TDD
+c38e2171 Add Kiro agent integration
+3e70f85b Merge branch 'main' into alisha/kiro-oneshot
+81ddee25 Merge pull request #544 from entireio/soph/release-0-4-8
+65897b98 credits for cursor community pr
+94e9f456 changelog for 0.4.8
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

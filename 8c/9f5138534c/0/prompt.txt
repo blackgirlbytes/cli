@@ -1,0 +1,586 @@
+ok we're working on the pr some more.
+
+better approach, only use in two situations:
+
+pre-push before we merge trees
+in entire doctor, with detection and pointers to run doctor
+
+so we can remove it from the other places and just have it be done with what is invoked from the pre-push hook. it has to be done before we do the tree merge in the pre-push. 
+
+then in the other places where a disconnected branch may cause unexpected behaviour, like missing checkpoints, briefly explain the situation to the user and offer `entire doctor` as a fix
+
+
+the entire doctor implemenation just does the same thing,  but behaves like other doctor operations, explaining what it's found and fixing it.
+
+---
+
+push it to the branch
+
+---
+
+open it in github
+
+---
+
+// isEmptyMetadataBranch returns true if the branch ref points to a commit with an empty tree.
+
+review comment; This intentionally only checks the tip commit's tree. If someone had an empty orphan commit followed by a data commit, the tip wouldn't be empty and this wouldn't match — which is correct for the intended use case (the bug created a single empty orphan that's the tip). Worth a brief doc comment clarifying this only checks the tip, so future readers don't wonder about the multi-commit case.
+
+update the comment to clarify
+
+---
+
+metadata_reconcile.go:128
+Nit: ReconcileDisconnectedMetadataBranch creates its own context.Background() here, but callers like getBranchCheckpoints already have a ctx. Threading context through would allow cancellation to propagate and would be more idiomatic Go.
+
+---
+
+puush
+
+---
+
+ok now build it, and create a manual test script for me where i can test all the use cases. 
+
+use my awesome repo https://github.com/entirehq/terrible-temp-test-repo-that-sucks-to-test-pr-533
+
+pull to temp, break it, run through the differen commands, doctor it, and prove it's fixed. 
+
+generate the test commands as markdown and i'll execute them
+
+---
+
+ace. Here are my results (**Actual**) through test 5. 
+
+I stopped here becuase i was worried about the tree from test 5. can you assess?
+
+# Manual Test: Disconnected Metadata Branch Reconciliation
+
+Binary: `/tmp/entire-test`
+Test repo: `entirehq/terrible-temp-test-repo-that-sucks-to-test-pr-533`
+
+## Setup
+
+```bash
+# Clean slate
+cd /tmp
+rm -rf terrible-temp-test-repo-that-sucks-to-test-pr-533
+git clone git@github.com:entirehq/terrible-temp-test-repo-that-sucks-to-test-pr-533.git
+cd terrible-temp-test-repo-that-sucks-to-test-pr-533
+
+# Fetch the remote metadata branch (creates remote-tracking ref)
+git fetch origin entire/checkpoints/v1
+
+# Create local metadata branch from remote (normal state)
+git branch entire/checkpoints/v1 origin/entire/checkpoints/v1
+
+# Verify: local and remote should match
+git log --oneline entire/checkpoints/v1 -3
+git log --oneline origin/entire/checkpoints/v1 -3
+```
+
+## Test 1: Doctor reports OK when branches are connected
+
+```bash
+/tmp/entire-test doctor --force
+```
+
+**Expected:** `Metadata branches: OK` followed by stuck sessions check.
+
+**Actual**
+```
+Metadata branches: OK
+
+No stuck sessions found.
+```
+
+---
+
+## Test 2: Break it - create a disconnected local metadata branch
+
+```bash
+# Create a disconnected orphan branch with a fake local checkpoint
+git checkout --orphan temp-orphan
+git rm -rf .
+mkdir -p ff/ff00112233
+echo '{"checkpoint_id":"ffff00112233","session_id":"test-disconnected"}' > ff/ff00112233/metadata.json
+git add .
+git commit -m "Checkpoint: ffff00112233"
+
+# Point local metadata branch to this disconnected orphan
+git branch -f entire/checkpoints/v1 temp-orphan
+git checkout main
+
+# Verify they're disconnected (exit code 1 = no common ancestor)
+git merge-base entire/checkpoints/v1 origin/entire/checkpoints/v1
+echo "Exit code: $?"
+# Should print "Exit code: 1"
+```
+**Expected:** `Exit code: 1`
+**Actual** `Exit code: 1`
+
+---
+
+## Test 3: Warning on read paths (explain)
+
+```bash
+# explain reads checkpoints - should show the disconnected warning
+/tmp/entire-test explain 2>&1
+```
+
+**Expected:** Stderr shows:
+```
+[entire] Warning: Local and remote session metadata branches are disconnected.
+[entire] Some checkpoints from remote may not be visible. Run 'entire doctor' to fix.
+```
+
+The warning should appear only once even if multiple read paths are hit.
+
+**Actual**
+```
+[entire] Warning: Local and remote session metadata branches are disconnected.
+[entire] Some checkpoints from remote may not be visible. Run 'entire doctor' to fix.
+Branch: main
+Checkpoints: 0
+
+No checkpoints found on this branch.
+Checkpoints will appear here after you save changes during a Claude session.
+```
+---
+
+## Test 4: Doctor detects and explains the problem
+
+```bash
+/tmp/entire-test doctor
+```
+
+**Expected output:**
+```
+Metadata branches: DISCONNECTED
+  Local and remote entire/checkpoints/v1 branches share no common ancestor.
+  Some remote checkpoints may not be visible locally.
+  Fix: cherry-pick local checkpoints onto remote tip (preserves all data).
+? Fix disconnected metadata branches? Yes
+```
+
+**Say Yes.** Then expect:
+```
+[entire] Detected disconnected session metadata (local and remote share no common ancestor)
+[entire] Cherry-picking 1 local checkpoint(s) onto remote...
+[entire] Done — all local and remote checkpoints preserved
+  -> Fixed: metadata branches reconciled
+```
+
+**Actual**
+```
+Metadata branches: DISCONNECTED
+  Local and remote entire/checkpoints/v1 branches share no common ancestor.
+  Some remote checkpoints may not be visible locally.
+  Fix: cherry-pick local checkpoints onto remote tip (preserves all data).
+
+  YES
+
+
+[entire] Detected disconnected session metadata (local and remote share no common ancestor)
+[entire] Cherry-picking 1 local checkpoint(s) onto remote...
+[entire] Done — all local and remote checkpoints preserved
+  -> Fixed: metadata branches reconciled
+
+No stuck sessions found.
+```
+---
+
+## Test 5: Verify the fix preserved all data
+
+```bash
+# Local should now be ahead of remote (cherry-picked on top)
+git log --oneline entire/checkpoints/v1 -5
+
+# Verify ALL data is present - both remote checkpoints and our local one
+git ls-tree -r --name-only entire/checkpoints/v1 | grep metadata.json
+
+# Our fake checkpoint should be there
+git ls-tree -r --name-only entire/checkpoints/v1 | grep "ff/ff00112233"
+
+# Remote checkpoints should also be there
+git ls-tree -r --name-only entire/checkpoints/v1 | grep "0c/66dc95f5c0"
+git ls-tree -r --name-only entire/checkpoints/v1 | grep "e8/63f7b5d8b2"
+
+# Linear history (no merge commits) - parent of tip should be the old remote tip
+git log --oneline --graph entire/checkpoints/v1 -5
+```
+
+**Expected:** All checkpoint shards present, linear history, our `ff/ff00112233` on top.
+
+**Actual**
+```
+* e601dc7 (entire/checkpoints/v1) Checkpoint: ffff00112233
+* b3e9833 (origin/entire/checkpoints/v1) Checkpoint: e863f7b5d8b2
+* 55b6295 Checkpoint: 8b68bd0ab277
+*   91d8939 Merge remote session logs
+|\
+| * 6b09d69 Finalize transcript for Checkpoint: 49796b38a0cb
+```
+This looks intresting - is there a problem here? 
+
+---
+
+## Test 6: Doctor reports OK after fix
+
+```bash
+/tmp/entire-test doctor --force
+```
+
+**Expected:** `Metadata branches: OK`
+**Actual**
+```
+Metadata branches: OK
+
+No stuck sessions found.
+```
+
+---
+
+i think test 7 failed because my hooks are pointing to the installed version of entire, not to the test build
+
+---
+
+everything passed. 
+
+can you help me unpick the temp PATH hacks
+
+---
+
+final transcript
+
+# Manual Test: Disconnected Metadata Branch Reconciliation
+
+Binary: `/tmp/entire-test`
+Test repo: `entirehq/terrible-temp-test-repo-that-sucks-to-test-pr-533`
+
+## Setup
+
+```bash
+# Clean slate
+cd /tmp
+rm -rf terrible-temp-test-repo-that-sucks-to-test-pr-533
+git clone git@github.com:entirehq/terrible-temp-test-repo-that-sucks-to-test-pr-533.git
+cd terrible-temp-test-repo-that-sucks-to-test-pr-533
+
+# Fetch the remote metadata branch (creates remote-tracking ref)
+git fetch origin entire/checkpoints/v1
+
+# Create local metadata branch from remote (normal state)
+git branch entire/checkpoints/v1 origin/entire/checkpoints/v1
+
+# Verify: local and remote should match
+git log --oneline entire/checkpoints/v1 -3
+git log --oneline origin/entire/checkpoints/v1 -3
+```
+
+## Test 1: Doctor reports OK when branches are connected
+
+```bash
+/tmp/entire-test doctor --force
+```
+
+**Expected:** `Metadata branches: OK` followed by stuck sessions check.
+
+**Actual**
+```
+Metadata branches: OK
+
+No stuck sessions found.
+```
+
+---
+
+## Test 2: Break it - create a disconnected local metadata branch
+
+```bash
+# Create a disconnected orphan branch with a fake local checkpoint
+git checkout --orphan temp-orphan
+git rm -rf .
+mkdir -p ff/ff00112233
+echo '{"checkpoint_id":"ffff00112233","session_id":"test-disconnected"}' > ff/ff00112233/metadata.json
+git add .
+git commit -m "Checkpoint: ffff00112233"
+
+# Point local metadata branch to this disconnected orphan
+git branch -f entire/checkpoints/v1 temp-orphan
+git checkout main
+
+# Verify they're disconnected (exit code 1 = no common ancestor)
+git merge-base entire/checkpoints/v1 origin/entire/checkpoints/v1
+echo "Exit code: $?"
+# Should print "Exit code: 1"
+```
+**Expected:** `Exit code: 1`
+**Actual** `Exit code: 1`
+
+---
+
+## Test 3: Warning on read paths (explain)
+
+```bash
+# explain reads checkpoints - should show the disconnected warning
+/tmp/entire-test explain 2>&1
+```
+
+**Expected:** Stderr shows:
+```
+[entire] Warning: Local and remote session metadata branches are disconnected.
+[entire] Some checkpoints from remote may not be visible. Run 'entire doctor' to fix.
+```
+
+The warning should appear only once even if multiple read paths are hit.
+
+**Actual**
+```
+[entire] Warning: Local and remote session metadata branches are disconnected.
+[entire] Some checkpoints from remote may not be visible. Run 'entire doctor' to fix.
+Branch: main
+Checkpoints: 0
+
+No checkpoints found on this branch.
+Checkpoints will appear here after you save changes during a Claude session.
+```
+---
+
+## Test 4: Doctor detects and explains the problem
+
+```bash
+/tmp/entire-test doctor
+```
+
+**Expected output:**
+```
+Metadata branches: DISCONNECTED
+  Local and remote entire/checkpoints/v1 branches share no common ancestor.
+  Some remote checkpoints may not be visible locally.
+  Fix: cherry-pick local checkpoints onto remote tip (preserves all data).
+? Fix disconnected metadata branches? Yes
+```
+
+**Say Yes.** Then expect:
+```
+[entire] Detected disconnected session metadata (local and remote share no common ancestor)
+[entire] Cherry-picking 1 local checkpoint(s) onto remote...
+[entire] Done — all local and remote checkpoints preserved
+  -> Fixed: metadata branches reconciled
+```
+
+**Actual**
+```
+Metadata branches: DISCONNECTED
+  Local and remote entire/checkpoints/v1 branches share no common ancestor.
+  Some remote checkpoints may not be visible locally.
+  Fix: cherry-pick local checkpoints onto remote tip (preserves all data).
+
+  YES
+
+
+[entire] Detected disconnected session metadata (local and remote share no common ancestor)
+[entire] Cherry-picking 1 local checkpoint(s) onto remote...
+[entire] Done — all local and remote checkpoints preserved
+  -> Fixed: metadata branches reconciled
+
+No stuck sessions found.
+```
+---
+
+## Test 5: Verify the fix preserved all data
+
+```bash
+# Local should now be ahead of remote (cherry-picked on top)
+git log --oneline entire/checkpoints/v1 -5
+
+# Verify ALL data is present - both remote checkpoints and our local one
+git ls-tree -r --name-only entire/checkpoints/v1 | grep metadata.json
+
+# Our fake checkpoint should be there
+git ls-tree -r --name-only entire/checkpoints/v1 | grep "ff/ff00112233"
+
+# Remote checkpoints should also be there
+git ls-tree -r --name-only entire/checkpoints/v1 | grep "0c/66dc95f5c0"
+git ls-tree -r --name-only entire/checkpoints/v1 | grep "e8/63f7b5d8b2"
+
+# Linear history (no merge commits) - parent of tip should be the old remote tip
+git log --oneline --graph entire/checkpoints/v1 -5
+```
+
+**Expected:** All checkpoint shards present, linear history, our `ff/ff00112233` on top.
+
+**Actual**
+```
+* e601dc7 (entire/checkpoints/v1) Checkpoint: ffff00112233
+* b3e9833 (origin/entire/checkpoints/v1) Checkpoint: e863f7b5d8b2
+* 55b6295 Checkpoint: 8b68bd0ab277
+*   91d8939 Merge remote session logs
+|\
+| * 6b09d69 Finalize transcript for Checkpoint: 49796b38a0cb
+```
+This looks intresting - is there a problem here? 
+Claude:
+  The merge commit at 91d8939 Merge remote session logs is pre-existing history on the remote metadata branch — it was created by a
+  previous push that used the normal fetchAndMergeSessionsCommon tree merge path. That's not from our reconciliation.
+
+  What matters is the top of the graph:
+
+  * e601dc7 (entire/checkpoints/v1) Checkpoint: ffff00112233   <-- our cherry-picked local
+  * b3e9833 (origin/entire/checkpoints/v1) Checkpoint: e863f7b5d8b2  <-- old remote tip
+
+  Our reconciliation cherry-picked the 1 local data commit linearly on top of the remote tip. No merge commit from us, parent chain is
+  correct. The rest of the history below is just whatever was already on the remote branch.
+
+  You're good to continue with tests 7 and 8.
+```
+---
+
+## Test 6: Doctor reports OK after fix
+
+```bash
+/tmp/entire-test doctor --force
+```
+
+**Expected:** `Metadata branches: OK`
+**Actual**
+```
+Metadata branches: OK
+
+No stuck sessions found.
+```
+---
+
+## Test 7: Pre-push reconciliation (break it again, push to trigger)
+
+```bash
+# Break it again
+git checkout --orphan temp-orphan-3
+git rm -rf .
+mkdir -p aa/bb11223344
+echo '{"checkpoint_id":"aabb11223344"}' > aa/bb11223344/metadata.json
+git add .
+git commit -m "Checkpoint: aabb11223344"
+git branch -f entire/checkpoints/v1 temp-orphan-3
+git checkout main
+
+# Verify disconnected again
+git merge-base entire/checkpoints/v1 origin/entire/checkpoints/v1
+echo "Exit code: $?"
+
+# Now do a push - the pre-push hook should reconcile before tree merge
+# Make a trivial change to push
+echo "test-$(date +%s)" >> test-push.txt
+git add test-push.txt
+git commit -m "test push to trigger pre-push hook"
+git push origin main
+```
+
+**Expected:** During push, stderr shows:
+```
+[entire] Pushing session logs to origin...
+[entire] Detected disconnected session metadata (local and remote share no common ancestor)
+[entire] Cherry-picking 1 local checkpoint(s) onto remote...
+[entire] Done — all local and remote checkpoints preserved
+```
+
+```bash
+# Verify the metadata branch was pushed with reconciled data
+git fetch origin entire/checkpoints/v1
+git log --oneline entire/checkpoints/v1 -5
+git ls-tree -r --name-only entire/checkpoints/v1 | grep "aa/bb11223344"
+```
+
+**Actual**
+```
+[main 2dd9237] test push to trigger pre-push hook
+ 1 file changed, 1 insertion(+)
+[entire] Pushing session logs to origin...
+[entire] Syncing with remote session logs...
+[entire] Detected disconnected session metadata (local and remote share no common ancestor)
+[entire] Cherry-picking 1 local checkpoint(s) onto remote...
+[entire] Done — all local and remote checkpoints preserved
+Enumerating objects: 5, done.
+Counting objects: 100% (5/5), done.
+Delta compression using up to 12 threads
+Compressing objects: 100% (2/2), done.
+Writing objects: 100% (3/3), 296 bytes | 296.00 KiB/s, done.
+Total 3 (delta 1), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (1/1), completed with 1 local object.
+To github.com:entirehq/terrible-temp-test-repo-that-sucks-to-test-pr-533.git
+   2838cc2..2dd9237  main -> main
+```
+
+---
+
+## Test 8: Empty orphan case (no local data, just the bug artifact)
+
+```bash
+# Create empty orphan (the exact bug scenario)
+git checkout --orphan temp-orphan-4
+git rm -rf .
+git commit --allow-empty -m "Initialize metadata branch"
+git branch -f entire/checkpoints/v1 temp-orphan-4
+git checkout main
+
+# Doctor should detect and fix by just resetting to remote
+/tmp/entire-test doctor --force
+```
+
+**Expected:**
+```
+Metadata branches: DISCONNECTED
+  ...
+[entire] Detected disconnected session metadata (local and remote share no common ancestor)
+[entire] Done — local had no checkpoint data, reset to remote
+  -> Fixed: metadata branches reconciled
+```
+
+**Actual**
+```
+Metadata branches: DISCONNECTED
+  Local and remote entire/checkpoints/v1 branches share no common ancestor.
+  Some remote checkpoints may not be visible locally.
+  Fix: cherry-pick local checkpoints onto remote tip (preserves all data).
+[entire] Detected disconnected session metadata (local and remote share no common ancestor)
+[entire] Done — local had no checkpoint data, reset to remote
+  -> Fixed: metadata branches reconciled
+
+No stuck sessions found.
+```
+
+```bash
+# Verify local now matches remote exactly
+git rev-parse entire/checkpoints/v1
+git rev-parse origin/entire/checkpoints/v1
+# Should be the same hash
+```
+
+**Actual**
+```
+20:38 /tmp/terrible-temp-test-repo-that-sucks-to-test-pr-533 main $ git rev-parse entire/checkpoints/v1
+32d64a5e58fe53b99d37f696f3721eb7e3d4aa21
+20:38 /tmp/terrible-temp-test-repo-that-sucks-to-test-pr-533 main $ git rev-parse origin/entire/checkpoints/v1
+32d64a5e58fe53b99d37f696f3721eb7e3d4aa21
+```
+---
+
+## Cleanup
+
+```bash
+cd /tmp
+rm -rf terrible-temp-test-repo-that-sucks-to-test-pr-533
+```
+
+---
+
+yes, format it nicely
+
+---
+
+‎cmd/entire/cli/strategy/common.go‎:315 
+use [entire] instead of the tick
+
+---
+
+push

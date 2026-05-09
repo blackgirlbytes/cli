@@ -1,0 +1,32 @@
+Review the code in https://github.com/entireio/cli/pull/877
+
+---
+
+> If writeOpts.CompactTranscriptStart is ever greater than current fullLines (e.g. transcript truncation/rotation, format/compaction behavior change across versions, or stale state), compactLines becomes negative and the saved CompactTranscriptStart is reduced. That can make subsequent checkpoints re-scope incorrectly and re-include already-condensed compact content.
+
+why would that be the case
+
+---
+
+and it doesn't cause any regressions?
+
+---
+
+transcript is append-only and the compacting logic would only change if the agents start changing the logs we need to convert to transcript.jsonl but I think that would be another issue
+
+---
+
+what does this mean?
+"In the migration path, tryCompactTranscript produces a scoped compact (using StartLine: m.GetTranscriptStart()), and this scoped result is assigned to opts.CompactTranscript. But computeCompactOffset calculates a non-zero CompactTranscriptStart offset that represents a position within the cumulative compact. The live path (buildCompactTranscript) correctly generates a cumulative compact with startLine=0 for storage. Migration now writes a transcript.jsonl containing only new-since-checkpoint content, paired with metadata claiming the content starts at a non-zero offset — a mismatch that would confuse any reader expecting cumulative content matching the live-path format."
+
+is it an issue?
+
+---
+
+So the migration path is wrong but otherwise the logic is correct.
+
+The intention is that when we convert full.jsonl to transcript.jsonl, the migration should append if the session is a continuation of a previous checkpoint's session
+
+---
+
+Ok, let's fix migration path

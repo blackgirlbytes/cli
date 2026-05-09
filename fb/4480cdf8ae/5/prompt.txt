@@ -1,0 +1,60 @@
+Implement Task 2 from the implementation plan: add a prompt-composition slot for a rendered review brief. You are not alone in the codebase: do not revert edits made by others, and adjust your implementation to fit the current files. Do not commit changes.
+
+Repository/worktree: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/entire-review`
+
+Ownership:
+- Modify only `cmd/entire/cli/review.go` and `cmd/entire/cli/review_test.go`.
+
+Current state:
+- Task 1 is complete: `reviewScope` includes `BaseRef`, and focused detect/base tests pass.
+- `renderReviewBrief` does not exist yet. Do NOT add `buildReviewPrompt` in Task 2, because it would reference the renderer before Task 3.
+
+Follow TDD exactly:
+1. Add failing prompt tests first.
+2. Run `go test ./cmd/entire/cli -run TestComposeReviewPrompt -count=1` and confirm it fails for the expected signature/behavior reason.
+3. Implement minimal code.
+4. Rerun the same focused test and confirm it passes.
+
+Task 2 requirements:
+1. Change `composeReviewPrompt` signature from:
+```go
+func composeReviewPrompt(skills []string) string
+```
+to:
+```go
+func composeReviewPrompt(skills []string, brief string) string
+```
+2. Keep the existing skills-list output exactly the same when `brief == ""`.
+3. When `brief != ""`, append exactly one blank line after the skills list, then append `brief`. The renderer owns the full `Commits in scope` section; `composeReviewPrompt` should not add headers.
+4. Update existing production/test call sites to pass `""` for the brief.
+5. Add tests:
+```go
+func TestComposeReviewPrompt_IncludesBrief(t *testing.T) {
+    t.Parallel()
+    brief := "Commits in scope (newest first):\n\n  commit     checkpoint     files  agent        subject\n"
+    got := composeReviewPrompt([]string{"/review-pr"}, brief)
+    want := "Please run these review skills in order:\n  1. /review-pr\n\n" + brief
+    if got != want {
+        t.Errorf("composeReviewPrompt() =\n%q\nwant:\n%q", got, want)
+    }
+}
+
+func TestComposeReviewPrompt_OmitsEmptyBrief(t *testing.T) {
+    t.Parallel()
+    got := composeReviewPrompt([]string{"/review-pr"}, "")
+    if strings.Contains(got, "Commits in scope") {
+        t.Errorf("empty brief should not add commit section: %s", got)
+    }
+}
+```
+If names conflict with existing tests, adapt names but keep behavior.
+
+Required verification:
+- Red run: `go test ./cmd/entire/cli -run TestComposeReviewPrompt -count=1` fails before implementation.
+- Final run: same command passes.
+
+Final response format:
+- Status: DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED
+- Files changed
+- Tests run, with pass/fail
+- Short notes on deviations.

@@ -1,0 +1,81 @@
+Implement the following plan:
+
+# Plan: Isolate integration tests from user git config
+
+## Context
+
+The user's `~/.gitconfig` sets `core.excludesFile` to `~/.gitignore-global`, which contains `*.log`. This caused `TestShadow_UntrackedFilePreservation` to fail because `git ls-files --others --exclude-standard` (used by `collectUntrackedFiles()` during rewind) treated `temp-debug.log` as gitignored and invisible.
+
+The first commit fixed `cliEnv()` in `testenv.go` by adding `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_SYSTEM=/dev/null`. However, many other callsites in the integration test suite build `cmd.Env` independently or don't set `cmd.Env` at all, leaving them vulnerable to the same class of issues.
+
+## Approach
+
+1. **Add `gitIsolatedEnv()` helper** to `testenv.go` — returns `os.Environ()` with git isolation vars appended
+2. **Update `cliEnv()`** to delegate to `gitIsolatedEnv()` instead of `os.Environ()`
+3. **Replace all `os.Environ()` in `cmd.Env` assignments** with `gitIsolatedEnv()`
+4. **Add `cmd.Env = gitIsolatedEnv()`** for bare `exec.Command("git", ...)` calls that don't set `cmd.Env`
+
+## Files to modify
+
+### `testenv.go` — add helper, update existing code
+- Add `gitIsolatedEnv()` function (before `cliEnv()`)
+- Update `cliEnv()` to use `gitIsolatedEnv()` instead of `os.Environ()`
+- Line 560 (`GitCheckoutNewBranch`): add `cmd.Env = gitIsolatedEnv()`
+- Line 1091 (`GitRm`): add `cmd.Env = gitIsolatedEnv()`
+
+### `hooks.go` — 5 callsites (Pattern 1: replace `os.Environ()`)
+- Line 212: `runHookInRepoDir` (Claude)
+- Line 393: `runHookWithOutput` (Claude)
+- Line 543: `runGeminiHookInRepoDir`
+- Line 562: `runGeminiHookWithOutput`
+- Line 797: `runOpenCodeHookInRepoDir`
+
+### `hook_logging_test.go` — 2 callsites (Pattern 1)
+- Line 39, Line 96
+
+### `hook_bench_test.go` — 3 callsites
+- Line 164: bare `git rev-parse` (Pattern 2: add `cmd.Env`)
+- Line 179: bare `git rev-parse` (Pattern 2: add `cmd.Env`)
+- Line 239: `append(os.Environ(), ...)` (Pattern 1)
+
+### `subdirectory_test.go` — 2 callsites (Pattern 1)
+- Line 44, Line 111
+
+### `resume_test.go` — 2 callsites (Pattern 1)
+- Line 491, Line 508
+
+### `interactive.go` — 1 callsite (Pattern 1)
+- Line 25
+
+### `mid_session_commit_test.go` — 3 callsites (Pattern 1)
+- Line 42, Line 155, Line 237
+
+### `mid_session_rebase_test.go` — 3 callsites (Pattern 2: add `cmd.Env`)
+- Line 105: `git rebase master`
+- Line 234: `gitCheckout` helper
+- Line 338: `git rebase master`
+
+### `worktree_test.go` — 1 callsite (Pattern 2: add `cmd.Env`)
+- Line 32: `git worktree add`
+
+### `git_author_test.go` — mixed
+- Pattern 1 (replace `os.Environ()`): Lines 83, 251
+- Pattern 2 (add `cmd.Env`): Lines 53, 60, 74, 94, 245, 260
+- **DO NOT TOUCH**: Lines 132-187 — these use explicit `[]string{...}` envs intentionally
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:integration
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/paul/.claude/projects/-Users-paul-src-entireio-cli--claude-worktrees-agile-marinating-sonnet/c998d569-564c-4db1-ace2-895235d0b29e.jsonl
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+Commit with explanation.

@@ -1,0 +1,347 @@
+Implement the following plan:
+
+# Fix: Cursor stop hook failures and deferred session-end checkpoint
+
+## Context
+
+The Cursor `stop` hook IS firing, but `handleLifecycleTurnEnd` hard-fails because:
+1. `sanitizePathForCursor` produces wrong paths (`-Users-soph-...` instead of `Users-soph-...`)
+2. The transcript file doesn't exist at the computed path
+3. `handleLifecycleTurnEnd` returns `"transcript file not found"` error at line 166
+4. The error goes to stderr (captured by Cursor) and is never logged
+
+Additionally, if `stop` truly doesn't fire (different Cursor versions/modes), `handleLifecycleSessionEnd` does no checkpoint — it only marks the session as ended.
+
+## Changes
+
+### 1. Fix `sanitizePathForCursor` (root cause)
+
+**File:** `cmd/entire/cli/agent/cursor/cursor.go:154-156`
+
+Strip leading path separator before regex replacement:
+
+```go
+func sanitizePathForCursor(path string) string {
+    path = strings.TrimLeft(path, "/")
+    return nonAlphanumericRegex.ReplaceAllString(path, "-")
+}
+```
+
+**Test file:** `cmd/entire/cli/agent/cursor/cursor_test.go` — fix test expectations that encode the wrong leading `-` behavior.
+
+### 2. Make `handleLifecycleTurnEnd` resilient to missing transcripts
+
+**File:** `cmd/entire/cli/lifecycle.go:161-167`
+
+Change the transcript check from hard-fail to soft-continue. When transcript is missing, skip transcript extraction but still detect file changes via git status and save the checkpoint:
+
+```go
+transcriptRef := event.SessionRef
+hasTranscript := transcriptRef != "" && fileExists(transcriptRef)
+if !hasTranscript {
+    logging.Warn(logCtx, "transcript not available, falling back to git status",
+        slog.String("session_ref", transcriptRef))
+}
+```
+
+Then guard transcript-dependent operations (read, copy, extract prompts/summary/files) behind `if hasTranscript { ... }`. The git status detection (`DetectFileChanges`) and `SaveStep` work independently and don't need a transcript.
+
+### 3. Deferred SaveStep in `handleLifecycleSessionEnd`
+
+**File:** `cmd/entire/cli/lifecycle.go:421-442`
+
+When session-end fires and the session is still ACTIVE (TurnEnd never happened), dispatch a synthetic TurnEnd first:
+
+```go
+func handleLifecycleSessionEnd(ctx context.Context, ag agent.Agent, event *agent.Event) error {
+    // ... existing logging ...
+
+    // Check if session is still ACTIVE (TurnEnd never fired)
+    state, _ := strategy.LoadSessionState(ctx, event.SessionID)
+    if state != nil && state.Phase == session.PhaseActive {
+        // Deferred turn-end: stop hook didn't fire or failed
+        logging.Info(logCtx, "deferred turn-end: session ending while still active")
+        syntheticEvent := &agent.Event{
+            Type:      agent.TurnEnd,
+            SessionID: event.SessionID,
+            SessionRef: event.SessionRef,
+            Timestamp: event.Timestamp,
+        }
+        if err := handleLifecycleTurnEnd(ctx, ag, syntheticEvent); err != nil {
+            logging.Warn(logCtx, "deferred turn-end failed", "err", err)
+            // Continue to mark session ended even if deferred save fails
+        }
+    }
+
+    if err := markSessionEnded(ctx, event.SessionID); err != nil {
+        fmt.Fprintf(os.Stderr, "Warning: failed to mark session ended: %v\n", err)
+    }
+    return nil
+}
+```
+
+This reuses the existing `handleLifecycleTurnEnd` (now resilient to missing transcripts) instead of duplicating logic.
+
+### 4. Update tests
+
+- `cmd/entire/cli/agent/cursor/cursor_test.go` — fix `TestSanitizePathForCursor` expectations (remove leading `-`)
+- `cmd/entire/cli/agent/cursor/cursor_test.go` — fix `TestCursorAgent_GetSessionDir_DefaultPath` if affected
+- `cmd/entire/cli/lifecycle_test.go` — update `TestHandleLifecycleTurnEnd_NonexistentTranscript` (now should succeed with git-status-only, not error)
+- Add test for deferred turn-end in session-end (ACTIVE session)
+
+## Files to modify
+
+1. `cmd/entire/cli/agent/cursor/cursor.go` — `sanitizePathForCursor`
+2. `cmd/entire/cli/agent/cursor/cursor_test.go` — fix test expectations
+3. `cmd/entire/cli/lifecycle.go` — `handleLifecycleTurnEnd` (soft-fail on missing transcript), `handleLifecycleSessionEnd` (deferred turn-end)
+4. `cmd/entire/cli/lifecycle_test.go` — update/add tests
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. Rebuild binary: `go build -o /Users/soph/.local/bin/entire ./cmd/entire/`
+3. Re-test with test_cursor2 wrapper to confirm stop hook succeeds (EXIT=0)
+4. Verify shadow branch is created after a Cursor agent session
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.claude/projects/-Users-soph-Work-entire-devenv-cli-experiments/14d503b8-b844-49b4-9cac-a6f0f60580ff.jsonl
+
+---
+
+ok, this clearly made progress, the issue is still: 
+
+1. session i asked it to make a change and commit -> trailer on commit, no commit in checkpoint branch
+2. session I asked it to make a change, and exit, commited manually -> trailer + checkpoint working
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user provided a detailed implementation plan with 4 changes to fix Cursor stop hook failures and deferred session-end checkpoint.
+
+2. I read 4 files to understand the current code:
+   - `cmd/entire/cli/agent/cursor/cursor.go` - Contains `sanitizePathForCursor` with the leading `-` bug
+   - `cmd/entire/cli/agent/cursor/cursor_test.go` - Tests with wrong expected values (leading `-`)
+   - `cmd/entire/cli/lifecycle.go` - Contains `handleLifecycleTurnEnd` (hard-fails on missing transcript) and `handleLifecycleSessionEnd` (no deferred checkpoint)
+   - `cmd/entire/cli/lifecycle_test.go` - Tests that expect hard-fail behavior
+
+3. I then looked up session phase constants and types to understand the session state machine:
+   - `session.PhaseActive`, `session.PhaseIdle`, `session.PhaseEnded`
+   - `strategy.SessionState` is an alias for `session.State`
+   - `State.Phase` field of type `session.Phase`
+
+4. I implemented 4 changes:
+
+   **Change 1: Fix sanitizePathForCursor** 
+   - Added `strings` import to cursor.go
+   - Added `strings.TrimLeft(path, "/")` before regex replacement
+   
+   **Change 2: Make handleLifecycleTurnEnd resilient to missing transcripts**
+   - Changed hard-fail on missing transcript to soft-continue
+   - Added `hasTranscript` boolean check
+   - Moved pre-prompt state loading before the transcript block
+   - Guarded all transcript-dependent operations inside `if hasTranscript { ... }`
+   - Default `commitMessage` to "checkpoint" when no transcript
+   - Git status detection and SaveStep work independently outside the transcript guard
+   
+   **Change 3: Deferred SaveStep in handleLifecycleSessionEnd**
+   - Added check for ACTIVE session phase when session ends
+   - If ACTIVE, dispatches a synthetic TurnEnd event via `handleLifecycleTurnEnd`
+   - Failures are logged as warnings; session still marked as ended
+   
+   **Change 4: Updated tests**
+   - Fixed cursor test expectations (removed leading `-`)
+   - Changed `TestHandleLifecycleTurnEnd_NonexistentTranscript` to verify soft-fail
+   - Added `TestHandleLifecycleSessionEnd_DeferredTurnEnd` test
+   - Added `session` import to lifecycle_test.go
+
+5. Lint error: `errcheck` flagged `strategy.LoadSessionState` return value not being checked. Fixed by adding proper error handling with warning message.
+
+6. All tests passed including integration tests. Binary was rebuilt.
+
+7. User reported the fix made progress but there's still an issue:
+   - Scenario 1: Agent commits during session → trailer on commit, BUT no checkpoint branch commit
+   - Scenario 2: User commits manually after exit → trailer + checkpoint working correctly
+
+8. I started investigating the PostCommit flow to understand why condensation isn't happening when the agent commits during an active Cursor session. I read:
+   - `manual_commit_hooks.go` - Full PostCommit flow, PrepareCommitMsg, etc.
+   - `hooks_git_cmd.go` - Git hook command setup
+   - `manual_commit_condensation.go` - CondenseSession, extractSessionData, etc.
+   - Cursor lifecycle.go and types.go - Hook parsing, transcript resolution
+
+Key finding from investigation:
+- CursorAgent does NOT implement `TranscriptAnalyzer` interface
+- For mid-session commits (ACTIVE, no shadow branch): PostCommit calls `CondenseSession` → `extractSessionDataFromLiveTranscript`
+- `extractSessionDataFromLiveTranscript` reads the transcript file and tries to extract files
+- When `state.FilesTouched` is empty, it falls back to `extractModifiedFilesFromLiveTranscript`
+- But this needs `TranscriptAnalyzer` which Cursor doesn't implement → returns nil
+- The committed files fallback should then kick in (line 198 in condensation.go)
+
+I was in the middle of investigating the PostCommit flow when the summary was requested. The investigation was looking at how `findSessionsForWorktree` works, and tracing the full PostCommit execution path for Cursor agent commits to understand why `entire/checkpoints/v1` doesn't get written.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to implement a plan to fix Cursor stop hook failures and add deferred session-end checkpoints. The plan had 4 specific changes:
+   1. Fix `sanitizePathForCursor` producing wrong paths (`-Users-soph-...` instead of `Users-soph-...`)
+   2. Make `handleLifecycleTurnEnd` resilient to missing transcripts (soft-fail instead of hard-fail)
+   3. Add deferred SaveStep in `handleLifecycleSessionEnd` when session is still ACTIVE
+   4. Update all affected tests
+   
+   After implementation, the user reported the fix "clearly made progress" but there's still an issue: when the Cursor agent makes a change AND commits during the session, the trailer is added to the commit but NO checkpoint is written to the `entire/checkpoints/v1` branch. However, when the user manually commits after the Cursor session exits, both the trailer and checkpoint work correctly.
+
+2. Key Technical Concepts:
+   - Cursor agent hook lifecycle: SessionStart → TurnStart → TurnEnd (stop) → SessionEnd
+   - Shadow branch strategy: `entire/<commit-hash[:7]>-<worktreeHash[:6]>` for temporary checkpoints
+   - Checkpoint branch: `entire/checkpoints/v1` for permanent storage (condensation target)
+   - Session phases: ACTIVE → IDLE → ENDED (state machine in `session/phase.go`)
+   - PostCommit hook flow: checks for `Entire-Checkpoint` trailer, finds sessions, runs condensation
+   - CursorAgent does NOT implement `TranscriptAnalyzer` interface (no tool_use blocks in Cursor transcripts)
+   - Mid-session commits (agent commits while ACTIVE): no shadow branch exists yet, PostCommit must use live transcript
+   - `sanitizePathForCursor` converts repo path to Cursor's directory format for transcript discovery
+   - `hasTTY()` check determines agent vs human commit (fast path for agent commits)
+
+3. Files and Code Sections:
+
+   - **`cmd/entire/cli/agent/cursor/cursor.go`** (MODIFIED)
+     - Root cause fix for wrong transcript path computation
+     - Added `strings` import and `strings.TrimLeft(path, "/")`:
+     ```go
+     func sanitizePathForCursor(path string) string {
+         path = strings.TrimLeft(path, "/")
+         return nonAlphanumericRegex.ReplaceAllString(path, "-")
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/cursor/cursor_test.go`** (MODIFIED)
+     - Updated `TestSanitizePathForCursor` expected values to remove leading `-`:
+     ```go
+     {"/Users/robin/project", "Users-robin-project"},
+     {"/tmp/test", "tmp-test"},
+     {"simple", "simple"},
+     {"/path/with spaces/dir", "path-with-spaces-dir"},
+     {"/path.with.dots/dir", "path-with-dots-dir"},
+     ```
+
+   - **`cmd/entire/cli/lifecycle.go`** (MODIFIED - two changes)
+     - `handleLifecycleTurnEnd` (lines ~148-399): Changed transcript check from hard-fail to soft-continue. Key change:
+     ```go
+     hasTranscript := fileExists(transcriptRef)
+     if !hasTranscript {
+         logging.Warn(logCtx, "transcript not available, falling back to git status",
+             slog.String("session_ref", transcriptRef))
+     }
+     ```
+     All transcript-dependent operations (read, copy, extract prompts/summary/files, write prompt/summary files, generate commit message) are now guarded behind `if hasTranscript { ... }`. Default `commitMessage` is `"checkpoint"`. Git status detection and SaveStep proceed independently.
+     
+     - `handleLifecycleSessionEnd` (lines ~435-475): Added deferred turn-end when session is still ACTIVE:
+     ```go
+     state, loadErr := strategy.LoadSessionState(ctx, event.SessionID)
+     if loadErr != nil {
+         fmt.Fprintf(os.Stderr, "Warning: failed to load session state for deferred turn-end: %v\n", loadErr)
+     }
+     if state != nil && state.Phase == session.PhaseActive {
+         logging.Info(logCtx, "deferred turn-end: session ending while still active")
+         syntheticEvent := &agent.Event{
+             Type:       agent.TurnEnd,
+             SessionID:  event.SessionID,
+             SessionRef: event.SessionRef,
+             Timestamp:  event.Timestamp,
+         }
+         if err := handleLifecycleTurnEnd(ctx, ag, syntheticEvent); err != nil {
+             logging.Warn(logCtx, "deferred turn-end failed", slog.String("err", err.Error()))
+         }
+     }
+     ```
+
+   - **`cmd/entire/cli/lifecycle_test.go`** (MODIFIED)
+     - Added `session` import
+     - `TestHandleLifecycleTurnEnd_NonexistentTranscript`: Changed to verify soft-fail (no "transcript file not found" error)
+     - Added `TestHandleLifecycleSessionEnd_DeferredTurnEnd`: Creates ACTIVE session, sends SessionEnd, verifies deferred turn-end runs and session is marked ended
+
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** (READ - investigation)
+     - Full PostCommit flow traced: lines 623-880
+     - Key: For ACTIVE sessions `hasNew = true` (line 780-781)
+     - `filesTouchedBefore` populated from `state.FilesTouched` or `extractFilesFromLiveTranscript` (line 799-803)
+     - `shouldCondenseWithOverlapCheck`: empty filesTouchedBefore + isActive = returns true (fail-open, line 580-581)
+     - `CondenseSession` called → if no shadow branch, uses `extractSessionDataFromLiveTranscript`
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation.go`** (READ - investigation)
+     - `CondenseSession` (line 120): When no shadow branch exists and TranscriptPath is set, calls `extractSessionDataFromLiveTranscript`
+     - `extractSessionDataFromLiveTranscript` (line 502): When `state.FilesTouched` is empty, tries `extractModifiedFilesFromLiveTranscript` which needs `TranscriptAnalyzer` → Cursor doesn't implement it → returns nil
+     - Fallback at line 198: if `FilesTouched` is empty AND `!hadFilesBeforeFiltering`, populate from `committedFiles`
+
+   - **`cmd/entire/cli/agent/cursor/lifecycle.go`** (READ - investigation)
+     - `parseTurnEnd` uses `resolveTranscriptRef` to compute transcript path
+     - `parseSessionEnd` also uses `resolveTranscriptRef`
+     - `resolveTranscriptRef` computes path via `GetSessionDir(repoRoot)` + `ResolveSessionFile`
+     - CursorAgent explicitly does NOT implement TranscriptAnalyzer (line 47-49)
+
+   - **`cmd/entire/cli/agent/cursor/types.go`** (READ - investigation)
+     - All hook input types have `TranscriptPath` field
+     - IDE provides transcript_path; CLI sends null
+
+4. Errors and fixes:
+   - **Lint error: errcheck on `strategy.LoadSessionState`**: The `state, _ := strategy.LoadSessionState(ctx, event.SessionID)` line in `handleLifecycleSessionEnd` was flagged. Fixed by adding proper error handling: `state, loadErr := strategy.LoadSessionState(...)` with a warning log.
+   - **User feedback after initial implementation**: User reported "this clearly made progress, the issue is still: 1. session i asked it to make a change and commit -> trailer on commit, no commit in checkpoint branch / 2. session I asked it to make a change, and exit, commited manually -> trailer + checkpoint working". This indicated the sanitizePathForCursor fix and resilient turn-end helped scenario 2, but scenario 1 (agent mid-session commit) still doesn't produce a checkpoint branch commit.
+
+5. Problem Solving:
+   - **Solved**: `sanitizePathForCursor` leading `-` bug, hard-fail on missing transcripts, missing deferred checkpoint on session end
+   - **Ongoing investigation**: Why `PostCommit` doesn't create a checkpoint on `entire/checkpoints/v1` when the Cursor agent commits mid-session (scenario 1). Investigation traced the full PostCommit → CondenseSession → extractSessionDataFromLiveTranscript path. Key finding: CursorAgent doesn't implement TranscriptAnalyzer, so file extraction from live transcript returns nil, but the committed-files fallback should still populate FilesTouched. The investigation was still in progress - I was about to look at whether `state.TranscriptPath` is correctly set during InitializeSession for Cursor, and whether the transcript file actually exists at commit time.
+
+6. All user messages:
+   - **Message 1**: "Implement the following plan: [detailed plan with 4 changes for fixing Cursor stop hook failures and deferred session-end checkpoint, including specific file paths, code snippets, and verification steps]"
+   - **Message 2**: "ok, this clearly made progress, the issue is still: 1. session i asked it to make a change and commit -> trailer on commit, no commit in checkpoint branch / 2. session I asked it to make a change, and exit, commited manually -> trailer + checkpoint working"
+
+7. Pending Tasks:
+   - Diagnose and fix why PostCommit doesn't write to `entire/checkpoints/v1` when the Cursor agent commits during an active session (scenario 1 from user's message 2)
+   - Rebuild binary after fix: `go build -o /Users/soph/.local/bin/entire ./cmd/entire/`
+   - Re-test with test_cursor2 wrapper to confirm both scenarios work
+
+8. Current Work:
+   Investigating why the Cursor agent mid-session commit (scenario 1) produces a trailer but no checkpoint branch commit. I was deep into tracing the `PostCommit` → `CondenseSession` → `extractSessionDataFromLiveTranscript` code path. The investigation had reached `findSessionsForWorktree` and was about to verify:
+   - Whether `state.TranscriptPath` is correctly populated for Cursor sessions
+   - Whether the live transcript file exists at commit time
+   - Whether `extractSessionDataFromLiveTranscript` can actually read and parse the Cursor transcript successfully
+   - Whether the committed-files fallback for empty `FilesTouched` (line 198 in manual_commit_condensation.go) works correctly for Cursor
+
+9. Optional Next Step:
+   Continue investigating the PostCommit flow for Cursor mid-session commits. The user's exact words were: "ok, this clearly made progress, the issue is still: 1. session i asked it to make a change and commit -> trailer on commit, no commit in checkpoint branch". I need to determine the root cause of why `CondenseSession` fails or is skipped during Cursor agent commits. The most likely candidates to check are:
+   - Whether `state.TranscriptPath` is set (could be empty if Cursor CLI sends null for `transcript_path` in `beforeSubmitPromptInputRaw`)
+   - Whether `extractSessionDataFromLiveTranscript` returns an error that causes `condenseAndUpdateState` to return false
+   - Whether there's a log file at `.entire/logs/` from a test run that would reveal the exact error
+   
+   A good diagnostic step would be to add logging or check the `.entire/logs/` from a real Cursor test session to see exactly where `PostCommit` fails.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.claude/projects/-Users-soph-Work-entire-devenv-cli-experiments/ea3f8f47-2d40-474f-bb55-bde41f47b79c.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+ok, this works, can you now compare our fixes to 527
+
+---
+
+yeah #527 has still the issue with mid turn commits, can we go to that branch and just apply that fix, and also use the one pass we use
+
+---
+
+why is in lifecycle.go:22 the ctx needed?
+
+---
+
+hmm, I just tried it and a prompt that does a change and commits is not working anymore, it worked before, what did we miss?
+
+---
+
+so I tried this now in the cursor ide, same repo as before, and it failed mid turn, can you check the logs?
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+/Users/soph/Work/entire/test/test_cursor2

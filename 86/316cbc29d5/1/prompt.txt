@@ -1,0 +1,765 @@
+can you dispatch multiple competing agents to review the changes in this branch?
+
+---
+
+<task-notification>
+<task-id>a6ad198</task-id>
+<status>completed</status>
+<summary>Agent "Review architecture & design" completed</summary>
+<result>I have completed my architectural analysis. Let me present the full review here since the file write was denied:
+
+---
+
+# Architectural Review of Agent Refactor (soph/agent-refactor)
+
+## Design Rating: 4/5
+
+## Previous Review Status (Review-01)
+
+Review-01 was approved. Checking which issues were addressed:
+
+- **Potential nil dereference in DetectFileChanges** - PARTIALLY ADDRESSED (now uses nil check at line 298: `if changes != nil`)
+- **nolint:maintidx reasoning** - STILL OUTSTANDING
+- **Magic number 12 in string slice** - STILL OUTSTANDING
+- **PreviousSessionID field unused** - Documented for future use per PLAN.md
+- **Code duplication in readAndParse** - STILL OUTSTANDING
+
+These are all minor; none block the architectural approval.
+
+---
+
+## Architectural Assessment
+
+### 1. Abstraction Quality: EXCELLENT (5/5)
+
+**Event abstraction (`agent/event.go`)**
+
+The `EventType` enum is well-designed with 7 event types that map cleanly to all known agent lifecycle states: `SessionStart`, `TurnStart`, `TurnEnd`, `Compaction`, `SessionEnd`, `SubagentStart`, `SubagentEnd`. This covers the full agent lifecycle without being overly specific.
+
+The `Event` struct is appropriately general with `json.RawMessage` for extensible payloads and `map[string]string` for agent-specific state.
+
+**Interface segregation (`agent/agent.go`)**
+
+The interface hierarchy is well-structured:
+- **Core Agent**: 10 methods - identity, event mapping, transcript storage
+- **TranscriptAnalyzer**: 4 methods - format-specific parsing (optional)
+- **TranscriptPreparer**: 1 method - flush/sync (Claude-specific)
+- **TokenCalculator**: 1 method - usage tracking (optional)
+- **SubagentAwareExtractor**: 2 methods - subagent aggregation (optional)
+
+This allows graceful degradation - agents without `TranscriptAnalyzer` still work via git-status-only file detection.
+
+### 2. Separation of Concerns: EXCELLENT (5/5)
+
+Clear package boundaries:
+
+| Package | Responsibility |
+|---------|---------------|
+| `agent/` | Agent identity + event translation (pure data) |
+| `agent/claudecode/` | Claude-specific parsing, no framework logic |
+| `agent/geminicli/` | Gemini-specific parsing, no framework logic |
+| `cli/lifecycle.go` | Framework orchestration (state transitions, strategy calls) |
+| `strategy/` | Storage and git operations |
+| `session/` | State machine definition |
+
+**No reverse dependencies:**
+- `agent/claudecode/` does NOT import `cli`, `strategy`, or `session`
+- `lifecycle.go` imports `agent/` (correct direction)
+
+This is the "agents are data providers, not orchestrators" principle from PLAN.md executed correctly.
+
+### 3. Extensibility: GOOD (4/5)
+
+**Adding a new agent requires:**
+1. Implement `Agent` interface (10 methods, 5 are one-liners)
+2. Implement `ParseHookEvent()` to translate hooks to events
+3. Optionally implement `TranscriptAnalyzer` for richer metadata
+4. Register via `agent.Register()` in `init()`
+
+**What could be better:**
+- No formal plugin system (agents must be compiled in)
+- Hook input normalization is partial (argv handling mentioned in PLAN.md not implemented)
+- `ToolInput json.RawMessage` requires per-agent parsing in dispatcher
+
+### 4. Coupling Analysis: GOOD (4/5)
+
+**Loose coupling achieved:**
+- Agents don't know about strategies
+- Lifecycle dispatcher uses interfaces, not concrete types
+
+**Remaining tight coupling:**
+```go
+// lifecycle.go:384-387 - Special-cases auto-commit by name
+if strat.Name() == strategy.StrategyNameAutoCommit && newTranscriptPosition > 0 {
+    updateAutoCommitTranscriptPosition(sessionID, newTranscriptPosition)
+}
+```
+
+Consider using an optional interface (`TranscriptPositionUpdater`) instead.
+
+```go
+// hook_registry.go:145-148 - Hard-coded agent name check
+if agentName == agent.AgentNameClaudeCode && hookName == claudecode.HookNamePostTodo {
+    hookErr = handleClaudeCodePostTodo()
+}
+```
+
+PostTodo is correctly documented as Claude-specific, but consider a mechanism for agent-specific hook extensions.
+
+### 5. Consistency: EXCELLENT (5/5)
+
+All lifecycle handlers follow the same structure:
+1. Log with context
+2. Validate required fields
+3. Call framework functions
+4. Transition state machine
+5. Return errors appropriately
+
+Consistent naming: `handleLifecycle*` for handlers, `parse*` for agent parsing, `*Context` for strategy parameters.
+
+### 6. Migration Path: EXCELLENT (5/5)
+
+**Clean removal:**
+- `hooks_claudecode_handlers.go` (886 lines) - DELETED
+- `hooks_geminicli_handlers.go` (659 lines) - DELETED
+- Total: ~1545 lines removed
+
+**New code is smaller:**
+- `lifecycle.go` (752 lines) - unified dispatcher
+- `claudecode/lifecycle.go` (320 lines) - parsing only
+- `geminicli/lifecycle.go` (176 lines) - parsing only
+- Total new: ~1248 lines (net reduction of ~300 lines)
+
+**Backward compatibility preserved:**
+- `PrePromptState.normalizePrePromptState()` migrates old field names
+- Legacy `Agent` methods kept (marked with "Legacy" comment block)
+
+---
+
+## Structural Issues That Could Cause Problems
+
+### Issue 1: Type assertions for optional interfaces (MEDIUM RISK)
+
+Multiple type assertions in the dispatcher:
+```go
+if analyzer, ok := ag.(agent.TranscriptAnalyzer); ok { ... }
+if preparer, ok := ag.(agent.TranscriptPreparer); ok { ... }
+if calculator, ok := ag.(agent.TokenCalculator); ok { ... }
+if subagentExtractor, ok := ag.(agent.SubagentAwareExtractor); ok { ... }
+```
+
+This is correct Go idiom but could become cluttered. Consider a capability-based pattern if 3+ more optional interfaces are added.
+
+### Issue 2: State machine action dispatch inconsistency (LOW RISK)
+
+The lifecycle dispatcher uses `NoOpActionHandler{}` for most transitions, but `TurnEndHandler` is called separately. This works but creates two pathways. Document the distinction.
+
+### Issue 3: Global state via GetStrategy() (ACCEPTABLE)
+
+For a CLI tool this is acceptable, but it makes testing harder. The tests work around this by using real git repos in temp directories.
+
+---
+
+## Design Rating Breakdown
+
+| Criterion | Score | Notes |
+|-----------|-------|-------|
+| Abstraction Quality | 5/5 | Event types and interfaces are well-designed |
+| Separation of Concerns | 5/5 | Clean package boundaries, no reverse deps |
+| Extensibility | 4/5 | Good but no formal plugin system |
+| Coupling | 4/5 | Generally loose, some strategy-name checks |
+| Consistency | 5/5 | Patterns followed throughout |
+| Migration Path | 5/5 | Clean removal, backward compat preserved |
+
+**Overall: 4/5** - Excellent architectural improvement with minor coupling concerns.
+
+---
+
+## Recommendations for Future Growth
+
+1. **Document the event/action distinction** in CLAUDE.md
+2. **Consider capability-based interface discovery** if more optional interfaces are added
+3. **Extract strategy-specific logic** via optional interfaces rather than name checks
+4. **Add integration tests** for `ParseHookEvent` methods
+5. **Consider hook extension mechanism** for agent-specific hooks like PostTodo
+
+---
+
+## Summary
+
+This refactor successfully achieves the goals outlined in PLAN.md:
+
+- **Inverts control flow**: Framework dispatches; agents provide data
+- **Reduces duplication**: ~1545 lines removed, ~1248 lines added
+- **Improves contributor experience**: Adding an agent requires implementing 10 interface methods + `ParseHookEvent`, no framework logic duplication
+- **Maintains backward compatibility**: Old state files migrate cleanly
+
+The design is solid and will scale well as new agents are added. The minor coupling issues identified are acceptable trade-offs for a CLI tool.
+
+**Verdict: APPROVE**
+
+---
+
+Key files for reference:
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go` - Main dispatcher (752 lines)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/event.go` - Event types (95 lines)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/agent.go` - Interface definitions (206 lines)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/claudecode/lifecycle.go` - Claude event parsing (320 lines)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/geminicli/lifecycle.go` - Gemini event parsing (176 lines)
+- `/Users/soph/Work/entire/devenv/cli/PLAN.md` - Design rationale (677 lines)</result>
+</task-notification>
+Full transcript available at: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/a6ad198.output
+
+---
+
+<task-notification>
+<task-id>a84b9dd</task-id>
+<status>completed</status>
+<summary>Agent "Review test coverage" completed</summary>
+<result>I'll provide the comprehensive test coverage review in my response since file writing permissions were denied.
+
+---
+
+# Test Coverage Review: soph/agent-refactor Branch
+
+## Test Coverage Rating: 3/5 (Adequate but Gaps Exist)
+
+The branch has good unit test coverage for the core lifecycle dispatcher (`lifecycle.go`) but significant gaps in testing the agent-specific lifecycle implementations.
+
+---
+
+## Detailed Analysis
+
+### Coverage Assessment by Component
+
+| File | Lines Changed | Test Coverage | Rating |
+|------|--------------|---------------|--------|
+| `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go` | 752 lines | Good - `lifecycle_test.go` (617 lines) | 4/5 |
+| `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/event.go` | 95 lines | Partial - tested via dispatcher only | 3/5 |
+| `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/claudecode/lifecycle.go` | 320 lines | **Poor - no direct tests** | 1/5 |
+| `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/geminicli/lifecycle.go` | 176 lines | **Poor - no direct tests** | 1/5 |
+| `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/state.go` (changes) | ~145 lines | Good - `state_test.go` | 4/5 |
+| `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/hook_registry.go` | ~160 lines | Fair - `hook_registry_test.go` | 3/5 |
+
+---
+
+## Critical Coverage Gaps
+
+### 1. [Critical] No Unit Tests for `ParseHookEvent` Methods
+
+**Files affected:**
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/claudecode/lifecycle.go` (lines 35-55)
+- `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/geminicli/lifecycle.go` (lines 28-47)
+
+**Problem:** The core contribution of this refactor - the `ParseHookEvent` method that translates native hooks to normalized events - has **zero direct unit tests** for either agent implementation.
+
+**Why this matters:** These methods contain critical logic:
+- JSON parsing of hook input from stdin
+- Field extraction (session_id, transcript_path, tool_use_id, etc.)
+- Event type mapping (which hook maps to which EventType)
+- Error handling for malformed input
+
+**Current state:** Only compile-time interface assertions exist in both files.
+
+**Tests needed:**
+```go
+// NEW FILE: cmd/entire/cli/agent/claudecode/lifecycle_test.go
+func TestParseHookEvent_SessionStart(t *testing.T)    // session-start -> SessionStart
+func TestParseHookEvent_TurnStart(t *testing.T)       // user-prompt-submit -> TurnStart  
+func TestParseHookEvent_TurnEnd(t *testing.T)         // stop -> TurnEnd
+func TestParseHookEvent_SessionEnd(t *testing.T)      // session-end -> SessionEnd
+func TestParseHookEvent_SubagentStart(t *testing.T)   // pre-task -> SubagentStart
+func TestParseHookEvent_SubagentEnd(t *testing.T)     // post-task -> SubagentEnd
+func TestParseHookEvent_PostTodo_ReturnsNil(t *testing.T)  // post-todo -> nil (handled separately)
+func TestParseHookEvent_UnknownHook_ReturnsNil(t *testing.T)
+func TestParseHookEvent_EmptyInput(t *testing.T)
+func TestParseHookEvent_MalformedJSON(t *testing.T)
+```
+
+### 2. [Critical] No Tests for `readAndParse` Generic Helper
+
+Both `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/claudecode/lifecycle.go:222-235` and `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/geminicli/lifecycle.go:162-176` contain identical `readAndParse[T]` functions with no tests.
+
+**Tests needed:**
+- Empty input returns error
+- Read error propagation
+- JSON unmarshal error handling
+- Valid input round-trip
+
+---
+
+## Important Coverage Gaps
+
+### 3. [Important] Lifecycle Dispatcher Error Paths
+
+`/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle_test.go` tests basic validation but misses:
+
+1. **TranscriptPreparer failure** (lifecycle.go:182-185)
+   - What happens when `PrepareTranscript` returns an error?
+
+2. **TokenCalculator fallback** (lifecycle.go:344-360)
+   - No tests verify fallback from `SubagentAwareExtractor` to `TokenCalculator`
+
+3. **Strategy interface type assertions** (lifecycle.go:77, 133)
+   - `ConcurrentSessionChecker` interface assertion not tested
+   - `SessionInitializer` interface assertion not tested
+
+4. **Session state machine failures** (lifecycle.go:93-100)
+   - Behavior when `TransitionAndLog` fails is untested
+
+### 4. [Important] Compaction Event Has Limited Testing
+
+`handleLifecycleCompaction` (lifecycle.go:401-429) has only one test: `TestHandleLifecycleCompaction_ResetsTranscriptOffset`
+
+**Missing tests:**
+- Compaction when session state doesn't exist
+- Compaction during IDLE phase
+- Compaction after partial work
+
+### 5. [Important] Subagent Lifecycle Flow Not Fully Tested
+
+The tests in lifecycle_test.go for SubagentStart/SubagentEnd are minimal:
+
+```go
+{
+    name:        "SubagentStart with valid data",
+    eventType:   agent.SubagentStart,
+    expectError: true, // Will fail due to CapturePreTaskState needing git repo
+},
+```
+
+**Missing:**
+- Successful SubagentStart -> SubagentEnd flow with git repo
+- File change detection from subagent transcript
+- Task checkpoint creation verification
+- UUID extraction from main transcript
+
+### 6. [Important] Gemini CLI Integration Tests Missing
+
+All integration tests in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/integration_test/` use Claude Code hooks. No tests verify:
+- Full Gemini workflow: `before-agent` -> file changes -> `after-agent`
+- Gemini compaction (`pre-compress` hook)
+- Cross-agent checkpoint consistency
+
+---
+
+## Test Quality Issues
+
+### 7. [Suggestion] Tests Not Using Parallel Execution
+
+Several tests in `lifecycle_test.go` cannot use `t.Parallel()` due to `t.Chdir()`:
+
+```go
+func TestHandleLifecycleCompaction_ResetsTranscriptOffset(t *testing.T) {
+    // Cannot use t.Parallel() because we use t.Chdir()
+    tmpDir := t.TempDir()
+    t.Chdir(tmpDir)
+```
+
+**Recommendation:** Refactor to use absolute paths to enable parallel execution.
+
+### 8. [Suggestion] Mock Agent Missing Optional Interfaces
+
+The `mockLifecycleAgent` in lifecycle_test.go doesn't implement:
+- `TranscriptAnalyzer`
+- `TranscriptPreparer`
+- `TokenCalculator`
+
+This limits testing of conditional code paths in the dispatcher.
+
+---
+
+## What's Well Tested
+
+### Praise
+
+1. **Lifecycle dispatcher core logic** - `lifecycle_test.go` has good coverage for:
+   - Nil agent/event handling
+   - Unknown event types
+   - Empty session IDs
+   - Empty/nonexistent transcripts
+   - Empty repository edge case
+   - Context file generation format
+
+2. **Integration tests for Claude Code** - Comprehensive coverage in:
+   - `hooks_test.go` - UserPromptSubmit, Stop, PreTask, PostTask
+   - `phase_transitions_test.go` - Commit-while-active, amend scenarios
+   - `subagent_checkpoints_test.go` - Subagent file detection
+   - `old_session_basecommit_test.go` - Session state edge case (NEW)
+
+3. **State migration tests** - `state_test.go` covers backward compatibility for deprecated fields:
+   - `TestPrePromptState_BackwardCompat_LastTranscriptLineCount`
+
+4. **File change detection** - Multiple tests in state_test.go for `DetectFileChanges`:
+   - Deleted files with nil pre-state
+   - New and deleted files
+   - No changes scenario
+   - Nil previouslyUntracked behavior
+
+---
+
+## Summary of Required Tests
+
+### Must Add (Blocking):
+
+| Priority | Area | Files to Create/Modify |
+|----------|------|----------------------|
+| Critical | ParseHookEvent unit tests | NEW: `cmd/entire/cli/agent/claudecode/lifecycle_test.go` |
+| Critical | ParseHookEvent unit tests | NEW: `cmd/entire/cli/agent/geminicli/lifecycle_test.go` |
+| Critical | readAndParse helper tests | Include in above files |
+
+### Should Add (Important):
+
+| Priority | Area | Notes |
+|----------|------|-------|
+| Important | TranscriptAnalyzer interface tests | Test via dispatcher with proper mock |
+| Important | Subagent lifecycle full flow | Need git repo setup |
+| Important | Compaction edge cases | Session doesn't exist, wrong phase |
+| Important | Gemini CLI integration | NEW integration test file |
+
+### Nice to Have:
+
+- Parallel-safe test refactoring
+- Mock agent with optional interfaces
+- Cross-agent consistency tests
+
+---
+
+## Verdict
+
+**REQUEST CHANGES**
+
+The refactor introduces significant new code in the agent lifecycle layer (`ParseHookEvent` methods) that has zero direct test coverage. While the integration tests provide good end-to-end coverage for Claude Code, the lack of unit tests for the event translation logic means bugs in JSON parsing, field extraction, or event type mapping would not be caught until integration testing.
+
+**Blocking issues:**
+1. No tests for `ParseHookEvent` in `claudecode/lifecycle.go`
+2. No tests for `ParseHookEvent` in `geminicli/lifecycle.go`
+
+**Estimated effort:** 4-6 hours to add the required tests.</result>
+</task-notification>
+Full transcript available at: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/a84b9dd.output
+
+---
+
+<task-notification>
+<task-id>a9e1340</task-id>
+<status>completed</status>
+<summary>Agent "Review security concerns" completed</summary>
+<result>I apologize that I cannot write the review file directly. Let me provide you with the complete security review output:
+
+---
+
+# Security Review - Branch `soph/agent-refactor` vs `main`
+
+## Review Summary
+
+**Security Posture Rating: 4/5**
+
+**Verdict: APPROVE with minor concerns**
+
+The branch introduces a significant architectural refactor that actually *improves* the security posture by centralizing input handling in one dispatcher, using strongly-typed `Event` structs instead of raw JSON, and reducing code duplication that could lead to inconsistent validation.
+
+---
+
+## Critical Security Issues
+
+**None identified.**
+
+---
+
+## Important Security Findings
+
+### 1. Session IDs from agent events lack validation at entry points
+**Files:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:155-157, 409`
+
+Session IDs come directly from agent hook input (parsed JSON) and are used in file path construction:
+
+```go
+// lifecycle.go:155-157
+sessionID := event.SessionID
+if sessionID == "" {
+    sessionID = unknownSessionID
+}
+```
+
+While validation exists deeper in the stack (`validation.ValidateSessionID` is called in `checkpoint.WriteTemporary`, `checkpoint.WriteCommitted`, and `strategy.SaveSessionState`), there is **no validation at the lifecycle dispatcher entry points**.
+
+**Risk Level:** Low - defense-in-depth gap, but downstream validation exists.
+
+**Suggested Fix:** Add validation at dispatcher entry points:
+```go
+import "github.com/entireio/cli/cmd/entire/cli/validation"
+
+if err := validation.ValidateSessionID(event.SessionID); err != nil {
+    return fmt.Errorf("invalid event: %w", err)
+}
+```
+
+---
+
+### 2. State file paths use sessionID/toolUseID without validation
+**Files:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/state.go:272, 409`
+
+The `prePromptStateFile` and `preTaskStateFile` functions construct paths using unvalidated IDs:
+
+```go
+// state.go:272
+return filepath.Join(tmpDirAbs, fmt.Sprintf("pre-prompt-%s.json", sessionID))
+```
+
+**Risk Level:** Medium - a malicious agent could potentially inject path traversal characters.
+
+**Mitigating factors:**
+- `ValidateSessionID` checks for `/` and `\` characters (line 22 in `validation/validators.go`)
+- The validation is called in checkpoint functions but not in state.go
+
+---
+
+### 3. Subagents directory constructed from transcript path
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:215`
+
+```go
+subagentsDir := filepath.Join(filepath.Dir(transcriptRef), "subagents")
+```
+
+The `transcriptRef` comes from agent hook input. Operations on this path are read-only.
+
+**Risk Level:** Low - read-only operations on potentially untrusted paths.
+
+---
+
+## Security Areas Without Concerns
+
+### Input Validation
+- **Existing validation in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/validation/validators.go`** properly rejects path traversal characters in session IDs and tool use IDs
+- Validation is called in checkpoint and session packages
+
+### Path Handling
+- `ToRelativePath` in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/paths/paths.go:137` correctly rejects paths starting with `..`
+- `IsInfrastructurePath` correctly filters `.entire/` paths
+- `FilterAndNormalizePaths` in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/state.go:250` uses both functions
+
+### Command Injection
+- No new shell command execution introduced
+- Existing `exec.Command` calls use static command names with properly separated arguments
+
+### Sensitive Data Exposure
+- Logging in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go` only includes:
+  - Event types (strings)
+  - Session IDs (identifiers)
+  - Session refs (file paths)
+  - Tool use IDs (identifiers)
+- **No user prompts, file contents, or credentials are logged**
+
+### File Permissions
+- State files: `0o600` (owner read/write only)
+- Directories: `0o750` (owner rwx, group rx)
+- Metadata files: `0o644` (readable by all)
+
+### Race Conditions
+- TOCTOU risks in `FindActivePreTaskFile` are minimal
+- `.entire/tmp/` directory is repo-local
+- Worst case is stale read, not security vulnerability
+
+---
+
+## Recommendations
+
+| Priority | Finding | Effort | File |
+|----------|---------|--------|------|
+| Important | Add sessionID validation at lifecycle entry points | 15 min | `lifecycle.go` |
+| Important | Add sessionID/toolUseID validation in state capture | 15 min | `state.go` |
+| Suggestion | Document trust model for agent hook inputs | 30 min | CLAUDE.md |
+| Suggestion | Consider transcript path allowlist | 1 hour | `lifecycle.go` |
+
+---
+
+## Conclusion
+
+The refactor **improves security** by:
+1. Centralizing input handling in one dispatcher (easier to audit)
+2. Using strongly-typed `Event` structs instead of raw JSON parsing
+3. Reducing code duplication that could lead to inconsistent validation
+
+No critical security issues were found. The important findings relate to defense-in-depth improvements that should be addressed but do not block merging, as the existing validation in lower-level packages provides adequate protection.</result>
+</task-notification>
+Full transcript available at: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/a9e1340.output
+
+---
+
+<task-notification>
+<task-id>a2c09fb</task-id>
+<status>completed</status>
+<summary>Agent "Review code quality & correctness" completed</summary>
+<result>Let me provide the review directly since I can't write to the filesystem.
+
+---
+
+# Code Review: soph/agent-refactor Branch
+
+## Previous Review Status
+
+Review-01 has been addressed. The key fix was the nil dereference issue at lifecycle.go:298 which now checks `if changes != nil` before accessing fields.
+
+## Code Quality Rating: 4/5
+
+| Category | Score | Notes |
+|----------|-------|-------|
+| Correctness | 4 | Logic sound; one dead code block is harmless |
+| Error Handling | 5 | Consistent warning/error patterns throughout |
+| Code Clarity | 4 | Well-structured; minor dead code issue |
+| Go Idioms | 5 | Proper interface usage, error wrapping |
+| Dead Code | 3 | One dead if-block, missing compile-time check |
+
+## Critical Issues (Must Fix)
+
+None.
+
+## Important Issues (Should Fix)
+
+### 1. Dead code block with unused type assertion
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:552-556`
+
+```go
+if analyzer, ok := ag.(agent.TranscriptAnalyzer); ok {
+    // Use ExtractModifiedFilesFromOffset on the main transcript to get position info
+    // and then look for checkpoint UUID via the legacy path
+    _ = analyzer // UUID lookup requires transcript parsing -- delegate to existing helper
+}
+```
+
+This entire if-block is dead code. The `analyzer` variable is captured but immediately discarded with `_ = analyzer`. The comment suggests it was meant to do something but was deferred. Either remove the block entirely (the fallback code below handles the case) or implement the intended logic.
+
+### 2. Missing compile-time interface assertion for SubagentAwareExtractor
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/claudecode/lifecycle.go:20-25`
+
+`ClaudeCodeAgent` implements `SubagentAwareExtractor` (methods at `claude.go:448-459`), but there's no compile-time interface assertion:
+
+```go
+var (
+    _ agent.TranscriptAnalyzer    = (*ClaudeCodeAgent)(nil)
+    _ agent.TranscriptPreparer    = (*ClaudeCodeAgent)(nil)
+    _ agent.TokenCalculator       = (*ClaudeCodeAgent)(nil)
+    // Missing: _ agent.SubagentAwareExtractor = (*ClaudeCodeAgent)(nil)
+)
+```
+
+This won't cause runtime bugs since the interface is correctly implemented, but adding the assertion is good hygiene to catch interface drift at compile time.
+
+### 3. Subagent diagnostics use stdout instead of stderr
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:458-462, 496-504`
+
+```go
+fmt.Fprintf(os.Stdout, "[entire] Subagent started\n")
+fmt.Fprintf(os.Stdout, "  Session ID: %s\n", event.SessionID)
+// ...
+fmt.Fprintf(os.Stdout, "[entire] Subagent completed\n")
+```
+
+The rest of the codebase consistently uses stderr for informational/diagnostic messages. Using stdout could interfere with pipe-based workflows. Change to `os.Stderr`.
+
+## Suggestions (Consider)
+
+### 4. Strategy-specific logic in generic dispatcher
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/lifecycle.go:383-387`
+
+```go
+// Update session state transcript position for auto-commit strategy
+if strat.Name() == strategy.StrategyNameAutoCommit && newTranscriptPosition > 0 {
+    updateAutoCommitTranscriptPosition(sessionID, newTranscriptPosition)
+}
+```
+
+This strategy-specific logic in the generic dispatcher breaks the abstraction. Consider having auto-commit implement a `TurnEndHandler` method (already exists for manual-commit) instead.
+
+### 5. PreviousSessionID field defined but unused
+**File:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/agent/event.go:67-69`
+
+The `PreviousSessionID` field is documented as for "session continuation or handoff" but no code sets or reads it. Consider adding a TODO comment explaining when this will be implemented, or remove if not needed.
+
+## Praise
+
+1. **Clean fix for nil dereference** - The fix at line 298 properly checks `if changes != nil` before accessing fields
+2. **All tests pass** - Unit and integration tests pass cleanly
+3. **Lint-clean code** - `mise run lint` passes with no issues  
+4. **Well-focused PR feedback commit** - The review-01 fixes are clean without unrelated changes
+
+## Summary
+
+**Verdict: APPROVE**
+
+This is a well-executed refactor. The ~1500 lines of duplicated agent-specific handler code have been successfully consolidated into a unified lifecycle dispatcher. The previous review issues have been addressed. The remaining issues are minor and don't block merge:
+
+- One dead code block (harmless, just cleanup)
+- Missing compile-time assertion (good hygiene, won't cause bugs)
+- Stdout vs stderr inconsistency (minor UX issue)
+
+**Estimated effort to address feedback:** 15-30 minutes</result>
+</task-notification>
+Full transcript available at: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/a2c09fb.output
+
+---
+
+can you do those things?
+
+---
+
+please add the unit tests
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+<task-notification>
+<task-id>be97bd1</task-id>
+<output-file>/private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/be97bd1.output</output-file>
+<status>completed</status>
+<summary>Background command "Full CI check" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/be97bd1.output
+
+---
+
+<task-notification>
+<task-id>b5e7d90</task-id>
+<output-file>/private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/b5e7d90.output</output-file>
+<status>completed</status>
+<summary>Background command "Run full CI tests" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/b5e7d90.output
+
+---
+
+<task-notification>
+<task-id>b71caa4</task-id>
+<output-file>/private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/b71caa4.output</output-file>
+<status>failed</status>
+<summary>Background command "Run full test suite" failed with exit code 1</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/b71caa4.output
+
+---
+
+<task-notification>
+<task-id>b3b0fb9</task-id>
+<output-file>/private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/b3b0fb9.output</output-file>
+<status>failed</status>
+<summary>Background command "Run unit tests directly" failed with exit code 137</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/b3b0fb9.output
+
+---
+
+<task-notification>
+<task-id>b907e14</task-id>
+<output-file>/private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/b907e14.output</output-file>
+<status>completed</status>
+<summary>Background command "Run CLI package tests" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: /private/tmp/claude/-Users-soph-Work-entire-devenv-cli/tasks/b907e14.output
+
+---
+
+how do you know it's preexisting?

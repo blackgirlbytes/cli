@@ -1,0 +1,414 @@
+Implement the following plan:
+
+# Plan: OpenCode Agent Implementation (based on PR #341, aligned with agent-guide)
+
+## Context
+
+PR #341 adds OpenCode agent support with good transcript parsing, token tracking, and plugin code. However, it pre-dates the lifecycle dispatcher refactor — it creates 462 lines of custom handler code (`hooks_opencode_handlers.go`) that duplicate what `DispatchLifecycleEvent()` already does. The agent guide says: "An agent never calls strategy methods or manages session state directly."
+
+**Goal:** Create a new branch from PR #341, refactor to align with the agent guide, and delete all the hand-rolled orchestration code. The OpenCode agent should work exactly like claudecode and geminicli — implement `ParseHookEvent()`, and the framework handles everything.
+
+## Hook Mapping
+
+OpenCode doesn't have a native "before-agent" hook like Claude Code's `user-prompt-submit` or Gemini's `before-agent`. The PR #341 worked around this by re-capturing state at the end of each stop hook. Instead, we add a `prompt-submit` hook triggered by `message.updated` events (filtered to `role === "user"`) in the TypeScript plugin.
+
+| Plugin Event | Hook Verb | → Event Type | Purpose |
+|---|---|---|---|
+| `session.created` | `session-start` | `SessionStart` | Banner, concurrent session check |
+| `message.updated` (role=user) | `prompt-submit` | `TurnStart` | Capture pre-prompt state, ensure setup |
+| `session.idle` | `stop` | `TurnEnd` | Extract metadata, save checkpoint |
+| `session.compacted` | `session-end` | `SessionEnd` | Mark session ended |
+| `tool.execute.before` (task) | `task-start` | `SubagentStart` | Capture pre-task state |
+| `tool.execute.after` (task) | `task-complete` | `SubagentEnd` | Save task checkpoint |
+
+## Key Changes from PR #341
+
+### DELETE (anti-patterns from PR #341)
+- `cmd/entire/cli/hooks_opencode_handlers.go` — entire 462-line file (duplicates lifecycle.go)
+- `hook_registry.go` `RegisterHookHandler` calls — not needed (lifecycle dispatcher handles everything via `ParseHookEvent`)
+- `CaptureOpencodePrePromptState()` in `state.go` — generic `CapturePrePromptState(ag, ...)` already works via `TranscriptAnalyzer` interface
+- `createContextFileForOpencode()` — `createContextFile()` in `lifecycle.go` already handles all agents
+
+### KEEP (good code from PR #341)
+- `types.go` — transcript type definitions, hook input structs, tool constants
+- `transcript.go` — `ParseTranscript`, `ExtractModifiedFiles`, `CalculateTokenUsage`, `ExtractAllUserPrompts`, `ExtractLastAssistantMessage`
+- `hooks.go` — `HookSupport` impl (plugin file install/uninstall)
+- `opencode.go` — core Agent methods (identity, session mgmt, transcript chunking)
+- `registry.go` constants — `AgentNameOpenCode`, `AgentTypeOpenCode`
+- `hooks_cmd.go` blank import
+- `setup.go` refactoring (agent loop instead of hardcoded agents)
+- `summarize.go` stub
+- Unit tests and integration tests
+
+### ADD (missing from PR #341, required by agent guide)
+- `lifecycle.go` with `ParseHookEvent()` + `HookNames()` — the **core contribution surface**
+- `prompt-submit` hook in plugin (`message.updated` with role=user) → `TurnStart`
+- Compile-time interface assertions in `lifecycle.go`
+- `lifecycle_test.go` — tests for every hook event type + nil returns + error cases
+
+### REFACTOR
+- `entire.ts`: Add `message.updated` handler for `prompt-submit`, add `session.compacted` for `session-end`
+- `opencode.go`: Simplify `ParseHookInput()` to use `ReadAndParseHookInput[T]` generic helper
+- `opencode.go`: Wire `ExtractPrompts()`, `ExtractSummary()`, `CalculateTokenUsage()` to satisfy `TranscriptAnalyzer` and `TokenCalculator` interfaces
+- `hook_registry.go`: Only add OpenCode hook names to `getHookType()` switch
+
+## File Layout
+
+```
+cmd/entire/cli/agent/opencode/
+├── opencode.go           # Core Agent interface + init() + session mgmt
+├── lifecycle.go          # ParseHookEvent + HookNames + compile-time assertions
+├── types.go              # Hook input structs, transcript types, tool constants
+├── hooks.go              # HookSupport + HookHandler (plugin install/uninstall)
+├── transcript.go         # Transcript parsing, file extraction, token calc
+├── entire.ts             # OpenCode plugin (embedded via go:embed)
+├── opencode_test.go      # Core agent tests
+├── lifecycle_test.go     # ParseHookEvent tests (all hook names + errors)
+├── hooks_test.go         # Hook installation tests
+└── transcript_test.go    # Transcript analysis tests
+```
+
+## Implementation Steps
+
+### 1. Create branch from PR #341
+```bash
+gh pr checkout 341
+git checkout -b soph/opencode-agent-guide
+git reset --hard origin/main
+gh pr diff 341 --patch | git apply --3way
+```
+Or simpler: cherry-pick relevant commits from #341 onto main.
+
+### 2. Port `types.go` (from PR #341 — keep as-is)
+Hook input structs, transcript types, tool constants. Add `promptInputRaw` struct for TurnStart.
+
+### 3. Refactor `entire.ts` (from PR #341 — add prompt-submit hook)
+Keep existing session.created, session.idle, tool hooks. Add:
+- `message.updated` → filter `role === "user"` → call `prompt-submit` hook
+- `session.compacted` → call `session-end` hook (replaces missing session.end event)
+
+### 4. Port `transcript.go` (from PR #341 — keep as-is)
+`ParseTranscript`, `ExtractModifiedFiles`, `CalculateTokenUsage`, `ExtractAllUserPrompts`, `ExtractLastAssistantMessage`.
+
+### 5. Create `lifecycle.go` (NEW — core contribution)
+- Hook name constants: `session-start`, `prompt-submit`, `stop`, `session-end`, `task-start`, `task-complete`
+- `HookNames()` returning all six hooks
+- `ParseHookEvent(hookName, stdin)` switching on hook name:
+  - `session-start` → `SessionStart` event
+  - `prompt-submit` → `TurnStart` event (with `Prompt` field)
+  - `stop` → `TurnEnd` event
+  - `session-end` → `SessionEnd` event
+  - `task-start` → `SubagentStart` event (with `ToolUseID`)
+  - `task-complete` → `SubagentEnd` event (with `ToolUseID`)
+- Compile-time assertions for `TranscriptAnalyzer`, `TokenCalculator`
+
+### 6. Refactor `opencode.go` (from PR #341 — simplify)
+- Keep: identity methods, `DetectPresence`, session mgmt, `ChunkTranscript`/`ReassembleTranscript`, `ReadTranscript`
+- Add: `ExtractPrompts()`, `ExtractSummary()`, `CalculateTokenUsage()` (delegate to transcript.go functions)
+- Keep: `GetTranscriptPosition()`, `ExtractModifiedFilesFromOffset()` (already in PR)
+- Simplify `ParseHookInput()` to use `ReadAndParseHookInput[T]` pattern
+
+### 7. Port `hooks.go` (from PR #341 — keep as-is)
+Plugin file install/uninstall via `embed.FS`. Update `GetHookNames()` to include `prompt-submit` and `session-end`.
+
+### 8. Update framework files
+- `cmd/entire/cli/agent/registry.go`: Add `AgentNameOpenCode`, `AgentTypeOpenCode` constants
+- `cmd/entire/cli/hooks_cmd.go`: Add blank import `_ ".../agent/opencode"`
+- `cmd/entire/cli/hook_registry.go`: Add opencode hook names to `getHookType()` switch only
+- `cmd/entire/cli/setup.go`: Port the agent-loop refactoring for `removeAgentHooks` and `GetAgentsWithHooksInstalled`
+- `cmd/entire/cli/summarize/summarize.go`: Add `AgentTypeOpenCode` stub
+
+### 9. Port tests
+- Unit tests from PR: `opencode_test.go`, `hooks_test.go`, `transcript_test.go`
+- NEW: `lifecycle_test.go` with `ParseHookEvent` tests for every hook
+- Integration tests from PR (adjust to work with lifecycle dispatcher — remove references to custom handlers)
+
+### 10. Do NOT create
+- `hooks_opencode_handlers.go` — not needed
+- `CaptureOpencodePrePromptState` in `state.go` — generic version works
+- Any custom `RegisterHookHandler` calls
+
+## Critical Files to Modify
+- `cmd/entire/cli/agent/registry.go` — add constants
+- `cmd/entire/cli/hooks_cmd.go` — add import
+- `cmd/entire/cli/hook_registry.go` — add to `getHookType()` only
+- `cmd/entire/cli/setup.go` — agent-loop refactoring
+- `cmd/entire/cli/summarize/summarize.go` — stub
+
+## Verification
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Test that:
+1. Unit tests pass for all opencode package files
+2. Integration tests pass (both strategies)
+3. `entire enable --agent opencode` creates `.opencode/plugins/entire.ts`
+4. Hook dispatch works: `echo '{"session_id":"s1","transcript_path":"/tmp/t.jsonl"}' | entire hooks opencode session-start`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user asked me to implement a plan for OpenCode Agent Implementation based on PR #341, aligned with an agent-guide. The plan was detailed and specified:
+   - Create a new branch from PR #341
+   - Refactor to align with the agent guide (lifecycle dispatcher pattern)
+   - Delete hand-rolled orchestration code from PR #341
+   - Implement ParseHookEvent() so the framework handles everything
+
+2. I created task tracking items for the work:
+   - Task 1: Create branch and get PR #341 code
+   - Task 2: Implement opencode agent package files
+   - Task 3: Update framework files for opencode support
+   - Task 4: Write tests for opencode agent
+   - Task 5: Run fmt, lint, and tests
+
+3. I explored the existing codebase extensively:
+   - Read PR #341 files from origin/soph/opencode branch
+   - Read existing agent implementations (claudecode, geminicli) for patterns
+   - Read registry.go, agent.go, hook_registry.go, hooks_cmd.go, lifecycle.go, setup.go, summarize.go
+   - Read the agent-guide.md for implementation patterns
+
+4. Key findings from PR #341:
+   - It had a 514-line hooks_opencode_handlers.go that duplicated lifecycle dispatcher logic
+   - It used a RegisterHookHandler pattern instead of ParseHookEvent
+   - It changed AgentName from typed to string (we should NOT do this)
+   - It didn't have an embedded TypeScript plugin (referenced external npm package)
+   - It only had session-start, stop, task-start, task-complete hooks (missing prompt-submit and session-end)
+
+5. I created the branch soph/opencode-agent-guide from origin/main
+
+6. Created the opencode agent files:
+   - types.go - Hook input structs, transcript types, tool constants
+   - opencode.go - Core Agent interface implementation with TranscriptAnalyzer and TokenCalculator
+   - lifecycle.go - ParseHookEvent + HookNames + compile-time assertions
+   - hooks.go - HookSupport implementation with embedded TypeScript plugin
+   - entire.ts - OpenCode plugin TypeScript file
+
+7. Updated framework files:
+   - registry.go - Added AgentNameOpenCode and AgentTypeOpenCode constants
+   - hooks_cmd.go - Added blank import for opencode package
+   - hook_registry.go - Added opencode import and task hooks to getHookType()
+   - setup.go - Refactored removeAgentHooks to use agent loop, refactored uninstall display
+   - summarize.go - Added AgentTypeOpenCode to the switch statement
+
+8. Created test files:
+   - lifecycle_test.go - Tests for all ParseHookEvent hook types
+   - opencode_test.go - Tests for identity, detection, transcript operations
+   - hooks_test.go - Tests for plugin install/uninstall/idempotency
+
+9. I was in the middle of Task 4 (writing tests) and had just finished creating hooks_test.go. Task 5 (run fmt, lint, test:ci) was still pending.
+
+Let me check what files were fully created and what's still needed.
+
+Files created:
+- cmd/entire/cli/agent/opencode/types.go ✓
+- cmd/entire/cli/agent/opencode/opencode.go ✓
+- cmd/entire/cli/agent/opencode/lifecycle.go ✓
+- cmd/entire/cli/agent/opencode/hooks.go ✓
+- cmd/entire/cli/agent/opencode/entire.ts ✓
+- cmd/entire/cli/agent/opencode/lifecycle_test.go ✓
+- cmd/entire/cli/agent/opencode/opencode_test.go ✓
+- cmd/entire/cli/agent/opencode/hooks_test.go ✓
+
+Framework files modified:
+- cmd/entire/cli/agent/registry.go ✓
+- cmd/entire/cli/hooks_cmd.go ✓
+- cmd/entire/cli/hook_registry.go ✓
+- cmd/entire/cli/setup.go ✓
+- cmd/entire/cli/summarize/summarize.go ✓
+
+Pending:
+- Run `mise run fmt && mise run lint && mise run test:ci`
+- Fix any issues that arise
+- The plan also mentions integration tests - these haven't been created yet
+
+The hooks_test.go has a custom `contains` helper that reimplements strings.Contains which should probably use the standard library instead. This might cause lint issues.
+
+Also I notice some tests use `t.Chdir()` without `t.Parallel()` which is correct per the CLAUDE.md instructions (process-global state).
+
+Summary:
+1. Primary Request and Intent:
+   The user asked me to implement a detailed plan for adding OpenCode agent support to the Entire CLI. The plan is based on PR #341 (branch `soph/opencode`) which added OpenCode support but pre-dated the lifecycle dispatcher refactor, resulting in 462+ lines of custom handler code that duplicated what `DispatchLifecycleEvent()` already does. The goal is to create a new branch from main, implement the OpenCode agent following the agent-guide pattern (where agents only implement `ParseHookEvent()` and the framework handles everything), and delete all hand-rolled orchestration code from PR #341. The plan specifies exact files to keep, delete, add, and refactor.
+
+2. Key Technical Concepts:
+   - **Lifecycle Dispatcher Pattern**: Agents implement `ParseHookEvent()` to normalize native hooks into `agent.Event` types, then `DispatchLifecycleEvent()` handles all orchestration
+   - **Agent Interface Hierarchy**: Core `Agent` interface (19 methods) + optional interfaces (`HookSupport`, `HookHandler`, `TranscriptAnalyzer`, `TokenCalculator`, `SubagentAwareExtractor`, `TranscriptPreparer`)
+   - **Agent Registry Pattern**: Thread-safe map with `init()` self-registration via `agent.Register()`
+   - **Event Types**: `SessionStart`, `TurnStart`, `TurnEnd`, `SessionEnd`, `SubagentStart`, `SubagentEnd`, `Compaction`
+   - **Hook Mapping**: OpenCode plugin events → Entire hook verbs → Event types
+   - **JSONL Transcript Format**: OpenCode uses JSONL (like Claude Code) not JSON (like Gemini)
+   - **Embedded TypeScript Plugin**: OpenCode uses `.opencode/plugins/entire.ts` for hooks (unlike Claude/Gemini which use JSON settings files)
+   - **AgentName vs AgentType**: `AgentName` is registry key (e.g., "opencode"), `AgentType` is display name (e.g., "OpenCode")
+   - **`ReadAndParseHookInput[T]`**: Generic helper for reading stdin and unmarshaling JSON
+   - **`//nolint:nilnil`**: Required on intentional `nil, nil` returns from `ParseHookEvent` for pass-through hooks
+
+3. Files and Code Sections:
+
+   **Files Read for Reference (existing codebase on main):**
+   
+   - `cmd/entire/cli/agent/agent.go` - Core Agent interface with 19 methods across Identity, Event Mapping, Transcript Storage, and Legacy groups. Plus optional interfaces: HookSupport, HookHandler, TranscriptAnalyzer, TranscriptPreparer, TokenCalculator, SubagentAwareExtractor.
+   
+   - `cmd/entire/cli/agent/registry.go` - Agent registry with `AgentName` typed string, `AgentType` typed string, `Register()`, `Get()`, `List()`, `DetectAll()`, `Detect()`, `GetByAgentType()`, `AllProtectedDirs()`. Constants: `AgentNameClaudeCode`, `AgentNameGemini`, `AgentTypeClaudeCode`, `AgentTypeGemini`, `AgentTypeUnknown`.
+   
+   - `cmd/entire/cli/agent/claudecode/lifecycle.go` - Reference implementation of `ParseHookEvent()`. Shows pattern of compile-time assertions, `HookNames()` delegating to `GetHookNames()`, switch-based `ParseHookEvent()`, internal parse functions using `agent.ReadAndParseHookInput[T]`, transcript flush sentinel logic.
+   
+   - `cmd/entire/cli/agent/geminicli/lifecycle.go` - Simpler reference implementation. Shows same pattern without subagent support. Includes `Compaction` event type.
+   
+   - `cmd/entire/cli/agent/geminicli/gemini.go` - Full Agent interface implementation reference. Shows all 19 methods, TranscriptAnalyzer implementation, ChunkTranscript/ReassembleTranscript for JSON format.
+   
+   - `cmd/entire/cli/agent/geminicli/hooks.go` - HookSupport reference using JSON settings file. Shows `InstallHooks`, `UninstallHooks`, `AreHooksInstalled` pattern with idempotent installs and raw JSON preservation.
+   
+   - `cmd/entire/cli/hook_registry.go` - Current dispatcher that uses `ParseHookEvent` → `DispatchLifecycleEvent`. Has `getHookType()` for logging, `newAgentHookVerbCmdWithLogging()` that reads stdin via `cmd.InOrStdin()`.
+   
+   - `cmd/entire/cli/hooks_cmd.go` - Creates `entire hooks` command, iterates `agent.List()`, adds subcommands for agents implementing `HookHandler`.
+   
+   - `cmd/entire/cli/setup.go` - Enable/disable commands, agent detection, hook installation. Has `removeAgentHooks()` with hardcoded agent list, `runUninstall()` with hardcoded agent checks.
+   
+   - `cmd/entire/cli/summarize/summarize.go` - `BuildCondensedTranscriptFromBytes` switches on `AgentType` to choose parser.
+   
+   - `docs/architecture/agent-guide.md` - Complete agent implementation guide with step-by-step instructions, code templates, testing patterns.
+
+   **Files Read from PR #341 (origin/soph/opencode):**
+   
+   - `cmd/entire/cli/agent/opencode/opencode.go` (PR) - Had old-style `ParseHookInput()` implementation, `HookInput` struct, session management. Used `agent.AgentNameOpenCode` as plain string (PR changed AgentName to string type).
+   
+   - `cmd/entire/cli/agent/opencode/types.go` (PR) - Only had `PluginName` const and 4 hook name constants (missing prompt-submit and session-end).
+   
+   - `cmd/entire/cli/hooks_opencode_handlers.go` (PR) - 514 lines of custom handler code that directly calls strategy methods. This is the anti-pattern we're eliminating.
+   
+   - PR diff for `hook_registry.go` - Replaced lifecycle dispatcher with `RegisterHookHandler` registry pattern (anti-pattern).
+   
+   - PR diff for `setup.go` - Simplified enable command, added `newSetupAgentHooksCmd()`.
+   
+   - PR diff for `registry.go` - Changed `AgentName` from typed to plain string, removed `DetectAll`, `GetByAgentType`, `AllProtectedDirs`.
+
+   **Files Created (new opencode agent):**
+   
+   - `cmd/entire/cli/agent/opencode/types.go` - Hook input structs (`sessionInfoRaw`, `promptInputRaw`, `taskHookInputRaw`, `postTaskHookInputRaw`), transcript types (`TranscriptEntry`, `UserMessage`, `AssistantMessage`, `ContentBlock`, `TokenUsageEntry`), tool constants (`ToolWrite="Write"`, `ToolEdit="Edit"`), `FileModificationTools` slice.
+   
+   - `cmd/entire/cli/agent/opencode/opencode.go` - Full Agent interface implementation:
+     ```go
+     func init() {
+         agent.Register(agent.AgentNameOpenCode, NewOpenCodeAgent)
+     }
+     type OpenCodeAgent struct{}
+     ```
+     Identity: `Name()` returns `AgentNameOpenCode`, `Type()` returns `AgentTypeOpenCode`, `DetectPresence()` checks `.opencode` dir and `opencode.json`, `ProtectedDirs()` returns `[".opencode"]`.
+     Transcript: JSONL-based with `ChunkJSONL`/`ReassembleJSONL`.
+     TranscriptAnalyzer: `GetTranscriptPosition()` counts JSONL lines, `ExtractModifiedFilesFromOffset()` parses tool_use blocks for Write/Edit tools, `ExtractPrompts()` extracts user messages, `ExtractSummary()` finds last assistant text.
+     TokenCalculator: `CalculateTokenUsage()` sums usage from assistant message entries.
+     Internal helpers: `countJSONLLines()`, `parseJSONLEntries()`, `extractFilesFromEntry()`.
+   
+   - `cmd/entire/cli/agent/opencode/lifecycle.go` - Core contribution surface:
+     ```go
+     var (
+         _ agent.TranscriptAnalyzer = (*OpenCodeAgent)(nil)
+         _ agent.TokenCalculator    = (*OpenCodeAgent)(nil)
+     )
+     ```
+     Hook constants: `HookNameSessionStart`, `HookNamePromptSubmit`, `HookNameStop`, `HookNameSessionEnd`, `HookNameTaskStart`, `HookNameTaskComplete`.
+     `HookNames()` delegates to `GetHookNames()`.
+     `ParseHookEvent()` switches on hookName, returns normalized `agent.Event` for each:
+     - `session-start` → `SessionStart`
+     - `prompt-submit` → `TurnStart` (with Prompt field)
+     - `stop` → `TurnEnd`
+     - `session-end` → `SessionEnd`
+     - `task-start` → `SubagentStart` (with ToolUseID, ToolInput)
+     - `task-complete` → `SubagentEnd` (with ToolUseID, SubagentID)
+     - unknown → `nil, nil`
+   
+   - `cmd/entire/cli/agent/opencode/hooks.go` - HookSupport with embedded TypeScript plugin:
+     ```go
+     var (
+         _ agent.HookSupport = (*OpenCodeAgent)(nil)
+         _ agent.HookHandler = (*OpenCodeAgent)(nil)
+     )
+     //go:embed entire.ts
+     var pluginFS embed.FS
+     ```
+     `InstallHooks()` reads embedded entire.ts, replaces `__ENTIRE_BIN__` with command prefix, writes to `.opencode/plugins/entire.ts`. Returns 6 (hook count). Idempotent unless force=true.
+     `UninstallHooks()` removes the plugin file.
+     `AreHooksInstalled()` checks if plugin file exists and contains Entire hook prefixes.
+     `entireBinPrefix()` returns `"entire"` or `"go run ${OPENCODE_PROJECT_DIR}/cmd/entire/main.go"` for localDev.
+   
+   - `cmd/entire/cli/agent/opencode/entire.ts` - TypeScript plugin for OpenCode:
+     Listens for: `session.created` → `session-start`, `message.updated` (role=user) → `prompt-submit`, `session.idle` → `stop`, `session.compacted` → `session-end`, `tool.execute.before` (task) → `task-start`, `tool.execute.after` (task) → `task-complete`.
+     Uses `Bun.spawn` for fire-and-forget hook calls.
+     `__ENTIRE_BIN__` placeholder replaced at install time.
+
+   **Framework Files Modified:**
+   
+   - `cmd/entire/cli/agent/registry.go` - Added:
+     ```go
+     AgentNameOpenCode AgentName = "opencode"
+     AgentTypeOpenCode AgentType = "OpenCode"
+     ```
+   
+   - `cmd/entire/cli/hooks_cmd.go` - Added blank import:
+     ```go
+     _ "github.com/entireio/cli/cmd/entire/cli/agent/opencode"
+     ```
+   
+   - `cmd/entire/cli/hook_registry.go` - Added import `oc "github.com/entireio/cli/cmd/entire/cli/agent/opencode"` and added to `getHookType()`:
+     ```go
+     case oc.HookNameTaskStart, oc.HookNameTaskComplete:
+         return "subagent"
+     ```
+   
+   - `cmd/entire/cli/setup.go` - Refactored `removeAgentHooks()` from hardcoded agent list to generic loop over `agent.List()`. Replaced `checkClaudeCodeHooksInstalled()`/`checkGeminiCLIHooksInstalled()` with generic `getAgentNamesWithHooksInstalled()`. Updated uninstall display to use agent type names dynamically.
+   
+   - `cmd/entire/cli/summarize/summarize.go` - Added `agent.AgentTypeOpenCode` to the JSONL format case:
+     ```go
+     case agent.AgentTypeClaudeCode, agent.AgentTypeOpenCode, agent.AgentTypeUnknown:
+     ```
+
+   **Test Files Created:**
+   
+   - `cmd/entire/cli/agent/opencode/lifecycle_test.go` - Tests for all 6 hook events (SessionStart, PromptSubmit, Stop, SessionEnd, TaskStart, TaskComplete), unknown hook returns nil, empty input error, malformed JSON error, HookNames completeness.
+   
+   - `cmd/entire/cli/agent/opencode/opencode_test.go` - Tests for identity methods, ProtectedDirs, DetectPresence (with .opencode dir and opencode.json), ReadTranscript, FormatResumeCommand, GetTranscriptPosition, ExtractPrompts (with offset), ExtractSummary, ExtractModifiedFilesFromOffset, CalculateTokenUsage, ChunkTranscript, ReassembleTranscript.
+   
+   - `cmd/entire/cli/agent/opencode/hooks_test.go` - Tests for InstallHooks (creates plugin), InstallHooks with localDev, idempotent install, force reinstall, UninstallHooks, AreHooksInstalled when no file, GetSupportedHooks, GetHookNames.
+
+4. Errors and fixes:
+   - **PR #341 branch fetch failed**: `git fetch origin adrianmg/opencode-support` failed because the remote branch name was different. Fixed by fetching `origin/soph/opencode` instead.
+   - **Missing files in PR**: Expected `transcript.go`, `hooks_test.go`, etc. in the PR's opencode directory, but only `opencode.go` and `types.go` existed. The plan's file list was aspirational - adapted by creating all needed files from scratch using the agent-guide template.
+   - **No embedded TypeScript plugin in PR**: PR #341 referenced an external npm package `opencode-entire-integration`. I created an embedded `.ts` plugin file instead, following the pattern described in the plan.
+   - **Large diff output truncated**: Reading the full PR diff exceeded tool limits. Used offset/limit to read portions.
+
+5. Problem Solving:
+   - Solved the architectural mismatch between PR #341's custom handler approach and the lifecycle dispatcher pattern by completely rewriting the opencode agent from scratch following the agent-guide template
+   - Solved the hook mapping problem: OpenCode doesn't have a native "before-agent" hook, so the TypeScript plugin maps `message.updated` (role=user) to `prompt-submit` → `TurnStart`
+   - Solved the agent enumeration problem in setup.go by refactoring hardcoded agent checks to generic loops over `agent.List()`
+   - Solved the transcript format question: OpenCode uses JSONL like Claude Code (not JSON like Gemini), so can reuse `agent.ChunkJSONL`/`ReassembleJSONL`
+
+6. All user messages:
+   - "Implement the following plan: [detailed plan for OpenCode Agent Implementation based on PR #341, aligned with agent-guide]" - This was the sole user request with a comprehensive implementation plan.
+
+7. Pending Tasks:
+   - Task 5: Run `mise run fmt && mise run lint && mise run test:ci` to verify everything compiles and passes
+   - Fix any lint, format, or test failures
+   - The plan mentions integration tests from PR #341 that should be adapted, but these haven't been created yet
+   - The hooks_test.go has a custom `contains` helper that reimplements `strings.Contains` - this should be replaced to avoid duplication lint warnings
+
+8. Current Work:
+   I had just finished creating `cmd/entire/cli/agent/opencode/hooks_test.go` (Task 4 - writing tests). All source files and test files have been written. Task 4 was nearly complete (all three test files created: lifecycle_test.go, opencode_test.go, hooks_test.go). The next immediate step is Task 5: running `mise run fmt && mise run lint && mise run test:ci` to verify everything compiles and passes.
+
+9. Optional Next Step:
+   Run `mise run fmt && mise run lint && mise run test:ci` as specified in Task 5 and the plan's verification section:
+   > "## Verification
+   > ```bash
+   > mise run fmt && mise run lint && mise run test:ci
+   > ```"
+   
+   This is directly in line with the user's plan which states this as a required step. After that, fix any issues that arise from the build/test cycle. The hooks_test.go file also has a custom `contains` helper that should be replaced with `strings.Contains` to avoid lint issues.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.

@@ -1,0 +1,82 @@
+A bug report has been filed that in Windows tree entries are being created empty, corrupting the git repository from the user. Investigate and create a test to confirm it. Here's the details:
+
+Bug Summary
+Entire CLI creates shadow branches (entire/<commit>-<hash>) containing git tree objects with empty filename entries. This corrupts the git repository — git fsck reports badTree errors and git bundle create --all fails.
+
+Environment
+OS: Windows 10 Home 10.0.19045
+Entire CLI: dev (unknown) — Go 1.26.1, windows/amd64
+Git: 2.52.0.windows.1
+Repo path: C:\Users\rober\Vaults\Flowsign (an Obsidian vault)
+Root Cause
+Entire CLI appears to be splitting the absolute Windows repo path (C:\Users\rober\Vaults\Flowsign) into tree entries by path component. The drive letter C: gets split into:
+
+An empty-named directory entry (the part before C)
+A directory named c
+A directory named Users
+...and so on
+The empty-named entry (entry #1) is invalid per git's tree object format. Git requires all tree entries to have non-empty filenames.
+
+Reproduction
+# 1. Check for corrupted trees
+git fsck --full 2>&1 | grep "badTree" | wc -l
+# Output: 34
+
+# 2. Show the corruption
+git fsck --full 2>&1 | head -4
+# error: empty filename in tree entry
+# error: empty filename in tree entry
+# error in tree 0f996a098e26ad70bb4a8b0cc367c3c0b92193a8: badTree: cannot be parsed as a tree
+
+# 3. Examine a corrupted tree (raw binary parse)
+# Entry 6 in tree 0f996a09... has mode=40000, name="" (empty string)
+# That empty-named tree contains: "" -> c -> Users -> rober -> ...
+# This is the absolute Windows path leaking into the tree structure
+
+# 4. Show what the empty-named tree resolves to
+git cat-file -p 80de0046f62591d42e08b1e4ff700c19ec6a9c3e
+# 040000 tree 5c1b42b451dd51d91a21e08ca06630e94851a17b    c
+
+git cat-file -p 5c1b42b451dd51d91a21e08ca06630e94851a17b
+# 040000 tree f0fcfbc3b7d45c637a1a01d4152e5840e1bd87fb    Users
+
+git cat-file -p f0fcfbc3b7d45c637a1a01d4152e5840e1bd87fb
+# 040000 tree 23f90b8d9004a854a59ef2b66da74005afd70569    rober
+
+# 5. This breaks git bundle (used by tools like Claude Code /ultraplan)
+git bundle create /tmp/test.bundle --all
+# fatal: empty filename in tree entry
+# error: pack-objects died
+
+# 6. Main branch alone bundles fine — corruption is only in entire/* branches
+git bundle create /tmp/test.bundle main
+# (succeeds)
+Impact
+34 corrupted tree objects across 280 shadow branches
+git bundle create --all fails completely — blocks any tool that needs to pack the full repo
+git fsck reports errors on every run
+entire clean --force removes the shadow branches but the corrupted tree objects remain in the object store until garbage collected
+Workaround
+entire clean --force    # removes 280 shadow branches
+git gc --prune=now      # removes unreferenced corrupted objects
+Expected Behavior
+Shadow branch tree objects should only contain paths relative to the repository root, not absolute Windows paths. The drive letter component (C:) should never appear in tree entries.
+
+Additional Context
+All 280 shadow branches follow the entire/<short-sha>-e3b0c4 naming pattern
+The entire/checkpoints/v1 branch and main branch are NOT corrupted
+The corruption is consistent: every shadow branch has the same empty-filename tree entry at the same position (entry 6 in the root tree)
+entire clean correctly identifies these as orphaned shadow branches
+
+---
+
+Fix the issue
+
+---
+
+This only happens to shadow branches. What would it look like to implement an option in entire doctor that fixes this on any outstanding shadow branch.
+
+---
+
+Expand on the tests to ensure that a wider range of scenarios are being considered - use a table driven approach.
+Instead of erroring, those entries should be skipped but logged. This way invalid scenarios are not possible, but there is still a way to debug missing entries.

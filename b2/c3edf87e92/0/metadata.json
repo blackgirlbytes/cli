@@ -1,0 +1,98 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "b2c3edf87e92",
+  "session_id": "505074f6-04f8-47f5-ba59-9d9444474e9c",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T16:07:35.706412Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 2,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "75389a6e7b3c",
+  "token_usage": {
+    "input_tokens": 3028,
+    "cache_creation_tokens": 503187,
+    "cache_read_tokens": 21845468,
+    "output_tokens": 66040,
+    "api_call_count": 184
+  },
+  "session_metrics": {
+    "turn_count": 1
+  },
+  "summary": {
+    "intent": "Improve memory quality in the memory-loop system by replacing prompt-based soft filtering with a deterministic evidence gate, fix startup performance of the summary command, and fix missing skill patches after the evidence gate was introduced.",
+    "outcome": "Implemented a two-layer evidence gate (provenance + session ID validation) replacing passesReviewDerivedGate, removed unconditional backfill from summary command startup, fixed skill opportunity threshold in analyzer so singletons reach the evidence gate, and changed default branch filter to current branch.",
+    "learnings": {
+      "repo": [
+        "AffectedSessions in PatternAnalysis uses CheckpointID, but the generator prompt was exposing SessionID — identifier mismatch blocked Layer 2 validation; fixed by switching prompt to CheckpointID.",
+        "SkillOpportunities in improve/analyzer.go filtered out count < 2 entries before the generator saw them, making the singleton exception in passesEvidenceGate unreachable.",
+        "passesReviewDerivedGate was the only kind-specific filter and was fully subsumed by passesEvidenceGate; it was removed to avoid double-filtering.",
+        "The summary command ran summaryBackfillSummaries and summaryBackfillFacets unconditionally on every invocation even when all sessions were already processed.",
+        "logicalRuleSimilarity is defined in memoryloop.go and used there, not only in generator.go — removing passesReviewDerivedGate did not require removing it.",
+        "llmcli.ExtractJSONFromMarkdown strips code fences but not trailing plain text; the LLM returned JSON followed by a word starting with 'n', causing parse failure."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 319,
+          "end_line": 319,
+          "finding": "Prompt instruction 'avoid one-off incidents' was advisory to LLM, not enforced in code — root cause of low-quality memories."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 155,
+          "end_line": 161,
+          "finding": "Post-filter caught low confidence/strength but not singleton evidence; a high-confidence one-off sailed through."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 173,
+          "end_line": 173,
+          "finding": "SourceSessionIDs was captured but never validated for length or authenticity against actual session data."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 360,
+          "end_line": 375,
+          "finding": "passesReviewDerivedGate enforced count >= 2 || strong only for review-derived rules; all other kinds were ungated."
+        },
+        {
+          "path": "cmd/entire/cli/improve/analyzer.go",
+          "line": 319,
+          "end_line": 319,
+          "finding": "Skill opportunities with count < 2 were dropped before the generator, making the singleton exception in passesEvidenceGate unreachable."
+        },
+        {
+          "path": "cmd/entire/cli/summary_cmd.go",
+          "line": 195,
+          "end_line": 196,
+          "finding": "Unconditional backfill calls (summaries + facets) on every summary command invocation caused 50-170s silent LLM calls on first load."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "finding": "Default branch filter was filterRepo (main/master); changed to filterCurrentBranch so users see their own work by default."
+        }
+      ],
+      "workflow": [
+        "Codex was used as a second reviewer on the design doc (MEMORY_QUALITY_ANALYSIS.md) and caught material gaps before implementation began.",
+        "Design doc was written first, reviewed externally, then used to drive implementation — findings from that review changed the recommendation before a line of code was written.",
+        "Binary must be rebuilt after commits for CLI changes to take effect; the JSON parse fix appeared to not work until the binary was rebuilt."
+      ]
+    },
+    "friction": [
+      "LLM returned JSON with trailing plain text ('n...' after closing brace), causing json.Unmarshal to fail with 'invalid character n after top-level value' — required adding extractJSONObject fallback.",
+      "The fix was committed but the binary wasn't rebuilt, so the error reappeared and looked like the fix hadn't worked.",
+      "Two tests (TestReconcileGeneratedRecords_NormalizedDuplicateRefreshReconcilesIntoExistingRecord and TestReconcileGeneratedRecords_FilteredGenericCandidateDoesNotCreateExtraRecord) were missed in the initial test update pass and caught only during the full test run.",
+      "The original design doc recommendation (cross-reference against PatternAnalysis signals) was undermined by missing provenance links in the data model — required a full design revision before implementation.",
+      "The fallback 'allow if unmatched' in the original sketch would have nullified the gate for exactly the bad cases it was meant to block — caught by Codex before implementation."
+    ],
+    "open_items": [
+      "Option 4 (show evidence count in TUI before promotion) is still useful for transparency alongside the evidence gate but was not implemented.",
+      "repo_learning and workflow_learning are marked context-only in the prompt but still consume prompt tokens generating memories that will be rejected; prompt could be tightened to omit them from generation input.",
+      "Existing low-quality memories already in memory-loop.json are not retroactively re-evaluated by the evidence gate; a backfill/re-evaluation pass may be needed.",
+      "matchedSignal.Kind scoping prevents singleton exception leakage across signal types — should be verified with an explicit test for non-skill-patch records from skill opportunities.",
+      "The 'Repo' filter in the summary TUI shows nothing if no sessions are on the default branch — root cause not addressed, only the default changed."
+    ]
+  }
+}
