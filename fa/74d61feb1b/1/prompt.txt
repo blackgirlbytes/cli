@@ -1,0 +1,294 @@
+was this added in nightly build 
+peytonmontei@Peytons-MacBook-Pro ~/D/e/d/e/cli (main)> entire version
+Entire CLI v0.6.2-nightly.202605080644.bb4c8faf-dev-018edea72 (018edea72)
+Go version: go1.26.2
+OS/Arch: darwin/arm64https://github.com/entireio/cli/pull/1145#top
+
+---
+
+then why don't i see changse when running entire reviw
+
+---
+
+no it was from main, ~/D/e/d/e/cli (main)> entire review
+Reviewing main vs issues: 10 commits, 37 files changed, 4 uncommitted
+AGENT                 STATUS      DURATION  TOKENS    PREVIEW
+claude-code           ✓ done      16m8s               The local branch is 22 commits behind `…
+codex                 ✓ done      7m40s               Both passed. I reviewed `issues...HEAD`…
+
+2 agent(s) done — 2 succeeded, 0 failed, 0 cancelled
+Press any key to exit.
+
+  # claude-code review
+
+  ## Final summary
+
+  All four reviews complete. Headline findings ranked across all skills:
+  Real bugs worth fixing (HIGH):
+
+  1.  parsePostToolUse  swallows  tool_input  JSON errors → silent dataloss on
+  Codex schema drift ( agent/codex/lifecycle.go:127 )
+  2.  RecordFilesTouched  failure silently corrupts checkpoint file lists
+  ( lifecycle.go:308 )
+  3.  UninstallHooks  returns  nil  on EACCES →  entire disable  lies about
+  success ( agent/codex/hooks.go:170 )
+  4.  ensureProjectFeatureEnabled  writes TOML without validation; substring
+  collision can corrupt  .codex/config.toml  ( agent/codex/hooks.go:380 )
+  Forward-compat traps (HIGH):
+  5.  entire explain --json ,  session list --json ,  LocalReviewManifest  all
+  lack a  schema_version  field on the public envelope;
+   localReviewManifestVersion  is set on write but never validated on read
+  Test gaps (HIGH):
+  6. Cross-process flock untested;  state_lock_windows.go  has zero coverage
+  7.  ClearSessionState -during-active-mutation race has no documented winner
+  Code-quality cleanups (project-convention):
+  8. Multi-paragraph design narratives in  session_state.go  violate CLAUDE.md
+  "no multi-paragraph docstrings"
+  9. New  state_lock_unix.go / state_lock_windows.go  duplicate the existing
+   cmd/entire/cli/lockfile  package
+  Security: No vulnerabilities at confidence ≥8.
+  The local branch is 22 commits behind  origin/main , and all flagged code is
+  already merged upstream. Tell me which to act on (open a follow-up PR
+  against  main ) and I'll do it; otherwise this is just the report.
+
+
+  # codex review
+
+  Findings
+  Medium:  entire explain --json --session <old-session>  still misses
+  archived sessions in multi-session checkpoints. The new filter checks
+   RewindPoint.SessionIDs , and the JSON output exposes  session_count  /
+   session_ids , but  getBranchCheckpoints  never copies those fields into the
+   RewindPoint . It only sets the latest  SessionID , so multi-session list
+  JSON omits those fields and filtering by an older contributing session still
+  drops the checkpoint. See explain.go
+  /Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/expl
+  ain.go:2169 and explain_export.go
+  /Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/expl
+  ain_export.go:543. The existing test only exercises
+   checkpointMatchesSessionFilter  with a synthetic  RewindPoint , so it does
+  not catch the real list path.
+  Medium: SHA-256 support still has a SHA-1-only guard in transcript
+  restoration for shadow checkpoints.  selectedPoint.ID  is a 64-character
+  commit hash in SHA-256 repos, so the  len(selectedPoint.ID) == 40  checks
+  skip  restoreSessionTranscriptFromShadow . That leaves SHA-256 rewinds
+  dependent on local fallback files and can fail to restore transcript state
+  from the shadow commit. See rewind.go
+  /Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/rewi
+  nd.go:337 and rewind.go
+  /Users/peytonmontei/Documents/entire/devenv/entireio/cli/cmd/entire/cli/rewi
+  nd.go:540. The new SHA-256 integration test covers
+  enable/checkpoint/condense, but not rewind.
+  Verification
+  Ran:
+   GOCACHE=/private/tmp/entire-go-cache go test ./cmd/entire/cli
+  ./cmd/entire/cli/review ./cmd/entire/cli/checkpoint
+  ./cmd/entire/cli/strategy 
+  Ran targeted integration:
+   GOCACHE=/private/tmp/entire-go-cache go test -tags integration
+  ./cmd/entire/cli/integration_test -run
+  REDACTED -count=1 
+  Both passed. I reviewed  issues...HEAD ; uncommitted local files were
+  outside that diff scope.
+
+2 agent(s) done — 2 succeeded, 0 failed, 0 cancelled
+Generating summary...
+
+  ## Unified Review Verdict
+
+  ### Common Findings
+
+  Both agents flagged the JSON schema/version gap: claude-code identified
+  missing  schema_version  on public envelopes ( explain --json ,  session
+  list --json ,  LocalReviewManifest ), while codex found the related bug that
+   getBranchCheckpoints  never populates  SessionIDs  into  RewindPoint ,
+  making session filtering and JSON output incomplete. These are the same
+  surface — serialized state structs lack proper versioning and aren't fully
+  populated.
+
+  ### Unique Findings
+
+  claude-code only:
+
+  • Silent error swallowing in  parsePostToolUse  (dataloss risk)
+  •  RecordFilesTouched  failure corrupting checkpoint file lists
+  •  UninstallHooks  returning  nil  on EACCES (lying about success)
+  • TOML write without validation in  ensureProjectFeatureEnabled  (substring
+  collision)
+  • Cross-process flock untested; Windows lock file has zero coverage
+  • New lock files duplicate existing  cmd/entire/cli/lockfile  package
+
+  codex only:
+
+  • SHA-256 repos:  len(selectedPoint.ID) == 40  guard skips transcript
+  restoration for shadow checkpoints — rewind silently falls back to local
+  files and can fail
+
+  ### Disagreements
+
+  None — the agents reviewed different scopes (claude-code focused on
+   agent/codex/ , codex on  cmd/entire/cli/ ), so findings are largely
+  complementary rather than contradictory.
+
+  ### Priority Order
+
+   #   Issue                                             Severity
+  --- ------------------------------------------------- ----------------------
+   1    len(id) == 40  SHA-256 guard breaks rewind       Data loss
+       transcript restore
+   2    parsePostToolUse  swallows JSON errors →         Data loss
+       silent data loss
+   3    UninstallHooks  returns  nil  on EACCES          Correctness
+   4    getBranchCheckpoints  never populates            Correctness
+        SessionIDs  → broken multi-session filter
+   5   TOML write without validation in                  Correctness/security
+        ensureProjectFeatureEnabled 
+
+  The SHA-256 rewind bug (#1) is the highest risk because it's user-visible,
+  fails silently, and the new integration test explicitly doesn't cover it.
+  Fix that first.
+
+peytonmontei@Peytons-MacBook-Pro ~/D/e/d/e/cli (main)> entire version
+Entire CLI v0.6.2-nightly.202605080644.bb4c8faf-dev-018edea72 (018edea72)
+Go version: go1.26.2
+OS/Arch: darwin/arm64
+peytonmontei@Peytons-MacBook-Pro ~/D/e/d/e/cli (main)> entire review --help
+Run the review skills configured in .entire/settings.json against
+the current branch. On first run, an interactive picker writes the config.
+
+Labs entry: review is experimental. We are actively refining it based on user
+feedback.
+
+The review session is recorded as part of the next checkpoint, so the
+review metadata is permanently attached to the commit it covers.
+
+Flags:
+  --edit         re-open the review config picker
+  --findings     browse local review findings
+  --fix          apply review findings in a normal agent session
+  --all          with --fix, apply all sources/findings without selectors
+  --agent NAME   select a specific configured agent when more than one is
+                 configured (default: alphabetically first)
+
+Subcommands:
+  attach <id>    tag an existing session as a review (equivalent to
+                 'entire attach --review <id>')
+
+Usage:
+  entire review [flags]
+  entire review [command]
+
+Available Commands:
+  attach      Tag an existing agent session as a review
+
+Flags:
+      --agent string   select a specific configured agent (default: alphabetically first)
+      --all            with --fix, apply all sources/findings without selectors
+      --edit           re-open the review config picker
+      --findings       browse local review findings
+      --fix            apply review findings in a normal agent session
+  -h, --help           help for review
+
+Use "entire review [command] --help" for more information about a command.
+peytonmontei@Peytons-MacBook-Pro ~/D/e/d/e/cli (main)> entire review --findings
+No local review findings found.
+peytonmontei@Peytons-MacBook-Pro ~/D/e/d/e/cli (main)>
+
+---
+
+and also at the end of review output did not prompt me to run --fix or --findings with the correct command, whichi this should hav edone
+
+---
+
+why did this happen, the missing handshake?
+
+---
+
+im just confused because it was just ran from main, like how did env var become missing? like this seems like a normal case, how would it ever work then
+
+---
+
+so how do i test it?
+
+---
+
+okay that worked, but i don't understasnd why just cuz it's a new terminal? like do we still need to fix
+
+---
+
+this is old: HOME=/Users/peytonmontei
+PATH=/Users/peytonmontei/.local/bin:/Users/peytonmontei/.local/share/mise/installs/go/1.26.2/bin:/Users/peytonmontei/.local/share/mise/installs/golangci-lint/2.11.3/golangci-lint-2.11.3-darwin-arm64:/Users/peytonmontei/.local/share/mise/installs/shellcheck/0.11.0/shellcheck-v0.11.0:/Users/peytonmontei/.local/share/mise/installs/tmux/3.6a/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-entire-agent-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/python/3.12.12/bin:/Users/peytonmontei/.local/share/mise/installs/node/24.12.0/bin:/opt/homebrew/opt/mise/bin:/opt/homebrew/opt/mysql-client@8.4/bin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin:/opt/homebrew/bin:/Applications/Ghostty.app/Contents/MacOS
+PWD=/Users/peytonmontei/Documents/entire/devenv/entireio/cli this is new:
+
+---
+
+this is old: HOME=/Users/peytonmontei
+PATH=/Users/peytonmontei/.local/bin:/Users/peytonmontei/.local/share/mise/installs/go/1.26.2/bin:/Users/peytonmontei/.local/share/mise/installs/golangci-lint/2.11.3/golangci-lint-2.11.3-darwin-arm64:/Users/peytonmontei/.local/share/mise/installs/shellcheck/0.11.0/shellcheck-v0.11.0:/Users/peytonmontei/.local/share/mise/installs/tmux/3.6a/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-entire-agent-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/python/3.12.12/bin:/Users/peytonmontei/.local/share/mise/installs/node/24.12.0/bin:/opt/homebrew/opt/mise/bin:/opt/homebrew/opt/mysql-client@8.4/bin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin:/opt/homebrew/bin:/Applications/Ghostty.app/Contents/MacOS
+PWD=/Users/peytonmontei/Documents/entire/devenv/entireio/cli this is new: HOME=/Users/peytonmontei
+PATH=/Users/peytonmontei/.local/bin:/Users/peytonmontei/.local/share/mise/installs/go/1.26.2/bin:/Users/peytonmontei/.local/share/mise/installs/golangci-lint/2.11.3/golangci-lint-2.11.3-darwin-arm64:/Users/peytonmontei/.local/share/mise/installs/shellcheck/0.11.0/shellcheck-v0.11.0:/Users/peytonmontei/.local/share/mise/installs/tmux/3.6a/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-entire-agent-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/python/3.12.12/bin:/Users/peytonmontei/.local/share/mise/installs/node/24.12.0/bin:/opt/homebrew/opt/mise/bin:/opt/homebrew/opt/mysql-client@8.4/bin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin:/opt/homebrew/bin:/Applications/Ghostty.app/Contents/MacOS
+PWD=/Users/peytonmontei/Documents/entire/devenv/entireio/cli
+
+---
+
+old: HOME=/Users/peytonmontei
+PATH=/Users/peytonmontei/.local/bin:/Users/peytonmontei/.local/share/mise/installs/go/1.26.2/bin:/Users/peytonmontei/.local/share/mise/installs/golangci-lint/2.11.3/golangci-lint-2.11.3-darwin-arm64:/Users/peytonmontei/.local/share/mise/installs/shellcheck/0.11.0/shellcheck-v0.11.0:/Users/peytonmontei/.local/share/mise/installs/tmux/3.6a/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-entire-agent-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/python/3.12.12/bin:/Users/peytonmontei/.local/share/mise/installs/node/24.12.0/bin:/opt/homebrew/opt/mise/bin:/opt/homebrew/opt/mysql-client@8.4/bin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin:/opt/homebrew/bin:/Applications/Ghostty.app/Contents/MacOS
+PWD=/Users/peytonmontei/Documents/entire/devenv/entireio/cli
+
+---
+
+new HOME=/Users/peytonmontei
+PATH=/Users/peytonmontei/.local/bin:/Users/peytonmontei/.local/share/mise/installs/go/1.26.2/bin:/Users/peytonmontei/.local/share/mise/installs/golangci-lint/2.11.3/golangci-lint-2.11.3-darwin-arm64:/Users/peytonmontei/.local/share/mise/installs/shellcheck/0.11.0/shellcheck-v0.11.0:/Users/peytonmontei/.local/share/mise/installs/tmux/3.6a/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/go-github-com-entireio-roger-roger-cmd-entire-agent-roger-roger/latest/bin:/Users/peytonmontei/.local/share/mise/installs/python/3.12.12/bin:/Users/peytonmontei/.local/share/mise/installs/node/24.12.0/bin:/opt/homebrew/opt/mise/bin:/opt/homebrew/opt/mysql-client@8.4/bin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/pmk/env/global/bin:/opt/homebrew/bin:/Applications/Ghostty.app/Contents/MacOS
+PWD=/Users/peytonmontei/Documents/entire/devenv/entireio/cli
+
+---
+
+this is empty, diff /tmp/env-old.txt /tmp/env-new.txt
+
+---
+
+peytonmontei@Peytons-MacBook-Pro ~/D/e/d/e/cli (main)> ls -lt .git/entire-review/manifests/ | head -3
+total 48
+-rw-------@ 1 peytonmontei  staff   2303 May  8 14:25 20260508T181950-019e08d1-39da-74e0-92bf-8780abdcf72a.json
+-rw-------@ 1 peytonmontei  staff  20052 May  7 16:09 20260507T195529-073be48b-2a68-473e-b783-9fa7b78a85aa.json peytonmontei@Peytons-MacBook-Pro ~/D/e/d/e/cli (main)> grep -E "adopted review env|adoption skipped|review env
+                                                         adoption|review manifest" .entire/logs/entire.log | tail -20
+{"time":"2026-05-08T14:19:58.076323-04:00","level":"DEBUG","msg":"adopted review env","session_id":"6a33efd5-b943-4c6b-ba1b-ea16dacde14a","component":"lifecycle","agent":"codex","agent":"codex","skill_count":1}
+
+---
+
+what are the changes exactly your proposig
+
+---
+
+so what do users see thats different after this
+
+---
+
+but this only shows up if it doesn't get tagged as review session so then when it works properly everything looks normal?
+
+---
+
+okay we can add
+
+---
+
+make sure in new branch
+
+---
+
+do we need to smoke test beyond integration tests
+
+---
+
+i did that and see this    MetadataDir /lack of  CheckpointID .
+  I reviewed the committed diff for  issues...HEAD  and ignored unrelated
+  uncommitted worktree changes. I did not run tests.
+
+1 agent(s) done — 1 succeeded, 0 failed, 0 cancelled
+
+Review complete.
+
+To apply all review findings:
+  entire review --fix 019e08f0-3506-7202-98b9-5945d8302618 --all
+
+To choose findings:
+  entire review --fix 019e08f0-3506-7202-98b9-5945d8302618
