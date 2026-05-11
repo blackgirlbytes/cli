@@ -1,0 +1,40 @@
+fix   Findings:
+
+  1. High: mise-tasks/learn/regenerate /Users/alisha/.
+  marvin/worktrees/cli/entire-learn/mise-tasks/learn/regenerate:23 no longer
+  provides the atomic-write guarantee its comment promises.  mktemp  creates
+  the temp file in the system temp dir, then line 41 does  mv "$tmp"
+  cmd/entire/cli/learn/embedded/learn.md . That rename is only atomic when
+  source and destination are on the same filesystem; on common setups ( /tmp
+  on tmpfs, repo on disk) it degrades to copy+unlink. An interrupted copy can
+  still leave  learn.md  truncated or partially rewritten, which is exactly
+  the failure mode this script claims to prevent. Create the temp file in
+   cmd/entire/cli/learn/embedded/  and rename within that directory.
+  2. Medium: release.yml /Users/alisha/.marvin/worktrees/cli/entire-learn/.
+  github/workflows/release.yml:58 and the changelog skill /Users/alisha/.
+  marvin/worktrees/cli/entire-learn/.claude/skills/changelog/SKILL.md:19 leave
+  releases able to ship stale embedded learn content with no automation signal.
+  The workflow still publishes both stable and prerelease tags, and the
+  prerelease path at lines 68-83 never goes through changelog generation. But
+  the only remaining regeneration hook is now the manual “Step 0” in the
+  changelog skill, and the release job goes straight to GoReleaser without any
+   learn.md  freshness check. So a nightly tag, or any tagged release cut
+  after command-surface changes but without a manual regen, will embed
+  outdated  entire learn  output. At minimum this needs a CI validation step
+  in  release.yml  or a dedicated prerelease regeneration path.
+  I did not find a direct correctness/security regression in the  learn
+  command wiring itself; the material risks in this branch are the
+  release/regen path and the broken atomic-write assumption.
+
+---
+
+fix  1.  mktemp  template broken on macOS — data corruption risk on every regen;
+  move the suffix:  mktemp "$target_dir/.learn-XXXXXX"  then  mv  to final
+  name.
+  2. Stale  tour  in shipped code —  state.go:32,57 ,  learn_cmd.go:103
+  ( "Regenerating tour"  spinner). Two are user-visible; one is a dead cross-
+  reference.
+  3. Release gate doesn't detect content drift — gate against live
+   Discover()  output or at minimum run on PRs, not only tags.
+  4. Validation not on PR path — lift the 12-line check into a  pull_request
+  workflow filtered to  learn.md .
