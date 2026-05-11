@@ -1,0 +1,368 @@
+Implement the following plan:
+
+# Wire Up Checkpoint Search via Turbopuffer
+
+## Context
+
+Checkpoints have been backfilled into Turbopuffer (namespace `checkpoints-{repo_id}`) with embeddings and attributes. The frontend currently does client-side string matching over prompts, commit messages, and authors. We need to:
+
+1. Add a search API endpoint that queries Turbopuffer
+2. Replace the frontend's client-side filtering with API-driven search
+
+## Approach
+
+- **API**: Direct `fetch()` calls to Turbopuffer REST API from the Cloudflare Worker (no new runtime dependencies)
+- **Frontend**: Replace client-side filter entirely — when search input is non-empty, call the search endpoint; when empty, show the normal checkpoint list
+
+## Files to Modify
+
+| File | Action | Description |
+|------|--------|-------------|
+| `api/src/lib/turbopuffer.ts` | **Create** | Thin Turbopuffer REST client (query function) |
+| `api/src/env.ts` | **Modify** | Add optional `TURBOPUFFER_API_KEY` to `Env` interface |
+| `api/src/routes/cache.ts` | **Modify** | Add `GET /:org/:repo/checkpoints/search` endpoint |
+| `frontend/src/domains/platform/checkpoints/api.ts` | **Modify** | Add `searchCheckpoints()` fetch function + response type |
+| `frontend/src/domains/platform/checkpoints/hooks/useCommitsQuery.ts` | **Modify** | Add `useSearchCheckpointsQuery()` hook |
+| `frontend/src/domains/platform/checkpoints/pages/CheckpointsPage.tsx` | **Modify** | Wire search input to API query, replace client-side filter |
+
+## Implementation Details
+
+### 1. Turbopuffer REST Client (`api/src/lib/turbopuffer.ts`)
+
+Thin wrapper around Turbopuffer's REST API using `fetch()`. No SDK needed.
+
+```typescript
+export interface TurbopufferSearchResult {
+  checkpoint_id: string;
+  // other attributes returned for convenience
+}
+
+export async function searchCheckpoints(
+  apiKey: string,
+  repoId: string,
+  query: string,
+  filters?: { branch?: string },
+  limit?: number,
+): Promise<TurbopufferSearchResult[]>
+```
+
+**Turbopuffer REST endpoint**: `POST https://api.turbopuffer.com/v1/vectors/checkpoints-{repo_id}/query`
+
+**Request body** — use BM25 full-text search on the `text` attribute + optional attribute filters:
+```json
+{
+  "top_k": 50,
+  "rank_by": ["text", "BM25", "search query here"],
+  "filters": {
+    "branch": [["Eq", "main"]]
+  },
+  "include_attributes": ["checkpoint_id"]
+}
+```
+
+Returns `checkpoint_id` values which we use to fetch full checkpoint data from PlanetScale.
+
+### 2. Env Update (`api/src/env.ts`)
+
+Add `TURBOPUFFER_API_KEY?: string` as optional to the `Env` interface. Not added to `REQUIRED_ENV_VARS` since search is an optional feature — the endpoint returns 503 if the key is missing.
+
+### 3. Search API Endpoint (`api/src/routes/cache.ts`)
+
+New route on `repoRoutes`: `GET /:org/:repo/checkpoints/search?q=<query>&branch=<branch>`
+
+**Flow**:
+1. Validate `q` param (required, non-empty)
+2. Check repo access (reuse existing `checkRepoAccess()` helper)
+3. If `TURBOPUFFER_API_KEY` not set, return 503
+4. Call `searchCheckpoints()` with `repoRecord.id`, query, and optional branch filter
+5. Get the `checkpoint_id` list from results
+6. Fetch full checkpoint data from PlanetScale using existing `db.checkpoints.getByIds(repoId, checkpointIds)`
+7. Map through existing `mapCheckpointToInfo()` to build response
+8. Return in same shape as the existing checkpoints endpoint for frontend compatibility
+
+**Auth**: Same `optionalAuth + rateLimitUnauthenticated` pattern as existing checkpoint routes.
+
+**Response**: Same `CheckpointsResponse` type so the frontend can render search results identically to the normal list.
+
+### 4. Frontend API Function (`frontend/src/domains/platform/checkpoints/api.ts`)
+
+Add:
+```typescript
+export async function searchCheckpoints(
+  org: string, repo: string, query: string, branch?: string,
+): Promise<CheckpointsResponse> {
+  const params = new URLSearchParams({ q: query });
+  if (branch) params.set("branch", branch);
+  return request<CheckpointsResponse>(
+    `/api/v1/cache/${org}/${repo}/checkpoints/search?${params.toString()}`
+  );
+}
+```
+
+Reuses the existing `CheckpointsResponse` type — no new response types needed.
+
+### 5. Frontend Hook (`frontend/src/domains/platform/checkpoints/hooks/useCommitsQuery.ts`)
+
+Add:
+```typescript
+export function useSearchCheckpointsQuery(
+  org: string, repo: string, query: string, branch: string,
+) {
+  return useQuery<CheckpointsResponse>({
+    queryKey: ["github", "checkpoints-search", org, repo, query, branch],
+    queryFn: () => searchCheckpoints(org, repo, query, branch),
+    enabled: query.trim().length > 0,
+    staleTime: 30_000,
+    placeholderData: (prev) => prev, // keep previous results while fetching
+  });
+}
+```
+
+### 6. Frontend Page (`frontend/src/domains/platform/checkpoints/pages/CheckpointsPage.tsx`)
+
+Replace the client-side filter block (lines 82-95) with debounced API search:
+
+- Add `useEffect`-based debounce (300ms) on `searchQuery` → `debouncedQuery`
+- Call `useSearchCheckpointsQuery(org, repo, debouncedQuery, branch)`
+- When `debouncedQuery` is non-empty, use search results; otherwise use normal checkpoint list
+- Show subtle loading indicator while search is in flight
+- Update "No matching checkpoints" empty state to work with search results
+
+Key changes:
+- Remove: the `allCheckpoints.filter(...)` client-side logic
+- Add: `debouncedQuery` state + `useEffect` debounce
+- Add: `useSearchCheckpointsQuery` hook call
+- Modify: `checkpoints` derivation to branch on `isSearchActive`
+
+## Verification
+
+1. Set `TURBOPUFFER_API_KEY` via `wrangler secret put TURBOPUFFER_API_KEY` for staging
+2. Start API locally with `wrangler dev` — verify search endpoint:
+   ```
+   curl "http://localhost:8787/api/v1/cache/entireio/cli/checkpoints/search?q=authentication&branch=main"
+   ```
+3. Start frontend locally — test search UX:
+   - Debounced API calls (no call until 300ms after typing stops)
+   - Results render in the same ListView format
+   - Empty query shows normal checkpoint list
+   - "No results" state for queries with no matches
+   - Previous results stay visible while new search is loading
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/504a5988-0478-439b-bb41-a58eeaef723a.jsonl
+
+---
+
+can i set the env vars in .dev.vars? or wheer should i set them?
+
+also what do the serach results return?
+
+---
+
+getting this error:
+
+
+[wrangler:info] GET /api/v1/cache/entireio/cli/checkpoints/search 500 Internal Server Error (108ms)
+<-- GET /api/v1/cache/entireio/cli/checkpoints/search?q=commit+linking&branch=main
+✘ [ERROR] Failed to search checkpoints for entireio/cli: Error: Turbopuffer query failed (404): {"error":"🤷 namespace 'checkpoints-019ca7ec-f5b9-7d49-bab3-54b3fed93277' was not found","status":"error"}
+
+      at searchCheckpoints
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/turbopuffer.ts:51:11)
+      at null.<anonymous> (async
+  file:///Users/evisdrenova/code/entire/devenv/entire.io/api/.wrangler/tmp/dev-AIHNB6/index.js:63841:27)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async rateLimitUnauthenticated
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/middleware.ts:45:5)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async optionalAuth
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/middleware.ts:31:3)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async cors2
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/middleware/cors/index.js:79:5)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at null.<anonymous> (async
+  file:///Users/evisdrenova/code/entire/devenv/entire.io/api/.wrangler/tmp/dev-AIHNB6/index.js:11168:7)
+
+
+--> GET /api/v1/cache/entireio/cli/checkpoints/search?q=commit+linking&branch=main 500 93ms
+
+which makes sense since in turbo puffer i only ahve one namesapce with 1,189 documents:
+
+---
+
+can't you just use this repo_id here: checkpoints-5be1c302-97d2-4cf4-8436-b001efe227e0
+
+that's the name of the namespace
+
+---
+
+i backfilled from production to production turbopuffer, so that tis the repo_id in productionl which si fine for now, i just want one repo anyways.
+
+---
+
+now getting this error: 
+
+--> GET /api/v1/cache/entireio/cli/checkpoints/search?q=where+did+we+make+commit+changes%3F&branch=main 500 103ms
+[wrangler:info] GET /api/v1/cache/entireio/cli/checkpoints/search 500 Internal Server Error (105ms)
+<-- GET /api/v1/cache/entireio/cli/checkpoints/search?q=where+did+we+make+commit+changes%3F&branch=main
+✘ [ERROR] Failed to search checkpoints for entireio/cli: Error: Turbopuffer query failed (400): {"error":"💔 full text search not enabled for attribute 'text'. needs to be specified in the schema, see turbopuffer.com/docs/schema","status":"error"}
+
+      at searchCheckpoints
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/turbopuffer.ts:52:11)
+      at null.<anonymous> (async
+  file:///Users/evisdrenova/code/entire/devenv/entire.io/api/.wrangler/tmp/dev-AIHNB6/index.js:63841:27)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async rateLimitUnauthenticated
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/middleware.ts:45:5)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async optionalAuth
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/middleware.ts:31:3)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async cors2
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/middleware/cors/index.js:79:5)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at null.<anonymous> (async
+  file:///Users/evisdrenova/code/entire/devenv/entire.io/api/.wrangler/tmp/dev-AIHNB6/index.js:11168:7)
+
+
+--> GET /api/v1/cache/entireio/cli/checkpoints/search?q=where+did+we+make+commit+changes%3F&branch=main 500 126ms
+[wrangler:info] GET /api/v1/cache/entireio/cli/checkpoints/search 500 Internal Server Error (128ms)
+
+---
+
+now seeing this:
+
+[wrangler:info] GET /api/v1/cache/entireio/cli/checkpoints/search 500 Internal Server Error (1182ms)
+✘ [ERROR] Failed to search checkpoints for entireio/cli: TypeError: result.data is not iterable
+
+      at searchCheckpoints
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/turbopuffer.ts:95:28)
+      at null.<anonymous> (async
+  file:///Users/evisdrenova/code/entire/devenv/entire.io/api/.wrangler/tmp/dev-CNaPWH/index.js:63867:27)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async rateLimitUnauthenticated
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/middleware.ts:45:5)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async optionalAuth
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/middleware.ts:31:3)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async cors2
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/middleware/cors/index.js:79:5)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at null.<anonymous> (async
+  file:///Users/evisdrenova/code/entire/devenv/entire.io/api/.wrangler/tmp/dev-CNaPWH/index.js:11168:7)
+
+
+
+my query was "commit changes"
+
+---
+
+this si what the result looks like when you print it (refer to teh turbopuffer.ts file:
+
+<-- GET /api/v1/cache/entireio/cli/checkpoints/search?q=commit+changes&branch=main
+result [
+  {
+    dist: 0.40682757,
+    id: 488,
+    attributes: { checkpoint_id: 'bd1e99effa13' }
+  },
+  {
+    dist: 0.44047153,
+    id: 1023,
+    attributes: { checkpoint_id: '4b7d5121b42a' }
+  },
+  {
+    dist: 0.46442693,
+    id: 561,
+    attributes: { checkpoint_id: '0999195c12b1' }
+  },
+  {
+    dist: 0.47678834,
+    id: 190,
+    attributes: { checkpoint_id: '6e4ca1c6d5f5' }
+  },
+  {
+    dist: 0.48739314,
+    id: 618,
+    attributes: { checkpoint_id: '35762f1bcfdb' }
+  },
+  {
+    dist: 0.4894824,
+    id: 923,
+    attributes: { checkpoint_id: '117be7bec4b4' }
+  },
+  {
+    dist: 0.49560034,
+    id: 89,
+    attributes: { checkpoint_id: '0126b012e698' }
+  },
+  {
+    dist: 0.49969965,
+    id: 91,
+    attributes: { checkpoint_id: '39441e648927' }
+  },
+  {
+    dist: 0.499844,
+    id: 111,
+    attributes: { checkpoint_id: 'bb5d597f9fee' }
+  },
+  {
+    dist: 0.5056387,
+
+still getting this error:
+
+  }
+]
+✘ [ERROR] Failed to search checkpoints for entireio/cli: TypeError: result.rows is not iterable
+
+      at searchCheckpoints
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/turbopuffer.ts:98:28)
+      at null.<anonymous> (async
+  file:///Users/evisdrenova/code/entire/devenv/entire.io/api/.wrangler/tmp/dev-CNaPWH/index.js:63868:27)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async rateLimitUnauthenticated
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/middleware.ts:45:5)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async optionalAuth
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/src/lib/middleware.ts:31:3)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at async cors2
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/middleware/cors/index.js:79:5)
+      at async dispatch
+  (file:///Users/evisdrenova/code/entire/devenv/entire.io/api/node_modules/hono/dist/compose.js:22:17)
+      at null.<anonymous> (async
+  file:///Users/evisdrenova/code/entire/devenv/entire.io/api/.wrangler/tmp/dev-CNaPWH/index.js:11168:7)
+
+
+--> GET /api/v1/cache/entireio/cli/checkpoints/search?q=commit+changes&branch=main 500 891ms
+[wrangler:info] GET /api/v1/cache/entireio/cli/checkpoints/search 500 Internal Server Error (896ms)
+<-- GET /api/v1/cache/sync-status
+
+---
+
+okay let's create an initial com
+mit and push this to remote
+
+---
+
+okay, let's move onto the next step here and handle real time updates when checkpoints come into the api layer via webhooks. we'll want to make the upsert async and non-blocking to the webhook. also, let's use the cloudflare queues as we have them set up.
+
+---
+
+[Request interrupted by user for tool use]

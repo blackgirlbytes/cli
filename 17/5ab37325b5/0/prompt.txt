@@ -1,0 +1,88 @@
+Implement the following plan:
+
+# Plan: Remove backward-compatibility fallbacks for unknown agent types
+
+## Context
+
+Agent type tracking was added on Jan 9, 2026 (6 days after repo creation) and shipped in v0.3.5 (Jan 15). There are no realistic production sessions without agent type info. The codebase has several backward-compat patterns (`DefaultAgentType`, `isSpecificAgentType`, `ResolveAgentForRewind` fallback, backfill logic in hooks) that add complexity for a case that no longer exists. Clean them up.
+
+## Changes
+
+### 1. Remove `DefaultAgentType` and `isSpecificAgentType` (`strategy/common.go`)
+
+- Delete `DefaultAgentType = agent.AgentTypeUnknown` constant (L231-232)
+- Delete `isSpecificAgentType()` function (L270-274)
+
+### 2. Simplify `resolveAgentType` (`strategy/common.go` L276-286)
+
+Before: falls back to `DefaultAgentType` when no specific type.
+After: just use `ctx.AgentType` or state's agent type directly. Return empty string if neither is set (callers already handle empty).
+
+```go
+func resolveAgentType(ctxAgentType agent.AgentType, state *SessionState) agent.AgentType {
+    if state != nil && state.AgentType != "" {
+        return state.AgentType
+    }
+    return ctxAgentType
+}
+```
+
+### 3. Simplify `ResolveAgentForRewind` (`strategy/manual_commit_rewind.go` L708-723)
+
+Remove the `!isSpecificAgentType` fallback-to-default branch. Just call `agent.GetByAgentType` directly:
+
+```go
+func ResolveAgentForRewind(agentType agent.AgentType) (agent.Agent, error) {
+    ag, err := agent.GetByAgentType(agentType)
+    if err != nil {
+        return nil, fmt.Errorf("resolving agent %q: %w", agentType, err)
+    }
+    return ag, nil
+}
+```
+
+### 4. Remove backfill logic in hooks (`strategy/manual_commit_hooks.go`)
+
+- L337: Change `agentType := DefaultAgentType` to `agentType := agent.AgentType("")` (or just `var agentType agent.AgentType`). The value is overwritten on L341-343 if sessions exist.
+- L1540-1543: Remove the `isSpecificAgentType` backfill block entirely. Agent type is always set correctly at session creation time.
+
+### 5. Remove nil guards added for nil agents
+
+- `strategy/common.go` `prepareTranscriptIfNeeded`: remove the `ag == nil` guard (L1454) — function already resolves agent internally from `agentType`, so this is about `GetByAgentType` failing, which won't happen for valid types.
+- Check if there are any remaining nil guards from the previous session.
+
+### 6. Update tests
+
+- **`rewind_test.go`**: Remove the `"AgentTypeUnknown falls back to default agent"` test case (~L223). Update empty-string test to expect an error instead of a fallback.
+- **`manual_commit_test.go`**: Remove `TestInitializeSession_BackfillsUnknownAgentType` test (~L1800-1839). Remove `AgentTypeUnknown` references from `TestSaveStep_UsesCtxAgentType_WhenPartialState`.
+
+### 7. Keep `AgentTypeUnknown` constant and switch-case usages
+
+`AgentTypeUnknown` in `agent/registry.go` stays — it's used in switch cases that treat unknown transcripts as JSONL (Claude Code format). These are format-detection patterns, not fallback logic:
+- `manual_commit_condensation.go` L250, 561, 605, 648
+- `summarize/summarize.go` L122
+- `explain.go` L550, 1551
+- `ReadAgentTypeFromTree` return value (L513)
+
+These are correct: old checkpoints without metadata *should* be parsed as Claude Code JSONL.
+
+## Files to modify
+
+1. `cmd/entire/cli/strategy/common.go` — remove `DefaultAgentType`, `isSpecificAgentType`, simplify `resolveAgentType`, remove nil guard from `prepareTranscriptIfNeeded`
+2. `cmd/entire/cli/strategy/manual_commit_rewind.go` — simplify `ResolveAgentForRewind`
+3. `cmd/entire/cli/strategy/manual_commit_hooks.go` — remove backfill logic
+4. `cmd/entire/cli/strategy/rewind_test.go` — update tests
+5. `cmd/entire/cli/strategy/manual_commit_test.go` — remove backfill tests
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-remove-auto-commit/0759affd-c396-458d-98ea-8ea96d13c7bb.jsonl
+
+---
+
+commit it

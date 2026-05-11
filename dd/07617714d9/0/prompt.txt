@@ -1,0 +1,72 @@
+Implement the following plan:
+
+# Fix: Remove ActionUpdateLastInteraction from EventGitCommit transitions
+
+## Context
+
+`entire status` shows 57+ zombie sessions from January that appear "active 2h ago". Root cause: the PostCommit hook iterates ALL sessions for the current worktree (via `findSessionsForWorktree`), runs `TransitionAndLog(EventGitCommit)` on each, which includes `ActionUpdateLastInteraction`. This refreshes `LastInteractionTime` on every commit — even for sessions that have nothing to condense. This prevents `IsStale()` (7-day threshold) from ever returning true, so zombie sessions persist indefinitely.
+
+A git commit is not a user/agent interaction. `TurnStart`, `TurnEnd`, and `SessionStop` already cover real interactions.
+
+## Changes
+
+### 1. `cmd/entire/cli/session/phase.go` — Remove ActionUpdateLastInteraction from GitCommit transitions
+
+**transitionFromIdle** (line 169-172): Remove ActionUpdateLastInteraction
+```go
+// Before
+Actions: []Action{ActionCondense, ActionUpdateLastInteraction}
+// After
+Actions: []Action{ActionCondense}
+```
+
+**transitionFromActive** (line 209-212): Remove ActionUpdateLastInteraction
+```go
+// Before
+Actions: []Action{ActionCondense, ActionUpdateLastInteraction}
+// After
+Actions: []Action{ActionCondense}
+```
+
+**transitionFromEnded** (line 250-253): Remove ActionUpdateLastInteraction
+```go
+// Before (HasFilesTouched=true)
+Actions: []Action{ActionCondenseIfFilesTouched, ActionUpdateLastInteraction}
+// After
+Actions: []Action{ActionCondenseIfFilesTouched}
+```
+
+**transitionFromEnded** (line 255-258): Remove ActionUpdateLastInteraction
+```go
+// Before (HasFilesTouched=false)
+Actions: []Action{ActionDiscardIfNoFiles, ActionUpdateLastInteraction}
+// After
+Actions: []Action{ActionDiscardIfNoFiles}
+```
+
+### 2. `cmd/entire/cli/session/phase_test.go` — Update test expectations
+
+Update these test cases to remove ActionUpdateLastInteraction from expected actions:
+
+- `TestTransitionFromIdle/GitCommit_triggers_condense` (line 143)
+- `TestTransitionFromActive/GitCommit_condenses_immediately` (line 199)
+- `TestTransitionFromEnded/GitCommit_with_files_condenses` (line 242)
+- `TestTransitionFromEnded/GitCommit_without_files_discards` (line 249)
+- `TestTransitionBackwardCompat/empty_phase_GitCommit_treated_as_IDLE` (line 298)
+- `TestApplyTransition_CallsHandlerForCondense` (line 444) — update actions list
+- `TestApplyTransition_CallsHandlerForCondenseIfFilesTouched` (line 462) — update actions list
+- `TestApplyTransition_CallsHandlerForDiscardIfNoFiles` (line 478) — update actions list
+- `TestApplyTransition_ReturnsHandlerError_ButRunsCommonActions` (lines 528, 537-538) — update actions list AND remove the LastInteractionTime assertion (no common action to test here anymore)
+
+### 3. `cmd/entire/cli/session/phase_test.go` — Update Mermaid diagram test
+
+`TestTransitionDiagram_ContainsAllStates` (line ~380) — the generated diagram text may change since GitCommit transitions no longer include UpdateLastInteraction.
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.claude/projects/-Users-soph-Work-entire-devenv-cli/8ae52333-e3d1-4dcd-81c9-c6bc81ec8814.jsonl

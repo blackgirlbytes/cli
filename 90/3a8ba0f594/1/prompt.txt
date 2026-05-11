@@ -1,0 +1,59 @@
+Implement the following plan:
+
+# Fix: e2e.yml `matrix` not available in job-level `if`
+
+## Context
+GitHub Actions doesn't allow referencing `matrix` context in a job-level `if` condition (line 36). The `matrix` context is only available inside steps. The intent is to filter matrix entries when a specific agent is selected via `workflow_dispatch`.
+
+## Approach: Dynamic matrix via setup job
+
+Replace the static matrix + job-level `if` with a setup job that computes the matrix dynamically.
+
+### Changes to `.github/workflows/e2e.yml`
+
+1. **Add a `setup` job** that outputs the agent list:
+   - If `workflow_dispatch` with a specific agent → output `["<agent>"]`
+   - Otherwise (push, or empty agent) → output full list
+
+2. **Update `e2e-tests` job**:
+   - Add `needs: setup`
+   - Replace static `matrix.agent` list with `${{ fromJSON(needs.setup.outputs.agents) }}`
+   - Remove the invalid job-level `if`
+
+3. **Update `notify-slack` job**:
+   - Keep `needs: [e2e-tests]` (unchanged)
+
+### Result
+```yaml
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      agents: ${{ steps.set-matrix.outputs.agents }}
+    steps:
+      - id: set-matrix
+        run: |
+          if [[ "${{ github.event.inputs.agent }}" != "" ]]; then
+            echo 'agents=["${{ github.event.inputs.agent }}"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'agents=["claude-code","opencode","gemini-cli","factoryai-droid","cursor-cli","kiro"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  e2e-tests:
+    needs: setup
+    # ... (no job-level if)
+    strategy:
+      matrix:
+        agent: ${{ fromJSON(needs.setup.outputs.agents) }}
+```
+
+## Verification
+- Validate with: `gh workflow view e2e.yml` or push to a branch and check the Actions tab
+- Or use `actionlint` locally if installed: `actionlint .github/workflows/e2e.yml`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/7181acd5-e015-461f-8897-58b63e21321b.jsonl
+
+---
+
+commit and push

@@ -1,0 +1,281 @@
+In cmd/entire/cli/strategy/manual_commit_hooks.go I see this diff: ```    analyzer, ok := ag.(agent.TranscriptAnalyzer)
+    // Ensure transcript file is up-to-date (OpenCode creates/refreshes it via `opencode export`).
+    // Only wait for flush when the session is active — for idle/ended sessions the
+    // transcript is already fully flushed (the Stop hook completed the flush).
+    if state.Phase.IsActive() {
+        if preparer, ok := agent.AsTranscriptPreparer(ag); ok {
+            if prepErr := preparer.PrepareTranscript(ctx, state.TranscriptPath); prepErr != nil {
+                logging.Debug(logCtx, "prepare transcript failed",
+                    slog.String("session_id", state.SessionID),
+                    slog.String("agent_type", string(state.AgentType)),
+                    slog.String("transcript_path", state.TranscriptPath),
+                    slog.Any("error", prepErr),
+                )
+            }
+        }
+    }
+
+    analyzer, ok := agent.AsTranscriptAnalyzer(ag)``` that doesn't look right, I think we should just take what is present in main and use the `As*` method instead of type assertion
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a1e721472992b4372</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>I was attempting to write the review file to `/Users/nodo/work/cli/docs/requirements/external-plugins/review-03.md` but the Write tool was denied. I'll present the review inline instead.
+
+---
+
+# Review 03
+
+> Status: pending-dev
+> Date: 2026-03-05
+> Reviewer: Code Review Agent
+> Verdict: REQUEST CHANGES
+
+## Previous Review Status
+
+- [x] Issue 1 from review-01: Unbounded `io.ReadAll` in `ParseHookEvent` - FIXED (uses `io.LimitReader`)
+- [x] Issue 7 from review-01: No stdout buffer size limit - FIXED (uses `limitedWriter` with 10MB cap)
+- [ ] Issue 5 from review-01: Agent name from filename not validated - STILL OUTSTANDING
+- [ ] Issue 11 from review-01: Unchecked `EventType` cast - STILL OUTSTANDING
+- [ ] Issue 12 from review-01: Silent empty-string returns with no logging - STILL OUTSTANDING
+- [x] Issue 1 from review-02: Discovery runs during command tree construction - FIXED (moved to lazy RunE fallback)
+- [x] Issue 2 from review-02: No stdout buffer limit - FIXED
+- [ ] Issue 3 from review-02: Agent name validation missing - STILL OUTSTANDING (same as review-01 issue 5)
+- [ ] Issue 4 from review-02: Silent failures without logging - STILL OUTSTANDING (same as review-01 issue 12)
+- [ ] Issue 5 from review-02: `EventType` not validated - STILL OUTSTANDING (same as review-01 issue 11)
+
+## New Findings
+
+### Important (Should Fix)
+
+**1. [`cmd/entire/cli/agent/external/types.go`:30-38 + `cmd/entire/cli/agent/capabilities.go`:16-24] `Capabilities` and `DeclaredCaps` are structurally identical**
+
+`external.Capabilities` and `agent.DeclaredCaps` have the exact same 7 boolean fields with the same names. The only difference is JSON tags on `Capabilities`. In `Wrap()`, one is copied field-by-field into the other:
+
+```go
+caps: agent.DeclaredCaps{
+    Hooks:                  caps.Hooks,
+    TranscriptAnalyzer:     caps.TranscriptAnalyzer,
+    TranscriptPreparer:     caps.TranscriptPreparer,
+    // ... 4 more identical lines
+},
+```
+
+This is redundant state that must be kept in sync manually. When a new capability is added, both structs AND the field-by-field copy in `Wrap()` must be updated -- a guaranteed source of bugs.
+
+Suggested fix: Add JSON tags to `agent.DeclaredCaps` and use it directly in `InfoResponse`, eliminating `external.Capabilities` entirely. Then `Wrap()` becomes `caps: ea.info.Capabilities` with no field-by-field copy.
+
+**2. [`cmd/entire/cli/agent/external/external.go`:454-467] `limitedWriter` silently truncates output, causing misleading JSON parse errors**
+
+When an external binary writes more than 10MB to stdout, `limitedWriter` silently discards the overflow (returning `len(p), nil`). The caller then receives truncated bytes which `json.Unmarshal` fails on with an opaque "unexpected end of JSON input" error. There is no indication that truncation occurred.
+
+The 10MB limit is correct, but the error UX is poor. Suggested fix: Track a `truncated` bool in `limitedWriter` and check it in `run()` before returning the buffer, producing a clear "output exceeded 10MB limit" error instead.
+
+**3. [`cmd/entire/cli/hook_registry.go`:78-87] `getHookType` hardcodes built-in agent hook names, returns "agent" for all external agent hooks**
+
+`getHookType` switches on `claudecode.HookNamePreTask`, `geminicli.HookNameBeforeTool`, etc. For external agents whose hook names do not match these string constants, every hook is classified as `"agent"` type in logs. Since this is only used for logging, impact is limited to log quality. But if an external agent happens to use hooks named "pre-task" (matching Claude's constant values), it gets the "subagent" classification by coincidence. This is fragile coupling between logging and agent-specific constants.
+
+**4. [`cmd/entire/cli/agent/external/external.go`:123-137, 151-162, 192-202] Three methods silently swallow all errors -- carried from reviews 01 and 02**
+
+`GetSessionID`, `ResolveSessionFile`, and `FormatResumeCommand` swallow marshal errors, run errors, and unmarshal errors, returning empty strings with no logging. External agent failures (binary crashes, protocol mismatches, timeouts) are significantly more likely than built-in agent failures and much harder to diagnose. Adding `logging.Debug` calls is minimal effort with high debugging value. This has been flagged in both previous reviews.
+
+**5. [`cmd/entire/cli/agent/external/types.go`:148-150] `EventType` cast is not validated -- carried from reviews 01 and 02**
+
+`agent.EventType(ej.Type)` accepts any integer. Valid range is 1-7. An external agent returning `"type": 0` or `"type": 999` creates an event with an unknown type that propagates through the lifecycle dispatcher silently. One-line fix:
+
+```go
+if ej.Type < int(agent.SessionStart) || ej.Type > int(agent.SubagentEnd) {
+    return nil, fmt.Errorf("unknown event type: %d", ej.Type)
+}
+```
+
+### Suggestions (Consider)
+
+**6. [`cmd/entire/cli/agent/capabilities.go`:28-115] Seven `As*` functions are structurally identical**
+
+Each follows: (1) type-assert to interface, (2) check `CapabilityDeclarer`, (3) return. Could be collapsed with a generic helper reducing ~90 lines to ~25. Adding an 8th capability currently requires copying an entire function body. The current code is readable and grep-friendly, so this is a style judgment.
+
+**7. [`cmd/entire/cli/agent/external/capabilities.go`:34-136] `wrappedAgent` forwarding methods could use embedding**
+
+Every method except `DeclaredCapabilities()` is a pure forward to `w.ea.X(...)`. Embedding `*Agent` directly would eliminate all 30+ forwarding methods. New methods added to `Agent` would be inherited automatically instead of requiring a matching forwarding method -- an easy thing to forget.
+
+### Praise
+
+- **Lazy discovery is well-implemented**: The `RunE` fallback in `hooks_cmd.go` is elegant. Built-in agents get subcommands at zero cost; external agents are discovered only when an unrecognized agent name is encountered. This directly fixes the review-02 critical finding.
+
+- **`limitedWriter` approach is correct**: Silently discarding excess output (returning `len(p), nil`) rather than erroring prevents the process from being killed by a broken pipe, which is the right behavior for subprocess output limiting.
+
+- **Clean `executeAgentHook` extraction**: The refactoring to a standalone function with the `initLogging` parameter cleanly handles the difference between the subcommand path and the `RunE` fallback path.
+
+- **Type assertion migration is thorough**: All 11 call sites across 6 files were migrated from direct `ag.(agent.X)` to `agent.AsX(ag)`. No sites were missed.
+
+## Summary
+
+**Overall assessment: REQUEST CHANGES**
+
+The critical issues from previous reviews (unbounded I/O, eager discovery) have been properly addressed. The lazy discovery pattern is elegant. However:
+
+**Key concerns:**
+1. **`Capabilities` / `DeclaredCaps` duplication** (item 1) -- identical structs guaranteed to diverge when a new capability is added. Easy fix.
+2. **Silent truncation causes misleading errors** (item 2) -- clear "output too large" error instead of opaque JSON parse failure.
+3. **Three items carried from two previous reviews** (items 3-5: EventType validation, silent error swallowing, agent name validation) -- ~30 minutes combined work, flagged three times now.
+
+**Estimated effort:** ~2 hours for all Important items, ~1 hour for Suggestions (optional).
+
+---
+
+The review file should be saved to `/Users/nodo/work/cli/docs/requirements/external-plugins/review-03.md`. Please grant Write permission if you would like me to persist it, or copy the content above manually.</result>
+<usage><total_tokens>69874</total_tokens><tool_uses>32</tool_uses><duration_ms>164981</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-nodo-work-cli/tasks/a1e721472992b4372.output
+
+---
+
+<task-notification>
+<task-id>a541277b90d03618d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>I was unable to write the review file to `/Users/nodo/work/cli/docs/requirements/external-plugins/review-03.md` because Write permissions were denied. Here is the complete code reuse review:
+
+---
+
+# Review 03 - Code Reuse Focus
+
+**Verdict: APPROVE (no code reuse issues found)**
+
+I systematically searched the codebase for every potential reuse violation in the diff. Here is what I found:
+
+## No Real Code Reuse Issues
+
+### 1. The 7 As* helpers in `capabilities.go` (lines 28-115)
+
+All seven functions follow an identical pattern. A generic helper like `asCapability[T any](ag Agent, capCheck func(DeclaredCaps) bool) (T, bool)` could reduce ~90 lines to ~20. The codebase already uses generics (e.g., `readJSONFromBlob[T any]` in `checkpoint/committed.go`).
+
+**However**, this is a style preference, not a reuse bug. Each function is ~8 lines, the pattern is explicit and grep-friendly, and Go developers generally favor clarity over cleverness. The duplication is mechanical and unlikely to drift. No action needed.
+
+### 2. `external.Capabilities` vs `agent.DeclaredCaps` have identical fields
+
+Both structs have the same 7 booleans. The `Wrap()` function manually copies each field. This looks like duplication but is intentional: `external.Capabilities` is a JSON protocol type with tags, while `agent.DeclaredCaps` is an internal domain type. Merging them would couple the internal API to the external protocol schema. The field-by-field copy in `Wrap()` is the correct boundary pattern.
+
+### 3. `limitedWriter` - no existing equivalent
+
+I searched for `limitedWriter`, `LimitWriter`, `LimitedWriter`, and similar across the entire codebase. Nothing exists. The stdlib provides `io.LimitReader` but no `io.LimitWriter`. This is correctly a new utility.
+
+### 4. PATH scanning in `discovery.go` - novel to this codebase
+
+Searched for `filepath.SplitList` and PATH scanning patterns. Only other occurrence is test setup in `e2e/tests/main_test.go`. No utility to reuse.
+
+### 5. `run()` method (JSON-over-process-stdout) - no shared utility exists
+
+I checked `claudecode/generate.go`, `summarize/claude.go`, and `opencode/cli_commands.go` which also run external processes and parse JSON. Each has different requirements (different env handling, stdin, error handling, timeouts). No shared "exec and parse JSON" wrapper exists, and the variations are significant enough that extracting one would be premature.
+
+### 6. `marshalHookInput` / `marshalAgentSession` / `unmarshalAgentSession` - necessary custom serialization
+
+These convert domain types with `time.Time` fields to JSON with RFC3339 strings. Neither `agent.HookInput` nor `agent.AgentSession` have JSON tags or existing serialization methods. These helpers are unique to the external protocol boundary.
+
+### 7. `IsExternalAgentsEnabled` - correctly follows existing pattern
+
+Matches the exact same pattern as `IsSummarizeEnabled` (line 293) and `IsSetUpAndEnabled` (line 280) in the same file. Good reuse of established convention.
+
+## Correct Reuse Observed
+
+The diff correctly reuses:
+- The `settings.IsXxxEnabled` pattern for the new `IsExternalAgentsEnabled`
+- The `agent.Register` / `agent.Get` / `agent.List` registry API
+- The `paths.WorktreeRoot` utility for repo root resolution
+- The `logging.Debug` structured logging throughout discovery
+- The `agent.Event` and `agent.HookInput` domain types (not reinvented)
+
+## Summary
+
+Zero real code reuse issues found. No existing functionality was duplicated. No hand-rolled patterns replaced existing helpers. Every new function serves a purpose not covered by existing utilities. The only arguable duplication (the 7 As* helpers) is a deliberate readability-over-DRY tradeoff that I consider reasonable.
+
+The review file would be at: `/Users/nodo/work/cli/docs/requirements/external-plugins/review-03.md`. Please grant Write permission if you would like me to persist it to disk.</result>
+<usage><total_tokens>85850</total_tokens><tool_uses>43</tool_uses><duration_ms>189713</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-nodo-work-cli/tasks/a541277b90d03618d.output
+
+---
+
+<task-notification>
+<task-id>a9f2499c32a652ef3</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>I was unable to write the review file due to a permission restriction. Here is the complete efficiency review:
+
+---
+
+## Review 03 - Efficiency Focus
+
+**Status**: pending-dev | **Date**: 2026-03-05 | **Verdict**: REQUEST CHANGES
+
+### Previous Review Status
+
+- [x] Issue 1 from review-02: `DiscoverAndRegister` runs during command tree construction - FIXED (now lazy via RunE fallback)
+- [x] Issue 2 from review-02: No stdout buffer limit - FIXED (`limitedWriter` at `external.go`:431-432)
+- [ ] Issue 3 from review-02: Agent name validation - STILL OUTSTANDING
+- [ ] Issue 4 from review-02: Silent failures without logging - STILL OUTSTANDING
+- [ ] Issue 5 from review-02: `eventJSON.toEvent()` no EventType validation - STILL OUTSTANDING
+
+### Important (Should Fix)
+
+**1. [`cmd/entire/cli/strategy/manual_commit_hooks.go`:1493-1503] Double `PrepareTranscript` process spawn on the prepare-commit-msg hot path**
+
+When `sessionHasNewContentFromLiveTranscript` (line 1352) runs:
+- Step 1: `hasNewTranscriptWork` (line 1355) calls `PrepareTranscript` (line 1434-1435)
+- Step 2: If step 1 returns true, `extractModifiedFilesFromLiveTranscript` (line 1364) calls `PrepareTranscript` **again** (lines 1493-1503, added in this branch)
+
+For external agents, each `PrepareTranscript` is a full subprocess spawn (fork + exec + JSON). For OpenCode, it runs `opencode export`. The transcript does not change between these two calls, which happen milliseconds apart in the same function.
+
+The function's own doc comment at line 1476-1477 states: "Callers must ensure the transcript is prepared [...] before calling this function." All callers satisfy this:
+- `sessionHasNewContentFromLiveTranscript` prepares via `hasNewTranscriptWork`
+- `resolveFilesTouched` prepares via `prepareTranscriptForState` (line 1405)
+
+The new PrepareTranscript block inside `extractModifiedFilesFromLiveTranscript` is therefore redundant in all call paths and should be removed (lines 1490-1504).
+
+**Impact**: One extra process spawn per prepare-commit-msg hook invocation for agents implementing TranscriptPreparer.
+
+### Suggestions (Consider)
+
+**2. [`cmd/entire/cli/agent/external/external.go`:416] `cmd.Environ()` copies the full environment on every `run()` call**
+
+Each `run()` invocation copies the full OS environment via `cmd.Environ()`. For a single hook invocation, `run()` may be called multiple times. This could be avoided by caching `os.Environ()` once at the `Agent` level. However, the allocation cost is small (slice of string pointers, not deep copies), so this is a minor optimization.
+
+**Other areas investigated -- no issues found:**
+
+- **`paths.WorktreeRoot(ctx)` in `run()`**: Already cached with RWMutex + cwd-keyed cache. No redundant work.
+- **`wrappedAgent` forwarding**: One level of indirection is negligible relative to subprocess costs.
+- **`DiscoverAndRegister` PATH scanning**: Only runs for external agent hook invocations (lazy via RunE fallback) or `entire enable`. Gated behind `IsExternalAgentsEnabled`. The `os.ReadDir` calls are single syscalls per directory. Acceptable.
+- **Discovery 5-second shared timeout**: Actually good design -- caps total discovery cost and limits blast radius from slow agents.
+- **`limitedWriter` allocation per call**: Trivial cost relative to subprocess spawning.
+
+### Praise
+
+- **Lazy discovery is correct**: Built-in agents registered via import side-effect (zero cost), external agents only discovered when an unrecognized agent name appears in the RunE fallback. `entire hooks claude-code stop` never triggers discovery.
+- **`limitedWriter` silently discards excess**: Returns `len(p), nil` so the external process completes naturally rather than being killed by a write error. Well designed.
+- **`settings.IsExternalAgentsEnabled` guard**: When the feature flag is off (default), discovery is a single `settings.Load()` call. No PATH scanning, no process spawning.
+
+### Summary
+
+**Overall assessment: REQUEST CHANGES**
+
+Only one real efficiency issue: the double `PrepareTranscript` call in `extractModifiedFilesFromLiveTranscript` adds an unnecessary process spawn on every prepare-commit-msg hook invocation. All callers already prepare the transcript before calling this function, so the internal call (added in this branch at lines 1490-1504) is redundant and contradicts the function's own documented contract. Removing it is a ~15-minute fix.
+
+All other areas I investigated (env copying, PATH scanning, WorktreeRoot resolution, wrappedAgent indirection, limitedWriter allocation) are either already cached or negligible relative to subprocess costs.
+
+---
+
+I attempted to write this review to `/Users/nodo/work/cli/docs/requirements/external-plugins/review-03.md` but was denied write permission. You can save it manually or grant write access for me to create the file.</result>
+<usage><total_tokens>80312</total_tokens><tool_uses>37</tool_uses><duration_ms>190947</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-nodo-work-cli/tasks/a9f2499c32a652ef3.output

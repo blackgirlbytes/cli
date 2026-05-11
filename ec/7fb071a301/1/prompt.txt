@@ -1,0 +1,21 @@
+Verify this issue exists and fix it:
+
+`compactTranscriptForV2` internally calls `redact.JSONLBytes` on its input, expecting a raw transcript. In the finalize path, `fullTranscript` is already redacted at line 2323 before being passed to `compactTranscriptForV2` at line 2381, causing a redundant double-redaction. The condensation path at `manual_commit_condensation.go:277` correctly passes `sessionData.Transcript` (raw). While likely idempotent in practice, this is an inconsistency between the two call sites — the function contract expects unredacted input. @cmd/entire/cli/strategy/manual_commit_hooks.go:2380-2381 @cmd/entire/cli/strategy/manual_commit_condensation.go:931-947
+
+---
+
+undo those changes and just remove the redundant transcript.jsonl redaction
+
+---
+
+I think the problem is that compactTranscriptForV2() is called from two different places. When this function includes redaction, you get a comment about double redacting the transcript. When it doesn't you get a comment about missing redaction when it's called with un-redacted bytes.
+
+---
+
+`	rawTranscript := fullTranscript`
+
+why is this necessary
+
+---
+
+I don't think `compactTranscriptForV2` should take the raw transcript that's unredacted - we should only redact it once...? give it the redacted one

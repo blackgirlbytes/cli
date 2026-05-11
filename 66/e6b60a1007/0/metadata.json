@@ -1,0 +1,77 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "66e6b60a1007",
+  "session_id": "534a3173-7fa5-4d7a-81d1-10dd04328282",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T18:44:24.278292Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 2,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "3343070cb088",
+  "token_usage": {
+    "input_tokens": 160,
+    "cache_creation_tokens": 339359,
+    "cache_read_tokens": 10350917,
+    "output_tokens": 58760,
+    "api_call_count": 109
+  },
+  "session_metrics": {
+    "turn_count": 16
+  },
+  "summary": {
+    "intent": "Design and spec out three memory-loop features: memory editing (title/body/keywords), keyword-based injection boosting, and a configurable generation threshold with named presets.",
+    "outcome": "A fully refined spec was written to docs/superpowers/specs/2026-04-03-memory-loop-edit-keywords-threshold-design.md after three adversarial review rounds, an implementation plan was created in docs/superpowers/plans/2026-04-03-memory-loop-edit-keywords-threshold.md, and Task 1 (ParseKeywords + countMatchedKeywords) was dispatched to a subagent.",
+    "learnings": {
+      "repo": [
+        "Memory-loop generation pipeline filters candidates via three independent gates: evidence session count, confidence/strength floor, and generic advice phrase matching",
+        "Fingerprint for reconciliation is computed as FingerprintForRecord(kind, title, body) — keywords are intentionally excluded from the fingerprint",
+        "The huh library is used for interactive TUI form prompts throughout the wizard; force=true must be passed in tests to bypass TTY hangs",
+        "Singleton policy in the evidence gate was previously a bool but needs to be a tri-state string ('all', 'review-rules', 'none') to express balanced preset behavior",
+        "confidenceRank already exists in generator.go and returns ordered integers (low=1, medium=2, high=3), enabling comparison-based confidence filtering"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 186,
+          "end_line": 186,
+          "finding": "confidenceLow rejection gate — filters records where confidence == confidenceLow, equivalent to confidenceRank(confidence) < confidenceRank('medium')"
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/generator.go",
+          "line": 224,
+          "end_line": 224,
+          "finding": "confidenceRank function returns low=1, medium=2, high=3 — used to confirm behavioral equivalence when migrating to comparison-based threshold check"
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/detail_page.go",
+          "finding": "renderContentCard is where keywords display section needs to be added as Task 10"
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/wizard.go",
+          "finding": "Wizard has existing suppress/archive actions; new WizardIntentEdit and edit stages need to be added alongside them"
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_settings.go",
+          "finding": "Settings tab is where threshold chip selector and override indicator (e.g. 'balanced*') will be added"
+        }
+      ],
+      "workflow": [
+        "Adversarial Codex review used to stress-test specs before implementation — three passes caught multi-word tokenization flaw, singleton bool limitation, missing override validation, and missing edit history previous-value capture",
+        "Design decisions locked down through explicit Q&A (pros/cons per option) before any spec writing, preventing spec rewrites",
+        "Subagent-driven development pattern used for implementation: one subagent per task, orchestrator reviews between tasks",
+        "Self-review checklist run after spec write catches placeholder scan, internal consistency, scope, and ambiguity before handing off to adversarial review"
+      ]
+    },
+    "friction": [
+      "Codex companion script hit ENOBUFS buffer overflow when run against the working tree due to large binary files (insights.db) and many untracked files — had to fall back to an Agent-based adversarial review instead",
+      "Keyword tokenization design required a mid-spec correction: initial AND-token approach was flawed (would match 'go test' keyword against any prompt containing 'test'), needed to be redefined as exact case-insensitive phrase/substring matching"
+    ],
+    "open_items": [
+      "Tasks 2-14 of the implementation plan are unstarted — only Task 1 (ParseKeywords + countMatchedKeywords) was dispatched to a subagent",
+      "SIGINT during $EDITOR leaves a stale temp file — spec notes this as a known acceptable limitation (same as git) but no cleanup code planned",
+      "Keywords on generated memories create a reconciliation fingerprint divergence scenario (user adds keywords → generator updates memory with new fingerprint → old version with keywords gets orphaned) — documented in spec but resolution deferred to implementation"
+    ]
+  }
+}

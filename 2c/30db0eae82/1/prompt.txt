@@ -1,0 +1,210 @@
+Implement the following plan:
+
+# Plan: Add Cursor Agent Support on New Agent Interface
+
+## Context
+
+The `soph/agent-refactor` branch refactored the agent system from a callback-driven model (agents call framework functions) to a dispatcher-driven model (agents are passive data providers, framework calls agent methods). PR #260 attempted to add Cursor support on the *old* interface. We need to implement Cursor support on the *new* interface.
+
+The new architecture has a single `DispatchLifecycleEvent` dispatcher that routes normalized `Event` objects from any agent. Adding a new agent means:
+1. Implement the `Agent` interface (identity + `ParseHookEvent` + transcript methods)
+2. Implement `HookSupport` for hook installation
+3. Implement `HookHandler` (legacy, for backward compat)
+4. Register in `init()` — the framework auto-discovers agents
+
+## Branch
+
+Create `robin/cursor-agent` from `soph/agent-refactor`.
+
+## Files to Create
+
+### 1. `cmd/entire/cli/agent/cursor/cursor.go` — Main agent implementation
+
+Implements the core `Agent` interface:
+- **Identity:** `Name()="cursor"`, `Type()="Cursor"`, `Description()="Cursor - AI-powered code editor"`, `DetectPresence()` checks `.cursor/` dir, `ProtectedDirs()=[".cursor"]`
+- **Event Mapping:**
+  - `HookNames()` → `["session-start", "session-end", "before-submit-prompt", "stop", "pre-task", "post-task", "post-todo"]`
+  - `ParseHookEvent()` maps hooks to lifecycle events (see mapping table below)
+- **Transcript Storage:** `ReadTranscript`, `ChunkTranscript`, `ReassembleTranscript` — JSONL format (same as Claude Code, delegate to `agent.ChunkJSONL`/`agent.ReassembleJSONL`)
+- **Legacy methods:** `ParseHookInput`, `GetSessionID`, `GetSessionDir`, `ResolveSessionFile`, `ReadSession`, `WriteSession`, `FormatResumeCommand`, `GetHookConfigPath`, `SupportsHooks`
+
+Pattern to follow: `cmd/entire/cli/agent/claudecode/claude.go`
+
+### 2. `cmd/entire/cli/agent/cursor/lifecycle.go` — Event parsing
+
+Core `ParseHookEvent` implementation with private parse methods:
+- `parseSessionStart(stdin)` → `Event{Type: SessionStart, SessionID, SessionRef}`
+- `parseTurnStart(stdin)` → `Event{Type: TurnStart, SessionID, SessionRef, Prompt}`
+- `parseTurnEnd(stdin)` → `Event{Type: TurnEnd, SessionID, SessionRef}`
+- `parseSessionEnd(stdin)` → `Event{Type: SessionEnd, SessionID, SessionRef}`
+- `parseSubagentStart(stdin)` → `Event{Type: SubagentStart, SessionID, SessionRef, ToolUseID, ToolInput}`
+- `parseSubagentEnd(stdin)` → `Event{Type: SubagentEnd, SessionID, SessionRef, ToolUseID, SubagentID, ToolInput}`
+- `post-todo` → `nil, nil` (no lifecycle action, handled specially like Claude)
+
+Also implement `TranscriptAnalyzer` interface:
+- `GetTranscriptPosition(path)` — line count (JSONL)
+- `ExtractModifiedFilesFromOffset(path, startOffset)` — parse JSONL lines, extract Write/Edit tools
+- `ExtractPrompts(sessionRef, fromOffset)` — extract user messages
+- `ExtractSummary(sessionRef)` — last assistant text
+
+**Key insight:** Cursor uses the same JSONL transcript format as Claude Code (confirmed by PR #260 and Cursor docs). We can reuse Claude's transcript parsing utilities from the `transcript` package.
+
+Pattern to follow: `cmd/entire/cli/agent/claudecode/lifecycle.go`
+
+### 3. `cmd/entire/cli/agent/cursor/hooks.go` — Hook installation
+
+Implements `HookSupport` and `HookHandler` interfaces:
+- `InstallHooks(localDev, force)` — writes `.cursor/hooks.json`
+- `UninstallHooks()` — removes Entire entries from `.cursor/hooks.json`
+- `AreHooksInstalled()` — checks for Entire hooks
+- `GetSupportedHooks()` — returns supported hook types
+- `GetHookNames()` — returns hook verb list (delegates to `HookNames()`)
+
+**Cursor hooks.json format:**
+```json
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{"command": "entire hooks cursor session-start"}],
+    "sessionEnd": [{"command": "entire hooks cursor session-end"}],
+    "beforeSubmitPrompt": [{"command": "entire hooks cursor before-submit-prompt"}],
+    "stop": [{"command": "entire hooks cursor stop"}],
+    "preToolUse": [{"command": "entire hooks cursor pre-task", "matcher": "Task"}],
+    "postToolUse": [
+      {"command": "entire hooks cursor post-task", "matcher": "Task"},
+      {"command": "entire hooks cursor post-todo", "matcher": "TodoWrite"}
+    ]
+  }
+}
+```
+
+Note: Cursor's preToolUse/postToolUse support `matcher` field for filtering by tool name (similar to Claude's structure). The `matcher` field is optional.
+
+Pattern to follow: `cmd/entire/cli/agent/claudecode/hooks.go`
+
+### 4. `cmd/entire/cli/agent/cursor/types.go` — Type definitions
+
+Cursor-specific types:
+- `CursorHooksFile` — root `.cursor/hooks.json` structure
+- `CursorHooks` — hook arrays (camelCase keys: `sessionStart`, `sessionEnd`, `beforeSubmitPrompt`, `stop`, `preToolUse`, `postToolUse`)
+- `CursorHookEntry` — `{command, matcher?}`
+- stdin payload structs: `sessionInfoRaw`, `userPromptSubmitRaw`, `taskHookInputRaw`, `postToolHookInputRaw`
+
+Cursor payloads include both `session_id` and `conversation_id` (fallback). Use `session_id` if present, fall back to `conversation_id`.
+
+Pattern to follow: `cmd/entire/cli/agent/claudecode/types.go`
+
+### 5. `cmd/entire/cli/agent/cursor/hooks_test.go` — Hook installation tests
+
+Tests:
+- `TestInstallHooks_FreshInstall` — verify hooks.json created with all hooks
+- `TestInstallHooks_Idempotent` — verify no double-install
+- `TestAreHooksInstalled_NotInstalled`
+- `TestAreHooksInstalled_AfterInstall`
+- `TestUninstallHooks`
+- `TestInstallHooks_ForceReinstall`
+- `TestInstallHooks_PreservesExistingHooks`
+
+### 6. `cmd/entire/cli/agent/cursor/lifecycle_test.go` — Event parsing tests
+
+Tests:
+- `TestParseHookEvent_SessionStart`
+- `TestParseHookEvent_TurnStart`
+- `TestParseHookEvent_TurnEnd`
+- `TestParseHookEvent_SessionEnd`
+- `TestParseHookEvent_SubagentStart`
+- `TestParseHookEvent_SubagentEnd`
+- `TestParseHookEvent_PostTodo_ReturnsNil`
+- `TestParseHookEvent_UnknownHook_ReturnsNil`
+- `TestParseHookEvent_EmptyInput_ReturnsError`
+- `TestParseHookEvent_ConversationIDFallback`
+
+## Files to Modify
+
+### 7. `cmd/entire/cli/agent/registry.go` — Add Cursor constants
+
+Add:
+```go
+AgentNameCursor AgentName = "cursor"
+AgentTypeCursor AgentType = "Cursor"
+```
+
+### 8. `cmd/entire/cli/hooks_cmd.go` — Import cursor package
+
+Add blank import `_ "github.com/entireio/cli/cmd/entire/cli/agent/cursor"` to trigger `init()` registration.
+
+### 9. `cmd/entire/cli/hook_registry.go` — Add Cursor post-todo handling
+
+The lifecycle dispatcher handles all standard events. But `post-todo` is a special case (like Claude Code's). Add Cursor's `post-todo` handling alongside Claude's in `newAgentHookVerbCmdWithLogging`:
+
+```go
+} else if agentName == agent.AgentNameCursor && hookName == cursor.HookNamePostTodo {
+    hookErr = handleCursorPostTodo(ag, cmd.InOrStdin())
+}
+```
+
+Also update `getHookType()` to recognize Cursor's task-related hooks.
+
+### 10. `cmd/entire/cli/hooks_cursor_handlers.go` (NEW) — Cursor post-todo handler
+
+Single function `handleCursorPostTodo(ag, stdin)` that:
+1. Parses PostToolUse input from stdin
+2. Checks for active pre-task file
+3. Delegates to the existing `runPostTodoLogic()` function from the lifecycle dispatcher
+
+Actually, looking at the refactor branch more carefully — the lifecycle dispatcher already handles all events generically. The only special case is `post-todo` which returns `nil` from `ParseHookEvent`. We need a small handler file for this.
+
+### 11. `cmd/entire/cli/setup.go` — Minor adjustments
+
+The setup flow already works generically via the `agent.Get()` / `HookSupport` interface. The only change needed is the "Preview" label for Cursor (like Gemini).
+
+## Hook Name → Event Mapping
+
+| Cursor Hook Name | Event Type | Notes |
+|------------------|------------|-------|
+| `session-start` | `SessionStart` | Same as Claude |
+| `before-submit-prompt` | `TurnStart` | Cursor's name for user-prompt-submit |
+| `stop` | `TurnEnd` | Same as Claude |
+| `session-end` | `SessionEnd` | Same as Claude |
+| `pre-task` | `SubagentStart` | Maps from preToolUse[Task] |
+| `post-task` | `SubagentEnd` | Maps from postToolUse[Task] |
+| `post-todo` | `nil` | Incremental checkpoint, handled directly |
+
+## Key Design Decisions
+
+1. **JSONL transcript format**: Cursor uses the same JSONL format as Claude Code. Reuse the `transcript` package utilities for parsing.
+
+2. **No TranscriptPreparer**: Cursor doesn't need the sentinel-polling that Claude Code uses. The transcript is synchronously written before hooks fire.
+
+3. **conversation_id fallback**: Cursor payloads may send `conversation_id` instead of `session_id`. Parse both, prefer `session_id`.
+
+4. **Matcher support in hooks.json**: Cursor's hooks.json supports an optional `matcher` field on hook entries (similar to Claude's per-tool filtering). Use this for pre-task (Task matcher) and post-todo (TodoWrite matcher).
+
+5. **No settings merge**: Unlike PR #260's `.cursor/entire.json` approach, we use `.entire/settings.json` as the single source of truth. Cursor doesn't need separate settings.
+
+## Reusable Code
+
+- `agent.ChunkJSONL()` / `agent.ReassembleJSONL()` from `cmd/entire/cli/agent/chunking.go`
+- `transcript.ParseFromBytes()`, `transcript.ParseFromFileAtLine()` from `cmd/entire/cli/transcript/`
+- `transcript.ExtractUserContent()` for prompt extraction
+- `claudecode.ExtractModifiedFiles()` logic pattern (but Cursor may have different tool names)
+- Generic `readAndParse[T]()` pattern from Claude/Gemini lifecycle.go
+
+## Verification
+
+1. `mise run fmt && mise run lint` — ensure code passes formatting and linting
+2. `mise run test` — unit tests pass
+3. `mise run test:integration` — integration tests pass
+4. `mise run test:ci` — full CI suite
+5. Manual verification:
+   - `go build ./cmd/entire/` compiles
+   - `go run ./cmd/entire/ enable --agent cursor` in a test repo creates `.cursor/hooks.json`
+   - `go run ./cmd/entire/ disable` removes hooks from `.cursor/hooks.json`
+   - Hook commands exist: `go run ./cmd/entire/ hooks cursor --help` shows all hook verbs
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/robin/.REDACTED.jsonl
+
+---
+
+commit this and create a draft pr

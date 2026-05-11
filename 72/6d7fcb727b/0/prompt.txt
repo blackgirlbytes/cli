@@ -1,0 +1,56 @@
+Implement the following plan:
+
+# Plan: Create Example External Agent "test-agent"
+
+## Context
+
+The codebase has a new external agent protocol (`cmd/entire/cli/agent/external/`) that discovers binaries named `entire-agent-<name>` from `$PATH` and integrates them as agents. We need an example implementation called `entire-agent-test` to serve as a reference for building external agents.
+
+## Approach
+
+Create a minimal Go binary at `cmd/entire-agent-test/` that implements the external agent protocol. It will be a simple, self-contained agent with no real IDE integration — just enough to demonstrate the protocol and be discoverable by the CLI.
+
+### Files to Create
+
+**`cmd/entire-agent-test/main.go`** — Entry point with subcommand dispatch and helper functions (`writeJSON`, `fatal`). Pattern follows the prototype cursor external agent from git history (`8cffe0ef:cmd/entire-agent-cursor/main.go`).
+
+Subcommands to implement:
+- `info` — Return protocol v1 metadata, name="test-agent", type="Test Agent", no capabilities
+- `detect` — Always return `{"present": true}` (or check for a `.test-agent` marker dir)
+- `get-session-dir` — Return `<repo>/.test-agent/sessions`
+- `resolve-session-file` — Return `<session-dir>/<session-id>.jsonl`
+- `read-session` — Read HookInput JSON from stdin, return AgentSession JSON
+- `write-session` — Read from stdin, no-op (exit 0)
+- `format-resume-command` — Return `test-agent resume <session-id>`
+- `read-transcript` — Read file at `--session-ref` path, write raw bytes to stdout
+- `chunk-transcript` — Read stdin, split into base64 chunks, return ChunkResponse JSON
+- `reassemble-transcript` — Read JSON chunks from stdin, write raw bytes to stdout
+- Unsupported subcommands → stderr error + exit 1
+
+No optional capabilities (hooks, transcript_analyzer, etc.) — keeps it minimal.
+
+### Key Design Decisions
+
+- **Single file**: All logic in `main.go` for simplicity — this is a reference example, not production code
+- **No capabilities**: Declares no optional interfaces (hooks=false, transcript_analyzer=false, etc.), so the CLI wraps it as a `baseAgent` only
+- **Stateless**: Session read/write are stubs — just enough to satisfy the protocol
+- **Protocol v1**: Matches `external.ProtocolVersion` constant
+
+### Response types (reuse JSON shapes from `cmd/entire/cli/agent/external/types.go`)
+
+- `InfoResponse` shape for `info`
+- `DetectResponse` shape for `detect`
+- `SessionDirResponse` for `get-session-dir`
+- `SessionFileResponse` for `resolve-session-file`
+- `ChunkResponse` for `chunk-transcript`
+- `ResumeCommandResponse` for `format-resume-command`
+
+## Verification
+
+1. `go build ./cmd/entire-agent-test/` — must compile
+2. `./cmd/entire-agent-test/entire-agent-test info` — returns valid InfoResponse JSON
+3. `./cmd/entire-agent-test/entire-agent-test detect` — returns `{"present":true}`
+4. `mise run fmt && mise run lint && mise run test:ci` — all pass (no test changes needed)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/nodo/.claude/projects/-Users-nodo-work-cli/844ce1e6-6492-42d7-8fdc-60ae28435898.jsonl

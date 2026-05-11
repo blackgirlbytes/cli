@@ -1,0 +1,283 @@
+I want to create a new skill that can create ADRs based on previously recorded plans that are stored in entire checkpoints. See the CLIs source code for commands to access them. What are our options?
+
+---
+
+I'm not interested in writing ADRs, but sometimes an agent needs knowledge about previous decisions and I believe they could be reconstructed from the transcripts. I need to validate this hypothesis though.
+
+---
+
+yes
+
+---
+
+1
+
+---
+
+how would this be different than any of the skills in @../skills
+
+---
+
+Should we extend /explain instead?
+
+---
+
+yes
+
+---
+
+yes, update my local skill
+
+---
+
+would an agent use this skill to make decisions? how can we test this?
+
+---
+
+Yes
+
+---
+
+yes
+
+---
+
+So there's no other way to make an agent use this skill automatically?
+
+---
+
+any way to do this without CLAUDE.md or hook changes? Ideally I'd like to use this as a skill without needing to change repos.
+
+---
+
+Should we say "instead of looking for ADR docs, use this skill instead"? Sometimes agents look for ADRs
+
+---
+
+<task-notification>
+<task-id>ad5c22d85a749aece</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-georgf-src-entirehq-cli/cbd7e838-c4a0-4bcc-b539-22c28e55f309/tasks/ad5c22d85a749aece.output</output-file>
+<status>completed</status>
+<summary>Agent "ADR-prior trigger test" completed</summary>
+<result>No formal ADR system exists. The rationale is recorded in (a) commit messages, (b) the linked GitHub PR description, (c) CLAUDE.md/AGENTS.md, and (d) `docs/architecture/sessions-and-checkpoints.md`.
+
+---
+
+## What I did (verbatim, in order)
+
+1. Bash: `ls /Users/georgf/src/entirehq/cli/docs/`
+2. Bash: `ls /Users/georgf/src/entirehq/cli/`
+3. Bash: `ls /Users/georgf/src/entirehq/cli/docs/architecture/`
+4. Bash: `find /Users/georgf/src/entirehq/cli -type d -name "adr" -not -path "*/node_modules/*" 2&gt;/dev/null`
+5. Bash: `grep -rn "worktreeHash\|worktree-hash\|worktree hash\|WorktreeHash" /Users/georgf/src/entirehq/cli/docs/ 2&gt;/dev/null`
+6. Bash: `grep -rn "worktreeHash\|worktree-hash\|WorktreeHash\|worktreeID\|WorktreeID" /Users/georgf/src/entirehq/cli/cmd/ 2&gt;/dev/null | head -80`
+7. Read: `/Users/georgf/src/entirehq/cli/docs/architecture/sessions-and-checkpoints.md` (full file)
+8. Read (failed, type error): `/Users/georgf/src/entirehq/cli/cmd/entire/cli/checkpoint/temporary.go` with string offset
+9. Read: `/Users/georgf/src/entirehq/cli/cmd/entire/cli/checkpoint/temporary.go` lines 1–220
+10. Bash: `grep -rn "ShadowBranchNameForCommit\|ParseShadowBranchName" /Users/georgf/src/entirehq/cli/cmd/entire/cli/checkpoint/ | head -40`
+11. Read: `/Users/georgf/src/entirehq/cli/cmd/entire/cli/checkpoint/temporary.go` lines 640–730
+12. Bash: `grep -n "GetWorktreeID\|WorktreeID\|worktree" /Users/georgf/src/entirehq/cli/cmd/entire/cli/paths/*.go | head -40`
+13. Bash: `git log --all --oneline --grep="worktree" -i | head -40`
+14. Bash: `git log --all --oneline -S"HashWorktreeID" 2&gt;/dev/null | head -20`
+15. Bash: `git log --all --oneline -S"WorktreeIDHashLength" 2&gt;/dev/null | head -20`
+16. Bash: `git log --all --oneline --grep="shadow branch" -i | head -30`
+17. Bash: `git log --all --oneline --grep="worktreeID" -i 2&gt;/dev/null | head -20`
+18. Bash: `git log --all --oneline --grep="namespace\|isolat\|conflict\|collide\|cross-worktree\|per-worktree\|worktree-specific" -i -- "*.go" 2&gt;/dev/null | head -30`
+19. Bash: `git show --stat 4b7c71d21 2&gt;/dev/null | head -60`
+20. Bash: `git log --format="%H%n%s%n%n%b%n---END---" 4b7c71d21 -1 2&gt;/dev/null`
+21. Bash: `git log --format="%H%n%s%n%n%b%n---END---" 619f25fd2 48e7f2942 d5668d70e 9bb6754e2 0854bd7ba 469cb2eea -6 2&gt;/dev/null`
+22. Bash: `git log --format="%H%n%s%n%n%b%n---END---" -1 619f25fd2 ; ... ; -1 48e7f2942 ; ... ; -1 d5668d70e` (chained)
+23. Bash: `gh pr list --state merged --search "worktree-specific shadow" --limit 5 2&gt;/dev/null`
+24. Bash: `gh pr view 135 2&gt;/dev/null`
+25. Bash: `find /Users/georgf/src/entirehq/cli -type f \( -name "ADR*" -o -name "adr*" -o -name "*decision*" \) -not -path "*/.git/*" -not -path "*/node_modules/*" 2&gt;/dev/null | head -20`
+
+---
+
+## Findings
+
+### How decisions are recorded in this repo
+There is no formal ADR directory — no `docs/adr/`, no ADR-style files anywhere in the tree. Architectural rationale is captured through a combination of:
+- Architecture docs under `/Users/georgf/src/entirehq/cli/docs/architecture/`
+- Top-of-repo `CLAUDE.md` and `AGENTS.md`
+- Commit messages (the project enforces detailed, explanatory messages)
+- GitHub PR descriptions
+
+### Why shadow branches carry a worktree-hash suffix
+
+The change came in via PR #135 ("fix: make shadow branches worktree-specific to prevent false conflicts", merged 2026-02-02), implemented across these commits:
+
+- `48e7f2942` — `feat(paths): add GetWorktreeID to extract internal worktree name`
+- `619f25fd2` — `feat(checkpoint): add HashWorktreeID for worktree-specific branch names`
+- `d5668d70e` — `feat(checkpoint): add WorktreeID to checkpoint package APIs`
+- `4b7c71d21` — `feat(strategy): make shadow branches worktree-specific`
+- `9bb6754e2` — `test(integration): update tests for worktree-specific shadow branches`
+- `0854bd7ba` — `fix: address PR review comments for worktree-specific shadow branches`
+- `469cb2eea` — `Fix broken import path and missing worktreeID arg in migration`
+
+**Original reasoning (verbatim from `4b7c71d21` commit message):**
+&gt; Updates shadow branch naming from `entire/&lt;commit[:7]&gt;` to `entire/&lt;commit[:7]&gt;-&lt;hash(worktreeID)[:6]&gt;` to prevent collisions between different worktrees sharing the same base commit.
+&gt;
+&gt; This eliminates the false positive "Shadow branch conflict detected" error that occurred when starting a new session in a different worktree at the same commit as another worktree's session.
+
+**PR #135 description (https://github.com/entireio/cli/pull/135) elaborates:**
+&gt; - Fixes false positive "Shadow branch conflict detected" errors when starting Claude in a new terminal or different worktree
+&gt; - Each git worktree now gets its own shadow branch namespace, eliminating cross-worktree conflicts
+&gt; - Removed dead code: `ShadowBranchConflictError` and cross-worktree conflict detection (now impossible)
+&gt; - Kept: `SessionIDConflictError` for same-worktree, different-session conflicts (still valid)
+
+**Why a hash and not the worktree name itself** — from `48e7f2942` (`GetWorktreeID`): the function returns the *internal* git worktree identifier from `.git/worktrees/&lt;name&gt;/`, which "is stable across `git worktree move` operations, making it ideal for worktree-specific shadow branch naming." From `619f25fd2` (`HashWorktreeID`): the worktree ID is hashed to produce a "short, deterministic" 6-char suffix — this normalizes arbitrary worktree names (which can include `/`, spaces, or other characters not legal in git refs) and bounds the branch-name length.
+
+**Where it's documented going forward:**
+- `/Users/georgf/src/entirehq/cli/CLAUDE.md` — the strategy section explicitly calls out: *"Worktree-specific branches — each git worktree gets its own shadow branch namespace, preventing conflicts"* and *"Note: Different git worktrees have separate shadow branches (worktree-specific naming), so concurrent sessions in different worktrees do not conflict."*
+- `/Users/georgf/src/entirehq/cli/docs/architecture/sessions-and-checkpoints.md` — defines the format `entire/&lt;commit[:7]&gt;-&lt;worktreeHash[:6]&gt;` and documents the migration behavior on stash/pull/rebase.
+- `/Users/georgf/src/entirehq/cli/docs/architecture/checkpoint-scenarios.md` — describes shadow branches as `entire/&lt;commit-hash&gt;-&lt;worktree-hash&gt;`.
+- Source-level docs: `ShadowBranchNameForCommit` and `HashWorktreeID` in `/Users/georgf/src/entirehq/cli/cmd/entire/cli/checkpoint/temporary.go`, and `GetWorktreeID` in `/Users/georgf/src/entirehq/cli/cmd/entire/cli/paths/worktree.go`.
+
+### TL;DR rationale
+Two worktrees of the same repo can sit on the same base commit. Before this change the shadow branch was named purely from the commit hash (`entire/&lt;commit[:7]&gt;`), so two worktrees collided on a single git ref — a session starting in worktree B saw worktree A's shadow branch and threw a spurious "Shadow branch conflict detected." The fix gives each worktree its own ref namespace by appending a 6-hex-char SHA-256 hash of the internal git worktree ID (the directory name under `.git/worktrees/`, which is stable across `git worktree move`). The empty worktree ID (main worktree) hashes deterministically too, so main and linked worktrees coexist without special-casing. Cross-worktree `ShadowBranchConflictError` was deleted as no longer reachable; same-worktree `SessionIDConflictError` was preserved.</result>
+<usage><total_tokens>72322</total_tokens><tool_uses>25</tool_uses><duration_ms>129441</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>abf3bec83fed06db1</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-georgf-src-entirehq-cli/cbd7e838-c4a0-4bcc-b539-22c28e55f309/tasks/abf3bec83fed06db1.output</output-file>
+<status>completed</status>
+<summary>Agent "Re-run action-framed trigger test" completed</summary>
+<result>I have all the context I need now. Per the user's instructions, I am stopping before any Edit/Write tool calls.
+
+---
+
+## Verbatim record of what I did
+
+1. **Read context block** (CLAUDE.md/AGENTS.md project + user instructions) provided in the system prompt — no tool call.
+
+2. **Bash:** `grep -rn "worktreeHash\|worktree-hash\|WorktreeHash" /Users/georgf/src/entirehq/cli --include="*.go" | head -50` — found references in `clean.go`, `explain.go`, `explain_test.go`, `temporary.go`, `temporary_test.go`, `cleanup.go`, `clean_test.go`, `manual_commit_test.go`.
+
+3. **Bash (parallel with #2):** `grep -rn "entire/" /Users/georgf/src/entirehq/cli/cmd --include="*.go" | grep -v "_test.go" | grep -v "entire/cli" | head -50` — empty result (filtered out the `entire/cli` package path).
+
+4. **Read:** `/Users/georgf/src/entirehq/cli/cmd/entire/cli/checkpoint/temporary.go` lines 600-749 — read `ShadowBranchNameForCommit`, `ParseShadowBranchName`, `ShadowBranchExists`, `DeleteShadowBranch`.
+
+5. **Bash (parallel with #4):** `grep -rn "ShadowBranchPrefix\|shadowBranchPrefix\|HashWorktreeID\|getWorktreeHash\|getCurrentWorktreeHash" /Users/georgf/src/entirehq/cli --include="*.go" | head -50` — found `HashWorktreeID` callers, `getCurrentWorktreeHash` helper in `explain.go`, `shadowBranchPrefix` const in `strategy/common.go:306`, and `dispatch/mode_local.go:342`.
+
+6. **Read:** `/Users/georgf/src/entirehq/cli/cmd/entire/cli/checkpoint/temporary.go` lines 1-230 — confirmed const definitions (`ShadowBranchPrefix`, `ShadowBranchHashLength`, `WorktreeIDHashLength`), `HashWorktreeID`, `WriteTemporary`, `ReadTemporary`, `ListTemporary`.
+
+7. **Read:** `/Users/georgf/src/entirehq/cli/cmd/entire/cli/checkpoint/temporary_test.go` (full file) — saw all three test functions: `TestHashWorktreeID*`, `TestShadowBranchNameForCommit`, `TestParseShadowBranchName`, `TestParseShadowBranchName_RoundTrip`.
+
+8. **Bash:** `grep -rn "ShadowBranchNameForCommit\|ParseShadowBranchName\|WorktreeIDHashLength" /Users/georgf/src/entirehq/cli --include="*.go" | head -60` — enumerated all callers across `clean.go`, `reset_test.go`, `doctor.go`, `doctor_test.go`, `clean_test.go`, `integration_test/testenv.go`, `integration_test/*_test.go`, `checkpoint/checkpoint_test.go`, plus internal uses in `temporary.go`.
+
+9. **Bash (parallel with #8):** `grep -rn "WorktreeID\|worktreeID" /Users/georgf/src/entirehq/cli/cmd/entire/cli/checkpoint --include="*.go" | head -40` — saw `WorktreeID` field in `WriteTemporaryOptions` and `ListTemporaryCheckpointsOptions` structs in `checkpoint.go`.
+
+10. **Bash:** `grep -rn "WorktreeID\|worktreeID\|WorktreeIDFor\|getWorktreeID" /Users/georgf/src/entirehq/cli --include="*.go" | grep -v "_test.go" | head -60` — mapped all non-test callers across `clean.go`, `sessions.go`, `explain.go`, `doctor.go`, `integration_test/testenv.go`, `checkpoint.go`, `temporary.go`, `benchutil.go`, `paths/worktree.go`, `strategy/manual_commit_session.go`, etc.
+
+11. **Bash (parallel with #10):** `grep -rn "WorktreeID\|worktreeID\|getShadowBranchNameForCommit" /Users/georgf/src/entirehq/cli/cmd/entire/cli/strategy --include="*.go" | grep -v "_test.go" | head -60` — enumerated strategy-package call sites in `manual_commit_session.go`, `manual_commit_rewind.go`, `manual_commit_logs.go`, `manual_commit_git.go`, `manual_commit_hooks.go`, `manual_commit_condensation.go`, `manual_commit_reset.go`, `manual_commit_migration.go`, `cleanup.go`.
+
+12. **Bash (parallel with #10/#11):** `grep -rn "currentWorktreeHash\|branchWorktreeHash\|WorktreeHash" /Users/georgf/src/entirehq/cli --include="*.go" | head -40` — found `getCurrentWorktreeHash` in `explain.go:1542-1554`, the parsed-shadow filter at `explain.go:1789-1797`, and the `mainWorktreeHash := "e3b0c4"` constant in `manual_commit_test.go:701`.
+
+13. **Read:** `/Users/georgf/src/entirehq/cli/cmd/entire/cli/explain.go` lines 1530-1620 — read `getCurrentWorktreeHash` definition.
+
+14. **Read:** `/Users/georgf/src/entirehq/cli/cmd/entire/cli/explain.go` lines 1770-1819 — read `getReachableTemporaryCheckpoints` shadow-branch worktree filter.
+
+15. **Read:** `/Users/georgf/src/entirehq/cli/cmd/entire/cli/strategy/cleanup.go` lines 50-279 — read `shadowBranchPattern` regex (`^entire/[0-9a-fA-F]{7,}(-[0-9a-fA-F]{6})?$`), `IsShadowBranch`, `ListShadowBranches`, `DeleteShadowBranches`, and `ListOrphanedSessionStates`.
+
+16. **Read:** `/Users/georgf/src/entirehq/cli/cmd/entire/cli/strategy/manual_commit_test.go` lines 680-770 — read the `TestGetShadowBranchNameForCommit` test cases (with the hardcoded `"e3b0c4"`).
+
+17. **Read:** `/Users/georgf/src/entirehq/cli/cmd/entire/cli/strategy/manual_commit_session.go` lines 280-344 — read `initializeSession` (which sets `WorktreeID` on `SessionState`) and the local `getShadowBranchNameForCommit` wrapper.
+
+18. **Bash:** `grep -rn "WorktreeID\b" /Users/georgf/src/entirehq/cli/cmd/entire/cli/session --include="*.go" | head -30` — confirmed `WorktreeID` field on `SessionState` (`session/state.go:60-62`).
+
+19. **Bash (parallel with #18):** `grep -rn "WorktreeID\|worktreeID" /Users/georgf/src/entirehq/cli/docs 2&gt;/dev/null | head -30` — found doc references in `docs/architecture/sessions-and-checkpoints.md` lines 78 and 96.
+
+20. **Bash (parallel with #18):** `grep -rn "shadow branch\|shadow_branch\|ShadowBranch" /Users/georgf/src/entirehq/cli/docs 2&gt;/dev/null | head -30` — collected doc mentions in `security-and-privacy.md`, `claude-hooks-integration.md`, `commit-hook-perf-analysis.md`, `logging.md`, `sessions-and-checkpoints.md`, `checkpoint-scenarios.md`.
+
+21. **Bash:** `grep -rn "WorktreeID\b" /Users/georgf/src/entirehq/cli --include="*.go" | wc -l` (138 hits) and `... -l | head -30` — full file inventory of files that reference `WorktreeID`.
+
+22. **Read:** `/Users/georgf/src/entirehq/cli/cmd/entire/cli/paths/worktree.go` (full file) — confirmed `GetWorktreeID` returns `""` for main worktree, otherwise the linked-worktree internal name.
+
+23. **Bash (parallel with #22):** `grep -n "WorktreeID\|worktreeID" /Users/georgf/src/entirehq/cli/cmd/entire/cli/strategy/manual_commit_hooks.go | head -30` — six call sites at lines 1172, 1565, 2309, 2434, 2490, 2906.
+
+24. **Bash (parallel with #22):** `grep -rn "AGENTS.md\|CLAUDE.md" /Users/georgf/src/entirehq/cli -name "*.md" 2&gt;/dev/null | head; ls /Users/georgf/src/entirehq/cli/AGENTS.md` — confirmed `AGENTS.md` exists.
+
+25. **Bash:** `grep -n "shadow\|worktreeHash\|worktree-hash\|worktreeID\|WorktreeID" /Users/georgf/src/entirehq/cli/AGENTS.md | head -30` — confirmed `AGENTS.md` mirrors `CLAUDE.md` shadow-branch docs at lines 392-403, 464, 582, 608-625.
+
+26. **Bash (parallel with #25):** `grep -rn "concurrent session\|same directory\|different worktree" /Users/georgf/src/entirehq/cli --include="*.go" --include="*.md" | head -20` — confirmed CLAUDE.md/AGENTS.md describe the worktree-specific isolation guarantee that the user is removing.
+
+No `Skill`, `ToolSearch`, `Edit`, or `Write` calls were made. No `Monitor` or background processes were started.
+
+---
+
+## Key findings
+
+**Format definition (single source of truth):** `cmd/entire/cli/checkpoint/temporary.go`
+- Const `ShadowBranchPrefix = "entire/"`, `ShadowBranchHashLength = 7`, `WorktreeIDHashLength = 6`.
+- `HashWorktreeID(worktreeID)` — sha256, first 6 hex chars.
+- `ShadowBranchNameForCommit(baseCommit, worktreeID)` returns `entire/&lt;commit[:7]&gt;-&lt;hash(worktreeID)[:6]&gt;`.
+- `ParseShadowBranchName(branchName)` returns `(commitPrefix, worktreeHash, ok)`. Already handles old format `entire/abc1234` (no dash) — returns `worktreeHash=""`.
+
+**Format regex:** `cmd/entire/cli/strategy/cleanup.go:65` — `^entire/[0-9a-fA-F]{7,}(-[0-9a-fA-F]{6})?$` (the `(-...)? ` is already optional, so dropping the suffix won't break `IsShadowBranch`).
+
+**Worktree-aware filtering being removed:** `cmd/entire/cli/explain.go:1542-1554` (`getCurrentWorktreeHash`) and `:1785-1817` (`getReachableTemporaryCheckpoints` filters shadow branches by worktree hash). With single-namespace branches, this filter no longer makes sense.
+
+**`WorktreeID` field on `SessionState`** (`session/state.go:60-62`, set by `manual_commit_session.go:294-320`): currently used (a) to compute the shadow branch name and (b) appears in CLI session listings. After the rename, only purpose (b) remains — could keep the field as informational metadata or drop it.
+
+**Call sites of `ShadowBranchNameForCommit(baseCommit, worktreeID)`** (all pass a `worktreeID` argument):
+- `checkpoint/temporary.go` (internal): lines 69, 156, 258, 437, 630, 641 + def 653
+- `clean.go:182`, `doctor.go:241,677`, `reset_test.go:113`, `doctor_test.go:124,364`, `clean_test.go:299,345,449,789`
+- `integration_test/testenv.go:644,656`, `checkpoint/checkpoint_test.go:4012`
+- `strategy/cleanup.go:207`, `strategy/manual_commit_session.go:170,341` (wrapper `getShadowBranchNameForCommit`), `strategy/manual_commit_migration.go:108-109`, `strategy/manual_commit_git.go:73,218`, `strategy/manual_commit_hooks.go:1172,1565,2309,2434,2490`, `strategy/manual_commit_condensation.go:132,1325,1439,1529`, `strategy/manual_commit_reset.go:45,111`, `strategy/manual_commit_rewind.go:485`, `strategy/manual_commit_logs.go:52,145`
+
+**Tests that hardcode the worktree-hash format:**
+- `checkpoint/temporary_test.go` — `TestHashWorktreeID*`, `TestShadowBranchNameForCommit`, `TestParseShadowBranchName`, `TestParseShadowBranchName_RoundTrip`
+- `strategy/manual_commit_test.go:699-743` — `TestGetShadowBranchNameForCommit` with `mainWorktreeHash := "e3b0c4"`
+- `cmd/entire/cli/explain_test.go:2911-2925` — `TestGetCurrentWorktreeHash_MainWorktree`
+
+**Docs to update:** `CLAUDE.md` (lines 392-403, 464, 582, 608-625), `AGENTS.md` (parallel section), `docs/architecture/sessions-and-checkpoints.md:78,96`.
+
+---
+
+## Plan: what I would do next
+
+**Behavioral / semantic change to flag:** dropping the worktree suffix removes the isolation guarantee that lets two sessions in different git worktrees of the same repo (sharing `.git`) coexist. After this change, two worktrees pointing at the same base commit will collide on a single `entire/&lt;commit[:7]&gt;` branch. The user has explicitly asked for the simplification, so I'd implement it as requested — but I'd note this in commit message + doc updates and may want to confirm before deleting the worktree-isolation logic outright.
+
+**Step 1 — Core formatter (`checkpoint/temporary.go`):**
+- Simplify `ShadowBranchNameForCommit(baseCommit, worktreeID string)`: ignore `worktreeID`, return `ShadowBranchPrefix + commitPart`. (Keep parameter for source compatibility, or drop it and update all callers — preference: drop it, much cleaner; option: keep it for one release with a deprecation comment.) Decision: drop the parameter — clean break, single grep-able fix.
+- Simplify `ParseShadowBranchName` to return only `(commitPrefix, ok)`.
+- Delete `HashWorktreeID` and the `WorktreeIDHashLength` constant.
+- Update doc comments.
+
+**Step 2 — `WriteTemporaryOptions`/`ListTemporaryCheckpointsOptions` in `checkpoint/checkpoint.go`:** drop the `WorktreeID` field if no longer needed for naming. Keep it on `SessionState` as informational metadata (used by `sessions.go:152` for display); remove from path-construction call sites. Or simply drop everywhere if user prefers — I'd default to dropping everywhere since the user asked to "simplify."
+
+**Step 3 — Update all callers** to drop the second arg / `state.WorktreeID` pass-through:
+- `checkpoint/temporary.go` (six internal sites)
+- `clean.go`, `doctor.go`
+- `strategy/manual_commit_*.go` files (~20 call sites): collapse `getShadowBranchNameForCommit` wrapper to one-arg, fix `manual_commit_session.go`, `manual_commit_git.go`, `manual_commit_hooks.go`, `manual_commit_condensation.go`, `manual_commit_reset.go`, `manual_commit_rewind.go`, `manual_commit_logs.go`, `manual_commit_migration.go`, `cleanup.go`
+- `integration_test/testenv.go` helpers — drop `paths.GetWorktreeID` calls
+- `benchutil/benchutil.go` (only if it constructs branch names — it doesn't, it just records metadata; leave alone)
+
+**Step 4 — `explain.go`:**
+- Delete `getCurrentWorktreeHash` and the test `TestGetCurrentWorktreeHash_MainWorktree`.
+- Remove the per-worktree filter loop in `getReachableTemporaryCheckpoints`. (After change, all shadow branches under reachable base commits show up regardless of worktree.)
+
+**Step 5 — `strategy/cleanup.go` regex:** tighten `shadowBranchPattern` to `^entire/[0-9a-fA-F]{7,}$` (remove the optional `(-[0-9a-fA-F]{6})?` group). Update the doc comment block.
+
+**Step 6 — Tests:**
+- `checkpoint/temporary_test.go`: delete `TestHashWorktreeID*`. Rewrite `TestShadowBranchNameForCommit` to expect `entire/abc1234`. Rewrite `TestParseShadowBranchName` and round-trip test for the simpler format. Add a backward-compat parse test if we want to still accept the legacy `entire/&lt;commit&gt;-&lt;wkhash&gt;` shape (recommend: yes — `IsShadowBranch` regex should still match old branches so cleanup can delete them, but `ParseShadowBranchName` should accept either).
+- `strategy/manual_commit_test.go`: rewrite `TestGetShadowBranchNameForCommit` to drop `mainWorktreeHash` and the `worktreeID` field.
+- `cmd/entire/cli/explain_test.go`: drop the `getCurrentWorktreeHash` test.
+- Sweep `clean_test.go`, `doctor_test.go`, `reset_test.go`, `integration_test/*` for hardcoded worktree-hash references.
+
+**Step 7 — Backward compatibility for old shadow branches at upgrade time:** consider whether to keep `IsShadowBranch` regex tolerant of the old `-&lt;wkhash&gt;` form so `entire clean` can still find and delete leftover branches from prior CLI versions. Recommend keeping the regex permissive: `^entire/[0-9a-fA-F]{7,}(-[0-9a-fA-F]{6})?$` and only changing the **producer** (`ShadowBranchNameForCommit`). This avoids stranding branches users created with the old CLI. Document this in the commit message.
+
+**Step 8 — Docs:** update `CLAUDE.md`, `AGENTS.md`, `docs/architecture/sessions-and-checkpoints.md` to drop worktree-suffix references and rewrite the "Different git worktrees have separate shadow branches" caveat to note that worktrees on the same base commit now share a shadow branch (potential conflict source).
+
+**Step 9 — Verify:** `mise run fmt &amp;&amp; mise run lint &amp;&amp; mise run test:ci` (per project's required pre-commit checklist), plus `mise run test:e2e:canary` since shadow-branch naming is exercised by Vogon E2E flow.
+
+**Open questions I'd flag to the user before implementing:**
+1. Drop `WorktreeID` from `SessionState` entirely, or keep as informational metadata? (Recommend: keep — used in session display and is cheap.)
+2. Keep `IsShadowBranch` regex tolerant of the old format for one release (to allow `entire clean` to clean up legacy branches)? (Recommend: yes.)
+3. Drop the `worktreeID` parameter from `ShadowBranchNameForCommit` entirely or keep it (ignored) for source compatibility? (Recommend: drop — cleaner, and grep-able mass-update.)</result>
+<usage><total_tokens>87748</total_tokens><tool_uses>25</tool_uses><duration_ms>151390</duration_ms></usage>
+</task-notification>

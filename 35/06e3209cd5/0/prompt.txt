@@ -1,0 +1,98 @@
+When running the perf tool for post-commit hooks only, I do see a large discrepancy between the overall run time and the steps:
+
+❯ go run ./cmd/entire perf --hook post-commit --last 20
+post-commit  294ms  2026-03-06T14:14:26-08:00
+
+  STEP                        DURATION
+  carry_forward_files              0ms
+  check_session_content            0ms
+  cleanup_shadow_branches         12ms
+  find_sessions_for_worktree       0ms
+  open_repository_and_head         0ms
+  resolve_commit_trees             6ms
+  resolve_shadow_branch            0ms
+  save_session_state               0ms
+  transition_and_condense          0ms
+
+post-commit  3322ms  2026-03-06T13:59:36-08:00
+
+  STEP                        DURATION
+  carry_forward_files              0ms
+  check_session_content            0ms
+  cleanup_shadow_branches         11ms
+  find_sessions_for_worktree       0ms
+  open_repository_and_head         0ms
+  resolve_commit_trees             7ms
+  resolve_shadow_branch            0ms
+  save_session_state               0ms
+  transition_and_condense          0ms
+
+post-commit  3279ms  2026-03-06T13:56:48-08:00
+
+  STEP                        DURATION
+  carry_forward_files              0ms
+  check_session_content            0ms
+  cleanup_shadow_branches         11ms
+  find_sessions_for_worktree       0ms
+  open_repository_and_head         0ms
+  resolve_commit_trees             6ms
+  resolve_shadow_branch            0ms
+  save_session_state               0ms
+  transition_and_condense          0ms
+
+Are we missing some instrumentation code here or is there something else going on?
+
+---
+
+Can you help fix the instrumentation bug? I'll want to come back to the sentinel bottleneck later.
+
+---
+
+Sorry, I accidentally undid some of your changes. Can you redo them?
+
+---
+
+Okay, back to that 3 second sentinel issue: What options do we have to fix it?
+
+---
+
+What's the sentinel value actually for and what side effects would removing the wait for it have?
+
+---
+
+I would like to fix this but it should be in a separate worktree+branch+claude session. Can you write me a document with all the context for this issue so I can set another agent on this. It looks like this is a bit out of scope for the work I'm currently doing.
+
+---
+
+Okay, back to the `entire perf` work: There's a few changes I'd like to make but I'm not entirely sure about some details:
+
+First, I think it looks a bit off to have an output like this:
+
+  carry_forward_files              0ms
+  carry_forward_files.1            5ms
+  carry_forward_files.2            0ms
+  carry_forward_files.3            0ms
+
+What I'd like to have is a line that shows the cummulative duration for all the iterations and then an ascii tree where the individual iterations are listed. I'd also like it if each of the iterations had a unique step number starting with 0. Like carry_forward_files.0. That step number should only ever be shown in the sub-tree view and not the main steps table.
+
+I'm wondering if that indicates a need for an additional span to make the grouping easier or a new abstraction used for loop and such. What options do we have in this regard?
+
+---
+
+Let's go with A
+
+---
+
+Yes
+
+---
+
+Using the same span name for a parent and its children (in case of a loop) feels a bit unitutitive to me. What other patterns are there that we could use with our setup that wouldn't be as confusing?
+
+---
+
+I like version 2 but the implicit `.End()` could throw some people off. Could we do something like `iterSpan, iterCtx := loop.Iteration(ctx)` and then explicitly call `iterSpan.End()`. I think that would fit better with the go ethos of being clear but verbose. Are there reasons that would go against this option?
+
+---
+
+Love it

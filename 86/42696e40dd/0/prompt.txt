@@ -1,0 +1,268 @@
+Implement the following plan:
+
+# Fix: Stale ACTIVE sessions condensed into every commit
+
+## Context
+
+Checkpoint `6e19340bc0c8` on `entire/checkpoints/v1` contains 7 unrelated sessions (PR reviews, merge conflicts, logging work) all condensed together. Root cause: when an agent is killed without the Stop hook firing, its session remains in ACTIVE phase permanently. PostCommit unconditionally sets `hasNew = true` for ACTIVE sessions (line 611-612) and skips the `filesOverlapWithContent` check (line 494), so stale ACTIVE sessions get condensed into every commit.
+
+PR #359 fixed this for **IDLE** sessions but left stale **ACTIVE** sessions unaddressed.
+
+## Fix
+
+### File: `cmd/entire/cli/strategy/manual_commit_hooks.go`
+
+**1. Pass `filesTouchedBefore` to the handler** (around line 645)
+
+Add a `filesTouchedBefore` field to `postCommitActionHandler`. Set it from the already-computed `filesTouchedBefore` variable (line 630-634), which includes transcript-extracted files for ACTIVE sessions.
+
+**2. Apply overlap check in `HandleCondense` for ALL sessions** (line 487-503)
+
+Current:
+```go
+shouldCondense := h.hasNew
+if shouldCondense && !state.Phase.IsActive() {
+    shouldCondense = filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, state.FilesTouched)
+}
+```
+
+Change to:
+```go
+shouldCondense := h.hasNew
+if shouldCondense {
+    filesToCheck := h.filesTouchedBefore
+    if len(filesToCheck) > 0 {
+        shouldCondense = filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, filesToCheck)
+    }
+    // When filesToCheck is empty (transcript extraction failed + no SaveChanges yet),
+    // trust hasNew to avoid data loss for mid-turn commits.
+}
+```
+
+Key behavior changes:
+- **Currently active session**: `filesTouchedBefore` populated from transcript (line 632-634) -> overlap check succeeds against committed files -> condensed correctly
+- **Stale ACTIVE session**: `filesTouchedBefore` populated from old transcript -> overlap check fails (different files committed) -> NOT condensed
+- **ACTIVE session with empty filesTouchedBefore** (transcript extraction failed): overlap check skipped, trusts `hasNew` -> condensed (fail-open, same as current)
+- **IDLE/ENDED sessions**: `filesTouchedBefore == state.FilesTouched` -> same behavior as current
+
+### File: `cmd/entire/cli/strategy/phase_postcommit_test.go`
+
+**3. Add regression test**: `TestPostCommit_StaleActiveSession_NotCondensed`
+
+Setup:
+- Create an old ACTIVE session at a previous commit with `FilesTouched` from unrelated work
+- Create a checkpoint on the shadow branch (so it exists)
+- Advance HEAD with an unrelated commit
+- Create a new ACTIVE session at new HEAD
+- Make a commit from the new session
+
+Verify:
+- Old stale ACTIVE session is NOT condensed (no overlap between its files and committed files)
+- New ACTIVE session IS condensed
+- Old session's BaseCommit IS updated to new HEAD (ACTIVE sessions still get `updateBaseCommitIfChanged`)
+
+**4. Update existing test**: `TestPostCommit_ActiveSessionAlwaysCondenses` (line 180)
+
+This test verifies ACTIVE sessions always condense. It needs to be updated to ensure the test's ACTIVE session has `filesTouchedBefore` that overlaps with the committed files (it already does via `setupSessionWithCheckpoint` which modifies `test.txt`).
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Specifically:
+```bash
+go test -v -run "TestPostCommit_StaleActive" ./cmd/entire/cli/strategy/...
+go test -v -run "TestPostCommit_ActiveSession" ./cmd/entire/cli/strategy/...
+go test -v -run "TestPostCommit_OldIdleSession" ./cmd/entire/cli/strategy/...
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-2/0ad1ad8c-06d4-4015-8ca9-ee94dfe1d0ad.jsonl
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user provided a detailed implementation plan to fix stale ACTIVE sessions being condensed into every commit.
+
+2. The plan identified the root cause: when an agent is killed without the Stop hook firing, its session remains in ACTIVE phase permanently. PostCommit unconditionally sets `hasNew = true` for ACTIVE sessions and skips the `filesOverlapWithContent` check, so stale ACTIVE sessions get condensed into every commit.
+
+3. The plan specified changes to two files:
+   - `cmd/entire/cli/strategy/manual_commit_hooks.go` - Add `filesTouchedBefore` field and apply overlap check for ALL sessions
+   - `cmd/entire/cli/strategy/phase_postcommit_test.go` - Add regression test and update existing test
+
+4. I started implementing:
+   - Read `manual_commit_hooks.go` and `phase_postcommit_test.go`
+   - Created 4 tasks for tracking
+   - Added `filesTouchedBefore` field to `postCommitActionHandler` struct
+   - Passed `filesTouchedBefore` when constructing the handler
+   - Modified `HandleCondense` to apply overlap check for ALL sessions
+
+5. First implementation of HandleCondense was:
+```go
+shouldCondense := h.hasNew
+if shouldCondense && len(h.filesTouchedBefore) > 0 {
+    shouldCondense = filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, h.filesTouchedBefore)
+}
+```
+
+6. First test run: The new regression test failed because `filesOverlapWithContent` checks if a file EXISTS in the parent tree (not if it was CHANGED), so `test.txt` passed the overlap check even when it wasn't actually modified in the commit. The stale session wasn't filtered out.
+
+7. I fixed this by intersecting `filesTouchedBefore` with `committedFileSet` before calling `filesOverlapWithContent`:
+```go
+var committedTouchedFiles []string
+for _, f := range h.filesTouchedBefore {
+    if _, ok := h.committedFileSet[f]; ok {
+        committedTouchedFiles = append(committedTouchedFiles, f)
+    }
+}
+```
+
+8. Second test run: The regression test STILL failed because the checkpoint ID in the test (`stale1stale2`) contained non-hex characters. `trailers.ParseCheckpoint` validates hex format, so it returned `found=false`, causing PostCommit to exit early without processing any sessions.
+
+9. Fixed the checkpoint ID to `de1de2de3de4` (valid hex).
+
+10. Third test run: The regression test passed, but `TestHandleTurnEnd_PartialFailure` failed. This test creates 2 mid-turn commits and expects 2 checkpoint IDs. After the first commit, `test.txt` content is already on the main branch ("agent modified content"), so in the second commit `test.txt` isn't in the diff (same content). The intersection of `filesTouchedBefore=["test.txt"]` with `committedFileSet={"second.txt"}` is empty, so the second commit's condensation is skipped.
+
+11. I was about to fix this test when the summary was requested. The test needs to be updated so that the session's FilesTouched includes files that are actually changed in the second commit (like `second.txt`), and the shadow branch also has those files.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked me to implement a specific plan to fix stale ACTIVE sessions being condensed into every commit. The plan was provided in detail with exact file locations, code changes, and test additions. The root cause: when an agent is killed without the Stop hook firing, its session remains in ACTIVE phase permanently. PostCommit unconditionally sets `hasNew = true` for ACTIVE sessions (line 611-612) and skips the `filesOverlapWithContent` check (line 494), so stale ACTIVE sessions get condensed into every commit. PR #359 fixed this for IDLE sessions but left stale ACTIVE sessions unaddressed.
+
+2. Key Technical Concepts:
+   - Manual-commit strategy with shadow branches for checkpoint storage
+   - Session phase state machine (ACTIVE, IDLE, ENDED)
+   - `postCommitActionHandler` struct and `HandleCondense` method
+   - `filesOverlapWithContent` - content-aware overlap detection comparing shadow branch content with committed content
+   - `filesChangedInCommit` - diffs commit against parent to get changed files
+   - `filesTouchedBefore` - files the session touched, computed before state machine transition
+   - Checkpoint ID format: 12-hex-char string validated by `trailers.ParseCheckpoint`
+   - Intersection of `filesTouchedBefore` with `committedFileSet` needed to avoid false positives from files that exist in tree but weren't changed in the commit
+
+3. Files and Code Sections:
+   - `cmd/entire/cli/strategy/manual_commit_hooks.go`
+     - Core file being modified. Contains PostCommit logic, `postCommitActionHandler`, and `HandleCondense`.
+     - **Change 1**: Added `filesTouchedBefore []string` field to `postCommitActionHandler` struct (after `hasNew bool` field)
+     - **Change 2**: Passed `filesTouchedBefore` when constructing handler in PostCommit loop (~line 645):
+       ```go
+       handler := &postCommitActionHandler{
+           ...
+           hasNew:                 hasNew,
+           filesTouchedBefore:     filesTouchedBefore,
+       }
+       ```
+     - **Change 3**: Rewrote `HandleCondense` to apply overlap check for ALL sessions:
+       ```go
+       func (h *postCommitActionHandler) HandleCondense(state *session.State) error {
+           shouldCondense := h.hasNew
+           if shouldCondense && len(h.filesTouchedBefore) > 0 {
+               var committedTouchedFiles []string
+               for _, f := range h.filesTouchedBefore {
+                   if _, ok := h.committedFileSet[f]; ok {
+                       committedTouchedFiles = append(committedTouchedFiles, f)
+                   }
+               }
+               if len(committedTouchedFiles) > 0 {
+                   shouldCondense = filesOverlapWithContent(h.repo, h.shadowBranchName, h.commit, committedTouchedFiles)
+               } else {
+                   shouldCondense = false
+               }
+           }
+           if shouldCondense {
+               h.condensed = h.s.condenseAndUpdateState(h.logCtx, h.repo, h.checkpointID, state, h.head, h.shadowBranchName, h.shadowBranchesToDelete, h.committedFileSet)
+           } else {
+               h.s.updateBaseCommitIfChanged(h.logCtx, state, h.newHead)
+           }
+           return nil
+       }
+       ```
+
+   - `cmd/entire/cli/strategy/phase_postcommit_test.go`
+     - Test file. Added regression test `TestPostCommit_StaleActiveSession_NotCondensed` (~135 lines) at end of file.
+     - Test creates a stale ACTIVE session with `FilesTouched: ["test.txt"]`, advances HEAD, creates a new ACTIVE session touching `new-feature.txt`, commits only `new-feature.txt`, and verifies:
+       - Stale session is NOT condensed (StepCount unchanged)
+       - Stale session's BaseCommit IS updated (ACTIVE sessions get BaseCommit updated)
+       - New session IS condensed (StepCount reset to 0)
+       - `entire/checkpoints/v1` branch exists
+
+   - `cmd/entire/cli/strategy/content_overlap.go`
+     - Read-only. Contains `filesOverlapWithContent` which checks content overlap between committed files and shadow branch. Important detail: for "modified files" (exist in parent tree), it returns `true` immediately without content check. This is why intersecting with `committedFileSet` is necessary - files that exist in the tree but weren't actually changed in the commit would otherwise pass.
+
+   - `cmd/entire/cli/checkpoint/temporary.go`
+     - Read-only. Contains `WriteTemporary` which creates shadow branch trees. The tree is built from HEAD tree as base, overlaying modified/new files and metadata. Shadow branches contain ALL files from HEAD plus session changes.
+
+4. Errors and fixes:
+   - **Error 1: `filesOverlapWithContent` false positive for unchanged files**
+     - `filesOverlapWithContent` checks if a file EXISTS in the parent tree (isModified=true → immediate overlap), not if it was actually CHANGED in the commit. So `test.txt` in the stale session always passed the check since it exists in every commit's tree.
+     - Fix: Added intersection filter - only check files that are in BOTH `filesTouchedBefore` AND `committedFileSet` (files actually changed in the commit).
+   
+   - **Error 2: Invalid hex in checkpoint ID `"stale1stale2"`**
+     - Characters 's', 't', 'l' are not valid hex digits. `trailers.ParseCheckpoint` validates hex format, returning `found=false`, causing PostCommit to exit early via `postCommitUpdateBaseCommitOnly` path.
+     - Fix: Changed to `"de1de2de3de4"` (valid 12-char hex string).
+   
+   - **Error 3: `TestHandleTurnEnd_PartialFailure` now fails (CURRENT)**
+     - After first commit, `test.txt` content ("agent modified content") is already on main branch. Second commit stages test.txt again but content hasn't changed, so `filesChangedInCommit` only returns `{"second.txt"}`. The session's `FilesTouched=["test.txt"]` has no intersection with committed files, so condensation is skipped. Test expects 2 checkpoint IDs but only gets 1.
+     - Not yet fixed - this is the current work.
+
+5. Problem Solving:
+   - Successfully implemented the core fix: ACTIVE sessions now go through the same overlap check as IDLE/ENDED sessions
+   - Added necessary `committedFileSet` intersection to avoid false positives from `filesOverlapWithContent`'s "isModified" shortcut
+   - New regression test `TestPostCommit_StaleActiveSession_NotCondensed` passes
+   - All other PostCommit tests pass except `TestHandleTurnEnd_PartialFailure` which needs updating
+
+6. All user messages:
+   - User's single message: "Implement the following plan: [detailed plan for fixing stale ACTIVE sessions condensed into every commit]" with full context including the plan steps, file locations, code changes, and verification commands. The plan also referenced a transcript file path.
+
+7. Pending Tasks:
+   - Fix `TestHandleTurnEnd_PartialFailure` - needs updating so the second commit's session touches files actually changed in that commit (include `second.txt` in session's FilesTouched AND shadow branch)
+   - Run full verification: `mise run fmt && mise run lint && mise run test:ci`
+
+8. Current Work:
+   I was fixing the failing `TestHandleTurnEnd_PartialFailure` test. The test at lines 1189-1211 creates 2 mid-turn commits expecting 2 checkpoint IDs, but only 1 is created because:
+   - After first PostCommit, `test.txt` is already committed with "agent modified content"
+   - `setupSessionWithCheckpoint` refreshes shadow branch with only `test.txt` as modified file
+   - Second commit via `commitFilesWithTrailer(t, repo, dir, "b2c3d4e5f6a1", "second.txt")` stages test.txt + second.txt, but test.txt content hasn't changed so `filesChangedInCommit` returns only `{"second.txt"}`
+   - `filesTouchedBefore=["test.txt"]` has empty intersection with `committedFileSet={"second.txt"}`
+   - Condensation is skipped, so only 1 TurnCheckpointID instead of expected 2
+
+   The fix needs to ensure the second SaveChanges call includes `second.txt` as a new file so both `state.FilesTouched` and the shadow branch contain it. This way the intersection with `committedFileSet={"second.txt"}` will be non-empty.
+
+9. Optional Next Step:
+   Fix `TestHandleTurnEnd_PartialFailure` by replacing the `setupSessionWithCheckpoint` call for the second round with a direct `SaveChanges` call that includes `second.txt` as a new file (so both `state.FilesTouched` and the shadow branch contain it). Then run full verification (`mise run fmt && mise run lint && mise run test:ci`).
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-2/d54f5fdd-71a4-43e3-a8cf-ee0722e84c19.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+You are an expert code reviewer. Follow these steps:
+
+      1. If no PR number is provided in the args, run `gh pr list` to show open PRs
+      2. If a PR number is provided, run `gh pr view <number>` to get PR details
+      3. Run `gh pr diff <number>` to get the diff
+      4. Analyze the changes and provide a thorough code review that includes:
+         - Overview of what the PR does
+         - Analysis of code quality and style
+         - Specific suggestions for improvements
+         - Any potential issues or risks
+
+      Keep your review concise but thorough. Focus on:
+      - Code correctness
+      - Following project conventions
+      - Performance implications
+      - Test coverage
+      - Security considerations
+
+      Format your review with clear sections and bullet points.
+
+      PR number:
+
+---
+
+okay well let's push this change and raise a PR for now, but I'm not conviced we've gotten to the bottom of this

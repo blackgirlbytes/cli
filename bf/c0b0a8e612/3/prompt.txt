@@ -1,0 +1,1131 @@
+Implement the following plan:
+
+# Fix Factory AI Droid E2E Test Failures
+
+## Context
+
+Running `E2E_AGENT=factoryai-droid go test -tags=e2e ./cmd/entire/cli/e2e_test/...` produces 8 failures across 4 root causes. All tests pass with Claude Code but fail with Factory AI Droid because the Droid agent has different hook input behavior and missing method implementations.
+
+## Root Cause Analysis
+
+### RC1: `WriteSession`/`ReadSession` not implemented (1 test)
+- **Test:** `TestE2E_ResumeInRelocatedRepo`
+- **Error:** `"not implemented"` when resume tries to write session data to new location
+- `factoryaidroid.go:132-139` returns stub errors
+
+### RC2: `state.TranscriptPath` not set during carry-forward condensation (5 tests)
+- **Tests:** `Scenario4_UserSplitsCommits`, `ExistingFiles_SplitCommits`, `DeletedFiles_CommitDeletion`, `EndedSession_UserCommitsAfterExit`, `Scenario7_PartialStagingSimulated`
+- **Root cause:** `state.TranscriptPath` is set in `InitializeSession` (called from `user-prompt-submit` hook) via `event.SessionRef`. If Droid's `user-prompt-submit` hook input omits `transcript_path`, `state.TranscriptPath` stays empty. First commit works because it reads transcript from the shadow branch tree. Carry-forward commits fail because: (a) carry-forward shadow branch intentionally excludes transcript data, and (b) live transcript fallback in `extractSessionData` is skipped when `liveTranscriptPath == ""`.
+- **SaveStep works fine** because it uses `StepContext.TranscriptPath` from the `stop` hook's `event.SessionRef` directly, NOT from `state.TranscriptPath`.
+- `manual_commit.go` never writes to `state.TranscriptPath` — confirmed by grep showing zero matches.
+
+### RC3: TTY blocking during agent-initiated commits (2 tests)
+- **Tests:** `AgentCommitsDuringTurn`, `ExistingFiles_ModifyAndCommit` (both timeout at 120s)
+- **Root cause:** When Droid makes a `git commit` during its session, the git `prepare-commit-msg` hook runs. This hook checks `hasTTY()` — since Droid inherits the user's terminal, `hasTTY()` returns true. The hook then calls `askConfirmTTY()` which opens `/dev/tty` and blocks waiting for user input. The 2-minute timeout kills the Droid process.
+- `ENTIRE_TEST_TTY` is only set in `GitCommitWithShadowHooks` (test helper), not in the Droid runner's environment.
+
+### RC4: Zero rewind points in Scenario7 (1 test — subset of RC2)
+- `TestE2E_Scenario7_PartialStagingSimulated` shows 0 rewind points, meaning `SaveStep` was never called.
+- If `event.SessionRef` is empty in the `stop` hook, `handleLifecycleTurnEnd` errors at line 168-169 (`"transcript file not specified"`) and returns before calling SaveStep.
+
+## Plan
+
+### Fix 1: Implement `ReadSession` and `WriteSession` for Factory AI Droid
+
+**File:** `cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go`
+
+Mirror the Claude Code implementation (`cmd/entire/cli/agent/claudecode/claude.go:108-162`):
+
+**ReadSession:**
+1. Validate `input.SessionRef` is non-empty
+2. `os.ReadFile(input.SessionRef)` to get raw JSONL bytes
+3. Parse with `ParseDroidTranscriptFromBytes` to extract computed fields (ModifiedFiles)
+4. Return `*agent.AgentSession` with NativeData, ModifiedFiles, etc.
+
+**WriteSession:**
+1. Validate session is non-nil, AgentName matches, SessionRef is non-empty, NativeData is non-empty
+2. Create parent directories with `os.MkdirAll`
+3. `os.WriteFile(session.SessionRef, session.NativeData, 0o600)`
+
+### Fix 2: Propagate `TranscriptPath` to `state` during `SaveStep`
+
+**File:** `cmd/entire/cli/strategy/manual_commit.go` (in `SaveStep` method)
+
+After loading SessionState and before saving it, add:
+```go
+if state.TranscriptPath == "" && ctx.TranscriptPath != "" {
+    state.TranscriptPath = ctx.TranscriptPath
+}
+```
+
+This ensures `state.TranscriptPath` is set from the stop hook's transcript path if it wasn't set during the user-prompt-submit hook. This fixes carry-forward condensation because `extractSessionData` can then read the live transcript.
+
+**Rationale:** SaveStep already receives `StepContext.TranscriptPath` from the stop hook's `event.SessionRef`. The session state is loaded and saved within SaveStep. This is the narrowest, safest change.
+
+### Fix 3: Set `ENTIRE_TEST_TTY` in Droid runner environment
+
+**File:** `cmd/entire/cli/e2e_test/agent_runner.go`
+
+In `FactoryAIDroidRunner.RunPromptWithTools`, set environment variables on the `cmd`:
+```go
+cmd.Env = append(os.Environ(),
+    "ENTIRE_TEST_TTY=0",  // Prevent TTY prompts in git hooks during agent session
+)
+```
+
+Setting `ENTIRE_TEST_TTY=0` causes `hasTTY()` to return false, which triggers the fast-path in `PrepareCommitMsg` (line 291) that adds the trailer without prompting. This prevents the Droid process from hanging on TTY input.
+
+### Fix 4: Add dynamic transcript resolution fallback in `extractSessionData`
+
+**File:** `cmd/entire/cli/strategy/manual_commit_condensation.go` (in `extractSessionData`)
+
+After the live transcript path check fails and before falling back to shadow branch, add a dynamic resolution step:
+```go
+if fullTranscript == "" && liveTranscriptPath == "" {
+    // Dynamic fallback: compute transcript path from agent + repo path
+    if ag, err := agent.GetByAgentType(agentType); err == nil {
+        if repoRoot, pathErr := paths.RepoRoot(); pathErr == nil {
+            if sessionDir, dirErr := ag.GetSessionDir(repoRoot); dirErr == nil {
+                dynamicPath := ag.ResolveSessionFile(sessionDir, sessionID)
+                if liveData, readErr := os.ReadFile(dynamicPath); readErr == nil && len(liveData) > 0 {
+                    fullTranscript = string(liveData)
+                }
+            }
+        }
+    }
+}
+```
+
+**Rationale:** This provides defense-in-depth. Even if Fix 2 doesn't cover all edge cases (e.g., session state corruption, agent bugs), the transcript can still be found dynamically.
+
+**Note:** `extractSessionData` already takes `agentType` as parameter. `agent.GetByAgentType` resolves the agent. `GetSessionDir + ResolveSessionFile` computes the path. This mirrors how the resume command resolves transcript paths (resume.go line 476).
+
+## Verification
+
+After implementing all fixes:
+
+```bash
+# Run all E2E tests with Droid
+E2E_AGENT=factoryai-droid go test -tags=e2e ./cmd/entire/cli/e2e_test/...
+
+# Run specific failing tests individually
+E2E_AGENT=factoryai-droid go test -tags=e2e -run TestE2E_ResumeInRelocatedRepo ./cmd/entire/cli/e2e_test/...
+E2E_AGENT=factoryai-droid go test -tags=e2e -run TestE2E_Scenario4_UserSplitsCommits ./cmd/entire/cli/e2e_test/...
+E2E_AGENT=factoryai-droid go test -tags=e2e -run TestE2E_AgentCommitsDuringTurn ./cmd/entire/cli/e2e_test/...
+```
+
+Also ensure existing tests still pass:
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+## Files to Modify
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go` | Implement ReadSession + WriteSession |
+| `cmd/entire/cli/strategy/manual_commit.go` | Backfill state.TranscriptPath in SaveStep |
+| `cmd/entire/cli/e2e_test/agent_runner.go` | Set ENTIRE_TEST_TTY=0 in Droid runner env |
+| `cmd/entire/cli/strategy/manual_commit_condensation.go` | Add dynamic transcript resolution fallback |
+
+## Test Files (if new tests needed)
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go` | Add ReadSession/WriteSession unit tests |
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-factoryai-agent/400b42d9-2205-444b-b2b1-eca33f377c44.jsonl
+
+---
+
+how to run specific test TestE2E_BasicWorkflow
+
+---
+
+<bash-input>git st</bash-input>
+
+---
+
+<bash-stdout>On branch alisha/factoryai-agent
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+	modified:   cmd/entire/cli/e2e_test/agent_runner.go
+	modified:   cmd/entire/cli/e2e_test/testenv.go
+	modified:   cmd/entire/cli/integration_test/agent_test.go
+	modified:   cmd/entire/cli/strategy/manual_commit_condensation.go
+
+no changes added to commit (use "git add" and/or "git commit -a")</bash-stdout><bash-stderr></bash-stderr>
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+	modified:   cmd/entire/cli/e2e_test/agent_runner.go
+	modified:   cmd/entire/cli/e2e_test/testenv.go
+	modified:   cmd/entire/cli/integration_test/agent_test.go
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+index 4162a204..9c15e73a 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+@@ -8,6 +8,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
++	"time"
+ 
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
+ 	"github.com/entireio/cli/cmd/entire/cli/paths"
+@@ -128,14 +129,62 @@ func (f *FactoryAIDroidAgent) ResolveSessionFile(sessionDir, agentSessionID stri
+ 	return filepath.Join(sessionDir, agentSessionID+".jsonl")
+ }
+ 
+-// ReadSession is not implemented for Factory AI Droid.
+-func (f *FactoryAIDroidAgent) ReadSession(_ *agent.HookInput) (*agent.AgentSession, error) {
+-	return nil, errors.New("not implemented")
++// ReadSession reads a session from Factory AI Droid's storage (JSONL transcript file).
++// The session data is stored in NativeData as raw JSONL bytes.
++// ModifiedFiles is computed by parsing the transcript.
++func (f *FactoryAIDroidAgent) ReadSession(input *agent.HookInput) (*agent.AgentSession, error) {
++	if input.SessionRef == "" {
++		return nil, errors.New("session reference (transcript path) is required")
++	}
++
++	data, err := os.ReadFile(input.SessionRef)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read transcript: %w", err)
++	}
++
++	lines, err := ParseDroidTranscriptFromBytes(data)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse transcript: %w", err)
++	}
++
++	return &agent.AgentSession{
++		SessionID:     input.SessionID,
++		AgentName:     f.Name(),
++		SessionRef:    input.SessionRef,
++		StartTime:     time.Now(),
++		NativeData:    data,
++		ModifiedFiles: ExtractModifiedFiles(lines),
++	}, nil
+ }
+ 
+-// WriteSession is not implemented for Factory AI Droid.
+-func (f *FactoryAIDroidAgent) WriteSession(_ *agent.AgentSession) error {
+-	return errors.New("not implemented")
++// WriteSession writes a session to Factory AI Droid's storage (JSONL transcript file).
++// Uses the NativeData field which contains raw JSONL bytes.
++func (f *FactoryAIDroidAgent) WriteSession(session *agent.AgentSession) error {
++	if session == nil {
++		return errors.New("session is nil")
++	}
++
++	if session.AgentName != "" && session.AgentName != f.Name() {
++		return fmt.Errorf("session belongs to agent %q, not %q", session.AgentName, f.Name())
++	}
++
++	if session.SessionRef == "" {
++		return errors.New("session reference (transcript path) is required")
++	}
++
++	if len(session.NativeData) == 0 {
++		return errors.New("session has no native data to write")
++	}
++
++	if err := os.MkdirAll(filepath.Dir(session.SessionRef), 0o750); err != nil {
++		return fmt.Errorf("failed to create session directory: %w", err)
++	}
++
++	if err := os.WriteFile(session.SessionRef, session.NativeData, 0o600); err != nil {
++		return fmt.Errorf("failed to write transcript: %w", err)
++	}
++
++	return nil
+ }
+ 
+ // FormatResumeCommand returns the command to resume a Factory AI Droid session.
+diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+index 94f28346..53de31a5 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+@@ -201,6 +201,182 @@ func TestGetSessionDir(t *testing.T) {
+ 	}
+ }
+ 
++// --- ReadSession / WriteSession tests ---
++
++func TestReadSession(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	transcriptPath := filepath.Join(tmpDir, "transcript.jsonl")
++
++	// Write a Droid-format JSONL transcript with a file-modifying tool call
++	content := `{"type":"message","id":"msg1","message":{"role":"user","content":[{"type":"text","text":"create a file"}]}}
++{"type":"message","id":"msg2","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"hello.txt","content":"hi"}}]}}`
++	if err := os.WriteFile(transcriptPath, []byte(content), 0o644); err != nil {
++		t.Fatalf("failed to write transcript: %v", err)
++	}
++
++	ag := &FactoryAIDroidAgent{}
++	session, err := ag.ReadSession(&agent.HookInput{
++		SessionID:  "test-session-123",
++		SessionRef: transcriptPath,
++	})
++	if err != nil {
++		t.Fatalf("ReadSession() error = %v", err)
++	}
++
++	if session.SessionID != "test-session-123" {
++		t.Errorf("SessionID = %q, want %q", session.SessionID, "test-session-123")
++	}
++	if session.AgentName != agent.AgentNameFactoryAIDroid {
++		t.Errorf("AgentName = %q, want %q", session.AgentName, agent.AgentNameFactoryAIDroid)
++	}
++	if session.SessionRef != transcriptPath {
++		t.Errorf("SessionRef = %q, want %q", session.SessionRef, transcriptPath)
++	}
++	if len(session.NativeData) == 0 {
++		t.Error("NativeData should not be empty")
++	}
++	if len(session.ModifiedFiles) == 0 {
++		t.Error("ModifiedFiles should contain at least one file")
++	}
++}
++
++func TestReadSession_EmptyRef(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	_, err := ag.ReadSession(&agent.HookInput{SessionID: "test"})
++	if err == nil {
++		t.Error("ReadSession() should error on empty SessionRef")
++	}
++}
++
++func TestReadSession_MissingFile(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	_, err := ag.ReadSession(&agent.HookInput{
++		SessionID:  "test",
++		SessionRef: "/nonexistent/path/transcript.jsonl",
++	})
++	if err == nil {
++		t.Error("ReadSession() should error on missing file")
++	}
++}
++
++func TestWriteSession(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	// Write to a nested path to test directory creation
++	transcriptPath := filepath.Join(tmpDir, "sessions", "project", "transcript.jsonl")
++	nativeData := []byte(`{"type":"message","id":"msg1","message":{"role":"user","content":"hello"}}`)
++
++	ag := &FactoryAIDroidAgent{}
++	err := ag.WriteSession(&agent.AgentSession{
++		SessionID:  "test-session-456",
++		AgentName:  agent.AgentNameFactoryAIDroid,
++		SessionRef: transcriptPath,
++		NativeData: nativeData,
++	})
++	if err != nil {
++		t.Fatalf("WriteSession() error = %v", err)
++	}
++
++	// Verify file was written correctly
++	written, err := os.ReadFile(transcriptPath)
++	if err != nil {
++		t.Fatalf("failed to read written file: %v", err)
++	}
++	if string(written) != string(nativeData) {
++		t.Errorf("written data = %q, want %q", string(written), string(nativeData))
++	}
++}
++
++func TestWriteSession_NilSession(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	if err := ag.WriteSession(nil); err == nil {
++		t.Error("WriteSession(nil) should error")
++	}
++}
++
++func TestWriteSession_WrongAgent(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	err := ag.WriteSession(&agent.AgentSession{
++		AgentName:  "claude-code",
++		SessionRef: "/tmp/test.jsonl",
++		NativeData: []byte("data"),
++	})
++	if err == nil {
++		t.Error("WriteSession() should error for wrong agent name")
++	}
++}
++
++func TestWriteSession_EmptyRef(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	err := ag.WriteSession(&agent.AgentSession{
++		AgentName:  agent.AgentNameFactoryAIDroid,
++		NativeData: []byte("data"),
++	})
++	if err == nil {
++		t.Error("WriteSession() should error on empty SessionRef")
++	}
++}
++
++func TestWriteSession_EmptyNativeData(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	err := ag.WriteSession(&agent.AgentSession{
++		AgentName:  agent.AgentNameFactoryAIDroid,
++		SessionRef: "/tmp/test.jsonl",
++	})
++	if err == nil {
++		t.Error("WriteSession() should error on empty NativeData")
++	}
++}
++
++func TestReadWriteSession_RoundTrip(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	originalPath := filepath.Join(tmpDir, "original.jsonl")
++	restoredPath := filepath.Join(tmpDir, "restored.jsonl")
++
++	content := `{"type":"message","id":"msg1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
++{"type":"message","id":"msg2","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]}}`
++	if err := os.WriteFile(originalPath, []byte(content), 0o644); err != nil {
++		t.Fatalf("failed to write original: %v", err)
++	}
++
++	ag := &FactoryAIDroidAgent{}
++
++	// Read from original location
++	session, err := ag.ReadSession(&agent.HookInput{
++		SessionID:  "round-trip-test",
++		SessionRef: originalPath,
++	})
++	if err != nil {
++		t.Fatalf("ReadSession() error = %v", err)
++	}
++
++	// Write to new location
++	session.SessionRef = restoredPath
++	if err := ag.WriteSession(session); err != nil {
++		t.Fatalf("WriteSession() error = %v", err)
++	}
++
++	// Verify content matches
++	restored, err := os.ReadFile(restoredPath)
++	if err != nil {
++		t.Fatalf("failed to read restored: %v", err)
++	}
++	if string(restored) != content {
++		t.Errorf("round-trip mismatch:\n got: %q\nwant: %q", string(restored), content)
++	}
++}
++
+ // TestGetSessionDir_EnvOverride cannot use t.Parallel() due to t.Setenv.
+ func TestGetSessionDir_EnvOverride(t *testing.T) {
+ 	ag := &FactoryAIDroidAgent{}
+diff --git a/cmd/entire/cli/e2e_test/agent_runner.go b/cmd/entire/cli/e2e_test/agent_runner.go
+index 93ae0794..ee75e082 100644
+--- a/cmd/entire/cli/e2e_test/agent_runner.go
++++ b/cmd/entire/cli/e2e_test/agent_runner.go
+@@ -394,9 +394,8 @@ func (r *FactoryAIDroidRunner) RunPromptWithTools(ctx context.Context, workDir s
+ 		"-o", "text",
+ 	}
+ 
+-	if len(tools) > 0 {
+-		args = append(args, "--enabled-tools", strings.Join(tools, ","))
+-	}
++	// Droid uses its own permission system (.factory/settings.json), not --enabled-tools.
++	// E2E tests pass Claude-specific tool names that Droid doesn't recognize.
+ 
+ 	if r.Model != "" {
+ 		args = append(args, "-m", r.Model)
+@@ -411,6 +410,13 @@ func (r *FactoryAIDroidRunner) RunPromptWithTools(ctx context.Context, workDir s
+ 	cmd := exec.CommandContext(ctx, "droid", args...)
+ 	cmd.Dir = workDir
+ 
++	// Prevent TTY prompts in git hooks during agent-initiated commits.
++	// Without this, the prepare-commit-msg hook detects Droid's inherited TTY
++	// and blocks waiting for user input on the trailer confirmation prompt.
++	cmd.Env = append(os.Environ(),
++		"ENTIRE_TEST_TTY=0",
++	)
++
+ 	var stdout, stderr bytes.Buffer
+ 	cmd.Stdout = &stdout
+ 	cmd.Stderr = &stderr
+diff --git a/cmd/entire/cli/e2e_test/testenv.go b/cmd/entire/cli/e2e_test/testenv.go
+index aaed018b..39cc7927 100644
+--- a/cmd/entire/cli/e2e_test/testenv.go
++++ b/cmd/entire/cli/e2e_test/testenv.go
+@@ -281,6 +281,7 @@ func (env *TestEnv) GitCommitWithShadowHooks(message string, files ...string) {
+ 		"ENTIRE_TEST_TTY=1",
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := prepCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("prepare-commit-msg output: %s", output)
+@@ -322,6 +323,7 @@ func (env *TestEnv) GitCommitWithShadowHooks(message string, files ...string) {
+ 	postCmd.Env = append(os.Environ(),
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := postCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("post-commit output: %s", output)
+@@ -362,6 +364,7 @@ func (env *TestEnv) GitCommitStagedWithShadowHooks(message string) {
+ 		"ENTIRE_TEST_TTY=1",
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := prepCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("prepare-commit-msg output: %s", output)
+@@ -403,6 +406,7 @@ func (env *TestEnv) GitCommitStagedWithShadowHooks(message string) {
+ 	postCmd.Env = append(os.Environ(),
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := postCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("post-commit output: %s", output)
+@@ -435,6 +439,7 @@ func (env *TestEnv) GitCommitWithTrailerRemoved(message string, files ...string)
+ 		"ENTIRE_TEST_TTY=1",
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := prepCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("prepare-commit-msg output: %s", output)
+@@ -493,6 +498,7 @@ func (env *TestEnv) GitCommitWithTrailerRemoved(message string, files ...string)
+ 	postCmd.Env = append(os.Environ(),
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := postCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("post-commit output: %s", output)
+diff --git a/cmd/entire/cli/integration_test/agent_test.go b/cmd/entire/cli/integration_test/agent_test.go
+index 1d580275..7840f325 100644
+--- a/cmd/entire/cli/integration_test/agent_test.go
++++ b/cmd/entire/cli/integration_test/agent_test.go
+@@ -1119,41 +1119,82 @@ func TestFactoryAIDroidHelperMethods(t *testing.T) {
+ 	})
+ }
+ 
+-// TestFactoryAIDroidSessionStubs verifies that stub methods return not-implemented errors.
+-func TestFactoryAIDroidSessionStubs(t *testing.T) {
++// TestFactoryAIDroidSessionMethods verifies ReadSession, WriteSession, and GetSessionDir.
++func TestFactoryAIDroidSessionMethods(t *testing.T) {
+ 	t.Parallel()
+ 
+-	t.Run("ReadSession returns not-implemented error", func(t *testing.T) {
++	t.Run("ReadSession reads and parses transcript", func(t *testing.T) {
+ 		t.Parallel()
+ 
++		tmpDir := t.TempDir()
++		transcriptPath := filepath.Join(tmpDir, "transcript.jsonl")
++		content := `{"type":"message","id":"msg1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
++{"type":"message","id":"msg2","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}`
++		if err := os.WriteFile(transcriptPath, []byte(content), 0o644); err != nil {
++			t.Fatalf("failed to write transcript: %v", err)
++		}
++
+ 		ag, _ := agent.Get("factoryai-droid")
+-		_, err := ag.ReadSession(&agent.HookInput{
++		session, err := ag.ReadSession(&agent.HookInput{
+ 			SessionID:  "test",
+-			SessionRef: "/tmp/test.jsonl",
++			SessionRef: transcriptPath,
+ 		})
+-		if err == nil {
+-			t.Error("ReadSession() should return an error for Factory AI Droid")
++		if err != nil {
++			t.Fatalf("ReadSession() error = %v", err)
++		}
++		if session.SessionID != "test" {
++			t.Errorf("SessionID = %q, want %q", session.SessionID, "test")
+ 		}
+-		if !strings.Contains(err.Error(), "not implemented") {
+-			t.Errorf("ReadSession() error = %q, want to contain 'not implemented'", err.Error())
++		if len(session.NativeData) == 0 {
++			t.Error("NativeData should not be empty")
+ 		}
+ 	})
+ 
+-	t.Run("WriteSession returns not-implemented error", func(t *testing.T) {
++	t.Run("ReadSession errors on missing file", func(t *testing.T) {
+ 		t.Parallel()
+ 
+ 		ag, _ := agent.Get("factoryai-droid")
+-		err := ag.WriteSession(&agent.AgentSession{
++		_, err := ag.ReadSession(&agent.HookInput{
+ 			SessionID:  "test",
+-			AgentName:  "factoryai-droid",
+-			SessionRef: "/tmp/test.jsonl",
+-			NativeData: []byte("data"),
++			SessionRef: "/nonexistent/path/transcript.jsonl",
+ 		})
+ 		if err == nil {
+-			t.Error("WriteSession() should return an error for Factory AI Droid")
++			t.Error("ReadSession() should error on missing file")
++		}
++	})
++
++	t.Run("WriteSession round-trips with ReadSession", func(t *testing.T) {
++		t.Parallel()
++
++		tmpDir := t.TempDir()
++		originalPath := filepath.Join(tmpDir, "original.jsonl")
++		restoredPath := filepath.Join(tmpDir, "sub", "restored.jsonl")
++
++		content := `{"type":"message","id":"msg1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}`
++		if err := os.WriteFile(originalPath, []byte(content), 0o644); err != nil {
++			t.Fatalf("failed to write original: %v", err)
++		}
++
++		ag, _ := agent.Get("factoryai-droid")
++		session, err := ag.ReadSession(&agent.HookInput{
++			SessionID:  "test",
++			SessionRef: originalPath,
++		})
++		if err != nil {
++			t.Fatalf("ReadSession() error = %v", err)
++		}
++
++		session.SessionRef = restoredPath
++		if err := ag.WriteSession(session); err != nil {
++			t.Fatalf("WriteSession() error = %v", err)
++		}
++
++		restored, err := os.ReadFile(restoredPath)
++		if err != nil {
++			t.Fatalf("failed to read restored: %v", err)
+ 		}
+-		if !strings.Contains(err.Error(), "not implemented") {
+-			t.Errorf("WriteSession() error = %q, want to contain 'not implemented'", err.Error())
++		if string(restored) != content {
++			t.Errorf("round-trip mismatch:\n got: %q\nwant: %q", string(restored), content)
+ 		}
+ 	})
+- Current branch: alisha/factoryai-agent
+- Recent commits: 8fa5dc39 Audit Droid test suite: remove 13 trivial tests, add 9 high-value tests
+c73ebfba Add AgentTypeFactoryAIDroid to exhaustive switches and extract Droid transcript helper
+c5a1d93d Merge branch 'main' into alisha/factoryai-agent
+94a1d70d Implement GetSessionDir for Factory AI Droid
+ac7c4438 Add Factory AI Droid E2E test runner
+12d2099e Fix Droid "(no prompt)" after commit by adding agent-specific transcript parsing
+56fc2bce Merge pull request #442 from entireio/soph/better-agent-agent-instructions
+7b5f027e Merge pull request #441 from entireio/soph/small-rewind-refactor
+e386c99a Merge pull request #440 from entireio/rwr/streamline-setup
+b7247804 Merge branch 'main' into soph/better-agent-agent-instructions
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+	modified:   cmd/entire/cli/e2e_test/agent_runner.go
+	modified:   cmd/entire/cli/e2e_test/testenv.go
+	modified:   cmd/entire/cli/integration_test/agent_test.go
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+index 4162a204..9c15e73a 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+@@ -8,6 +8,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
++	"time"
+ 
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
+ 	"github.com/entireio/cli/cmd/entire/cli/paths"
+@@ -128,14 +129,62 @@ func (f *FactoryAIDroidAgent) ResolveSessionFile(sessionDir, agentSessionID stri
+ 	return filepath.Join(sessionDir, agentSessionID+".jsonl")
+ }
+ 
+-// ReadSession is not implemented for Factory AI Droid.
+-func (f *FactoryAIDroidAgent) ReadSession(_ *agent.HookInput) (*agent.AgentSession, error) {
+-	return nil, errors.New("not implemented")
++// ReadSession reads a session from Factory AI Droid's storage (JSONL transcript file).
++// The session data is stored in NativeData as raw JSONL bytes.
++// ModifiedFiles is computed by parsing the transcript.
++func (f *FactoryAIDroidAgent) ReadSession(input *agent.HookInput) (*agent.AgentSession, error) {
++	if input.SessionRef == "" {
++		return nil, errors.New("session reference (transcript path) is required")
++	}
++
++	data, err := os.ReadFile(input.SessionRef)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read transcript: %w", err)
++	}
++
++	lines, err := ParseDroidTranscriptFromBytes(data)
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse transcript: %w", err)
++	}
++
++	return &agent.AgentSession{
++		SessionID:     input.SessionID,
++		AgentName:     f.Name(),
++		SessionRef:    input.SessionRef,
++		StartTime:     time.Now(),
++		NativeData:    data,
++		ModifiedFiles: ExtractModifiedFiles(lines),
++	}, nil
+ }
+ 
+-// WriteSession is not implemented for Factory AI Droid.
+-func (f *FactoryAIDroidAgent) WriteSession(_ *agent.AgentSession) error {
+-	return errors.New("not implemented")
++// WriteSession writes a session to Factory AI Droid's storage (JSONL transcript file).
++// Uses the NativeData field which contains raw JSONL bytes.
++func (f *FactoryAIDroidAgent) WriteSession(session *agent.AgentSession) error {
++	if session == nil {
++		return errors.New("session is nil")
++	}
++
++	if session.AgentName != "" && session.AgentName != f.Name() {
++		return fmt.Errorf("session belongs to agent %q, not %q", session.AgentName, f.Name())
++	}
++
++	if session.SessionRef == "" {
++		return errors.New("session reference (transcript path) is required")
++	}
++
++	if len(session.NativeData) == 0 {
++		return errors.New("session has no native data to write")
++	}
++
++	if err := os.MkdirAll(filepath.Dir(session.SessionRef), 0o750); err != nil {
++		return fmt.Errorf("failed to create session directory: %w", err)
++	}
++
++	if err := os.WriteFile(session.SessionRef, session.NativeData, 0o600); err != nil {
++		return fmt.Errorf("failed to write transcript: %w", err)
++	}
++
++	return nil
+ }
+ 
+ // FormatResumeCommand returns the command to resume a Factory AI Droid session.
+diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+index 94f28346..53de31a5 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+@@ -201,6 +201,182 @@ func TestGetSessionDir(t *testing.T) {
+ 	}
+ }
+ 
++// --- ReadSession / WriteSession tests ---
++
++func TestReadSession(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	transcriptPath := filepath.Join(tmpDir, "transcript.jsonl")
++
++	// Write a Droid-format JSONL transcript with a file-modifying tool call
++	content := `{"type":"message","id":"msg1","message":{"role":"user","content":[{"type":"text","text":"create a file"}]}}
++{"type":"message","id":"msg2","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"hello.txt","content":"hi"}}]}}`
++	if err := os.WriteFile(transcriptPath, []byte(content), 0o644); err != nil {
++		t.Fatalf("failed to write transcript: %v", err)
++	}
++
++	ag := &FactoryAIDroidAgent{}
++	session, err := ag.ReadSession(&agent.HookInput{
++		SessionID:  "test-session-123",
++		SessionRef: transcriptPath,
++	})
++	if err != nil {
++		t.Fatalf("ReadSession() error = %v", err)
++	}
++
++	if session.SessionID != "test-session-123" {
++		t.Errorf("SessionID = %q, want %q", session.SessionID, "test-session-123")
++	}
++	if session.AgentName != agent.AgentNameFactoryAIDroid {
++		t.Errorf("AgentName = %q, want %q", session.AgentName, agent.AgentNameFactoryAIDroid)
++	}
++	if session.SessionRef != transcriptPath {
++		t.Errorf("SessionRef = %q, want %q", session.SessionRef, transcriptPath)
++	}
++	if len(session.NativeData) == 0 {
++		t.Error("NativeData should not be empty")
++	}
++	if len(session.ModifiedFiles) == 0 {
++		t.Error("ModifiedFiles should contain at least one file")
++	}
++}
++
++func TestReadSession_EmptyRef(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	_, err := ag.ReadSession(&agent.HookInput{SessionID: "test"})
++	if err == nil {
++		t.Error("ReadSession() should error on empty SessionRef")
++	}
++}
++
++func TestReadSession_MissingFile(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	_, err := ag.ReadSession(&agent.HookInput{
++		SessionID:  "test",
++		SessionRef: "/nonexistent/path/transcript.jsonl",
++	})
++	if err == nil {
++		t.Error("ReadSession() should error on missing file")
++	}
++}
++
++func TestWriteSession(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	// Write to a nested path to test directory creation
++	transcriptPath := filepath.Join(tmpDir, "sessions", "project", "transcript.jsonl")
++	nativeData := []byte(`{"type":"message","id":"msg1","message":{"role":"user","content":"hello"}}`)
++
++	ag := &FactoryAIDroidAgent{}
++	err := ag.WriteSession(&agent.AgentSession{
++		SessionID:  "test-session-456",
++		AgentName:  agent.AgentNameFactoryAIDroid,
++		SessionRef: transcriptPath,
++		NativeData: nativeData,
++	})
++	if err != nil {
++		t.Fatalf("WriteSession() error = %v", err)
++	}
++
++	// Verify file was written correctly
++	written, err := os.ReadFile(transcriptPath)
++	if err != nil {
++		t.Fatalf("failed to read written file: %v", err)
++	}
++	if string(written) != string(nativeData) {
++		t.Errorf("written data = %q, want %q", string(written), string(nativeData))
++	}
++}
++
++func TestWriteSession_NilSession(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	if err := ag.WriteSession(nil); err == nil {
++		t.Error("WriteSession(nil) should error")
++	}
++}
++
++func TestWriteSession_WrongAgent(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	err := ag.WriteSession(&agent.AgentSession{
++		AgentName:  "claude-code",
++		SessionRef: "/tmp/test.jsonl",
++		NativeData: []byte("data"),
++	})
++	if err == nil {
++		t.Error("WriteSession() should error for wrong agent name")
++	}
++}
++
++func TestWriteSession_EmptyRef(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	err := ag.WriteSession(&agent.AgentSession{
++		AgentName:  agent.AgentNameFactoryAIDroid,
++		NativeData: []byte("data"),
++	})
++	if err == nil {
++		t.Error("WriteSession() should error on empty SessionRef")
++	}
++}
++
++func TestWriteSession_EmptyNativeData(t *testing.T) {
++	t.Parallel()
++	ag := &FactoryAIDroidAgent{}
++	err := ag.WriteSession(&agent.AgentSession{
++		AgentName:  agent.AgentNameFactoryAIDroid,
++		SessionRef: "/tmp/test.jsonl",
++	})
++	if err == nil {
++		t.Error("WriteSession() should error on empty NativeData")
++	}
++}
++
++func TestReadWriteSession_RoundTrip(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	originalPath := filepath.Join(tmpDir, "original.jsonl")
++	restoredPath := filepath.Join(tmpDir, "restored.jsonl")
++
++	content := `{"type":"message","id":"msg1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
++{"type":"message","id":"msg2","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]}}`
++	if err := os.WriteFile(originalPath, []byte(content), 0o644); err != nil {
++		t.Fatalf("failed to write original: %v", err)
++	}
++
++	ag := &FactoryAIDroidAgent{}
++
++	// Read from original location
++	session, err := ag.ReadSession(&agent.HookInput{
++		SessionID:  "round-trip-test",
++		SessionRef: originalPath,
++	})
++	if err != nil {
++		t.Fatalf("ReadSession() error = %v", err)
++	}
++
++	// Write to new location
++	session.SessionRef = restoredPath
++	if err := ag.WriteSession(session); err != nil {
++		t.Fatalf("WriteSession() error = %v", err)
++	}
++
++	// Verify content matches
++	restored, err := os.ReadFile(restoredPath)
++	if err != nil {
++		t.Fatalf("failed to read restored: %v", err)
++	}
++	if string(restored) != content {
++		t.Errorf("round-trip mismatch:\n got: %q\nwant: %q", string(restored), content)
++	}
++}
++
+ // TestGetSessionDir_EnvOverride cannot use t.Parallel() due to t.Setenv.
+ func TestGetSessionDir_EnvOverride(t *testing.T) {
+ 	ag := &FactoryAIDroidAgent{}
+diff --git a/cmd/entire/cli/e2e_test/agent_runner.go b/cmd/entire/cli/e2e_test/agent_runner.go
+index 93ae0794..ee75e082 100644
+--- a/cmd/entire/cli/e2e_test/agent_runner.go
++++ b/cmd/entire/cli/e2e_test/agent_runner.go
+@@ -394,9 +394,8 @@ func (r *FactoryAIDroidRunner) RunPromptWithTools(ctx context.Context, workDir s
+ 		"-o", "text",
+ 	}
+ 
+-	if len(tools) > 0 {
+-		args = append(args, "--enabled-tools", strings.Join(tools, ","))
+-	}
++	// Droid uses its own permission system (.factory/settings.json), not --enabled-tools.
++	// E2E tests pass Claude-specific tool names that Droid doesn't recognize.
+ 
+ 	if r.Model != "" {
+ 		args = append(args, "-m", r.Model)
+@@ -411,6 +410,13 @@ func (r *FactoryAIDroidRunner) RunPromptWithTools(ctx context.Context, workDir s
+ 	cmd := exec.CommandContext(ctx, "droid", args...)
+ 	cmd.Dir = workDir
+ 
++	// Prevent TTY prompts in git hooks during agent-initiated commits.
++	// Without this, the prepare-commit-msg hook detects Droid's inherited TTY
++	// and blocks waiting for user input on the trailer confirmation prompt.
++	cmd.Env = append(os.Environ(),
++		"ENTIRE_TEST_TTY=0",
++	)
++
+ 	var stdout, stderr bytes.Buffer
+ 	cmd.Stdout = &stdout
+ 	cmd.Stderr = &stderr
+diff --git a/cmd/entire/cli/e2e_test/testenv.go b/cmd/entire/cli/e2e_test/testenv.go
+index aaed018b..39cc7927 100644
+--- a/cmd/entire/cli/e2e_test/testenv.go
++++ b/cmd/entire/cli/e2e_test/testenv.go
+@@ -281,6 +281,7 @@ func (env *TestEnv) GitCommitWithShadowHooks(message string, files ...string) {
+ 		"ENTIRE_TEST_TTY=1",
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := prepCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("prepare-commit-msg output: %s", output)
+@@ -322,6 +323,7 @@ func (env *TestEnv) GitCommitWithShadowHooks(message string, files ...string) {
+ 	postCmd.Env = append(os.Environ(),
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := postCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("post-commit output: %s", output)
+@@ -362,6 +364,7 @@ func (env *TestEnv) GitCommitStagedWithShadowHooks(message string) {
+ 		"ENTIRE_TEST_TTY=1",
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := prepCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("prepare-commit-msg output: %s", output)
+@@ -403,6 +406,7 @@ func (env *TestEnv) GitCommitStagedWithShadowHooks(message string) {
+ 	postCmd.Env = append(os.Environ(),
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := postCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("post-commit output: %s", output)
+@@ -435,6 +439,7 @@ func (env *TestEnv) GitCommitWithTrailerRemoved(message string, files ...string)
+ 		"ENTIRE_TEST_TTY=1",
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := prepCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("prepare-commit-msg output: %s", output)
+@@ -493,6 +498,7 @@ func (env *TestEnv) GitCommitWithTrailerRemoved(message string, files ...string)
+ 	postCmd.Env = append(os.Environ(),
+ 		"ENTIRE_TEST_CLAUDE_PROJECT_DIR="+filepath.Join(env.RepoDir, ".claude"),
+ 		"ENTIRE_TEST_GEMINI_PROJECT_DIR="+filepath.Join(env.RepoDir, ".gemini"),
++		"ENTIRE_TEST_DROID_PROJECT_DIR="+filepath.Join(env.RepoDir, ".factory"),
+ 	)
+ 	if output, err := postCmd.CombinedOutput(); err != nil {
+ 		env.T.Logf("post-commit output: %s", output)
+diff --git a/cmd/entire/cli/integration_test/agent_test.go b/cmd/entire/cli/integration_test/agent_test.go
+index 1d580275..7840f325 100644
+--- a/cmd/entire/cli/integration_test/agent_test.go
++++ b/cmd/entire/cli/integration_test/agent_test.go
+@@ -1119,41 +1119,82 @@ func TestFactoryAIDroidHelperMethods(t *testing.T) {
+ 	})
+ }
+ 
+-// TestFactoryAIDroidSessionStubs verifies that stub methods return not-implemented errors.
+-func TestFactoryAIDroidSessionStubs(t *testing.T) {
++// TestFactoryAIDroidSessionMethods verifies ReadSession, WriteSession, and GetSessionDir.
++func TestFactoryAIDroidSessionMethods(t *testing.T) {
+ 	t.Parallel()
+ 
+-	t.Run("ReadSession returns not-implemented error", func(t *testing.T) {
++	t.Run("ReadSession reads and parses transcript", func(t *testing.T) {
+ 		t.Parallel()
+ 
++		tmpDir := t.TempDir()
++		transcriptPath := filepath.Join(tmpDir, "transcript.jsonl")
++		content := `{"type":"message","id":"msg1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
++{"type":"message","id":"msg2","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}`
++		if err := os.WriteFile(transcriptPath, []byte(content), 0o644); err != nil {
++			t.Fatalf("failed to write transcript: %v", err)
++		}
++
+ 		ag, _ := agent.Get("factoryai-droid")
+-		_, err := ag.ReadSession(&agent.HookInput{
++		session, err := ag.ReadSession(&agent.HookInput{
+ 			SessionID:  "test",
+-			SessionRef: "/tmp/test.jsonl",
++			SessionRef: transcriptPath,
+ 		})
+-		if err == nil {
+-			t.Error("ReadSession() should return an error for Factory AI Droid")
++		if err != nil {
++			t.Fatalf("ReadSession() error = %v", err)
++		}
++		if session.SessionID != "test" {
++			t.Errorf("SessionID = %q, want %q", session.SessionID, "test")
+ 		}
+-		if !strings.Contains(err.Error(), "not implemented") {
+-			t.Errorf("ReadSession() error = %q, want to contain 'not implemented'", err.Error())
++		if len(session.NativeData) == 0 {
++			t.Error("NativeData should not be empty")
+ 		}
+ 	})
+ 
+-	t.Run("WriteSession returns not-implemented error", func(t *testing.T) {
++	t.Run("ReadSession errors on missing file", func(t *testing.T) {
+ 		t.Parallel()
+ 
+ 		ag, _ := agent.Get("factoryai-droid")
+-		err := ag.WriteSession(&agent.AgentSession{
++		_, err := ag.ReadSession(&agent.HookInput{
+ 			SessionID:  "test",
+-			AgentName:  "factoryai-droid",
+-			SessionRef: "/tmp/test.jsonl",
+-			NativeData: []byte("data"),
++			SessionRef: "/nonexistent/path/transcript.jsonl",
+ 		})
+ 		if err == nil {
+-			t.Error("WriteSession() should return an error for Factory AI Droid")
++			t.Error("ReadSession() should error on missing file")
++		}
++	})
++
++	t.Run("WriteSession round-trips with ReadSession", func(t *testing.T) {
++		t.Parallel()
++
++		tmpDir := t.TempDir()
++		originalPath := filepath.Join(tmpDir, "original.jsonl")
++		restoredPath := filepath.Join(tmpDir, "sub", "restored.jsonl")
++
++		content := `{"type":"message","id":"msg1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}`
++		if err := os.WriteFile(originalPath, []byte(content), 0o644); err != nil {
++			t.Fatalf("failed to write original: %v", err)
++		}
++
++		ag, _ := agent.Get("factoryai-droid")
++		session, err := ag.ReadSession(&agent.HookInput{
++			SessionID:  "test",
++			SessionRef: originalPath,
++		})
++		if err != nil {
++			t.Fatalf("ReadSession() error = %v", err)
++		}
++
++		session.SessionRef = restoredPath
++		if err := ag.WriteSession(session); err != nil {
++			t.Fatalf("WriteSession() error = %v", err)
++		}
++
++		restored, err := os.ReadFile(restoredPath)
++		if err != nil {
++			t.Fatalf("failed to read restored: %v", err)
+ 		}
+-		if !strings.Contains(err.Error(), "not implemented") {
+-			t.Errorf("WriteSession() error = %q, want to contain 'not implemented'", err.Error())
++		if string(restored) != content {
++			t.Errorf("round-trip mismatch:\n got: %q\nwant: %q", string(restored), content)
+ 		}
+ 	})
+- Current branch: alisha/factoryai-agent
+- Recent commits: 8fa5dc39 Audit Droid test suite: remove 13 trivial tests, add 9 high-value tests
+c73ebfba Add AgentTypeFactoryAIDroid to exhaustive switches and extract Droid transcript helper
+c5a1d93d Merge branch 'main' into alisha/factoryai-agent
+94a1d70d Implement GetSessionDir for Factory AI Droid
+ac7c4438 Add Factory AI Droid E2E test runner
+12d2099e Fix Droid "(no prompt)" after commit by adding agent-specific transcript parsing
+56fc2bce Merge pull request #442 from entireio/soph/better-agent-agent-instructions
+7b5f027e Merge pull request #441 from entireio/soph/small-rewind-refactor
+e386c99a Merge pull request #440 from entireio/rwr/streamline-setup
+b7247804 Merge branch 'main' into soph/better-agent-agent-instructions
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

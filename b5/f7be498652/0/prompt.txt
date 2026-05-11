@@ -1,0 +1,70 @@
+Implement the following plan:
+
+# Fix: Context compaction resets CheckpointTranscriptStart causing stale carry-forward
+
+## Context
+
+`TestRapidSequentialCommits` fails for Gemini because context compaction events (`pre-compress` hooks) unconditionally reset `CheckpointTranscriptStart = 0` in `lifecycle.go:410`. The Gemini transcript file grows monotonically (never truncated during compaction), so this reset causes stale files to re-appear in carry-forward.
+
+### Why the reset is wrong
+
+Gemini CLI fires `pre-compress` after **every tool call** as part of its standard `after-tool → pre-compress → before-model` pipeline. The E2E logs show it firing 8 times (once per tool call) with only ~10K tokens. The transcript file shows zero evidence of actual compression: all 9 messages are intact, no lines removed, no compaction summary entry inserted. These `pre-compress` events are **no-ops** transcript-wise.
+
+The handler unconditionally resets `CheckpointTranscriptStart = 0` on every `pre-compress`, even when no compression actually occurred. This causes subsequent `extractFilesFromLiveTranscript` calls to re-scan already-condensed messages.
+
+### Failure timeline (from `entire.log` and transcript)
+
+Transcript: 9 messages — msg 2: `write_file red.md`, msg 4: `write_file blue.md`, msg 6: `write_file green.md`.
+
+1. **Commit 1 (red.md)**: `extractFilesFromLiveTranscript(offset=0)` → `["docs/red.md"]`. Condensation → `CheckpointTranscriptStart = 3`
+2. **Compaction (`pre-compress`)**: resets `CheckpointTranscriptStart = 0`
+3. **Commit 2 (blue.md)**: `extractFilesFromLiveTranscript(offset=0)` re-scans ALL msgs → `["docs/red.md","docs/blue.md"]`. `subtractFilesByName` removes blue → carry-forward `["red.md"]`
+4. **Commit 3 (green.md)**: `FilesTouched = ["docs/red.md"]`, committed=`{"docs/green.md"}` → no overlap → `should_condense: false` → shadow branch persists → **test fails**
+
+## Fix
+
+### 1. Remove unconditional transcript offset reset in compaction handler
+
+**File:** `cmd/entire/cli/lifecycle.go:410`
+
+Remove:
+```go
+sessionState.CheckpointTranscriptStart = 0
+```
+
+Also update the stderr message to remove "transcript offset reset".
+
+In this test, `pre-compress` fires as a no-op — no actual compression occurs, so the offset should not be reset. We have no evidence of what a *real* Gemini compaction would do to the on-disk transcript (truncate, insert summary, etc.).
+
+Removing the reset is safe because:
+- For no-op compactions (the observed case): offset remains correct
+- For real compactions that might alter the transcript: `ExtractModifiedFilesFromOffset` handles offset > length gracefully (returns empty — the loop simply doesn't iterate), which is a safe default since those files were already condensed
+- If we later discover real compactions need special handling, we can add agent-specific logic at that point
+
+### 2. Update existing compaction test
+
+**File:** `cmd/entire/cli/lifecycle_test.go`
+
+The existing test `TestHandleLifecycleCompaction_ResetsTranscriptOffset` explicitly verifies the reset behavior. Update it to verify the offset is **preserved** instead.
+
+### 3. Add a unit test for the carry-forward scenario
+
+**File:** `cmd/entire/cli/strategy/manual_commit_hooks_test.go` (or `manual_commit_test.go`)
+
+Add a test that simulates the bug scenario: after condensation sets `CheckpointTranscriptStart = N`, verify that `extractFilesFromLiveTranscript` only returns files after offset N (not from offset 0).
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci` — all tests pass
+2. Run the failing E2E test: `mise run test:e2e:gemini TestRapidSequentialCommits`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alex/.claude/projects/-Users-alex-workspace-cli--worktrees-1/8b761911-336c-4f6c-9756-df16fb765955.jsonl
+
+---
+
+run our preflight fmt, lint, test:ci please
+
+---
+
+we all checked in? can we rebase on our upstream branch?
