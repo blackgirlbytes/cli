@@ -1,0 +1,245 @@
+Implement the following plan:
+
+# Plan: Add Copilot E2E Test Support
+
+## Context
+
+The copilot agent is implemented and can be enabled via `entire enable --agent github-copilot`, but the e2e test suite (`cmd/entire/cli/e2e_test/`) has no `CopilotRunner`. Running `E2E_AGENT=github-copilot` falls through to `unavailableRunner`. This plan adds copilot support so existing e2e scenarios work with `E2E_AGENT=github-copilot`.
+
+The Copilot CLI (`copilot` v0.0.411) is installed locally and supports non-interactive mode via `-p "prompt"` with `--model` and `--allow-all-tools` flags — very similar to Claude Code.
+
+## Changes
+
+### 1. Add `CopilotRunner` to `e2e_test/agent_runner.go`
+
+Add constant and runner:
+
+```go
+const AgentNameCopilot = "github-copilot"
+```
+
+**`CopilotRunner` struct**: `Model string`, `Timeout time.Duration`
+
+**`NewCopilotRunner(config)`**:
+- Model: `config.Model` || `E2E_COPILOT_MODEL` || `"claude-haiku-4.5"` (cheapest)
+- Timeout: `config.Timeout` || `E2E_TIMEOUT` || `2m`
+
+**`IsAvailable()`**:
+- `exec.LookPath("copilot")`
+- `copilot --version` with 10s timeout
+
+**`RunPromptWithTools(ctx, workDir, prompt, tools)`**:
+- Command: `copilot --model <model> -p "<prompt>" --allow-all-tools`
+- If `tools` provided: add `--available-tools <tools...>`
+- Same stdout/stderr/exitcode capture pattern as `ClaudeCodeRunner`
+
+**`RunPrompt()`**: delegates to `RunPromptWithTools` with `nil` tools
+
+**Register in `NewAgentRunner` switch**:
+```go
+case AgentNameCopilot:
+    return NewCopilotRunner(config)
+```
+
+### 2. Add copilot session dir env var to `e2e_test/testenv.go`
+
+The copilot agent's `GetSessionDir()` checks `ENTIRE_TEST_COPILOT_SESSION_DIR`. Without it, hooks try to read `~/.copilot/session-state/` which won't have test session data.
+
+In **3 methods** that set hook env vars — `GitCommitWithShadowHooks`, `GitCommitStagedWithShadowHooks`, `GitCommitWithTrailerRemoved` — add:
+
+```go
+"ENTIRE_TEST_COPILOT_SESSION_DIR=" + filepath.Join(env.RepoDir, ".copilot-sessions"),
+```
+
+This mirrors the existing `ENTIRE_TEST_CLAUDE_PROJECT_DIR` and `ENTIRE_TEST_GEMINI_PROJECT_DIR` patterns.
+
+## Files
+
+| File | Change |
+|---|---|
+| `cmd/entire/cli/e2e_test/agent_runner.go` | Add `AgentNameCopilot`, `CopilotRunner`, register in factory |
+| `cmd/entire/cli/e2e_test/testenv.go` | Add `ENTIRE_TEST_COPILOT_SESSION_DIR` to 3 hook env blocks |
+
+## Verification
+
+```bash
+# Build and run a single e2e test with copilot
+E2E_AGENT=github-copilot go test -tags=e2e -run TestE2E_BasicWorkflow ./cmd/entire/cli/e2e_test/...
+
+# If copilot not authenticated, tests should skip gracefully (exit 0)
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.REDACTED.jsonl
+
+---
+
+mise run test:e2e:copilot are failing
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Initial Request**: The user provided a detailed plan to add Copilot E2E test support to the CLI. The plan had two main changes:
+   - Add `CopilotRunner` to `e2e_test/agent_runner.go`
+   - Add `ENTIRE_TEST_COPILOT_SESSION_DIR` env var to `e2e_test/testenv.go`
+
+2. **Implementation Phase**: I read both target files, checked copilot agent implementation, verified CLI flags with `copilot --help`, then made the changes:
+   - Added `AgentNameCopilot` constant
+   - Added `CopilotRunner` struct with `NewCopilotRunner`, `IsAvailable`, `RunPrompt`, `RunPromptWithTools`
+   - Registered in `NewAgentRunner` switch
+   - Added `ENTIRE_TEST_COPILOT_SESSION_DIR` to all env blocks in testenv.go
+   - Had issues with non-unique string matching in Edit tool (had to use more context)
+   - Ran fmt, lint, test:ci - all passed
+
+3. **User reported test failures**: `mise run test:e2e:copilot` was failing
+
+4. **Investigation Phase 1**: Ran the full e2e suite and found 10 failures. Key discovery:
+   - Copilot's `--available-tools` flag RESTRICTS tools (opposite of Claude's `--allowedTools`)
+   - Copilot tool names differ from Claude's (e.g., "bash" vs "Bash", "create" vs "Write")
+   - Tests passing Claude tool names like `["Write", "Bash"]` caused copilot to report "Unknown tool name in the tool allowlist"
+
+5. **Fix 1**: Modified `CopilotRunner.RunPromptWithTools` to ignore the `tools` parameter since `--allow-all-tools` already grants all permissions. Changed `tools []string` to `_ []string` and removed the `--available-tools` logic.
+
+6. **Re-run results**: Down from 10 failures to 6. The remaining 6 all share the same pattern: "Transcript not found at .../full.jsonl" on the SECOND commit in multi-commit scenarios.
+
+7. **Investigation Phase 2**: Deep dive into the condensation flow:
+   - Read `manual_commit_condensation.go` - understood `CondenseSession` and `extractSessionData`
+   - Read `manual_commit_hooks.go` - understood `PostCommit`, `condenseAndUpdateState`, `carryForwardToNewShadowBranch`
+   - Read copilot agent files: `copilot.go`, `hooks.go`, `types.go`, `lifecycle.go`
+   - Key finding: Copilot's `userPromptSubmitted` hook does NOT include `sessionId` or `transcriptPath` - only `agentStop` does
+   - This means `InitializeSession` is never properly called from TurnStart (it fails with "no session_id")
+   - The carry-forward branch is created WITHOUT transcript metadata (by design)
+   - For the second commit, the transcript must come from `state.TranscriptPath` (live file), but this may not be available
+
+8. **Where investigation stopped**: I was about to run the failing test one more time to check the logs for more details about why the transcript is missing on the second commit. The investigation was still ongoing.
+
+Key files examined:
+- `cmd/entire/cli/e2e_test/agent_runner.go` - Modified (added CopilotRunner, fixed tool handling)
+- `cmd/entire/cli/e2e_test/testenv.go` - Modified (added ENTIRE_TEST_COPILOT_SESSION_DIR)
+- `cmd/entire/cli/agent/copilot/copilot.go` - Read (GetSessionDir, transcript handling)
+- `cmd/entire/cli/agent/copilot/hooks.go` - Read (hook installation)
+- `cmd/entire/cli/agent/copilot/types.go` - Read (stdin types, only agentStop has sessionId)
+- `cmd/entire/cli/agent/copilot/lifecycle.go` - Read (ParseHookEvent, parseTurnStart has no sessionID)
+- `cmd/entire/cli/strategy/manual_commit_condensation.go` - Read (CondenseSession, extractSessionData)
+- `cmd/entire/cli/strategy/manual_commit_hooks.go` - Read (PostCommit, carry-forward logic)
+- `cmd/entire/cli/hook_registry.go` - Read (hook dispatch flow)
+- `cmd/entire/cli/lifecycle.go` - Read (handleLifecycleTurnStart requires session_id)
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to implement a plan to add GitHub Copilot E2E test support to the CLI codebase. The plan specified adding a `CopilotRunner` to `e2e_test/agent_runner.go` and adding `ENTIRE_TEST_COPILOT_SESSION_DIR` env var to `e2e_test/testenv.go`. After implementation, the user reported that `mise run test:e2e:copilot` was failing, triggering an investigation and fix cycle.
+
+2. Key Technical Concepts:
+   - Copilot CLI (`copilot` v0.0.411) uses `-p "prompt"`, `--model`, `--allow-all-tools` for non-interactive mode
+   - Copilot's `--available-tools` flag RESTRICTS the tool list (opposite intent from Claude's `--allowedTools`)
+   - Copilot tool names differ from Claude Code (e.g., `bash` vs `Bash`, `create` vs `Write`, `edit` vs `Edit`)
+   - Copilot's hook system: only `agentStop` provides `sessionId` and `transcriptPath`; `sessionStart`, `userPromptSubmitted`, `sessionEnd` do NOT include these fields
+   - Manual-commit strategy condensation: shadow branches store checkpoint data, carry-forward creates new shadow branches WITHOUT transcript metadata
+   - The carry-forward second-commit condensation relies on reading transcript from `state.TranscriptPath` (live file on disk)
+   - `handleLifecycleTurnStart` requires `event.SessionID` and returns error if empty — this fails silently for copilot's `userPromptSubmitted` hook
+
+3. Files and Code Sections:
+   - **`cmd/entire/cli/e2e_test/agent_runner.go`** (MODIFIED)
+     - Core file for agent test runners. Added CopilotRunner support.
+     - Added constant: `const AgentNameCopilot = "github-copilot"`
+     - Registered in factory switch: `case AgentNameCopilot: return NewCopilotRunner(config)`
+     - Added full CopilotRunner implementation:
+     ```go
+     // CopilotRunner implements AgentRunner for GitHub Copilot CLI.
+     type CopilotRunner struct {
+         Model   string
+         Timeout time.Duration
+     }
+
+     func NewCopilotRunner(config AgentRunnerConfig) *CopilotRunner {
+         model := config.Model
+         if model == "" {
+             model = os.Getenv("E2E_COPILOT_MODEL")
+             if model == "" {
+                 model = "claude-haiku-4.5"
+             }
+         }
+         // timeout logic same as other runners (E2E_TIMEOUT env or 2m default)
+         // ...
+         return &CopilotRunner{Model: model, Timeout: timeout}
+     }
+
+     func (r *CopilotRunner) IsAvailable() (bool, error) {
+         // exec.LookPath("copilot") + copilot --version with 10s timeout
+     }
+
+     func (r *CopilotRunner) RunPromptWithTools(ctx context.Context, workDir string, prompt string, _ []string) (*AgentResult, error) {
+         // tools parameter ignored because Copilot tool names differ from Claude Code's
+         // and --available-tools restricts rather than allows
+         args := []string{"--model", r.Model, "-p", prompt, "--allow-all-tools"}
+         // standard exec pattern with stdout/stderr capture
+     }
+     ```
+   
+   - **`cmd/entire/cli/e2e_test/testenv.go`** (MODIFIED)
+     - Added `ENTIRE_TEST_COPILOT_SESSION_DIR` to all 6 hook env blocks (prepare-commit-msg and post-commit in `GitCommitWithShadowHooks`, `GitCommitStagedWithShadowHooks`, `GitCommitWithTrailerRemoved`):
+     ```go
+     "ENTIRE_TEST_COPILOT_SESSION_DIR="+filepath.Join(env.RepoDir, ".copilot-sessions"),
+     ```
+
+   - **`cmd/entire/cli/agent/copilot/types.go`** (READ)
+     - Critical finding: `userPromptRaw` only has `hookBase` + `Prompt`. Only `agentStopRaw` has `SessionID` and `TranscriptPath`.
+
+   - **`cmd/entire/cli/agent/copilot/lifecycle.go`** (READ)
+     - `parseTurnStart` returns Event with empty SessionID/SessionRef
+     - `parseTurnEnd` returns Event with SessionID and SessionRef from agentStop stdin
+
+   - **`cmd/entire/cli/lifecycle.go`** (READ)
+     - `handleLifecycleTurnStart` at line 120-123: requires `event.SessionID`, returns error if empty — this silently fails for copilot
+     - `handleLifecycleTurnEnd` at line 162-165: falls back to `unknownSessionID` if empty
+
+   - **`cmd/entire/cli/strategy/manual_commit_condensation.go`** (READ)
+     - `CondenseSession` tries shadow branch first, falls back to live transcript
+     - `extractSessionData` (line 370): tries `liveTranscriptPath` first, then shadow branch `metadataDir + "/" + paths.TranscriptFileName`
+     - `carryForwardToNewShadowBranch` in hooks.go explicitly sets `MetadataDir: ""` — no transcript on carry-forward branch
+
+   - **`cmd/entire/cli/strategy/manual_commit_hooks.go`** (READ)
+     - `condenseAndUpdateState` resets StepCount, FilesTouched but preserves TranscriptPath
+     - `carryForwardToNewShadowBranch` sets `StepCount=1`, `CheckpointTranscriptStart=0`, `LastCheckpointID=""`
+
+   - **`cmd/entire/cli/agent/copilot/copilot.go`** (READ)
+     - `GetSessionDir` checks `ENTIRE_TEST_COPILOT_SESSION_DIR` env override
+     - `ResolveSessionFile` returns `filepath.Join(sessionDir, agentSessionID, "events.jsonl")`
+
+4. Errors and fixes:
+   - **Edit tool non-unique string match**: When trying to append CopilotRunner after the GeminiCLIRunner, the string `result.ExitCode = 0\n\treturn result, nil\n}` appeared twice (once for each runner). Fixed by using a larger, unique context string that included GeminiCLI-specific code.
+   - **Copilot tool name mismatch (main fix)**: Tests passing Claude Code tool names (`"Write"`, `"Bash"`) to `RunPromptWithTools` caused copilot to report `Unknown tool name in the tool allowlist: "Write"` / `"Bash"`. Fixed by changing `tools []string` to `_ []string` in `RunPromptWithTools` and removing the `--available-tools` logic, since `--allow-all-tools` already grants all permissions.
+   - **Second commit transcript missing (UNSOLVED)**: 6 remaining tests fail with "Transcript not found at .../full.jsonl" on the second commit in multi-commit scenarios. Root cause under investigation — appears related to copilot's lack of sessionId in userPromptSubmitted hook, which prevents proper session initialization via `InitializeSession`.
+
+5. Problem Solving:
+   - **Solved**: Tool name mismatch — copilot uses different tool names and `--available-tools` restricts rather than allows. Fixed by ignoring tools parameter.
+   - **Unsolved**: Second-commit transcript missing in 6 tests. Investigation traced through: condensation flow → carry-forward creates shadow branch without transcript → second commit must read from live transcript path → copilot's `userPromptSubmitted` has no sessionId so `InitializeSession` never runs → session state may be incomplete. The investigation was ongoing when the summary was requested.
+   
+   Passing tests (24): TestE2E_BasicWorkflow, TestE2E_MultipleChanges, TestE2E_CheckpointMetadata, TestE2E_CheckpointIDFormat, TestE2E_AutoCommitStrategy, TestE2E_Scenario1_BasicFlow, TestE2E_Scenario2_AgentCommitsDuringTurn, TestE2E_Scenario3_MultipleGranularCommits, TestE2E_Scenario5_PartialCommitStashNextPrompt, TestE2E_RewindToCheckpoint, TestE2E_RewindAfterCommit, TestE2E_RewindMultipleFiles, TestE2E_SubagentCheckpoint_CommitFlow, TestE2E_TrailerRemoval_SkipsCondensation, TestE2E_SessionDepleted_ManualEditNoCheckpoint, TestE2E_ExistingFiles_ModifyAndCommit (flaky), TestE2E_ExistingFiles_StashModifications, TestE2E_ExistingFiles_RevertModification, TestE2E_ExistingFiles_MixedNewAndModified, TestE2E_ContentAwareOverlap_RevertAndReplace, TestE2E_AgentCommitsDuringTurn, TestE2E_AgentCommitsMidTurn_UserCommitsRemainder, TestE2E_Scenario6_StashSecondPromptUnstashCommitAll, TestE2E_MultipleAgentSessions
+   
+   Failing tests (5-6): TestE2E_Scenario4_UserSplitsCommits, TestE2E_DeletedFiles_CommitDeletion, TestE2E_EndedSession_UserCommitsAfterExit, TestE2E_ExistingFiles_SplitCommits, TestE2E_Scenario7_PartialStagingSimulated, (TestE2E_ExistingFiles_ModifyAndCommit - flaky)
+
+6. All user messages:
+   - "Implement the following plan: [detailed plan for adding Copilot E2E Test Support with specific code changes for agent_runner.go and testenv.go]"
+   - "mise run test:e2e:copilot are failing"
+
+7. Pending Tasks:
+   - Fix the remaining 5-6 e2e test failures where the second commit's checkpoint is missing `full.jsonl` and `content_hash.txt`
+   - Root cause appears to be that copilot's `userPromptSubmitted` hook lacks `sessionId`, preventing proper session initialization, which likely causes the transcript path to be unavailable for carry-forward condensation on subsequent commits
+
+8. Current Work:
+   Investigating why 5-6 copilot e2e tests fail with "Transcript not found" on the second commit in multi-commit scenarios. The investigation traced through the entire condensation and carry-forward flow and identified that copilot's `userPromptSubmitted` hook doesn't provide `sessionId` or `transcriptPath` (only `agentStop` does), which means `handleLifecycleTurnStart` fails silently and `InitializeSession` is never called. This likely causes incomplete session state where `TranscriptPath` might not be set or the live transcript file path becomes invalid for the carry-forward second-commit condensation. The last action was running `TestE2E_Scenario4_UserSplitsCommits` to see its detailed output showing checkpoint IDs but transcript not found on the second checkpoint.
+
+9. Optional Next Step:
+   Continue investigating the transcript-not-found issue on second commits. Key areas to check:
+   - Verify if `state.TranscriptPath` is actually populated after copilot's `agentStop` hook fires and whether it persists through the first commit's condensation
+   - Check if the live transcript file at `~/.copilot/session-state/<sessionId>/events.jsonl` still exists on disk after the copilot session ends
+   - Determine if the issue is that `InitializeSession` never running means the session state is created differently (perhaps only via SaveStep in TurnEnd), and whether the carry-forward code path properly handles this
+   - Consider adding debug logging in the test or checking `.entire/logs/` in the test repo to trace the exact condensation flow for the second commit
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.REDACTED.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.

@@ -1,0 +1,59 @@
+Implement the following plan:
+
+# Remove Unused Exported Symbols (Dead Code Cleanup)
+
+## Context
+
+Go does not warn about unused exported (uppercase) symbols at compile time, so dead exported code accumulates silently. This cleanup removes exported functions, types, and variables that are defined but never referenced from any other package (or anywhere at all). This reduces maintenance burden and prevents confusion about which APIs are actively supported.
+
+## Dead Code Identified
+
+After searching every exported symbol across all packages for references in the entire codebase (including tests, integration tests, and e2e tests), these **5 symbols** are confirmed dead:
+
+### 1. `ErrNotImplemented` in `strategy/strategy.go:27`
+- Error sentinel defined but never returned or checked anywhere
+- **Action:** Delete the var declaration and its comment (lines 26-27)
+
+### 2. `ReadSessionPromptFromShadow()` in `strategy/common.go:539-560`
+- Function reads prompt from shadow branch, but no caller exists
+- **Action:** Delete the function and its comment (lines 537-560)
+
+### 3. `PromptResponse` type in `strategy/session.go:63-72`
+- Only used as a field type inside `CheckpointDetails`, which is itself dead
+- **Action:** Delete the type and its comment (lines 62-72)
+
+### 4. `CheckpointDetails` type in `strategy/session.go:76-85`
+- Defined but never instantiated, populated, or referenced from any package
+- **Action:** Delete the type and its comment (lines 74-85)
+
+### 5. `RepoRootOr()` in `paths/paths.go:105-111`
+- Convenience wrapper around `RepoRoot()` with fallback, but never called
+- **Action:** Delete the function and its comment (lines 103-111)
+
+## Files to Modify
+
+| File | Changes |
+|------|---------|
+| `cmd/entire/cli/strategy/strategy.go` | Remove `ErrNotImplemented` (lines 26-27) |
+| `cmd/entire/cli/strategy/common.go` | Remove `ReadSessionPromptFromShadow` (lines 537-560) |
+| `cmd/entire/cli/strategy/session.go` | Remove `PromptResponse` (lines 62-72) and `CheckpointDetails` (lines 74-85) |
+| `cmd/entire/cli/paths/paths.go` | Remove `RepoRootOr` (lines 103-111) |
+
+## Symbols Investigated but Confirmed Used
+
+These were initially flagged but verified as actively used:
+- `ErrEmptyRepository` - used in `cli/lifecycle.go`
+- `SubagentCheckpoint` - used in `cli/hooks.go`, `checkpoint/committed.go`
+- `GetRemoteMetadataBranchTree` - used in `cli/resume.go`
+- `ExtractLastCompletedTodo` / `CountTodos` - used in `cli/hooks.go`
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+After deletion, the build must compile cleanly with no new lint errors, and all tests must pass. The removed symbols have zero references, so no test or production code should break.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.REDACTED.jsonl

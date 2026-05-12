@@ -1,0 +1,105 @@
+Compaction Summary
+
+  1. Task Overview
+
+  User reported entire migrate --checkpoints v2 taking 20-30min for 4k checkpoints, slowdown traced to recent generation-logic patches. They asked whether entire doctor trace could diagnose,
+  or if a --verbose flag was needed. Goal: identify the actual bottleneck.
+
+  2. Current State
+
+  Implemented entire migrate --checkpoints v2 --profile (this branch: v2-migration-performance, no commits yet):
+  - New file: cmd/entire/cli/migrate_profile.go — migrateProfiler with phases (one-shot timings) + aggregated stages (count/total/avg/max), context plumbing
+  (profileStartPhase/profileStartStage), formatProfileDuration helper.
+  - New file: cmd/entire/cli/migrate_profile_test.go — unit tests for profiler + integration test (TestMigrateCheckpointsV2_ProfilerCapturesPhasesAndStages) confirming spans fire in the real
+  migration code path.
+  - Modified cmd/entire/cli/migrate.go — added --profile flag + instrumentation:
+    - Phases: list_v1_checkpoints, build_full_artifacts_index, process_checkpoints, pack_partial_generation, repair_generation_metadata
+    - Stages (per-checkpoint, aggregated): read_v2_existing, resume_packing, backfill_compact_transcripts, read_v1_summary, read_v1_session, compact_transcript, write_v2_session,
+  collect_task_metadata, pack_full_generation
+  - Lint clean, all migrate/profile tests pass.
+
+  Diagnostic findings from real-repo runs:
+
+  ┌───────────────────────────────┬────────┬──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │           Run type            │ Total  │                                        Dominant cost                                         │
+  ├───────────────────────────────┼────────┼──────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Rerun (5110 ckpts, 30 fresh)  │ 13m48s │ repair_generation_metadata: 13m39s (99%)                                                     │
+  ├───────────────────────────────┼────────┼──────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Fresh (2478 ckpts, all fresh) │ 5m38s  │ compact_transcript 2m + pack_full_generation 2m + write_v2_session 51s + read_v1_session 40s │
+  └───────────────────────────────┴────────┴──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  3. Important Discoveries
+
+  - Original 20-30min reports were rerun-dominated by the repair pass, not the migration loop itself. Fresh runs scale to ~9min for 4k checkpoints.
+  - Why repair fires on near-no-op reruns: 30 freshly-migrated checkpoints land in pendingFull, the partial-generation pack at end of run trips RotateCurrentGenerationIfNeeded, which appends
+  one new archived ref to freshlyPackedRefs. That single ref trips the gate at migrate.go:172 (len(freshlyPackedRefs) > 0) — repair then walks every other archived generation (~3.4 min/archive
+   × ~4 archives = ~13.6min), even though those pre-existing archives are unchanged from prior runs.
+  - Design pivot mid-task: initially proposed using perf.Span/LoopSpan everywhere, but LoopSpan (manual_commit_hooks.go:990) emits one iteration span per pass — at 4k+ iterations × 6 sub-spans
+   each, that's 24k+ attrs in a single perf log line. Switched to a custom aggregator for per-checkpoint stages while keeping perf.Span-style timing for one-shot phases. (perf package itself
+  is untouched.)
+  - Minor reporting quirk: process_checkpoints phase wraps the entire migrateCheckpointsV2 call, so it nests the inner phases (list_v1_checkpoints, build_full_artifacts_index,
+  pack_partial_generation). Subtract those for the loop-body-only number. Fixable but not blocking.
+  - Pre-existing flake: TestResolveAgentForRewind in cmd/entire/cli/strategy/ is flaky on main too (~50% fail rate when run with the rest of the strategy suite, passes in isolation). Unrelated
+   to this work.
+
+  4. Next Steps
+
+  Recommended priority: fix the rerun blowup (bigger user-facing win, smaller blast radius). Two reasonable approaches discussed but not yet decided:
+  1. Version-tag generation.json — add e.g. "packer_version": "..." so the repair pass can skip archives already produced by the current packer. After one repair per archive, future runs are
+  O(0).
+  2. Tighten the gate at migrate.go:172 — only run repair against archives lacking the marker.
+
+  Lower priority: investigate fresh-run hot path (compact_transcript 35% + pack_full_generation 35%) for sub-stage profiling, but ~9min for 4k is tolerable.
+
+  Branch state: v2-migration-performance with uncommitted instrumentation changes. Not yet committed/pushed — user hasn't asked.
+
+  5. Context to Preserve
+
+  - User: nina@entire.io, working on Entire CLI repo at /Users/ninawork/entire/devenv/cli, Go 1.26.x, mise toolchain.
+  - User saved memory: don't run state-mutating commands against other repos in ~/entire/devenv/ without explicit go-ahead (e.g., no entire migrate against entire.io repo unless asked).
+  - Coding style preferences from CLAUDE.md: terse, no unnecessary comments, no over-engineering, don't add features beyond task. User confirmed terse is good ("Perfect", "Perfect yeah"
+  through this session — keep that pace).
+  - Methodology: TDD (tests first, watched RED, then GREEN), mise run fmt && mise run lint && mise run test:ci before commits.
+  - The --profile flag is currently hidden under entire migrate (whose parent command is Hidden: true). Likely fine to leave hidden alongside the rest of migrate.
+  - Running entire migrate --profile against a real repo requires either (a) acceptance that reruns will modify local v2 refs, or (b) the throwaway-clone recipe documented earlier in the
+  conversation (git clone --no-local …).
+
+  ---
+  The user's last meaningful question was: "Which do you want to tackle? My vote is the rerun fix — bigger ROI, smaller blast radius." They never answered which path (gate-tightening vs.
+  version-tagging) — but they didn't push back on tackling the rerun fix either. Awaiting their direction.
+
+---
+
+I want to focus on making the initial run of migrations faster
+
+---
+
+are you stuck
+
+---
+
+proceed
+
+---
+
+I don't understand what we lose or gained by having the double-compact. Will there be some transcripts not compacted if we skip that second compaction step?
+
+---
+
+So the computed offsets will still be correct if we only did one pass?
+
+---
+
+So the computed offsets will still be correct if we calculated it in pass 1?
+
+---
+
+It seems too risky, what are some other wins we can get? Maybe B?
+
+---
+
+Let's do C first
+
+---
+
+Why would 2478 become 3? doesn't it need to rotate every 100 checkpoints?

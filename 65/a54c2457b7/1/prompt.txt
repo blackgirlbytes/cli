@@ -1,0 +1,54 @@
+can you review the changes in this branch
+
+---
+
+on 2: this is a cli run on the users machine
+
+---
+
+can you review again
+
+---
+
+can you company your feedback with this feedback: 
+
+  1. Medium: cmd/entire/cli/explain_summary_provider.go:87 persists an auto-detected
+     summary provider into whichever settings file settingsTargetFile() picks, and cmd/
+     entire/cli/setup.go:194 prefers .entire/settings.json when it exists. That means a
+     read-only command path like entire explain --generate can silently dirty the branch
+     with a machine-local PATH decision and commit a provider/model that may not exist for
+     other developers. Since provider availability is explicitly host-local
+     (exec.LookPath), this should either write to settings.local.json by default or avoid
+     persistence unless the user explicitly configures it.
+  2. Medium: cmd/entire/cli/setup.go:158 loads only the target file with
+     settings.LoadFromFile, then cmd/entire/cli/setup.go:171. That breaks a valid override
+     flow: if the project file defines summary_generation.provider, entire configure
+     --local --summarize-model ... should be allowed, because merged runtime settings
+     already support “provider from project, model from local”. The configure path
+     currently ignores the inherited provider and errors out.
+
+  Assumptions / questions:
+
+  - I’m assuming summary-provider selection is intended to be machine-specific, because
+    discovery is based on local CLI binaries rather than repo detection. If you explicitly
+    want the provider choice to be shared repo-wide, finding 1 becomes less severe, but the
+    command still has the surprising side effect of modifying tracked config during
+    explain.
+
+---
+
+ok, let's address
+
+---
+
+Findings:
+
+1. Medium: [cmd/entire/cli/explain_summary_provider.go](/Users/soph/Work/entire/devenv/cli_worktree1/cmd/entire/cli/explain_summary_provider.go:87) auto-persists the detected summary provider into whichever settings file `settingsTargetFile()` chooses, and [cmd/entire/cli/setup.go](/Users/soph/Work/entire/devenv/cli_worktree1/cmd/entire/cli/setup.go:194) prefers the tracked project file when it exists. That makes `entire explain --generate` mutate repo config based on the local machine’s PATH, which is a surprising side effect for a read-only command and can create branch dirt that other developers cannot use. This should default to `settings.local.json` or require explicit user configuration before persisting.
+
+2. Medium: [cmd/entire/cli/setup.go](/Users/soph/Work/entire/devenv/cli_worktree1/cmd/entire/cli/setup.go:158) reads only the target file with `settings.LoadFromFile`, then [rejects `--summarize-model` unless that same file already contains a provider](/Users/soph/Work/entire/devenv/cli_worktree1/cmd/entire/cli/setup.go:171). That breaks the expected override flow where the provider lives in project settings and the model is set locally. Runtime loading supports merged settings, but `configure --local --summarize-model ...` does not.
+
+Assumptions:
+
+- I’m assuming summary-provider availability is machine-local because selection is based on `exec.LookPath`, not repo detection. Under that model, persisting to tracked config is the wrong default.
+
+I didn’t find a concrete bug in the Copilot VS Code hook compatibility or the new condensation-skip path. I also ran focused tests across the touched `agent`, `summarize`, `checkpoint`, `strategy`, `settings`, and `cli` packages; that slice passed.

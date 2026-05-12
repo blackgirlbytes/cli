@@ -1,0 +1,77 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "22d97de615d5",
+  "session_id": "49456f2f-51c7-4bbd-b8f8-3df6da366c33",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-01T04:15:09.197827Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "0ff7fb2f362a",
+  "token_usage": {
+    "input_tokens": 3613,
+    "cache_creation_tokens": 368059,
+    "cache_read_tokens": 13320416,
+    "output_tokens": 69231,
+    "api_call_count": 111
+  },
+  "session_metrics": {
+    "turn_count": 6
+  },
+  "summary": {
+    "intent": "The user wanted to understand the memory loop architecture, then explore adding an MCP tool interface so Claude could pull memories on demand rather than relying solely on hook-based injection.",
+    "outcome": "A full MCP server implementation was designed and built: two tools (search_memories, save_memory), a new `entire mcp-server` command, and hook installation changes to write mcpServers config into .claude/settings.json. All 14+ tests pass.",
+    "learnings": {
+      "repo": [
+        "Memory loop has two independent axes: mode (off/manual/auto) controls injection, activation_policy (review/auto) controls whether new memories auto-activate. These are frequently conflated.",
+        "Injection happens in maybeInjectMemoryLoop() via UserPromptSubmit hook — it's a one-shot write before Claude sees anything, making interactive memory retrieval impossible without MCP.",
+        "manual mode has no compelling use case without MCP: it allows curation but never injects, and auto+review_policy already provides safe staging. MCP gives manual mode a real identity.",
+        "Facets are the intermediate representation between raw transcripts and memory candidates — structured signals (repeated instructions, friction points, skill opportunities, etc.) extracted from summaries.",
+        "Reconciliation uses Jaccard similarity >= 0.50 for dedup; fingerprintForRecord was unexported and needed exporting for the save_memory handler.",
+        "AddManualRecord creates records with StatusActive, not StatusCandidate — the save_memory handler needed to bypass it and build records directly to enforce candidate status.",
+        "PreviewSelection is too restrictive for MCP search: it calls passesInjectionGate (StatusActive only) and returns empty on empty queries. Search handler needs its own filter+score path.",
+        "t.Parallel() cannot be combined with t.Chdir() in Go tests — subagent correctly omitted t.Parallel()."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/lifecycle.go",
+          "line": 282,
+          "end_line": 284,
+          "finding": "Injection gate: if mode != ModeAuto, maybeInjectMemoryLoop returns nil immediately. manual mode never injects."
+        },
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "finding": "AddManualRecord sets Status: StatusActive for manual records, not StatusCandidate. Save_memory handler must build records directly to set candidate status."
+        },
+        {
+          "path": "cmd/entire/cli/agent/claudecode/hooks.go",
+          "line": 185,
+          "finding": "InstallHooks already had high maintidx lint score before MCP changes — pre-existing issue, not introduced by this work."
+        }
+      ],
+      "workflow": [
+        "Subagent-driven development pattern: dispatch implementer subagents per task with rich context, verify tests after each task, commit incrementally. Subagents committed their own work, requiring git log checks to track state.",
+        "Self-review step on specs before writing plans caught a real ambiguity: search_memories needed to support status:candidate filter, which SelectRelevant/passesInjectionGate doesn't allow.",
+        "Reading existing test files before adding new tests is essential for matching style (writeSettingsFile helper pattern, t.Chdir usage, etc.).",
+        "Check which files were already modified by subagents before staging — subagents may have already committed, leaving nothing to stage."
+      ]
+    },
+    "friction": [
+      "User interrupted the brainstorming skill mid-execution twice, requiring 'continue' prompts to resume.",
+      "mcp-go dependency wasn't added to go.mod/go.sum until first import — the initial 'go get' step was effectively a no-op.",
+      "fingerprintForRecord was unexported, requiring a rename to export it and updating all call sites across the package.",
+      "UninstallHooks required multiple Read passes to find the right insertion point for MCP removal code — the function was long and the grep patterns didn't match cleanly.",
+      "Pre-existing lint issues (ireturn, maintidx) in modified files created noise when checking for new lint regressions introduced by this work."
+    ],
+    "open_items": [
+      "manual mode simplification (remove it or keep with MCP giving it purpose) was discussed but not resolved — the MCP implementation makes manual viable but the naming question remains open.",
+      "The MCP server mode gating returns 'memory loop is disabled' for off mode but the exact UX/error message wasn't finalized in the spec.",
+      "TUI keybinding to stage memories (i key on Memories tab) was mentioned in design but not implemented.",
+      "Full test suite (unit + integration + canary) was kicked off in background at end of session — results not confirmed in transcript.",
+      "The InstallHooks maintidx lint issue is pre-existing but adding ~15 lines may push it over threshold — worth a dedicated refactor.",
+      "save_memory dedup check uses FingerprintRecord but the reconciliation behavior (update vs reject) for exact matches was not fully specified."
+    ]
+  }
+}

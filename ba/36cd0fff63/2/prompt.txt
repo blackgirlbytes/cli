@@ -1,0 +1,77 @@
+Implement the following plan:
+
+# Switch Kiro CI auth from SIGV4 to device-flow token
+
+## Context
+
+SIGV4 auth was never ported to `kiro-cli-chat` — the binary ignores `AMAZON_Q_SIGV4` entirely (upstream issues: kirodotdev/Kiro#5938, aws/amazon-q-developer-cli#1051 both open). The workaround is device-flow auth: run `kiro-cli login --license free --use-device-flow` locally, then store the resulting token JSON as a GitHub secret (`KIRO_AUTH_TOKEN`). In CI, write it to `~/.aws/sso/cache/kiro-auth-token.json` so `kiro-cli-chat` picks it up automatically.
+
+## Changes
+
+### 1. `.github/workflows/e2e-isolated.yml`
+
+- **Remove** the "Configure AWS credentials (Kiro OIDC)" step (lines 39-44) — no longer needed
+- **Remove** the "Setup Kiro CLI" step (lines 46-52) — no longer needed
+- **Add kiro back** to the "Install agent CLI" case block (manual install, same pattern as before)
+- **Add new step** "Inject Kiro auth token" that writes `KIRO_AUTH_TOKEN` secret to `~/.aws/sso/cache/kiro-auth-token.json`
+- **Remove** `AMAZON_Q_SIGV4` and `AWS_REGION` env vars from bootstrap/test steps (no longer relevant)
+
+### 2. `.github/workflows/e2e.yml`
+
+- **Remove** the "Configure AWS credentials (Kiro OIDC)" step (lines 87-92)
+- **Add new step** "Inject Kiro auth token" (same as above)
+- **Remove** `AMAZON_Q_SIGV4` and `AWS_REGION` env vars from bootstrap/test steps
+- **Keep** the existing kiro install block (already has `mkdir -p`)
+
+### 3. Both workflows — new step template
+
+```yaml
+- name: Inject Kiro auth token
+  if: <agent> == 'kiro'
+  run: |
+    mkdir -p ~/.aws/sso/cache
+    echo "$KIRO_AUTH_TOKEN" > ~/.aws/sso/cache/kiro-auth-token.json
+  env:
+    KIRO_AUTH_TOKEN: ${{ secrets.KIRO_AUTH_TOKEN }}
+```
+
+### 4. Permissions cleanup
+
+- **Remove** `id-token: write` from `e2e-isolated.yml` — only needed for AWS OIDC which we're removing
+- **Keep** `id-token: write` in `e2e.yml` — used by the full matrix which may have other OIDC needs
+
+### 5. Kiro version
+
+Use version `1.27.0` (the version confirmed to exist on S3 in earlier testing).
+
+## Pre-requisite (manual, one-time)
+
+1. Run locally: `kiro-cli login --license free --use-device-flow`
+2. Copy the token: `cat ~/.aws/sso/cache/kiro-auth-token.json`
+3. Add as GitHub secret `KIRO_AUTH_TOKEN` in the repo settings
+
+## Verification
+
+Push and run the `e2e-isolated` workflow with `agent=kiro` from the GitHub Actions UI.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/127f24d2-01c3-4b68-a901-0efcaade7632.jsonl
+
+---
+
+KIRO_AUTH_TOKEN is the access token or the full json?
+
+---
+
+commit and push
+
+---
+
+how can this be tested / verified locally? waiting for CI is slow. it failed  [?25l
+▰▱▱▱▱▱▱ Opening auth portal and logging in...
+
+ Opening auth portal and logging in... [?25herror: OAuth error: Failed to open browser: Failed to open URL
+
+---
+
+[Request interrupted by user for tool use]

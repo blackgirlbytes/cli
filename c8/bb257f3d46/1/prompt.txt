@@ -1,0 +1,1138 @@
+go ahead and push please
+
+---
+
+tests are failing, can you run all core and integration tests
+
+---
+
+can you see all the failed runs here, https://github.com/entireio/cli/actions/runs/24207246682?pr=875
+
+---
+
+yes but do it carefully, so we don't end up with a problem liek c30039be2588e6af57dfa34bad72963c210b2bfa commit
+
+---
+
+well you can update with main, and then make sure c30039be isn't on there right? and what i mean is updating with main the right way, if this is what's causing the failures
+
+---
+
+can you do a pull on proper main and see if this is actually the right approach
+
+---
+
+is that's what causing the failures or somethgin else?
+
+---
+
+do one more check and make sure c30039be is not on this branch please
+
+---
+
+and it's no where anywhere in this pr at all?
+
+---
+
+okay so go ahead
+
+---
+
+go ahead
+
+---
+
+okay now let's go back to 887 fixes please, use /codex:adversarial-review
+
+---
+
+can you give me the commits in this branch that are from me and are only in this branch compared to         
+  backup/main-before-drop-8ebb9299a as a cherry-pick command and do not include c30039be2
+
+---
+
+are you on explain-summary-provider branch for this?
+
+---
+
+yes, and i want you to do the same thing there too so that we're fxing this branch so can you give me the commits in this branch that are from me and are only in this branch compared to backup/main-before-drop-8ebb9299a as a cherry-pick command And then you can reset your branch to main (pull first and make sure you really have the latest one) and run the cherry-pick on top but you must make sure c30039be2588e6af57dfa34bad72963c210b2bfa is not on explain-summary-provider either so we're up to date then go through code review/testing
+
+---
+
+first, please run /codex:adversarial-review on this branch please
+
+---
+
+<task-notification>
+<task-id>b0u8zf14c</task-id>
+<tool-use-id>toolu_01CZp9cGsEYBJYc6X21tvoLA</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-explain-review/59a27583-604f-47f9-8dc3-b5b83c2efe3a/tasks/b0u8zf14c.output</output-file>
+<status>completed</status>
+<summary>Background command "Codex adversarial review on explain-summary-provider" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+list proposed fixes and implementation plan first please
+
+---
+
+yes, but again, read agent docs, e.g.  Copilot: switch from -p prompt to stdin delivery (remove --allow-all-tools while at it)                         
+  - Cursor: switch from -p prompt to stdin delivery   - for accuracy
+
+---
+
+and this is confirmed from docs?
+
+---
+
+so stdin is the best?
+
+---
+
+do we use it for cursor/copilot anywhere else?
+
+---
+
+what do you think
+
+---
+
+does with work with -p ? can you test
+
+---
+
+that's good, so was the only concern is that -p command doens't work for copiot/cursor? not the summary generation part? because that's what we're actually concerned with is that it will work with these agents
+
+---
+
+yes please
+
+---
+
+and use -p to send back since this was the real concern too
+
+---
+
+yes go ahead
+
+---
+
+okay can you run manual tests on all fixes in this brnach please since this is enahncement on slecting summary provider. i have all providers, so you should be able to test with all - copilot, claude, cursor, gemini, copilot
+
+---
+
+yes go ahead
+
+---
+
+can you review the pr and comments using /pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>aa39c81b3acbf0b58</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-explain-review/59a27583-604f-47f9-8dc3-b5b83c2efe3a/tasks/aa39c81b3acbf0b58.output</output-file>
+<status>completed</status>
+<summary>Agent "Error handling review PR #887" completed</summary>
+<result>Now I have a thorough understanding of the PR. Let me compile my findings.
+
+---
+
+# Error Handling Audit: PR #887 (explain-summary-provider)
+
+## ISSUE 1: Silent JSON parse failures in `buildCondensedTranscriptFromCodex`
+
+**Location:** `cmd/entire/cli/summarize/summarize.go`, lines within `buildCondensedTranscriptFromCodex` (the `continue` statements in the JSONL parsing loop)
+
+**Severity:** HIGH
+
+**Issue Description:** The function contains four separate `continue` statements that silently skip malformed JSONL lines with no logging whatsoever:
+
+1. `if err := json.Unmarshal(lineBytes, &amp;line); err != nil { continue }` -- skips entirely unparseable lines
+2. `if err := json.Unmarshal(line.Content, &amp;blocks); err != nil { continue }` -- skips user blocks with bad content
+3. `if err := json.Unmarshal(line.Content, &amp;blocks); err != nil { continue }` -- skips assistant blocks with bad content
+4. `if err := json.Unmarshal(block.Input, &amp;input); err != nil { input = nil }` -- silently nullifies tool input
+
+**Hidden Errors:** A corrupted or malformed Codex transcript will silently produce an incomplete or empty condensed transcript. If most lines fail to parse, the function returns an empty `[]Entry` with a nil error, which then gets passed to the LLM for summarization. The user receives either a garbage summary or a confusing "transcript has no content to summarize" error with no indication that the real problem was unparseable transcript data.
+
+**User Impact:** Users running `explain --generate` on a Codex session with a slightly malformed transcript will get either a bad summary or a misleading "no content" error, with zero diagnostic information about what went wrong.
+
+**Recommendation:** At minimum, log each parse failure with `logging.Debug` so there is some trail for debugging. The existing pattern for Claude/Cursor transcripts in `BuildCondensedTranscript` does not skip lines silently -- it parses with `transcript.ParseFromBytes` which returns an error. This Codex path should be consistent. Consider counting parse failures and logging a warning if a significant portion of lines failed to parse.
+
+**Example:**
+```go
+var line compactLine
+if err := json.Unmarshal(lineBytes, &amp;line); err != nil {
+    logging.Debug(ctx, "skipping unparseable Codex transcript line",
+        "error", err.Error(),
+        "line_index", i)
+    continue
+}
+```
+
+Note: this function does not take a `ctx` parameter, so adding logging would require threading context through. That is a design constraint to flag.
+
+---
+
+## ISSUE 2: `parseSummaryText` retry logic silently swallows the original parse error on retry success
+
+**Location:** `cmd/entire/cli/summarize/claude.go`, `parseSummaryText` function
+
+**Severity:** MEDIUM
+
+**Issue Description:** The `parseSummaryText` function implements a brace-matching retry strategy when the initial JSON parse fails. When the retry succeeds (matching from `{` to last `}`), the function returns success with zero indication that the original parse failed and a fallback was used. The original error is silently discarded.
+
+```go
+if retryErr := json.Unmarshal([]byte(candidate), &amp;summary); retryErr == nil {
+    return &amp;summary, nil  // Original parse error is lost
+}
+```
+
+This means: (a) there is no logging that a recovery was needed, so the caller cannot distinguish a clean parse from a dirty one; (b) the pattern could mask cases where the brace-matching accidentally extracts a valid but wrong JSON object from surrounding text (e.g., a code block in the LLM response that happens to contain a valid JSON object that is NOT the intended summary).
+
+**Hidden Errors:** If the LLM returns text like `Here is your summary: {...valid JSON...} and some trailing text`, the first parse fails, the retry strips the surrounding text and succeeds. This works, but there is no log entry to help diagnose cases where the wrong JSON object was extracted.
+
+**User Impact:** Low immediate impact (the retry is genuinely useful), but it creates a debugging blind spot. When users report "my summary has wrong content", there will be no evidence in logs that a recovery path was taken.
+
+**Recommendation:** Add a `logging.Debug` or `logging.Info` call when the retry path succeeds, logging both the original error and the fact that brace extraction was used. This also applies to all providers using `parseSummaryText` through the shared `TextGeneratorAdapter`.
+
+---
+
+## ISSUE 3: `persistSummaryProviderSelection` failures are logged as warnings but may confuse users
+
+**Location:** `cmd/entire/cli/explain_summary_provider.go`, lines ~68-70 and ~86-88 (two call sites)
+
+**Severity:** MEDIUM
+
+**Issue Description:** When `persistSummaryProviderSelection` fails, the error is logged at `Warn` level and execution continues. This is an intentional design decision (the comment says "continuing without persistence"). However, the user receives no visible indication that their provider selection was NOT saved. The `logging.Warn` writes to `.entire/logs/`, not to the user's terminal.
+
+In the `case 1:` path (single candidate auto-selected), the user sees no output at all about which provider was chosen. The persistence failure is invisible. In the `default:` path (multi-provider prompt), the user sees "Using X for summary generation." but no mention that the choice was not saved.
+
+The next time the user runs `explain --generate`, they will be prompted again (or re-auto-selected), which will be confusing if they thought the choice was saved.
+
+**User Impact:** Users who hit a persistence failure (e.g., permission issue on `.entire/settings.json`) will be silently re-prompted on every `explain --generate` invocation with no explanation of why.
+
+**Recommendation:** Print a user-facing warning to `w` (the writer) in addition to the logging call, something like:
+```go
+fmt.Fprintf(w, "Warning: could not save provider selection: %s\n", saveErr)
+fmt.Fprintln(w, "You may be prompted again next time. Use `entire configure --summarize-provider` to set it permanently.")
+```
+
+---
+
+## ISSUE 4: Zero-candidate fallback to Claude Code masks missing agent installations
+
+**Location:** `cmd/entire/cli/explain_summary_provider.go`, `resolveCheckpointSummaryProvider`, `case 0:` branch
+
+**Severity:** HIGH
+
+**Issue Description:** When no summary-capable agents are installed (`len(candidates) == 0`), the code falls back to Claude Code with only a `logging.Info` message:
+
+```go
+case 0:
+    logging.Info(ctx, "no summary-capable agents installed, falling back to Claude Code")
+    return buildCheckpointSummaryProvider(agent.AgentNameClaudeCode, "")
+```
+
+This fallback is problematic because:
+1. If no agents are installed, Claude Code is also likely not installed -- but `buildCheckpointSummaryProvider` will succeed (it only checks the agent registry, not whether the binary exists on disk).
+2. The actual failure will happen later when `RunIsolatedTextGeneratorCLI` tries to execute the `claude` binary and gets "claude CLI not found".
+3. The `logging.Info` writes to the log file, not to the user's terminal. The user has no idea a fallback occurred.
+
+The same issue exists in the `default:` branch for non-interactive mode.
+
+**Hidden Errors:** A user running `explain --generate` in a CI pipeline (non-interactive) with only Codex installed but not Claude Code will get a confusing "claude CLI not found" error instead of "no summary-capable agents installed; please install Claude Code or configure a provider with `entire configure --summarize-provider`."
+
+**User Impact:** The error message the user eventually sees ("claude CLI not found") does not explain why Claude Code was attempted, or that it was a fallback because no providers were configured. The user has to dig through log files to understand the real problem.
+
+**Recommendation:** Either:
+(a) Print a user-facing message to `w` explaining the fallback: `fmt.Fprintf(w, "No configured summary provider found, attempting Claude Code...\n")`
+(b) Or better: verify the `claude` binary exists (`exec.LookPath("claude")`) before falling back, and return an actionable error if it does not exist:
+```go
+case 0:
+    if _, err := exec.LookPath("claude"); err != nil {
+        return nil, fmt.Errorf("no summary-capable agents installed and Claude Code not found; use `entire configure --summarize-provider` to configure one")
+    }
+    logging.Info(ctx, "no summary-capable agents installed, falling back to Claude Code")
+    return buildCheckpointSummaryProvider(agent.AgentNameClaudeCode, "")
+```
+
+---
+
+## ISSUE 5: `persistSummaryProviderSelection` discards error from `settingsTargetFile`
+
+**Location:** `cmd/entire/cli/explain_summary_provider.go`, `persistSummaryProviderSelection`, line `targetFile, _ := settingsTargetFile(ctx, false, false)`
+
+**Severity:** MEDIUM
+
+**Issue Description:** The second return value from `settingsTargetFile` (the display string) is discarded, which is fine. However, looking at the implementation, `settingsTargetFile` always returns valid values and does not return an error. But the pattern of ignoring the display string while having it available means the error message from this function ("loading settings for update: ...") will not tell the user WHICH settings file failed to load. This is a minor context gap rather than a swallowed error.
+
+More significantly, the `paths.AbsPath` error on the next line is handled by falling back to the raw target file path. This fallback is fine for correctness but means that if `AbsPath` fails (e.g., git root not found), the `LoadFromFile` call will use a relative path that may resolve to the wrong directory. No logging of the `AbsPath` failure occurs.
+
+**Recommendation:** Log the `AbsPath` failure:
+```go
+targetFileAbs, err := paths.AbsPath(ctx, targetFile)
+if err != nil {
+    logging.Debug(ctx, "could not resolve absolute settings path, using relative",
+        "path", targetFile, "error", err.Error())
+    targetFileAbs = targetFile
+}
+```
+
+---
+
+## ISSUE 6: Gemini `GenerateText` passes empty string as `-p` argument
+
+**Location:** `cmd/entire/cli/agent/geminicli/generate.go`, line `args := []string{"-p", ""}`
+
+**Severity:** HIGH
+
+**Issue Description:** The Gemini CLI `GenerateText` function passes an empty string as the `-p` flag value, and the actual prompt is passed via stdin (the `prompt` parameter becomes the `stdin` argument to `RunIsolatedTextGeneratorCLI`). If the Gemini CLI interprets `-p ""` as "empty prompt" rather than "read from stdin", this will produce an empty or unexpected response. The error handling downstream will not explain that the prompt was passed incorrectly.
+
+Compare with Copilot and Cursor which pass the prompt directly in args: `args := []string{"-p", prompt, ...}`.
+
+This is either: (a) intentional because Gemini CLI reads from stdin when `-p` is empty (in which case it should be documented), or (b) a bug where the prompt is being sent twice -- once empty via args and once via stdin.
+
+**User Impact:** If this is a bug, Gemini summary generation will produce garbage or empty results. The error message will be "failed to parse summary JSON" with no indication that the root cause was incorrect argument passing.
+
+**Recommendation:** Clarify the intent with a comment. If `-p ""` is genuinely needed to tell Gemini CLI to read from stdin, document it. If not, fix the argument to either pass the prompt via `-p prompt` (like Copilot/Cursor) or remove `-p ""` entirely and rely solely on stdin.
+
+---
+
+## ISSUE 7: `RunIsolatedTextGeneratorCLI` error for `exec.ExitError` includes stderr but not stdout
+
+**Location:** `cmd/entire/cli/agent/text_generator_cli.go`, exit error handling block
+
+**Severity:** MEDIUM
+
+**Issue Description:** When a CLI exits with a non-zero status, the error message includes `stderr.String()` but not `stdout.String()`. Some CLIs write error details to stdout (especially if they return JSON error envelopes), and some write nothing to stderr. In those cases, the error message will be: `"claude CLI failed (exit 1): "` -- an empty string after the colon, which is useless.
+
+**User Impact:** When a provider CLI fails, the user may see an error message with no diagnostic detail if the CLI wrote errors to stdout instead of stderr.
+
+**Recommendation:** Include both stdout and stderr in the error message when the exit code is non-zero, or at least fall back to stdout if stderr is empty:
+```go
+if errors.As(err, &amp;exitErr) {
+    detail := stderr.String()
+    if detail == "" {
+        detail = stdout.String()
+    }
+    return "", fmt.Errorf("%s CLI failed (exit %d): %s", displayName, exitErr.ExitCode(), detail)
+}
+```
+
+---
+
+## ISSUE 8: `validateSummaryProvider` replaces the original error with a generic message
+
+**Location:** `cmd/entire/cli/explain_summary_provider.go`, `validateSummaryProvider` function
+
+**Severity:** MEDIUM
+
+**Issue Description:** When `getSummaryAgent` fails, the function returns `fmt.Errorf("unknown summary provider %q", provider)` and discards the original error. The original error from `agent.Get()` might contain useful context like "agent not registered" or "external agent binary not found". The replacement error message is less actionable.
+
+```go
+func validateSummaryProvider(provider string) error {
+    ag, err := getSummaryAgent(types.AgentName(provider))
+    if err != nil {
+        return fmt.Errorf("unknown summary provider %q", provider)  // original err discarded
+    }
+```
+
+**User Impact:** If a user configures an external agent that fails to load, they see "unknown summary provider" instead of the actual reason the agent could not be loaded.
+
+**Recommendation:** Wrap the original error:
+```go
+return fmt.Errorf("unknown summary provider %q: %w", provider, err)
+```
+
+---
+
+## ISSUE 9: Double error wrapping across agent generate.go files produces verbose error chains
+
+**Location:** All agent `generate.go` files (claude, codex, gemini, cursor, copilot) and `summarize/text_generator.go`
+
+**Severity:** LOW (informational)
+
+**Issue Description:** The error wrapping chain creates deeply nested error messages. For example, when Claude Code's `claude` binary is not found, the error chain is:
+
+1. `RunIsolatedTextGeneratorCLI`: "claude CLI not found: exec: \"claude\": executable file not found in $PATH"
+2. `claudecode/generate.go`: "claude text generation failed: claude CLI not found: ..."
+3. `summarize/text_generator.go`: "provider text generation failed: claude text generation failed: claude CLI not found: ..."
+4. `explain.go`: "failed to generate summary: failed to generate summary: provider text generation failed: ..."
+
+This is four levels of wrapping, each adding context. While not a silent failure, it makes the error message unwieldy for users.
+
+**Recommendation:** Consider reducing the wrapping depth. The intermediate layers (agent-specific `generate.go` files) could return the error without additional wrapping since `RunIsolatedTextGeneratorCLI` already includes the display name:
+```go
+// Instead of:
+return "", fmt.Errorf("claude text generation failed: %w", err)
+// Simply:
+return "", err
+```
+
+---
+
+## Positive Observations
+
+1. **`RunIsolatedTextGeneratorCLI` error classification is well done.** The function correctly distinguishes between `exec.Error` (binary not found), `exec.ExitError` (non-zero exit), and other errors, providing appropriate messages for each. This is a good pattern.
+
+2. **`writeManagedSearchSubagent` error handling is thorough.** It correctly distinguishes between "file exists with different content", "file exists and is unmanaged", "file does not exist", and "permission/IO error". Each case is handled distinctly.
+
+3. **`updateSummaryGenerationSettings` validates before writing.** It checks provider validity and model constraints before touching the settings file, preventing partial writes.
+
+4. **The `setup.go` configure command properly sequences strategy flags and summary flags.** Both are independently validated and applied, with errors propagated correctly.
+
+5. **The read-only session gate in `manual_commit_hooks.go` includes good debug logging.** The `shouldCondenseWithOverlapCheck` function logs when it skips a session, which will help with diagnosing condensation behavior.</result>
+<usage><total_tokens>103412</total_tokens><tool_uses>30</tool_uses><duration_ms>172749</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>ad0b29396bca9dd5b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-explain-review/59a27583-604f-47f9-8dc3-b5b83c2efe3a/tasks/ad0b29396bca9dd5b.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage review PR #887" completed</summary>
+<result>Now I have a complete picture. Let me compile my analysis.
+
+---
+
+Here is my test coverage analysis for PR #887 (branch `explain-summary-provider`).
+
+---
+
+## 1. Summary
+
+This PR introduces multi-provider support for `explain --generate` (summary generation), adds Codex transcript support, scaffolds managed search subagents during `entire enable`, implements a read-only session gate to prevent spurious condensation, and converts all checkpoint fetches to partial clone. The test coverage is solid on the integration and settings layers, but has notable gaps at the unit level for newly created source files.
+
+---
+
+## 2. Critical Gaps (Criticality 8-10)
+
+### 2a. No unit tests for `RunIsolatedTextGeneratorCLI` (Criticality: 9)
+
+**File:** `cmd/entire/cli/agent/text_generator_cli.go`
+
+This is the new shared function that all five agent `GenerateText` implementations delegate to. It contains three distinct error-handling branches (exec.Error for binary-not-found, exec.ExitError for non-zero exit, and generic error), plus environment isolation logic (Dir=TempDir, StripGitEnv, conditional stdin piping). There are zero direct unit tests for this function.
+
+The existing `TestClaudeGenerator_GitIsolation` in `summarize/claude_test.go` tests the `ClaudeGenerator` (the auto-summarize path), which now also delegates to `RunIsolatedTextGeneratorCLI`. However, that test only verifies git isolation indirectly via the `ClaudeGenerator` wrapper. It does not directly exercise:
+- The `runner == nil` fallback path
+- The three error-type discriminations (exec.Error vs. exec.ExitError vs. generic)
+- The `stdin == ""` branch (no stdin piped, used by Copilot and Cursor)
+- The `TrimSpace` on stdout
+
+**Why it matters:** Every agent's `GenerateText` depends on this function. A regression in error handling (e.g., confusing a not-found error with an exit-code error) would produce misleading error messages across all providers, making debugging painful for users.
+
+### 2b. No unit tests for per-agent `GenerateText` implementations (Criticality: 8)
+
+**Files:**
+- `cmd/entire/cli/agent/codex/generate.go`
+- `cmd/entire/cli/agent/cursor/generate.go`
+- `cmd/entire/cli/agent/geminicli/generate.go`
+- `cmd/entire/cli/agent/copilotcli/generate.go`
+
+Each file has a package-level `var xxxCommandRunner = exec.CommandContext` specifically designed for test injection, yet none of these four files have tests. Each implementation constructs CLI arguments differently:
+- Codex uses `exec --skip-git-repo-check` and appends `-` for stdin
+- Cursor passes `-p prompt --force --trust --workspace &lt;tmpdir&gt;` with no stdin
+- Gemini passes `-p ""` with stdin (the empty string after `-p` looks like a potential bug or unusual convention)
+- Copilot passes `-p prompt --allow-all-tools` with no stdin
+
+**Why it matters:** The argument construction is provider-specific and cannot be validated through the shared `RunIsolatedTextGeneratorCLI` tests. A typo or wrong flag order would silently break generation for that provider. The `var xxxCommandRunner` pattern exists precisely to enable testing, and these tests should validate:
+- Correct binary name passed to runner
+- Expected argument construction with and without model parameter
+- Prompt passed via stdin vs. args as appropriate per provider
+
+### 2c. No test for `parseSummaryText` retry/fallback logic (Criticality: 8)
+
+**File:** `cmd/entire/cli/summarize/claude.go` (function `parseSummaryText`)
+
+The `parseSummaryText` function was refactored to add a new retry path: when initial JSON unmarshal fails, it attempts to find and extract a `{...}` substring. This retry logic has no dedicated test. The existing `TestExtractJSONFromMarkdown` tests handle the markdown-stripping layer, and `TestTextGeneratorAdapter_Generate` uses a well-formed markdown response -- neither exercises the `strings.Index("{")` / `strings.LastIndex("}")` retry fallback.
+
+**Why it matters:** This retry logic is triggered when LLM output contains preamble text before JSON (e.g., "Here is the summary: {...}"). If the `candidate != resultJSON` guard or the index arithmetic is wrong, summaries would silently fail for certain provider response formats. This is especially critical because the function is now used by all providers, not just Claude.
+
+---
+
+## 3. Important Improvements (Criticality 5-7)
+
+### 3a. No test for the zero-candidates fallback path (Criticality: 7)
+
+**File:** `cmd/entire/cli/explain_summary_provider.go`
+
+`resolveCheckpointSummaryProvider` has three branches after checking settings: 0 candidates (falls back to Claude Code), 1 candidate (auto-selects and persists), and multiple candidates (interactive or non-interactive fallback). Only the "configured provider" and "single installed provider" branches are tested. The zero-candidates path and the multi-provider non-interactive fallback path have no coverage.
+
+**Why it matters:** The zero-candidates path is hit when no text-generator-capable agent is installed but the user runs `explain --generate`. This should gracefully fall back to Claude Code. The non-interactive multi-provider path is hit in CI or piped contexts. Both are realistic production scenarios.
+
+### 3b. `listEnabledSummaryProviders` filtering has no dedicated test (Criticality: 6)
+
+**File:** `cmd/entire/cli/explain_summary_provider.go`
+
+This function filters installed agents to only those implementing `TextGenerator`. There is no test verifying that:
+- Agents without `TextGenerator` (e.g., Factory AI Droid, OpenCode) are correctly excluded
+- An error from `getSummaryAgent` is correctly propagated
+- The returned list matches the expected order
+
+This is partially covered by `TestResolveCheckpointSummaryProvider_SavesSingleInstalledProvider` which stubs the dependencies, but that test only exercises a single-agent scenario with a stub that always implements `TextGenerator`.
+
+### 3c. `buildCheckpointSummaryProvider` model defaulting logic has partial coverage (Criticality: 6)
+
+**File:** `cmd/entire/cli/explain_summary_provider.go`
+
+The function has specific defaulting logic:
+- Claude Code with empty model defaults to `summarize.DefaultModel`
+- Non-Claude agents with empty model show "provider default"
+
+`TestResolveCheckpointSummaryProvider_UsesConfiguredProvider` verifies Claude with `model: "haiku"` (explicit model), and `TestResolveCheckpointSummaryProvider_SavesSingleInstalledProvider` uses Codex without a model (verifying the Codex path). However, there is no test for the Claude Code default model path (where `model == ""` causes `effectiveModel = summarize.DefaultModel`).
+
+### 3d. `TestResolveCheckpointSummaryProvider_UsesConfiguredProvider` and `TestResolveCheckpointSummaryProvider_SavesSingleInstalledProvider` do not call `t.Parallel()` (Criticality: 5)
+
+**File:** `cmd/entire/cli/explain_summary_provider_test.go`
+
+Per the CLAUDE.md instructions: "Always use `t.Parallel()` in tests." These two tests use `t.Chdir(tmpDir)` which conflicts with `t.Parallel()`, so this is an acceptable exception. However, the current code swaps package-level vars (`loadSummarySettings`, `getSummaryAgent`, etc.) which is inherently non-parallel-safe. This is documented in CLAUDE.md as an acceptable exception for process-global state, but it would be worth noting that the var-swapping pattern creates a subtle race if another test in the same package happens to call these functions concurrently. The `t.Chdir` already forces non-parallel, so this is safe in practice -- but it should be documented with a comment explaining why `t.Parallel()` is omitted.
+
+---
+
+## 4. Test Quality Issues
+
+### 4a. Package-level var swapping pattern (acknowledged concern)
+
+The `explain_summary_provider_test.go` uses the `loadSummarySettings` / `getSummaryAgent` / `listInstalledAgents` var-swap pattern for test isolation. This pattern is already established in the codebase (e.g., `ClaudeGenerator.CommandRunner`). The tests correctly use `t.Cleanup` to restore originals. However, since these tests also use `t.Chdir`, they cannot be parallel anyway, so the var-swap race condition is not a practical concern.
+
+### 4b. Duplicate `stubTextAgent` / `mockTextGenerator` definitions
+
+`explain_summary_provider_test.go` defines `stubTextAgent` and `text_generator_test.go` defines `mockTextGenerator`. Both implement the same Agent + TextGenerator interface for testing. While they serve slightly different purposes (the stub returns canned JSON; the mock captures inputs), the boilerplate is substantial (~20 lines of method stubs each). This is not a testing correctness issue, but worth noting for future cleanup.
+
+### 4c. Integration test assertions could verify session ID directly
+
+In `read_only_session_test.go`, `AssertCheckpointContainsSession` and `AssertCheckpointExcludesSession` are well-designed helper methods. However, they silently return false when metadata unmarshal fails (line 1670-1672 in the diff). If the metadata format changes, these assertions would always pass, masking failures. Consider returning an error or logging when unmarshal fails.
+
+---
+
+## 5. Positive Observations
+
+**Read-only session integration tests are excellent.** The five scenarios in `read_only_session_test.go` (576 lines) are thorough, well-documented, and cover the key permutations: IDLE read-only, ACTIVE read-only during commit, ACTIVE across multiple commits, batch of 5 read-only sessions, and all-read-only with no checkpoint created. The state assertions (phase, BaseCommit advancement, FilesTouched, LastCheckpointID unchanged) are precise and would catch real regressions.
+
+**Settings merge tests are well-structured.** `TestMergeJSON_SummaryGeneration` correctly tests field-level merging where `settings.local.json` overrides `provider` but preserves `model` from the base settings. This matches the documented merge semantics.
+
+**Setup command tests cover key edge cases.** The `setup_test.go` additions test provider-switching clears stale model, model-without-provider errors, local-vs-project file isolation, and writes-to-correct-file. The `TestConfigureCmd_SummarizeProvider_SwitchClearsStaleModel` test in particular prevents a subtle bug where switching from claude-code+sonnet to codex would retain the stale "sonnet" model.
+
+**Search subagent scaffolding tests are comprehensive.** The four scenarios (create, idempotent, update managed, preserve user-owned) cover the full lifecycle of the managed file pattern. The `assertStrictJSONSearchInstructions` helper verifies both positive and negative content patterns, ensuring the subagent instructions don't regress.
+
+**The Codex transcript condensation test** (`TestBuildCondensedTranscriptFromBytes_Codex`) validates the full pipeline from raw Codex JSONL through compact conversion to condensed entries, including user messages, assistant text, and tool calls.
+
+**The `phase_postcommit_test.go` change** properly inverts the previous `TestPostCommit_ActiveSessionAlwaysCondenses` into `TestPostCommit_ReadOnlyActiveSessionNotCondensed`, reflecting the new behavior. The assertion change from `assert.Error` (shadow branch deleted) to `assert.NoError` (shadow branch preserved) correctly documents the new invariant.</result>
+<usage><total_tokens>101336</total_tokens><tool_uses>45</tool_uses><duration_ms>187111</duration_ms></usage>
+</task-notification>
+
+---
+
+there are still commits on 887 that shouldn't be there, meaning that when you tried to clean it up, it didn't work proplery
+
+---
+
+<task-notification>
+<task-id>a93b0cbbd8e4b66cb</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-explain-review/59a27583-604f-47f9-8dc3-b5b83c2efe3a/tasks/a93b0cbbd8e4b66cb.output</output-file>
+<status>completed</status>
+<summary>Agent "Type design review PR #887" completed</summary>
+<result>I now have all the information needed for a thorough type design review. Here is my analysis.
+
+---
+
+## Type: `checkpointSummaryProvider`
+
+**File**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/explain-review/cmd/entire/cli/explain_summary_provider.go`
+
+### Invariants Identified
+
+1. **Name must correspond to a registered, text-generation-capable agent** -- enforced at construction time in `buildCheckpointSummaryProvider` via `getSummaryAgent` + `AsTextGenerator`.
+2. **Generator must be non-nil and operable** -- always set by `buildCheckpointSummaryProvider` as a `*TextGeneratorAdapter` wrapping a verified `TextGenerator`.
+3. **DisplayName should match the agent's `Type()` string** -- set from `ag.Type()` in the builder, but can diverge from Name since Name is the registry key and DisplayName is the human label.
+4. **DisplayModel should never be empty** -- the builder sets it to `"provider default"` when no model is provided and it is not Claude Code.
+5. **Model and DisplayModel can differ** -- Model is the effective machine value (possibly empty), DisplayModel is always human-readable.
+
+### Ratings
+
+- **Encapsulation**: 4/10
+  The struct has all exported fields, yet it is an unexported type (`checkpointSummaryProvider`). This is a good start -- external packages cannot create instances -- but within the `cli` package itself (which is large), any code can construct an instance with arbitrary field values, bypassing `buildCheckpointSummaryProvider` entirely. The `listEnabledSummaryProviders` function already demonstrates this: it creates partial instances with only `Name` and `DisplayName` populated, leaving `Generator`, `Model`, and `DisplayModel` at their zero values. Those partial instances are used as UI candidates in `promptForSummaryProvider`, which means the same struct serves as both a "fully resolved provider ready for generation" and a "lightweight candidate for selection UI." These are two distinct states with different invariants, stuffed into one type.
+
+- **Invariant Expression**: 3/10
+  Nothing in the type's structure distinguishes a fully-initialized provider from a partially-initialized candidate. A reader encountering a `checkpointSummaryProvider` value cannot tell whether `Generator` is safe to call without tracing back through the call graph. The split between `Model` (machine value) and `DisplayModel` (human value) is a good idea, but the rules governing them (Claude Code gets `DefaultModel`, others get empty string for Model but `"provider default"` for DisplayModel) are buried in `buildCheckpointSummaryProvider` logic, not expressed by the type. There is no type-level or documented contract that says "if this was built by `buildCheckpointSummaryProvider`, Generator is guaranteed non-nil."
+
+- **Invariant Usefulness**: 6/10
+  The invariants that do exist (provider must be text-generation-capable, Generator wraps a verified TextGenerator) are useful and prevent real bugs. The auto-persist and fallback-to-Claude-Code logic in `resolveCheckpointSummaryProvider` is pragmatic. The concern is that the invariants are weaker than they appear -- the type permits states that the business logic does not intend.
+
+- **Invariant Enforcement**: 4/10
+  Construction via `buildCheckpointSummaryProvider` validates well: it checks `AsTextGenerator`, builds the adapter, and fills all fields. But there is no enforcement of always using this builder. `listEnabledSummaryProviders` creates instances directly with struct literals. If someone later passed one of those partial instances to `formatSummaryProviderDetails` or attempted to use its `Generator`, it would either produce misleading output or panic.
+
+### Strengths
+
+- Unexported type name prevents external misuse.
+- `buildCheckpointSummaryProvider` is a well-structured builder that validates the agent capability before constructing the provider.
+- The fallback logic in `resolveCheckpointSummaryProvider` (zero candidates -&gt; Claude Code, one candidate -&gt; auto-select and persist, multiple -&gt; prompt) is clear and handles edge cases.
+- Package-level function variables (`loadSummarySettings`, `getSummaryAgent`, etc.) enable clean test injection.
+
+### Concerns
+
+1. **Dual-purpose struct**: The type serves as both a "resolution candidate" (partial, no Generator) and a "resolved provider" (complete, with Generator). This is the most significant design concern. Callers of `promptForSummaryProvider` receive a `types.AgentName` back, but the candidates passed in are full `checkpointSummaryProvider` structs with nil Generators. If anyone adds code that tries to use the Generator from a candidate, it will nil-panic at runtime.
+
+2. **Model defaulting logic is Claude-Code-specific and spread across the builder**: The condition `if name == agent.AgentNameClaudeCode &amp;&amp; effectiveModel == ""` encodes a provider-specific default inside a generic builder. If more providers need defaults, this will become a chain of special cases.
+
+3. **`formatSummaryProviderDetails` trusts its input without defense**: It reads `DisplayName` and `DisplayModel` but does not guard against zero-value fields. A partial instance would produce `"Provider: \nModel: \n"`.
+
+### Recommended Improvements
+
+1. **Split into two types**: Create a lightweight `summaryProviderCandidate` (just `Name` and `DisplayName`) for selection UI, and keep `checkpointSummaryProvider` as the fully-resolved type with a private constructor. This makes illegal states (partial provider used for generation) unrepresentable.
+
+2. **Make Generator a required constructor parameter** rather than a struct field, or make the struct's fields unexported with accessor methods. Since the type is already unexported, making fields unexported adds minimal friction but prevents accidental construction of invalid instances within the large `cli` package.
+
+3. **Extract model defaulting into the agent or a registry**: Rather than special-casing Claude Code in `buildCheckpointSummaryProvider`, agents that have a default model could expose it via a `DefaultModel() string` method or a constant, keeping the builder generic.
+
+---
+
+## Type: `SummaryGenerationSettings`
+
+**File**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/explain-review/cmd/entire/cli/settings/settings.go`
+
+### Invariants Identified
+
+1. **Provider must be a valid agent name when non-empty** -- not enforced at the type level; validation happens in `validateSummaryProvider` and `buildCheckpointSummaryProvider`.
+2. **Model is only meaningful when Provider is set** -- partially enforced in `updateSummaryGenerationSettings` which rejects `--summarize-model` without a provider, but not at the type level.
+3. **Both fields are optional** -- the `omitempty` JSON tags and pointer wrapper (`*SummaryGenerationSettings`) in `EntireSettings` allow clean absence.
+
+### Ratings
+
+- **Encapsulation**: 5/10
+  This is a DTO/settings struct, and DTOs inherently have weak encapsulation. Both fields are exported, which is correct for JSON serialization. The use of `*SummaryGenerationSettings` in `EntireSettings` is good -- it allows distinguishing "not configured" (nil) from "configured with defaults" (non-nil, empty fields). However, the struct freely permits `Model` to be set with an empty `Provider`, which is a state the business logic explicitly rejects elsewhere.
+
+- **Invariant Expression**: 4/10
+  The relationship between Provider and Model (Model depends on Provider) is documented only in the CLI flag validation (`--summarize-model requires an existing summary provider or --summarize-provider`), not in the type. The type also uses plain `string` for Provider rather than `types.AgentName`, losing type safety at the persistence boundary.
+
+- **Invariant Usefulness**: 7/10
+  The invariants that exist are well-aligned with the feature requirements. Persisting provider selection avoids repeated prompts. The field-level merge in `mergeJSON` correctly handles local overrides (e.g., local sets provider, project sets model, merged result has both).
+
+- **Invariant Enforcement**: 3/10
+  No validation at construction or deserialization. The `mergeJSON` function will happily load `{"summary_generation": {"model": "gpt-5"}}` (model without provider) from a settings file, creating an invalid state. The runtime code in `resolveCheckpointSummaryProvider` does handle this gracefully (it checks `s.SummaryGeneration.Provider != ""` before using the settings), but it is defensive programming rather than structural enforcement.
+
+### Strengths
+
+- Clean JSON serialization with `omitempty` tags.
+- Pointer wrapper in parent struct allows clean nil-vs-empty distinction.
+- Field-level merge logic in `mergeJSON` is correct -- local file can override just the provider without clobbering the project-level model.
+- Good test coverage of merge behavior (`TestMergeJSON_SummaryGeneration`).
+
+### Concerns
+
+1. **Provider is `string`, not `types.AgentName`**: Every call site that uses `Provider` must cast to `types.AgentName`. This means typos like `"calude-code"` would be caught only at runtime.
+
+2. **No validation on load**: A corrupted or hand-edited settings file with `"provider": "nonexistent"` will be accepted by `Load()` and only fail later when `buildCheckpointSummaryProvider` tries to resolve the agent.
+
+3. **Model-without-Provider is representable but invalid**: The `mergeJSON` function can produce `{provider: "", model: "gpt-5"}` if one settings layer sets model and another does not set provider. The consumer code handles this but the type does not prevent it.
+
+### Recommended Improvements
+
+1. **Use `types.AgentName` for the Provider field** with a custom JSON marshaler/unmarshaler. This would provide compile-time type safety at the cost of slightly more complex serialization code.
+
+2. **Add a `Validate()` method** that checks (a) if Provider is non-empty, it is a known agent name, and (b) if Model is non-empty, Provider must also be non-empty. Call this from `Load()` or from consumers. This is pragmatic -- it does not prevent invalid states but surfaces them early.
+
+3. The current design is acceptable for a settings DTO, and the above suggestions should be weighed against the complexity they add. Settings types often accept invalid values and rely on consumers to validate, which is a reasonable trade-off for a configuration file format.
+
+---
+
+## Type: `TextCommandRunner`
+
+**File**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/explain-review/cmd/entire/cli/agent/text_generator_cli.go`
+
+### Invariants Identified
+
+1. **Must match the signature of `exec.CommandContext`** -- enforced at compile time by the function type definition.
+2. **Must return a non-nil `*exec.Cmd`** -- not enforced; a test double could return nil and cause a panic in `RunIsolatedTextGeneratorCLI`.
+3. **Should produce a Cmd that has not been started** -- implicit contract from `exec.CommandContext`; violated test doubles would cause `cmd.Run()` to fail with a confusing error.
+
+### Ratings
+
+- **Encapsulation**: 7/10
+  As a function type, there is no internal state to encapsulate. The type cleanly abstracts over `exec.CommandContext` for test injection. The pattern is idiomatic Go.
+
+- **Invariant Expression**: 6/10
+  The type signature exactly matches `exec.CommandContext`, which is self-documenting for Go developers. The name `TextCommandRunner` is clear about purpose. However, the implicit contract that the returned `*exec.Cmd` must be valid and unstated is not captured anywhere.
+
+- **Invariant Usefulness**: 8/10
+  This enables proper testing of CLI invocation without spawning real processes. Every agent's `generate.go` uses it (Codex, Copilot, Cursor, Gemini all declare package-level `var xxxCommandRunner = exec.CommandContext`), and tests can swap in fakes. This is a practical pattern that prevents a real class of test fragility bugs.
+
+- **Invariant Enforcement**: 5/10
+  `RunIsolatedTextGeneratorCLI` has a nil check for `runner` (falling back to `exec.CommandContext`), which is defensive. But it does not guard against a non-nil runner that returns a nil `*exec.Cmd`. The nil-runner fallback is also slightly questionable: if a caller explicitly passes `nil`, silently falling back to real execution could mask bugs in tests.
+
+### Strengths
+
+- Idiomatic Go pattern for abstracting `exec.CommandContext`.
+- Enables clean test injection without interfaces.
+- The `RunIsolatedTextGeneratorCLI` function consolidates duplicated execution logic (previously each agent had its own copy of the same buffer/error handling).
+
+### Concerns
+
+1. **Inconsistent injection patterns across agents**: Claude Code passes `exec.CommandContext` directly as a literal, while Codex/Copilot/Cursor/Gemini use package-level variables (`codexCommandRunner`, `copilotCommandRunner`, etc.). This inconsistency means Claude Code's `GenerateText` cannot be tested with a fake runner, while the others can. The PR consolidated the execution logic but left Claude Code's injection pattern different.
+
+2. **Nil runner fallback is a silent hazard**: In `RunIsolatedTextGeneratorCLI`, `if runner == nil { runner = exec.CommandContext }` means a test that forgets to set up a runner will silently call the real CLI. This would be better as an explicit error or removed entirely (require callers to always pass a valid runner).
+
+3. **`displayName` and `binary` are separate string parameters that must be kept consistent**: `RunIsolatedTextGeneratorCLI` takes both `binary` (actual executable name) and `displayName` (for error messages). These are always set together but nothing enforces their relationship. For example, Cursor passes `("agent", "cursor")` where the binary name is `"agent"` -- a new developer might get these backwards.
+
+### Recommended Improvements
+
+1. **Make Claude Code use a package-level variable** like the other agents, so its runner is also testable.
+
+2. **Remove the nil-runner fallback**: Require a non-nil runner and let the code panic on nil. In production, callers always pass `exec.CommandContext`; in tests, an explicit runner is required. The fallback creates a risk of accidentally invoking real CLIs in tests.
+
+3. **Consider a small struct** to pair `binary` and `displayName` rather than two separate string parameters, especially if more agents will be added. Something like:
+   ```go
+   type CLIIdentity struct {
+       Binary      string
+       DisplayName string
+   }
+   ```
+   This would prevent accidental parameter swaps.
+
+---
+
+## Type: `TextGeneratorAdapter`
+
+**File**: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/explain-review/cmd/entire/cli/summarize/text_generator.go`
+
+### Invariants Identified
+
+1. **TextGenerator must be non-nil** -- not enforced. A nil TextGenerator will cause a nil-pointer panic in `Generate` when calling `g.TextGenerator.GenerateText(...)`.
+2. **Model is passed through to the underlying TextGenerator** -- the adapter does not validate or transform it. Empty string is valid (agents handle their own defaults).
+3. **The adapter implements `summarize.Generator`** -- enforced at compile time by Go's structural typing when assigned to a `Generator` variable.
+
+### Ratings
+
+- **Encapsulation**: 3/10
+  Both fields are exported. The struct is exported. Any package can construct a `TextGeneratorAdapter` with a nil `TextGenerator`. The only construction site in the PR is inside `buildCheckpointSummaryProvider`, which always provides a valid TextGenerator, but nothing in the type prevents misuse. Since this is in the `summarize` package (a dependency of many things), the exposed surface is broad.
+
+- **Invariant Expression**: 3/10
+  The critical invariant (TextGenerator must be non-nil) is not expressed anywhere -- not in the type, not in documentation, not via a constructor. A developer looking at `TextGeneratorAdapter{TextGenerator: nil, Model: "gpt-5"}` would not know this is invalid without reading the `Generate` method.
+
+- **Invariant Usefulness**: 7/10
+  The adapter pattern itself is very useful. It bridges the `agent.TextGenerator` interface (agent-specific, returns raw text) to the `summarize.Generator` interface (summarize-specific, returns structured Summary). This is a classic adapter that avoids coupling the summarize package to specific agent implementations.
+
+- **Invariant Enforcement**: 2/10
+  Zero enforcement. No constructor, no nil check in `Generate`, no validation anywhere. The `Generate` method immediately calls `g.TextGenerator.GenerateText(...)` which will panic if TextGenerator is nil. This is the weakest point of all four types.
+
+### Strengths
+
+- Clean adapter pattern that properly separates concerns (agent text generation vs. summarization).
+- The `Generate` method does real work: it formats the transcript into a prompt, delegates to the TextGenerator, and parses the response. This is not an anemic adapter -- it adds meaningful behavior.
+- Compact implementation (under 20 lines of logic).
+
+### Concerns
+
+1. **Nil TextGenerator will panic at runtime**: This is the most critical issue. The struct is exported with exported fields, so any consumer can construct an invalid instance.
+
+2. **No constructor function**: Unlike `checkpointSummaryProvider` which has `buildCheckpointSummaryProvider`, this adapter has no builder or factory. It is always constructed via struct literal.
+
+3. **Error from `parseSummaryText` is not wrapped with adapter context**: If `parseSummaryText(result)` fails, the caller gets a generic parse error without knowing which provider produced the unparsable text. This makes debugging harder when multiple providers are in play.
+
+### Recommended Improvements
+
+1. **Add a nil check at the top of `Generate`**: At minimum, check `g.TextGenerator != nil` and return a clear error instead of allowing a nil-pointer panic. This is a one-line fix with significant safety benefit:
+   ```go
+   if g.TextGenerator == nil {
+       return nil, errors.New("TextGeneratorAdapter: TextGenerator is nil")
+   }
+   ```
+
+2. **Add a constructor function**: `NewTextGeneratorAdapter(tg agent.TextGenerator, model string) (*TextGeneratorAdapter, error)` that validates TextGenerator is non-nil. Make the fields unexported if practical, or at minimum document that construction should go through the constructor.
+
+3. **Wrap the parse error with provider context**: The error from `parseSummaryText` should include which provider produced the response, to aid debugging:
+   ```go
+   return nil, fmt.Errorf("failed to parse summary from %T: %w", g.TextGenerator, err)
+   ```
+
+---
+
+## Cross-cutting Observations
+
+**The four types form a coherent pipeline**: Settings (`SummaryGenerationSettings`) feeds into provider resolution (`checkpointSummaryProvider`), which creates an adapter (`TextGeneratorAdapter`) that uses an agent-specific CLI runner (via `TextCommandRunner`). The pipeline is sound architecturally, but invariant enforcement degrades at each stage: settings accepts anything, the provider has a good builder but can be bypassed, and the adapter has no protection at all.
+
+**The biggest systemic risk** is that `checkpointSummaryProvider` is used for two different purposes (selection candidate vs. resolved provider) without a type-level distinction. If refactored into two types, the remaining three types become much safer by construction because the partial-state instances can no longer be confused with the complete ones.
+
+**The consolidated `RunIsolatedTextGeneratorCLI`** is a clear improvement over the duplicated per-agent implementations, though the inconsistency between Claude Code's direct-pass pattern and the other agents' package-variable pattern should be harmonized.</result>
+<usage><total_tokens>75236</total_tokens><tool_uses>30</tool_uses><duration_ms>217628</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a89bb0f4c7b5355a1</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-explain-review/59a27583-604f-47f9-8dc3-b5b83c2efe3a/tasks/a89bb0f4c7b5355a1.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review PR #887" completed</summary>
+<result>Good. The binary name `"codex"` is consistent with how the Codex CLI is invoked.
+
+Now let me check the `Codex` `exec` subcommand with `-` for stdin.
+
+The Codex `GenerateText` uses `args := []string{"exec", "--skip-git-repo-check"}` with `-` appended at the end. The `-` argument tells the Codex CLI to read the prompt from stdin. This is correct.
+
+Let me now look at one more potential issue - the `ClaudeCodeAgent.GenerateText` uses `exec.CommandContext` directly instead of a package-level var like the other agents.
+
+Looking at `claudecode/generate.go` line 26: `agent.RunIsolatedTextGeneratorCLI(ctx, exec.CommandContext, claudePath, "claude", args, prompt)`. The other agents use package-level vars (`codexCommandRunner`, `geminiCommandRunner`, etc.) for testability. The Claude Code agent passes `exec.CommandContext` directly, which makes it harder to test. However, since the Claude Code `ClaudeGenerator` (in `summarize/claude.go`) already has its own `CommandRunner` injection mechanism, and the `GenerateText` method is mainly for the `TextGeneratorAdapter` path (not the auto-summarize path), this is a minor inconsistency but not a bug.
+
+I've now thoroughly reviewed the entire PR. Let me compile my findings.
+
+---
+
+## Review: PR #887 - Explain Summary Provider
+
+### Files Reviewed
+
+The PR touches 39 files across these key areas:
+- Agent `GenerateText` implementations: `/cmd/entire/cli/agent/{codex,copilotcli,cursor,geminicli}/generate.go`
+- Shared helper: `/cmd/entire/cli/agent/text_generator_cli.go`
+- Provider resolution: `/cmd/entire/cli/explain_summary_provider.go`
+- Settings: `/cmd/entire/cli/settings/settings.go`
+- Configure command: `/cmd/entire/cli/setup.go`
+- TextGeneratorAdapter: `/cmd/entire/cli/summarize/text_generator.go`
+- Codex transcript condensation: `/cmd/entire/cli/summarize/summarize.go`
+- Search subagent scaffolding: `/cmd/entire/cli/setup_subagents.go`
+- Read-only session gating: `/cmd/entire/cli/strategy/manual_commit_hooks.go`
+- Treeless fetch optimizations: `/cmd/entire/cli/git_operations.go`, `/cmd/entire/cli/strategy/push_common.go`, `/cmd/entire/cli/strategy/push_v2.go`, `/cmd/entire/cli/strategy/checkpoint_remote.go`
+- Tests across all the above
+
+### No High-Confidence Issues Found
+
+After thorough review, the code meets CLAUDE.md standards and contains no bugs that reach the &gt;= 80 confidence threshold. Here is my analysis of the key design decisions:
+
+**CLAUDE.md Compliance:**
+- Error handling follows the established patterns -- errors are explicitly handled and wrapped with context throughout.
+- Settings access goes through the `settings` package as required.
+- Logging uses the `logging` package for operational messages, `fmt.Fprint*` for user-facing output.
+- The `huh` form in `promptForSummaryProvider()` (line 115 of `explain_summary_provider.go`) correctly uses `NewAccessibleForm()` per the accessibility guidelines.
+- Tests that use `t.Chdir()` or mutate package-level state correctly omit `t.Parallel()`, matching the documented exception. `TestFormatSummaryProviderDetails` correctly uses `t.Parallel()` since it has no global side effects.
+- Integration tests use the `//go:build integration` tag and proper test isolation.
+
+**Code Quality:**
+- The `RunIsolatedTextGeneratorCLI` helper in `/cmd/entire/cli/agent/text_generator_cli.go` successfully deduplicates the CLI isolation pattern (temp dir, `StripGitEnv`, stdin, stderr/stdout buffering, error classification) that was previously copied across `claudecode/generate.go` and `summarize/claude.go`.
+- The `TextGeneratorAdapter` in `/cmd/entire/cli/summarize/text_generator.go` cleanly bridges the `agent.TextGenerator` interface to `summarize.Generator`, reusing `buildSummarizationPrompt()` and `parseSummaryText()`.
+- The `parseSummaryText` function adds a fallback JSON extraction (find first `{` to last `}`) which improves robustness for providers that may emit preamble text before JSON.
+
+**Correctness:**
+- The read-only session gating logic in `shouldCondenseWithOverlapCheck()` (line 715-721 of `manual_commit_hooks.go`) correctly prevents read-only sessions from being condensed when `sessionsWithCommittedFiles &gt; 0 &amp;&amp; len(filesTouchedBefore) == 0`. The counting of `sessionsWithCommittedFiles` (line 940-947) correctly skips fully-condensed ended sessions and counts each session at most once via `break`.
+- The `persistSummaryProviderSelection` function correctly clears the stale model when switching providers (line 189-191 of `explain_summary_provider.go`), preventing a Codex model hint from being passed to a Claude provider.
+- The Gemini `-p ""` pattern with stdin for the actual prompt is correct per Gemini CLI documentation for headless mode.
+
+**Items Noted But Below Threshold:**
+- `ClaudeCodeAgent.GenerateText` passes `exec.CommandContext` directly (line 26 of `claudecode/generate.go`) instead of using a package-level `var` like the other agents, making it less testable. However, the Claude Code path is already well-tested via the `ClaudeGenerator` in `summarize/claude.go`. Confidence: ~60.
+- The Codex case in `scopeTranscriptForCheckpoint` (line 581-582 of `explain.go`) could be combined with the ClaudeCode/Cursor/FactoryAI/Unknown case since they use the same `transcript.SliceFromLine`. But the explicit case makes the switch exhaustive for clarity. Confidence: ~30.
+- `listEnabledSummaryProviders` creates a fresh `context.Background()` (line 90 of `explain_summary_provider.go`) instead of accepting the context from the caller. The user confirmed this is a known non-issue since it's only used for `GetAgentsWithHooksInstalled` which just reads filesystem state. Confidence: ~50.
+
+**Summary:** The PR is well-structured, follows project conventions, has comprehensive test coverage (unit, integration, and strategy-level tests), and the confirmed flagged items (ARG_MAX, Gemini `-p ""`, `context.Background()`) are correctly non-issues. The code is ready to merge.</result>
+<usage><total_tokens>111941</total_tokens><tool_uses>63</tool_uses><duration_ms>272190</duration_ms></usage>
+</task-notification>
+
+---
+
+okay so what do you recommend now for fixes, priority
+
+---
+
+yes go ahead
+
+---
+
+can you run /code-simplifier on 887 too please? large diffs, so want to make sure we don't have unnecesary tests. etc
+
+---
+
+<task-notification>
+<task-id>a6983d997e2bd875a</task-id>
+<tool-use-id>toolu_015PnfJbSK8wvwhmZovhUQQH</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-explain-review/59a27583-604f-47f9-8dc3-b5b83c2efe3a/tasks/a6983d997e2bd875a.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review PR #887" completed</summary>
+<result>I'm unable to complete this review. Here's what's happening:
+
+**I cannot access the diff file at `/tmp/pr887.diff`.** Both the `Read` tool and `Bash` tool are denied access to `/tmp`, and `Glob`/`Grep` are also blocked for that path.
+
+**The functions you specifically asked about do not exist in this worktree:**
+- `resolveCheckpointSummaryProvider` -- not found
+- `listEnabledSummaryProviders` -- not found
+- `persistSummaryProviderSelection` -- not found
+- `RunIsolatedTextGeneratorCLI` -- not found
+
+These function names suggest they are part of proposed changes in the diff file that haven't been applied to this worktree yet. The `codex-explain-generate` branch in this worktree has a simpler architecture: a single `ClaudeGenerator` in `cmd/entire/cli/summarize/claude.go` with no multi-provider abstraction.
+
+**To proceed, I need one of:**
+1. Permission to read `/tmp/pr887.diff` (the Read tool needs to be allowed for `/tmp`)
+2. The diff content provided inline in the conversation
+3. The changes applied/checked out in the worktree so I can review the actual source files
+
+Could you provide the diff content directly, or grant file access to `/tmp`?</result>
+<usage><total_tokens>38072</total_tokens><tool_uses>25</tool_uses><duration_ms>71701</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a7426dc54c45e1610</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-explain-review/59a27583-604f-47f9-8dc3-b5b83c2efe3a/tasks/a7426dc54c45e1610.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review PR #887" completed</summary>
+<result>Now I have a thorough understanding of the PR. Here is my review.
+
+---
+
+## PR #887 Code Review Findings
+
+### 1. Duplicate `splitJSONL` function (Copy-paste)
+
+**`cmd/entire/cli/summarize/summarize.go:336-345`** -- `splitCompactJSONL` is a character-for-character duplicate of `codex/transcript.go:307-316` (`splitJSONL`). Both split `[]byte` on newlines, trim whitespace, and skip empty lines. This should be extracted to a shared utility (e.g., in the `transcript` package) or one should call the other.
+
+### 2. Redundant `AgentTypeCodex` case arm in `scopeTranscriptForCheckpoint`
+
+**`cmd/entire/cli/explain.go:575-576`** -- The new Codex case does exactly the same thing as the very next case (ClaudeCode/Cursor/FactoryAIDroid/Unknown): `transcript.SliceFromLine(fullTranscript, startOffset)`. Adding a separate case arm that falls through to identical behavior is pure noise. Codex should be merged into the existing case on line 577:
+
+```go
+case agent.AgentTypeCodex, agent.AgentTypeClaudeCode, agent.AgentTypeCursor, ...
+```
+
+This is already done correctly in `manual_commit_condensation.go:295`, making the `explain.go` version inconsistent with the pattern used elsewhere in this very PR.
+
+### 3. Stale comment on `extractGenericToolDetail`
+
+**`cmd/entire/cli/summarize/summarize.go:323`** -- The doc comment still says "Used by Gemini condensation" but the function is now also used by Codex condensation (called from `buildCondensedTranscriptFromCodex` at line 290). The comment should say "Used by Gemini and Codex condensation" or simply "Used by multiple agent condensation paths."
+
+### 4. `codexPayload.Output` field conflict with `custom_tool_call_output`
+
+**`cmd/entire/cli/transcript/compact/codex.go:69`** -- `codexPayload` has `Output string`, but `custom_tool_call_output` payloads have `output` as a JSON object (`{"type":"text","text":"..."}`), not a string. This means `json.Unmarshal` into `codexPayload` will silently fail for `custom_tool_call_output` lines (string field can't hold an object). The PR works around this by introducing `codexCallIDAndType` (line 406) with a narrow struct, but the underlying problem is that `codexPayload` is now a "god struct" trying to represent incompatible schemas. The `codexCallIDAndType` function exists solely because the shared struct is too loose -- a cleaner approach would be to use a separate struct for custom tool outputs, or make `Output` a `json.RawMessage`.
+
+### 5. `codexToolUseBlock` vs `codexCustomToolUseBlock` near-duplication
+
+**`cmd/entire/cli/transcript/compact/codex.go:335-351` vs `420-434`** -- These two functions share identical structure (build a `map[string]json.RawMessage` with `type`, `name`, optional `id`) and differ only in how they populate `input`. They could be unified into a single function:
+
+```go
+func codexBuildToolBlock(name, callID string, inputJSON json.RawMessage) map[string]json.RawMessage {
+    block := map[string]json.RawMessage{
+        "type": mustJSON(transcript.ContentTypeToolUse),
+        "name": mustJSON(name),
+    }
+    if callID != "" {
+        block["id"] = mustJSON(callID)
+    }
+    if inputJSON != nil {
+        block["input"] = inputJSON
+    }
+    return block
+}
+```
+
+Then callers handle their own input parsing (JSON string vs plain text) and pass the result in.
+
+### 6. `buildCondensedTranscriptFromCodex` double-parses through compact format unnecessarily
+
+**`cmd/entire/cli/summarize/summarize.go:226-299`** -- This function compacts Codex JSONL into the compact format and then immediately re-parses the compact JSONL to extract `Entry` structs. This is a roundtrip through serialization for no reason. The function defines three local struct types (`compactUserTextBlock`, `compactAssistantBlock`, `compactLine`) just to parse the output of `compact.Compact`. A more direct approach would be to parse the raw Codex JSONL directly into `Entry` structs (similar to how Gemini, OpenCode, and Droid do it), reusing existing Codex parsing helpers from `compact` or `codex/transcript.go`. The compact format is a storage/transport optimization, not an intermediate representation.
+
+### 7. Fake `MetadataFields` values in `buildCondensedTranscriptFromCodex`
+
+**`cmd/entire/cli/summarize/summarize.go:228-229`** -- `Agent: "codex", CLIVersion: "summarize"` are hardcoded filler values that get serialized into the compact JSONL and immediately discarded. Using `"summarize"` as a CLI version is misleading if the compact output were ever inspected for debugging. This reinforces finding #6 -- the compact step is an unnecessary intermediary.
+
+### 8. Test structure is solid but could use subtests for Codex condensation
+
+**`cmd/entire/cli/summarize/summarize_test.go:699-804`** -- Three separate test functions (`TestBuildCondensedTranscriptFromBytes_Codex`, `_Codex_CustomToolCall`, `_Codex_ExecCommandDetail`) test the same function with different inputs. These would be cleaner as subtests under a single `TestBuildCondensedTranscriptFromBytes_Codex` using a table-driven pattern, consistent with how `TestCompact_CodexInlineCases` in `codex_test.go` is structured. This is minor.
+
+### 9. `codexCustomOutputText` forward-compatibility comment is good but handling order is questionable
+
+**`cmd/entire/cli/transcript/compact/codex.go:445-447`** -- The comment says "Try as plain string first (for forward compatibility)" but the Codex API currently always sends an object. Trying string first means the common path takes two unmarshal attempts. Not a correctness issue, but the comment should explain *why* forward compatibility matters here (i.e., the API may change to strings in a future version) or the order should be flipped to optimize for the common case.
+
+### Summary of key issues by severity
+
+**Should fix:**
+- Finding 1: Duplicate `splitJSONL`/`splitCompactJSONL` -- extract to shared location
+- Finding 2: Redundant case arm in `explain.go` -- merge into existing case
+- Finding 6/7: Unnecessary roundtrip through compact format in `buildCondensedTranscriptFromCodex`
+
+**Consider fixing:**
+- Finding 3: Stale comment
+- Finding 4: `codexPayload` god struct with incompatible field types
+- Finding 5: Near-duplicate tool block builders
+
+**Minor/stylistic:**
+- Finding 8: Test organization
+- Finding 9: Parse order optimization</result>
+<usage><total_tokens>56632</total_tokens><tool_uses>30</tool_uses><duration_ms>123449</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a9f20671f01c28522</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-explain-review/59a27583-604f-47f9-8dc3-b5b83c2efe3a/tasks/a9f20671f01c28522.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review PR #887" completed</summary>
+<result>Here is my report of findings:
+
+---
+
+## PR #887 Code Reuse Review Findings
+
+### 1. DUPLICATE: `splitCompactJSONL` duplicates `splitJSONL`
+
+**File:** `cmd/entire/cli/summarize/summarize.go:336-345`
+
+The new `splitCompactJSONL` function is **byte-for-byte identical** to `splitJSONL` in `cmd/entire/cli/agent/codex/transcript.go:307-316`. Both split JSONL bytes by newline, trim whitespace, and skip empty lines. 
+
+**Recommendation:** Either export `splitJSONL` from the codex package (or move to a shared location like `transcript/`) and reuse it, or since this is a trivial utility, at minimum add a comment noting the duplication exists.
+
+### 2. REDUNDANT CASE: `scopeTranscriptForCheckpoint` Codex arm
+
+**File:** `cmd/entire/cli/explain.go:576-577`
+
+The new `AgentTypeCodex` case:
+```go
+case agent.AgentTypeCodex:
+    return transcript.SliceFromLine(fullTranscript, startOffset)
+```
+does the exact same thing as the immediately following case:
+```go
+case agent.AgentTypeClaudeCode, agent.AgentTypeCursor, agent.AgentTypeFactoryAIDroid, agent.AgentTypeUnknown:
+    return transcript.SliceFromLine(fullTranscript, startOffset)
+```
+and the default fallthrough at the end of the function. The approach in `manual_commit_condensation.go:296` (which merges Codex into the existing case) is the correct pattern. The `explain.go` change should follow suit by adding `agent.AgentTypeCodex` to the existing case rather than creating a separate one.
+
+### 3. UNNECESSARY NIL GUARD in `extractGenericToolDetail`
+
+**File:** `cmd/entire/cli/summarize/summarize.go:325-327`
+
+The added `if input == nil { return "" }` guard is unnecessary in Go. Iterating over a nil map with `range` is a no-op, and the `input[key].(string)` type assertion on a nil map returns `("", false)`. The `for` loop already handles both cases correctly. Note: `extractOpenCodeToolDetail` (line 313) does NOT have this guard, creating an inconsistency.
+
+**Recommendation:** Remove the nil guard for consistency, or if keeping it for clarity, add it to `extractOpenCodeToolDetail` too.
+
+### 4. STRUCTURAL DUPLICATION: `buildCondensedTranscriptFromCodex` reimplements shared condensation logic
+
+**File:** `cmd/entire/cli/summarize/summarize.go:226-300`
+
+The function's comment says "reuses the shared transcript condensation logic" but it doesn't. It defines three inline structs (`compactUserTextBlock`, `compactAssistantBlock`, `compactLine`) and reimplements the user/assistant/tool extraction loop that is structurally identical to `extractUserEntry` + `extractAssistantEntries` (lines 387-430).
+
+The compact format's assistant content blocks (`{"type":"text","text":"..."}` and `{"type":"tool_use","name":"...","input":{...}}`) are schema-compatible with `transcript.ContentBlock`. A cleaner approach would be:
+- Parse compact lines into an intermediate form that can feed into `BuildCondensedTranscript` or `extractAssistantEntries`
+- Or extract the inner content-block-to-Entry conversion into a shared helper
+
+This would eliminate ~40 lines of duplicate extraction logic and the three inline struct definitions.
+
+### 5. MINOR DUPLICATION: `codexToolUseBlock` vs `codexCustomToolUseBlock`
+
+**File:** `cmd/entire/cli/transcript/compact/codex.go:335-350` vs `codex.go:420-434`
+
+These two functions share identical boilerplate for building the block map with `"type"`, `"name"`, and `"id"` fields (~6 lines). They differ only in how `"input"` is set (parsed JSON string vs plain text wrapped in object). This could be unified with a shared base builder, but the duplication is minor enough to be acceptable.
+
+### 6. TEST OBSERVATIONS
+
+**Mostly reasonable test additions.** The three new `summarize_test.go` tests (`TestBuildCondensedTranscriptFromBytes_Codex`, `_Codex_CustomToolCall`, `_Codex_ExecCommandDetail`) each test a distinct scenario (basic flow, custom tool calls, tool detail extraction).
+
+**`TestScopeTranscriptForCheckpoint_CodexUsesStoredLineOffsets`** (`cmd/entire/cli/explain_test.go:2178`) is a useful integration test combining scoping + condensation for Codex, though it only provides value if the Codex case in `scopeTranscriptForCheckpoint` remains separate from the shared case (which per finding #2, it shouldn't be).
+
+**No shared test fixture builder:** Multiple test files construct Codex JSONL transcripts inline with repeated `session_meta` / `response_item` boilerplate. A helper like `testutil.BuildCodexTranscript(lines ...string) []byte` would reduce repetition, though this is a pre-existing pattern across the codebase and not specific to this PR.
+
+### Summary of Actionable Items (ordered by impact)
+
+1. **Eliminate `splitCompactJSONL`** - exact duplicate of existing `splitJSONL`
+2. **Merge Codex case in `explain.go:576`** into the existing `AgentTypeClaudeCode, ...` case (matches what `manual_commit_condensation.go` already does)
+3. **Refactor `buildCondensedTranscriptFromCodex`** to reuse `extractAssistantEntries` or a shared content-block-to-Entry converter instead of reimplementing it
+4. **Fix or remove nil guard** in `extractGenericToolDetail` for consistency with `extractOpenCodeToolDetail`
+5. **Minor:** Fix misleading comment "reuses the shared transcript condensation logic" in `buildCondensedTranscriptFromCodex`</result>
+<usage><total_tokens>55749</total_tokens><tool_uses>59</tool_uses><duration_ms>222548</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a3d335beb7d735b97</task-id>
+<tool-use-id>toolu_01XcGP59FnFUddUrNQLcwbcQ</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-explain-review/59a27583-604f-47f9-8dc3-b5b83c2efe3a/tasks/a3d335beb7d735b97.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review PR #887" completed</summary>
+<result>Now let me check one more thing - whether `listEnabledSummaryProviders` calls `getSummaryAgent` for each installed agent, and then `buildCheckpointSummaryProvider` calls it *again* for the selected one.
+
+Looking at the diff again at lines 398-472:
+
+- `listEnabledSummaryProviders()` (line 398): iterates installed agents, calls `getSummaryAgent(name)` for each, checks `AsTextGenerator`
+- Then in `resolveCheckpointSummaryProvider` (line 365-366): calls `buildCheckpointSummaryProvider(candidates[0].Name, "")` which calls `getSummaryAgent(name)` *again* and `AsTextGenerator` *again*
+
+Let me also check the test duplication between `stubTextAgent` and `mockTextGenerator`.
+
+Now I have all the information needed. Here is my review:
+
+---
+
+## Efficiency Review: PR #887
+
+### 1. Redundant agent lookup -- `getSummaryAgent` called twice on the same provider
+
+**`explain_summary_provider.go` (diff lines 398-414 and 441-472)**
+
+`listEnabledSummaryProviders()` calls `getSummaryAgent(name)` and `AsTextGenerator(ag)` for every installed agent. Then the caller immediately passes the winner to `buildCheckpointSummaryProvider()`, which calls `getSummaryAgent(name)` and `AsTextGenerator(ag)` **again** for the exact same agent. This affects both the `case 1` and `default` branches in `resolveCheckpointSummaryProvider`.
+
+Fix: `listEnabledSummaryProviders` already has the `agent.Agent` reference. Return it alongside the name so `buildCheckpointSummaryProvider` can skip the duplicate lookup, or have `buildCheckpointSummaryProvider` accept an optional pre-resolved agent.
+
+### 2. Near-duplicate settings-save logic -- `persistSummaryProviderSelection` vs `updateSummaryGenerationSettings`
+
+**`explain_summary_provider.go` (diff lines 485-517) vs `setup.go` (diff lines 885-935)**
+
+These two functions share identical core logic:
+- Resolve target settings file via `settingsTargetFile` + `paths.AbsPath`
+- `LoadFromFile`, nil-check `SummaryGeneration`, clear stale model on provider switch, set provider/model
+- Branch on local vs project save
+
+`updateSummaryGenerationSettings` adds validation and a `--model without --provider` guard, but the load-mutate-save kernel is copy-pasted. Extract a shared `applySummaryProviderToSettings(ctx, targetFile, provider, model)` helper to eliminate ~20 duplicated lines.
+
+### 3. `os.Environ()` called per subprocess invocation
+
+**`text_generator_cli.go` (diff line 239)**
+
+`RunIsolatedTextGeneratorCLI` calls `os.Environ()` and iterates the full env slice to strip `GIT_*` vars on every call. For the current single-call use case this is fine, but the function is designed as a shared utility. If ever invoked in a loop (e.g., fan-out to multiple providers), the filtered env should be computed once and passed in, or cached. Not blocking today, but worth a `// NOTE:` comment.
+
+### 4. `[]byte(stdoutText)` allocation in Claude Code JSON parsing
+
+**`claudecode/generate.go` (diff line 63) and `summarize/claude.go` (diff line 1212)**
+
+`RunIsolatedTextGeneratorCLI` returns a `string` (trimmed from `stdout.String()`). Callers immediately do `json.Unmarshal([]byte(stdoutText), ...)`, which copies the entire response body into a new byte slice. If `RunIsolatedTextGeneratorCLI` returned `[]byte` instead of `string`, callers that need JSON parsing (which is all of them except Codex) would avoid this extra allocation. The Codex path could cheaply convert `string(result)` instead.
+
+### 5. Duplicate test stubs: `stubTextAgent` and `mockTextGenerator`
+
+**`explain_summary_provider_test.go` (diff lines 549-575) and `text_generator_test.go` (diff lines 1342-1371)**
+
+Both are ~25-line structs implementing the full `Agent` + `TextGenerator` interface with identical no-op methods. They differ only in the `GenerateText` body. Extract a shared `testutil.StubTextAgent` that embeds default no-ops with a configurable `GenerateText` func field. This would also future-proof against interface changes requiring updates in two places.
+
+### 6. `validateSummaryProvider` does a full agent load just to type-check
+
+**`explain_summary_provider.go` (diff lines 474-483)**
+
+`validateSummaryProvider` calls `getSummaryAgent(name)` then `AsTextGenerator` purely to check capability. In `updateSummaryGenerationSettings`, if validation passes, the caller doesn't use the agent -- it just persists the string. This is fine for correctness but means an agent that requires disk I/O for instantiation pays that cost twice (once in validation, once when the provider is actually used later). Consider returning the agent from validation if it will be needed.
+
+### 7. `listEnabledSummaryProviders` does filesystem I/O on every `explain --generate` without configured provider
+
+**`explain_summary_provider.go` (diff lines 398-416)**
+
+When no `SummaryGeneration.Provider` is configured, `resolveCheckpointSummaryProvider` calls `listEnabledSummaryProviders`, which calls `GetAgentsWithHooksInstalled`. That function iterates all registered agents, instantiates each one, and calls `AreHooksInstalled(ctx)` -- which does filesystem reads (checking config files, plugin paths, etc.). This happens even if the user will immediately be auto-selected to the single installed agent, after which the selection is persisted. The persistence means this only happens once, so it is not a hot-path concern, but it is worth noting it is O(agents * filesystem-checks) on first run.
+
+### Summary of actionable items (by impact)
+
+| Priority | Issue | Savings |
+|----------|-------|---------|
+| **High** | #2: `persistSummaryProviderSelection` / `updateSummaryGenerationSettings` duplication | ~20 lines of duplicated load-mutate-save logic |
+| **Medium** | #1: Double `getSummaryAgent` + `AsTextGenerator` call for selected provider | Eliminates redundant agent instantiation |
+| **Medium** | #5: Duplicate test stub types across two test files | Reduces maintenance surface for interface changes |
+| **Low** | #4: `string` -&gt; `[]byte` -&gt; `Unmarshal` extra copy | One allocation per CLI call (small) |
+| **Low** | #3: `os.Environ()` per invocation | Only matters if called in a loop |
+| **Low** | #6/#7: Validation and discovery do redundant agent loads | Only on first-run or explicit configure |</result>
+<usage><total_tokens>53662</total_tokens><tool_uses>25</tool_uses><duration_ms>112553</duration_ms></usage>
+</task-notification>
+
+---
+
+kay can you rebase cleanly reset the branch to main (pull first and make sure you really have the latest one) and run the cherry-pick on top for 876 from me and are only in this branch compared to backup/main-before-drop-8ebb9299a as a cherry-pick command and check if c30039be2588e6af57dfa34bad72963c210b2bfa is in your branch, and then make sure to not merge this !

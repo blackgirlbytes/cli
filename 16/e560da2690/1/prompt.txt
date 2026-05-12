@@ -1,0 +1,131 @@
+Implement Task 4: Add The Static Command And Text Renderer
+
+## Task Description
+
+**Files:**
+- Modify: `cmd/entire/cli/root.go`
+- Modify: `cmd/entire/cli/why.go`
+- Create: `cmd/entire/cli/why_render.go`
+- Test: `cmd/entire/cli/why_render_test.go`
+- Test: `cmd/entire/cli/why_test.go`
+
+Requirements:
+1. Add a failing renderer test that verifies the static output includes Entire fields.
+2. Run `go test ./cmd/entire/cli -run TestRenderWhyStatic_IncludesEntireFields` and verify it fails first.
+3. Implement `renderWhyStatic([]whyBlock) string` in `cmd/entire/cli/why_render.go`.
+4. Add a failing command test that verifies `newWhyCmd()` renders static output when provided stubbed blame/enrichment data.
+5. Implement `newWhyCmd()` and `loadWhyDisplayData(ctx, path)` in `cmd/entire/cli/why.go`.
+6. Register `newWhyCmd()` in `cmd/entire/cli/root.go`.
+7. Static mode should call `renderWhyStatic` and use the existing pager helper path (`outputExplainContent`) for output.
+8. Do not implement TUI behavior yet.
+9. Do not implement Git commit fallback detail yet.
+10. Run the targeted tests and ensure they pass.
+
+Planned renderer test:
+
+```go
+func TestRenderWhyStatic_IncludesEntireFields(t *testing.T) {
+	t.Parallel()
+
+	out := renderWhyStatic([]whyBlock{{
+		StartLine: 23,
+		EndLine:   24,
+		Commit: whyCommitInfo{
+			ShortHash: "b550507521",
+			Author:    "Victor Gutierrez",
+			WhenText:  "2 weeks ago",
+		},
+		Entire: &whyEntireInfo{
+			CheckpointID: "a3b2c4d5e6f7",
+			Agent:        "Claude Code",
+			Summary:      "Add signal handling for graceful shutdown.",
+		},
+		CodeLines: []string{"if runtime.GOOS != \"windows\" {"},
+	}})
+
+	for _, want := range []string{"23-24", "b550507521", "Victor Gutierrez", "a3b2c4d5e6f7", "Claude Code"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+```
+
+Planned command test:
+
+```go
+func TestWhyCommand_StaticModeRendersBlocks(t *testing.T) {
+	t.Parallel()
+
+	origLoad := loadWhyDisplayData
+	t.Cleanup(func() { loadWhyDisplayData = origLoad })
+
+	loadWhyDisplayData = func(_ context.Context, path string) ([]whyBlock, error) {
+		if path != "cmd/entire/main.go" {
+			t.Fatalf("path = %q, want %q", path, "cmd/entire/main.go")
+		}
+		return []whyBlock{{
+			StartLine: 1,
+			EndLine:   1,
+			Commit:    whyCommitInfo{ShortHash: "7f93a963e3", Author: "Stefan Haubold", WhenText: "3 months ago"},
+			CodeLines: []string{"package main"},
+		}}, nil
+	}
+
+	cmd := newWhyCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"cmd/entire/main.go"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute error: %v", err)
+	}
+	if !strings.Contains(out.String(), "package main") {
+		t.Fatalf("output missing code block:\n%s", out.String())
+	}
+}
+```
+
+## Context
+
+This is Task 4 of the approved `entire why` prototype plan. Tasks 1-3 are already completed and committed. Task 4 should add only the static, non-interactive command path and text renderer. Do not implement fallback commit detail and do not implement the TUI.
+
+Work from: `/Users/pfleidi/entire/cli/.worktrees/feat/entire-why`
+
+## Important Constraints
+
+- You are not alone in the codebase. Do not revert edits you did not make.
+- Implement exactly Task 4 and nothing from later tasks.
+- Do not create any commits. The user wants review between steps.
+- Use `apply_patch` for edits.
+- Run only the targeted tests needed by Task 4.
+- Reuse existing pager helper behavior instead of inventing a new pager path.
+
+## Before You Begin
+
+If anything is unclear, ask now.
+
+## Report Format
+
+When done, report:
+- **Status:** DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
+- What you implemented
+- What you tested and test results
+- Files changed
+- Self-review findings
+- Any issues or concerns
+
+---
+
+Approved. Implement the full Task 4 scope exactly as described: add the failing renderer and command tests, confirm the failures, implement `renderWhyStatic`, implement `newWhyCmd()` and `loadWhyDisplayData(ctx, path)`, register the command in `root.go`, and rerun the targeted tests to green. Do not commit. Run only the targeted Task 4 tests unless you need one focused sanity check, self-review, and report back with changed files and test results.
+
+---
+
+Only one Task 4 fix is needed from the spec review:
+
+1. In `cmd/entire/cli/why_render_test.go`, strengthen `TestRenderWhyStatic_IncludesEntireFields` so it also asserts the rendered summary text, not just checkpoint ID and agent.
+
+Do NOT remove `selectWhySummary`, `commitSubject`, or commit-subject fallback logic from `why.go`. Those behaviors were introduced and approved in Task 3, so they are not Task 4 scope creep.
+
+Please make only the renderer test improvement, rerun the targeted Task 4 tests, self-review, and report back. Do not widen scope and do not commit.

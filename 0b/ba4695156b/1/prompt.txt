@@ -1,0 +1,84 @@
+Implement the following plan:
+
+# Plan: Handle `droid exec` missing UserPromptSubmit
+
+## Context
+
+`droid exec` fires `SessionStart → Stop → SessionEnd` without `UserPromptSubmit`. Since `UserPromptSubmit` maps to `TurnStart` (which creates session state, transitions IDLE→ACTIVE, captures pre-prompt state), the session lifecycle is broken:
+
+- **Phase stays IDLE** — PrepareCommitMsg/PostCommit hooks won't properly link mid-exec commits (Droid CAN auto-commit with `--auto medium/high`)
+- **No session state created** until SaveStep's late fallback (after agent is done)
+- **No PrePromptState** — pre-untracked file baseline is lost
+
+## Approach: Install `user-prompt-submit` on Droid's SessionStart event type
+
+The fix is entirely within Droid's hook installation code. When installing hooks, register the `user-prompt-submit` command as a **second hook under the `SessionStart` event type** in `.factory/settings.json`. This way, when Droid fires its SessionStart event, both commands run:
+
+1. `entire hooks factoryai-droid session-start` → SessionStart event → banner, concurrent session check
+2. `entire hooks factoryai-droid user-prompt-submit` → TurnStart event → session initialized, ACTIVE phase
+
+**Why this works:**
+- `userPromptSubmitRaw` is a superset of `sessionInfoRaw` (same fields + `prompt`). When SessionStart sends `{session_id, transcript_path}`, `json.Unmarshal` succeeds — `Prompt` is just `""`.
+- If `UserPromptSubmit` fires later (interactive/stream-jsonrpc mode), it's a benign ACTIVE→ACTIVE transition
+- If it doesn't fire (exec mode), the session is already ACTIVE from SessionStart
+- `removeEntireHooks` matches by `"entire "` prefix — both commands are properly removed during uninstall
+
+**Resulting `.factory/settings.json` SessionStart entry:**
+```json
+"SessionStart": [{
+  "matcher": "",
+  "hooks": [
+    {"type": "command", "command": "entire hooks factoryai-droid session-start"},
+    {"type": "command", "command": "entire hooks factoryai-droid user-prompt-submit"}
+  ]
+}]
+```
+
+## Changes
+
+### 1. `cmd/entire/cli/agent/factoryaidroid/hooks.go` — InstallHooks
+
+After the existing `sessionStart` hook installation (line ~158), add `userPromptSubmitCmd` to the `sessionStart` hook type:
+
+```go
+// Also install user-prompt-submit on SessionStart to ensure TurnStart fires
+// even when UserPromptSubmit doesn't (e.g., droid exec mode).
+// The user-prompt-submit handler gracefully handles SessionStart's stdin format
+// (userPromptSubmitRaw is a superset of sessionInfoRaw; Prompt defaults to "").
+if !hookCommandExists(sessionStart, userPromptSubmitCmd) {
+    sessionStart = addHookToMatcher(sessionStart, "", userPromptSubmitCmd)
+    count++
+}
+```
+
+No other code changes needed:
+- **UninstallHooks** — `removeEntireHooks` already removes all `"entire ..."` commands from all hook types
+- **AreHooksInstalled** — Already checks for `"entire hooks factoryai-droid stop"` which is sufficient
+- **GetHookNames/GetSupportedHooks** — No changes; `user-prompt-submit` already exists as a subcommand
+- **ParseHookEvent** — No changes; `parseTurnStart` already handles missing `prompt` field
+
+### 2. `cmd/entire/cli/agent/factoryaidroid/hooks_test.go` — Update tests
+
+- Update `TestInstallHooks` to verify SessionStart has TWO commands (session-start + user-prompt-submit)
+- Add test: verify `parseTurnStart` handles SessionStart-format stdin (missing `prompt` field)
+- Update uninstall tests to verify both commands are removed from SessionStart
+
+### Files Summary
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/agent/factoryaidroid/hooks.go` | Add `userPromptSubmitCmd` to `sessionStart` in InstallHooks (~3 lines) |
+| `cmd/entire/cli/agent/factoryaidroid/hooks_test.go` | Update install/uninstall tests |
+
+**No changes to:** `event.go`, `lifecycle.go`, `phase.go`, or any other agent's code.
+
+## Verification
+
+1. `mise run fmt && mise run lint` — passes
+2. `mise run test` — unit tests pass
+3. `mise run test:integration` — integration tests pass
+4. Manual: `entire enable --agent factoryai-droid` then inspect `.factory/settings.json` — verify SessionStart has both commands
+5. Manual: `entire disable --agent factoryai-droid` then inspect — verify both commands removed
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.REDACTED.jsonl

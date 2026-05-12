@@ -1,0 +1,51 @@
+can you review the changes in this branch/PR
+
+---
+
+can you merge this with this review: ## PR #990 Review — Accept checkpoint ID or commit SHA as positional arg to `explain`
+
+### Overview
+
+Makes `entire explain <id-or-sha>` auto-detect whether the positional argument is a checkpoint ID or a commit ref. Keeps `--checkpoint` / `--commit` as explicit overrides. Also allows `--generate` / `--raw-transcript` in combination with `--commit` (previously refused). 582/-60 across `explain.go` + `explain_test.go`.
+
+### What's good
+
+- **Typed sentinels for routing**: `checkpoint.ErrCheckpointNotFound` and `errCannotGenerateTemporaryCheckpoint` cleanly encode "no match → safe to fall back to commit" vs "temp matched but generate unsupported → don't fall back." This is a real improvement over substring-matching error text (which an earlier Codex review flagged).
+- **Ambiguity detection for short hex prefixes**: `resolveCommitUnambiguous` + `commitHashesWithPrefix` use `filesystem.Storage.HashesWithPrefix` — exactly what the reviewer suggested. go-git v6's `ResolveRevision` silently picks the first match on collision; this now surfaces.
+- **Dynamic abbreviation**: `abbreviateCommitHash` grows past 7 chars as repo collisions force it, matching git's `--abbrev` behavior. Nice touch, and the helpers are reused in display and resolution.
+- **`--generate` ambiguity guard** refuses to write a summary when a short target matches both a commit and a checkpoint prefix — the right defensive stance for a destructive operation.
+- **Trailer-less commit semantics**: side-effect modes (`--generate` / `--raw-transcript`) now error instead of silently exiting 0 — scripts can distinguish "done" from "didn't happen." Read-only modes still print the friendly message.
+- **Test coverage is thorough**: composite error chaining, trailer resolution, read-only vs side-effect dispatch on trailer-less commits, sentinel contract, hex-prefix collision via synthesized 2-char SHA collision, abbreviation growth/default, generate+ambiguity refusal, `--commit` + `--generate` validation.
+
+### Issues / suggestions
+
+**1. `runExplainAutoAmbiguityGuard` is best-effort by design — acknowledge the trap more loudly.** On `openRepository` / `listCommittedForExplain` failure it returns `nil`, meaning `--generate` proceeds and could still write to the "wrong" target if the committed-checkpoint listing transiently fails. The comment notes this, but the main flow's "real error" only surfaces if the *checkpoint path* then also fails. If it succeeds with a false-positive prefix match, the guard has failed silently. Low risk in practice (both git resolution and checkpoint listing failing-but-not-failing is rare), but worth a `logging.Warn` on the swallowed errors at minimum so users/operators can see when the guard degraded.
+
+**2. Missing test for the "temp checkpoint matched with --generate, don't fall back" path.** `TestRunExplainCheckpoint_NotFoundSentinels` covers the "nothing matched, fall back is safe" direction, but not the positive case: when a shadow-branch SHA *does* match a temp checkpoint and `--generate` is set, `errCannotGenerateTemporaryCheckpoint` must propagate without falling back to commit resolution. Adding that asymmetric test would lock the contract in both directions.
+
+**3. 1-char hex prefixes skip ambiguity detection.** `commitHashesWithPrefix` bails when `len(decoded) == 0` (even-byte floor of a 1-char prefix is empty). go-git's unordered pick wins. Edge case — but git CLI itself requires ≥4 chars. You could explicitly reject `len(ref) < 4` in `resolveCommitUnambiguous` for clarity, or leave it as a known edge.
+
+**4. `runExplainAuto` opens the repo twice.** Once inside `runExplainCheckpoint` (via its own `openRepository`), then again in the fallback path after `checkpointErr`. Not a correctness issue, but the repo handle could be hoisted and passed down to avoid the duplicated work for the common commit-fallback case.
+
+**5. `Use` string isn't asserted in tests.** `TestNewExplainCmd` now checks `cmd.Name()` instead of `cmd.Use` — which means the documented positional syntax `[checkpoint-id | commit-sha]` isn't guarded by a regression test. (Already raised inline by the reviewer bot; worth honoring.)
+
+**6. Minor nits**:
+- `generateOrRawLabel` reads awkwardly — consider `sideEffectModeLabel` or just inline the two call sites.
+- The `//nolint:wrapcheck` on `resolveCommitUnambiguous`'s first return carries a "caller contextualizes" promise — both callers *do* wrap on the error path, but the happy-path error from `ResolveRevision` (e.g., "reference not found") flows through as-is into the composite message. That's fine, just noting.
+
+### Risk
+
+**Medium-low.** Main behavior changes:
+- `--commit` now supports `--generate` / `--raw-transcript` (additive — no prior valid workflow breaks).
+- Short hex prefix now errors on collision instead of silently picking one. A user depending on old behavior would already have been at risk of silent mis-routing; this is strictly safer.
+- Trailer-less commits in side-effect modes now error instead of exiting 0 — a semantic break for any script, but the new behavior is clearly correct.
+
+No security concerns; no persistence/schema changes; scoped to one command.
+
+### Verdict
+
+**Approve with minor follow-ups.** The sentinel-based routing, HashesWithPrefix-based disambiguation, and side-effect-mode hardening are all solid improvements. The ambiguity guard's best-effort fallback is the one place I'd want either a warning-log or a tighter test, but it's not a blocker.
+
+---
+
+can you review again with the latest changes? can you then also look at the PR comments ?

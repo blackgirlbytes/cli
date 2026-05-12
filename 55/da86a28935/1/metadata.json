@@ -1,0 +1,85 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "55da86a28935",
+  "session_id": "46b6f0ad-8975-4306-94a6-56bf49f213dd",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-27T01:06:05.336607Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "956c6761aa18",
+  "token_usage": {
+    "input_tokens": 6500,
+    "cache_creation_tokens": 472983,
+    "cache_read_tokens": 24847736,
+    "output_tokens": 93741,
+    "api_call_count": 165
+  },
+  "session_metrics": {
+    "turn_count": 20
+  },
+  "summary": {
+    "intent": "Build a full interactive TUI dashboard for the memory-loop subsystem using Charmbracelet/bubbletea libraries, with 4 tabs (Memories, Injection, History, Settings) and full CRUD/lifecycle management.",
+    "outcome": "A working TUI was built and committed across multiple iterations. Core functionality works (memories tab, settings cycling, injection prompt tester) but visual polish is still in progress — settings tab styling doesn't match the mockup design.",
+    "learnings": {
+      "repo": [
+        "The CLI uses a `termstyle` package for ANSI 256-color theming that respects NO_COLOR; new TUI should use color codes from this palette rather than hardcoded hex.",
+        "The `docs/superpowers/` directory is gitignored — brainstorm artifacts and specs written there won't appear in git history.",
+        "Existing package structure follows `cmd/entire/cli/<feature>/` pattern; new TUI package placed at `cmd/entire/cli/memorylooptui/`.",
+        "ACCESSIBLE=1 env var is used throughout the CLI for screen-reader fallbacks; TUI falls back to plain-text show subcommand when set.",
+        "Memory loop state lives in `.entire/memory-loop.json`; must run `entire memory-loop refresh` before TUI has data to display."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memorylooptui/root.go",
+          "line": 88,
+          "end_line": 126,
+          "finding": "The tea.KeyMsg case in the root Update method processes global keys then exits the case block. Delegation to sub-tabs happens outside the switch at ~line 175 using the outer tea.Msg parameter — type assertion back to tea.KeyMsg works because the underlying value is preserved, but this is non-obvious."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_settings.go",
+          "finding": "Settings key handling was broken due to closure capture issues with pointer fields in settingsChangedMsg. Fixed by capturing the full struct value rather than pointer fields in the tea.Cmd closure."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/styles.go",
+          "finding": "Lipgloss color '8' (dark gray) is invisible on dark terminals — use '245' (light gray) for borders and inactive tab labels. Color '214' is the orange accent used throughout."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_injection.go",
+          "finding": "Log table height must be explicitly capped (e.g. h-10) to prevent content overflow that pushes the tab bar off-screen entirely."
+        },
+        {
+          "path": "cmd/entire/cli/memorylooptui/tab_memories.go",
+          "finding": "Detail pane width must be set to `width - 2` unconditionally (not gated on width > 0) to ensure lipgloss border renders. Border color must be '245' not '8'."
+        }
+      ],
+      "workflow": [
+        "Subagent-driven development worked well for parallelizing independent tab implementations but caused integration issues (uncommitted changes across agents, fix agents committing mid-session).",
+        "The brainstorm visual companion server shuts down between sessions and must be restarted; content must be re-written to the new session path.",
+        "Adding debug file logging (writing to /tmp) is a viable debugging technique for bubbletea apps where you can't use stdout — helped isolate the settings key handling bug.",
+        "Lipgloss v1 border API requires explicit width setting relative to terminal width; borders silently fail to render if width is 0 or unset.",
+        "When a subagent commits fixes, the parent session may not see those commits in `git diff` — always run `git log` to verify what was actually committed before committing again."
+      ]
+    },
+    "friction": [
+      "Lipgloss border color '8' is invisible on dark terminals — wasted multiple iterations debugging 'missing borders' that were actually just invisible.",
+      "Settings tab key handling was silently broken for the entire session until debug logging was added; no error surfaced, keys were simply swallowed.",
+      "The brainstorm visual companion server doesn't persist between sessions, requiring manual restart and content re-creation.",
+      "Subagent-driven execution led to uncommitted changes across multiple agents, requiring manual cleanup and re-committing at the end.",
+      "Terminal width cap of 80 columns was too narrow for the user's terminal, causing layout issues that weren't caught in code review.",
+      "Injection tab overflow (pushing tab bar off-screen) required multiple fix attempts before the correct height cap was found."
+    ],
+    "open_items": [
+      "Settings tab visual design still doesn't match the mockup — needs a single-panel row layout rather than individual bordered cards per setting.",
+      "History tab 'R' refresh trigger is a placeholder; async refresh with spinner not wired to actual memoryloop.Refresh() call.",
+      "Injection tab prompt tester may not be fully functional — user noted it 'doesn't seem like prompt injection works'.",
+      "No unit tests for any of the TUI components — manual verification only.",
+      "Injection log detail card when selecting a log entry may not be rendering correctly.",
+      "The 9-task plan included 'fmt, lint, test:ci, manual verification checklist' as Task 9 — tests were skipped as explicitly deferred.",
+      "Async spinner state for refresh operations was deferred from the History tab implementation.",
+      "The `prune` action (x keybinding) was added late in spec review — may not be fully implemented in the memories tab lifecycle actions."
+    ]
+  }
+}

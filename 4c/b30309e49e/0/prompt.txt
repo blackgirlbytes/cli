@@ -1,0 +1,178 @@
+4. Smudge only applied on RestoreLogsOnly — Commands like entire explain --raw-transcript
+   and prompt previews in rewind point listings still display __ent__/repo placeholders to
+  users. Either smudge at the read boundary or document as a known limitation.
+
+How can we approach this?
+
+---
+
+If we do Option A can we make sure it's not smudged before storing in checkpoint?
+
+---
+
+yesh do Optiona A with option 1
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a3a11f0d98c730d21</task-id>
+<tool-use-id>toolu_013nrUuU3aCioVZF11qA6kmR</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/e12f0643-bf19-48d5-8209-3df10dffa828/tasks/a3a11f0d98c730d21.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>This is a drive-by removal of a `nolint` directive on a deprecated function call -- the function is still deprecated, so linters will now flag this line.
+
+Here are the findings:
+
+---
+
+## Code Quality Review: `soph/add-filtering` branch
+
+### 1. Parameter sprawl -- pipeline threaded through too many layers
+- `temporary.go:722` -- `buildTreeWithChanges` gains a 7th parameter (`pipeline *filter.Pipeline`), 4 of its call sites pass `nil`
+- `temporary.go:938` -- `addDirectoryToChanges` gains pipeline param, only 1 of 2 call sites uses non-nil
+- `committed.go:1443` -- `createRedactedBlobFromFile` gains pipeline param, 2 of 3 call sites pass `nil`
+- `committed.go:552` -- `writeTranscript` gains pipeline param, only 1 call site
+
+**Suggestion:** The pipeline could be stored on `GitStore` or passed via context (it's already in context via `FromContext`) rather than being threaded as a parameter through 4 function signatures. Alternatively, an options struct would prevent each new concern from adding another parameter.
+
+### 2. Repeated `filter.FromContext(ctx)` calls -- redundant work
+- `committed.go:337`, `committed.go:1125`, `temporary.go:112`, `temporary.go:309`, `manual_commit_rewind.go:674` -- 5 separate `FromContext` calls, each re-reading settings from disk, calling `os.UserHomeDir()`, and `paths.WorktreeRoot()`. Within a single checkpoint write, this work is done once in the caller and then the result is threaded through. But across the codebase, it is not cached on context. Consider storing the pipeline in the context once (using `context.WithValue`).
+
+### 3. Copy-paste: identical prompt-cleaning pattern
+- `committed.go:357` and `committed.go:1201` -- `redact.String(pipeline.CleanString(strings.Join(opts.Prompts, "\n\n---\n\n")))` is duplicated verbatim. Extract a helper like `cleanAndRedactPrompts(pipeline, prompts)`.
+
+### 4. Copy-paste: `CleanString`/`SmudgeString` are thin wrappers with duplicated nil-checks
+- `filter.go:107-121` -- `CleanString` and `SmudgeString` each repeat the nil-guard pattern that `Clean`/`Smudge` already handle. The nil check is redundant since `p.Clean([]byte(s))` already handles `p == nil`. Could be a single-liner: `func (p *Pipeline) CleanString(s string) string { return string(p.Clean([]byte(s))) }`.
+
+### 5. `SmudgeString` is dead code in production
+- `filter.go:116-121` -- `SmudgeString` has zero production call sites (only used in tests). YAGNI -- remove until actually needed.
+
+### 6. `ValidateFilter` uses `bool isBuiltIn` instead of a type
+- `validate.go:21` -- `ValidateFilter(f Filter, isBuiltIn bool)` is a classic bool parameter that controls two distinct validation paths. A `FilterKind` enum (`BuiltIn`/`User`) would be self-documenting and extensible, or simply split into `validateBuiltInFilter`/`validateUserFilter`.
+
+### 7. No cross-filter collision validation
+- `filter.go:43-86` -- `NewPipeline` validates each filter in isolation but never checks if one filter's replacement token could appear in another filter's match string. For example, a user filter with `Match` containing `__ent__/` would be corrupted by the built-in filters applied first.
+
+### 8. `Filter.Clean`/`Filter.Smudge` re-allocate `[]byte` from string fields on every call
+- `filter.go:23,28` -- `[]byte(f.Match)` and `[]byte(f.Replace)` allocate on every invocation. Pre-computing `matchBytes`/`replaceBytes` in the `Filter` struct (or at `NewPipeline` time) would avoid repeated allocations for large transcripts.
+
+### 9. Unnecessary "WHAT" comments
+- `committed.go:337`: `// Construct filter pipeline once for both transcript and prompts` -- repeated 5 times with slight variation across files (`committed.go:1125`, `temporary.go:112`, `temporary.go:309`, `manual_commit_rewind.go:674`). The code is self-evident; the comment adds no WHY.
+- `filter.go:22`: `// Clean applies the filter in the "store" direction: Match -> Replace.` -- restates the method signature.
+- `filter.go:27`: `// Smudge applies the filter in the "restore" direction: Replace -> Match.` -- same.
+- `validate.go:13-14`: `Match` and `Replace` field comments (`// literal string to find`, `// literal string to substitute`) -- these are obvious from the field names and the type's doc comment.
+
+### 10. Drive-by `nolint` removal will break linting
+- `manual_commit_rewind.go:214` -- removed `//nolint:staticcheck` from a call to the still-deprecated `paths.CheckpointPath()`. This will cause staticcheck to flag the line. Either keep the nolint or migrate to `cpInfo.CheckpointID.Path()`.</result>
+<usage><total_tokens>52700</total_tokens><tool_uses>47</tool_uses><duration_ms>229345</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/e12f0643-bf19-48d5-8209-3df10dffa828/tasks/a3a11f0d98c730d21.output
+
+---
+
+<task-notification>
+<task-id>a501d23f97e9127c4</task-id>
+<tool-use-id>toolu_019AC457iUomf5h4GEC67fGi</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/e12f0643-bf19-48d5-8209-3df10dffa828/tasks/a501d23f97e9127c4.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Now let me check if `bytes.ReplaceAll` in Go actually allocates when there's no match. Let me also check if the `Filter.Clean/Smudge` methods could use `bytes.Contains` as a fast-path.
+
+Let me now look at the `Clean` method more carefully for a large transcript. If a transcript is 1MB and there are 2 built-in filters + N user filters, each `bytes.ReplaceAll` call will scan the entire buffer. With no match, Go's `bytes.Replace` returns `append([]byte(nil), s...)`, which copies the entire slice. So for a 1MB transcript with 4 filters, we get 4 full scans + 4 copies even if none match.
+
+Let me verify the Go stdlib behavior.
+
+Actually, looking at Go 1.22+ source code for `bytes.Replace`: when `n := Count(s, old)` is 0, it does `return append(s[:0:0], s...)` which indeed allocates a new slice. But wait -- `bytes.ReplaceAll` calls `Replace(s, old, new, -1)`. In `Replace`, when `m` (count) is 0, the function early-returns with `append(s[:0:0], s...)`. So yes, every call allocates even on no-match.
+
+Actually, let me re-check. In newer Go versions, there may be an optimization. But the key point is that even if the stdlib avoids the copy, there's still a linear scan for each filter. For a 1MB transcript with 4 filters, that's 4MB of scanning minimum.
+
+Now let me compile the findings.
+
+Here are my efficiency findings:
+
+**1. N+1 `filter.FromContext(ctx)` in display.go wrappers called from loops/multiple-call sites**
+
+- `__ent__/repo/cmd/entire/cli/explain.go:261,272` -- `ReadLatestSessionContentForDisplay` called twice (once to load, once to reload after summary generation). Each call triggers `filter.FromContext` -> `settings.Load` (2 file reads). When `generate` is true, that's 2 pipelines constructed, 4 settings files read.
+
+- `__ent__/repo/cmd/entire/cli/explain.go:446,455` -- `GetTranscriptFromCommitForDisplay` called twice (full transcript + parent transcript) for the verbose temporary checkpoint path. Each call constructs a new pipeline via `filter.FromContext` at `display.go:72`. That's 2 redundant `settings.Load` calls.
+
+- `__ent__/repo/cmd/entire/cli/strategy/manual_commit_rewind.go:648,675` -- In `RestoreLogsOnly`, when `!force`, `classifySessionsForRestore` (line 648) calls `filter.FromContext` at line 828, then `RestoreLogsOnly` itself calls `filter.FromContext` again at line 675. Two pipeline constructions for the same restore operation.
+
+**2. Every display.go ForDisplay wrapper independently calls `filter.FromContext(ctx)`**
+
+- `__ent__/repo/cmd/entire/cli/checkpoint/display.go:31,41,51,62,72` -- Five separate wrapper functions, each constructing its own pipeline. Any caller that uses more than one of these (e.g., explain.go) pays the `settings.Load` cost repeatedly. The pipeline could be constructed once and threaded through, or stashed in context.
+
+**3. `bytes.ReplaceAll` allocates even when no match found**
+
+- `__ent__/repo/cmd/entire/cli/filter/filter.go:23,28` -- `Filter.Clean` and `Filter.Smudge` each call `bytes.ReplaceAll`. In Go's stdlib, `bytes.Replace` with count=0 returns `append(s[:0:0], s...)`, which copies the entire input slice. For a pipeline with 2 built-in + N user filters, a 1MB transcript gets N+2 full copies even if no patterns match. A `bytes.Contains` guard before `ReplaceAll` would avoid the allocation.
+
+**4. `CleanString`/`SmudgeString` double-converts (string->[]byte->string)**
+
+- `__ent__/repo/cmd/entire/cli/filter/filter.go:111,120` -- `CleanString` does `string(p.Clean([]byte(s)))`, which allocates []byte from string, then each filter's `ReplaceAll` allocates again, then the final `string()` allocates again. Used for prompts at `committed.go:349` and `committed.go:1201`. For prompt strings this is minor, but the pattern is wasteful.
+
+**5. Hot-path I/O: `settings.Load` reads 2 files on every `FromContext` call**
+
+- `__ent__/repo/cmd/entire/cli/filter/context.go:32` -- `settings.Load` reads `.entire/settings.json` and `.entire/settings.local.json` from disk on every call (no caching). On the hot path (`WriteTemporary` called on every agent step at `temporary.go:111`), this means 2 file reads per checkpoint save just for filter construction. `paths.WorktreeRoot` is cached, but settings is not.
+
+**6. `addTaskMetadataToTree` constructs its own pipeline separately from caller**
+
+- `__ent__/repo/cmd/entire/cli/checkpoint/temporary.go:310` -- `addTaskMetadataToTree` calls `filter.FromContext(ctx)` internally rather than accepting a pipeline parameter. When called from `WriteTemporaryTask` (line 278), this is the only `FromContext` call so it's not a duplication issue, but it's an inconsistency with the pattern used in `WriteTemporary` (which passes pipeline through). If the call graph changes, this could become redundant.
+
+**Summary of severity:**
+
+- **High**: Finding 5 (hot-path settings I/O on every checkpoint save) -- `settings.Load` should be cached or the pipeline should be constructed once per request and passed through context.
+- **Medium**: Findings 1-2 (N+1 `FromContext` in explain/rewind paths) -- 2-4x redundant file reads on user-facing commands.
+- **Low**: Findings 3-4 (unnecessary allocations in `bytes.ReplaceAll` / string conversion) -- only matters for very large transcripts or many filters.
+- **Low**: Finding 6 (inconsistent pipeline threading) -- not a current problem but a latent risk.</result>
+<usage><total_tokens>65921</total_tokens><tool_uses>43</tool_uses><duration_ms>247558</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/e12f0643-bf19-48d5-8209-3df10dffa828/tasks/a501d23f97e9127c4.output
+
+---
+
+<task-notification>
+<task-id>a1b9975d3c580d716</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/e12f0643-bf19-48d5-8209-3df10dffa828/tasks/a1b9975d3c580d716.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>Confirmed: `display.go` is not in the branch diff. It exists locally but is uncommitted/untracked. The user listed it but it's not part of the PR.
+
+Here is my report.
+
+---
+
+## Code Reuse Review: `soph/add-filtering` branch
+
+### Files reviewed
+- `cmd/entire/cli/filter/context.go` (new)
+- `cmd/entire/cli/filter/filter.go` (new)
+- `cmd/entire/cli/filter/validate.go` (new)
+- `cmd/entire/cli/checkpoint/display.go` -- **not part of the branch diff** (exists locally as untracked/uncommitted; listed in the request but not on `soph/add-filtering`)
+- Modified: `checkpoint/committed.go`, `checkpoint/temporary.go`, `strategy/manual_commit_rewind.go`, `settings/settings.go`
+
+### Findings
+
+1. **No duplication found with `bytes.ReplaceAll` / `strings.ReplaceAll` usage.** The `Filter.Clean`/`Filter.Smudge` methods in `filter/filter.go:23,28` use `bytes.ReplaceAll` for a novel purpose (bidirectional path normalization). No existing utility in the codebase wraps this operation for similar find-and-replace pipelines. The `redact` package's `applyJSONReplacements` (`redact/redact.go:231`) does JSON-aware string replacement but is semantically different (works on JSON-encoded key-value pairs, not raw byte substitution).
+
+2. **Minor: `validateUserFilterKey` path-separator check overlaps with `validation.ValidateSessionID`.** `filter/validate.go:67` uses `strings.ContainsAny(key, "/\\")` which is the same pattern as `validation/validators.go:23`. However, the functions have different additional checks (empty-via-TrimSpace vs empty-string, `__ent` prefix rejection, different error messages), so extracting a shared helper would add complexity without real benefit. **Not actionable.**
+
+3. **`paths.CheckpointPath` deprecated call retained.** `strategy/manual_commit_rewind.go:214` -- the branch removed the `//nolint:staticcheck` comment but kept calling the deprecated `paths.CheckpointPath()`. The deprecation note says to use `cpInfo.CheckpointID.Path()` instead. This is tangential to the filter feature but was touched by the branch.
+
+4. **`filter.FromContext` re-constructs the pipeline on every call (11 call sites).** Each invocation calls `paths.WorktreeRoot` (cached), `os.UserHomeDir` (syscall), and `settings.Load` (disk read). The pipeline is immutable once built, so storing it in `context.Context` via `context.WithValue` after the first construction would avoid redundant `settings.Load` and `os.UserHomeDir` calls. The `logging` and `perf` packages already use context-value patterns (`logging/context.go`, `perf/context.go`). **Potential reuse of the context-value pattern, not a duplication issue.**
+
+5. **No existing path-normalization or home-dir-replacement utilities exist.** I searched for `tilde`, `shorten`, `abbreviate`, `home.*replace` patterns across the entire codebase. The `paths` package has `ToRelativePath` and `SanitizePathForClaude` but neither does bidirectional find-and-replace for storage normalization. The new `filter` package is genuinely novel functionality.
+
+6. **`display.go` is not on the branch.** `__ent__/repo/cmd/entire/cli/checkpoint/display.go` exists on disk but is not committed to `soph/add-filtering` or `main`. It imports `filter` and provides `SmudgeSessionContent` and various `ForDisplay` wrapper methods. If it's intended to be part of this PR, it needs to be committed.
+
+### Summary
+
+No meaningful code duplication was found. The `filter` package introduces genuinely new functionality (bidirectional path normalization for transcript portability) that has no existing counterpart in the codebase. The only actionable item is finding #3 (deprecated API still called) and finding #6 (uncommitted file that appears to be part of the feature).</result>
+<usage><total_tokens>70418</total_tokens><tool_uses>56</tool_uses><duration_ms>255932</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/e12f0643-bf19-48d5-8209-3df10dffa828/tasks/a1b9975d3c580d716.output

@@ -1,0 +1,74 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "764661cf3370",
+  "session_id": "90f3ff3b-83c8-4125-bbc4-c02734981f54",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-03T19:53:01.4642Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 2,
+  "files_touched": [],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "10861c9d78f4",
+  "token_usage": {
+    "input_tokens": 411,
+    "cache_creation_tokens": 805869,
+    "cache_read_tokens": 52384073,
+    "output_tokens": 92543,
+    "api_call_count": 313
+  },
+  "session_metrics": {
+    "turn_count": 4
+  },
+  "summary": {
+    "intent": "Enhance the summary TUI detail pane to show all available session data (scores, stats, files touched, tool usage, implementation rationale, tradeoffs, codebase patterns, and full facet evidence), fix the repo filter showing nothing, implement the memory-loop wizard edit action, and resolve copy/scroll conflicts in the TUI.",
+    "outcome": "Enhanced detail pane implemented with 4 grouped boxes (SUMMARY, CODE, LEARNINGS, SIGNALS) showing all previously hidden data; repo filter fixed to load its own 200 most recent sessions independently; memory-loop wizard edit action wired to a huh form; mouse capture removed to allow highlight-copy with keyboard scrolling for detail navigation.",
+    "learnings": {
+      "repo": [
+        "The summary TUI loads only the 200 most recent sessions via maxSummaryRecentSessions; the repo filter was broken because those 200 sessions were all from unmerged feature branches with zero overlap against main-reachable checkpoint IDs.",
+        "Facets backfilling means: sessions are cached with has_facets=0, and on improve/insights/memory-loop run, transcripts are condensed and sent to LLM to extract friction/learnings/failure_loops/repeated_instructions/missing_context/skill_signals/review_rule_signals, then marked has_facets=1.",
+        "The memory-loop wizard WizardIntentEdit was unhandled in the backend switch — the interactive edit path was explicitly marked 'not yet implemented' in the CLI.",
+        "tea.WithMouseCellMotion() captures all mouse events preventing terminal text selection; removing it restores highlight-copy while keyboard scrolling (pgup/pgdn/ctrl+u/ctrl+d) still works via viewport fallthrough."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "line": 181,
+          "end_line": 184,
+          "finding": "Unhandled keys fall through to the viewport, so pgup/pgdn/ctrl+u/ctrl+d scroll the detail pane without needing explicit key bindings."
+        },
+        {
+          "path": "cmd/entire/cli/insightsdb/queries.go",
+          "finding": "New QueryByCheckpointIDs method added to load sessions filtered to a specific set of checkpoint IDs for the repo filter view."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "finding": "Model now holds separate branchRows and repoRows slices; applyFilter swaps the source slice based on active branchFilter instead of client-side filtering a single merged rows slice."
+        },
+        {
+          "path": "cmd/entire/cli/memory_loop_cmd.go",
+          "line": 1598,
+          "finding": "Interactive edit mode was explicitly stubbed as not implemented; now wired to a huh form pre-populated with record title/body/keywords."
+        }
+      ],
+      "workflow": [
+        "Codex adversarial review companion hits ENOBUFS on large repos — the internal git diff buffer overflows and the review cannot complete regardless of foreground/background mode.",
+        "Brainstorming skill uses a local visual companion server (http://localhost:65000) for mockup rendering; it requires explicitly starting the server before use.",
+        "Subagent-driven development dispatches one agent per plan task; integration tasks that touch multiple files simultaneously are better handled inline by the orchestrator to avoid coordination issues."
+      ]
+    },
+    "friction": [
+      "Codex adversarial review failed with ENOBUFS on both foreground and background runs — repo diff is too large for the companion's internal buffer.",
+      "replace_all on renderSubSection call sites corrupted the parameter order — ended up passing len(allLines) as the title string argument, requiring manual repair.",
+      "Mouse capture (tea.WithMouseCellMotion) prevented text selection, but removing it broke scroll; required two back-and-forth reverts before landing on keyboard-only scroll as the solution.",
+      "The y-key copy feature was implemented and then removed when the user clarified they wanted highlight-copy (terminal text selection), not programmatic clipboard copy.",
+      "Root test models needed updating across multiple test functions when repoRows was split from branchRows — the scope of test changes was larger than anticipated."
+    ],
+    "open_items": [
+      "editMemoryMsg is defined but never used in the TUI — the in-TUI edit flow (as opposed to the wizard edit) is still unwired.",
+      "The Codex adversarial review is unusable on this repo due to buffer size limits — no workaround found.",
+      "suggestions table in insights.db has 0 rows — generated suggestions pipeline appears unimplemented or not running.",
+      "The visual companion brainstorm artifacts (.superpowers/brainstorm/) are untracked and not committed."
+    ]
+  }
+}

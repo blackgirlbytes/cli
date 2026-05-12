@@ -1,0 +1,696 @@
+Implement the following plan:
+
+# Droid Test Suite Assessment
+
+## Context
+Audit of all Factory AI Droid test files to determine whether they're testing meaningful behavior or are useless/redundant.
+
+---
+
+## File-by-File Assessment
+
+### 1. `factoryaidroid_test.go` — Mixed quality (40% trivial, 60% useful)
+
+**Genuinely useful tests:**
+- `TestDetectPresence` — Tests real filesystem behavior with `.factory/` directory
+- `TestReadTranscript` / `TestReadTranscript_MissingFile` — Tests file I/O and error path
+- `TestChunkTranscript_LargeContent` — Tests non-trivial chunking at line boundaries
+- `TestChunkTranscript_RoundTrip` — Tests the critical invariant: chunk + reassemble = original
+- `REDACTED` — Tests JSON parsing with error cases
+- `TestGetSessionDir` — Tests path sanitization logic (non-alphanumeric → `-`)
+- `TestGetSessionDir_EnvOverride` — Tests env var override for testing
+
+**Trivial / nearly useless tests (candidates for removal):**
+- `TestName` — Tests `return agent.AgentNameFactoryAIDroid` (a constant)
+- `TestType` — Tests `return agent.AgentTypeFactoryAIDroid` (a constant)
+- `TestDescription` — Tests `desc != ""` (meaningless assertion)
+- `TestGetHookConfigPath` — Tests `return ".factory/settings.json"` (a string literal)
+- `TestSupportsHooks` — Tests `return true`
+- `TestGetSessionID` — Tests `return input.SessionID` (single field access)
+- `TestReadSession` / `TestWriteSession` — Tests that unimplemented stubs return errors; will need to be deleted when implemented, protects nothing meaningful
+- `TestResolveSessionFile` — Tests `filepath.Join(dir, id+".jsonl")` (one-liner)
+- `TestFormatResumeCommand` — Tests `"droid --session-id " + sessionID` (string concat)
+- `TestChunkTranscript_SmallContent` — Trivial case (fits in one chunk), redundant with RoundTrip
+- `TestReassembleTranscript_SingleChunk` / `TestReassembleTranscript_MultipleChunks` — Redundant with RoundTrip test
+
+### 2. `lifecycle_test.go` — Solid (all tests are useful)
+
+Every test validates the critical hook-name → event-type mapping, which is the core contract between the Droid agent and the Entire CLI framework:
+
+- `TestParseHookEvent_SessionStart/TurnStart/TurnEnd/SessionEnd` — Each validates correct event type + field population
+- `TestParseHookEvent_SubagentStart/SubagentEnd` — Tests ToolUseID and SubagentID extraction from structured JSON
+- `TestParseHookEvent_Compaction` — Tests pre-compact hook mapping
+- `TestParseHookEvent_SubagentStop_PassThrough` / `Notification_PassThrough` — Tests that acknowledged-but-no-action hooks correctly return nil
+- `TestParseHookEvent_UnknownHook` — Tests graceful handling of future hooks
+- `TestParseHookEvent_EmptyInput` / `MalformedJSON` — Tests error paths
+
+**Verdict:** No changes needed. Every test validates meaningful behavior.
+
+### 3. `transcript_test.go` — Strongest file (nearly all tests are high-value)
+
+**High-value tests:**
+- `TestParseDroidTranscript_NormalizesEnvelope` — **THE most important Droid test.** Validates the Droid-specific format transformation (outer `type:"message"` + inner `role` → normalized `type:role`). Without this, all transcript parsing breaks.
+- `TestParseDroidTranscript_StartLineOffset` — Critical for incremental checkpoint processing
+- `TestParseDroidTranscript_RealDroidFormat` — Integration-style test with tool_use content
+- `TestCalculateTokenUsage_StreamingDeduplication` — Tests critical edge case where streaming creates duplicate message IDs
+- `REDACTED` — Protects against a documented bug where files modified only by subagents get missed
+- `TestExtractAllModifiedFilesFromTranscript_IncludesSubagentFiles` — Tests cross-agent file aggregation with actual filesystem
+- `TestCalculateTotalTokenUsageFromTranscript_PerCheckpoint` — Tests per-checkpoint token calculation at different offsets
+- `TestExtractSpawnedAgentIDs_FromToolResult` — Tests complex multi-layer JSON parsing
+
+**Lower-value but still reasonable:**
+- `TestSerializeTranscript` — Round-trip test, adds some value
+- `TestExtractModifiedFiles_Empty` / `TestCalculateTokenUsage_EmptyTranscript` — Nil/zero boundary tests (low value but harmless)
+
+**Verdict:** No changes needed. Very well-designed test file.
+
+### 4. `hooks_test.go` — Excellent (almost all tests are critical)
+
+**Critical tests (protect against data loss):**
+- `TestInstallHooks_PreservesUserHooksOnSameType` — Prevents nuking user's existing hooks during install
+- `TestInstallHooks_PreservesUnknownHookTypes` — Forward-compatibility with future hook types
+- `TestInstallHooks_PermissionsDeny_PreservesUserRules` — Prevents removing user's security rules
+- `TestInstallHooks_PermissionsDeny_PreservesUnknownFields` — Preserves unknown fields like `ask`
+- `TestUninstallHooks_PreservesUserHooks` — Prevents data loss during uninstall
+- `TestUninstallHooks_PreservesUserDenyRules` — Prevents data loss of security rules
+- `TestUninstallHooks_PreservesUnknownHookTypes` — Forward-compatibility during uninstall
+
+**Important functional tests:**
+- `TestInstallHooks_FreshInstall` — Validates all 7 hooks with correct commands
+- `TestInstallHooks_Idempotent` — Prevents hook duplication on re-enable
+- `TestInstallHooks_LocalDev` — Validates dev-mode command format
+- `TestInstallHooks_Force` — Tests force-reinstall path
+- `TestUninstallHooks` / `TestUninstallHooks_RemovesDenyRule` — Clean uninstall paths
+
+**Verdict:** No changes needed. Excellent coverage of critical data-preservation behavior.
+
+### 5. `setup_factoryai_hooks_test.go` (integration) — Useful smoke tests
+
+Both tests exercise the full CLI command path (`entire enable --agent factoryai-droid`). Useful for catching integration issues that unit tests miss.
+
+---
+
+## Key Gaps (Missing Tests)
+
+### Not tested at all:
+1. **`ExtractPrompts()`** — Parses user content from transcript and strips IDE context tags. Non-trivial logic, completely untested.
+2. **`ExtractSummary()`** — Finds last assistant text message. Completely untested.
+3. **Subagent token aggregation with actual files** — `TestCalculateTotalTokenUsageFromTranscript_PerCheckpoint` passes `""` for subagentsDir every time. No test validates that subagent tokens are correctly summed from real files.
+4. **Malformed JSONL line handling** — The parser silently skips bad lines, but this isn't tested (what happens with `{"broken json` mid-transcript?).
+5. **`HookNames()` / `GetHookNames()`** — Returns the list of 9 hook verbs. If a hook is accidentally removed from this list, no test catches it.
+
+---
+
+## Recommendations
+
+### Remove (trivial, zero risk of regression):
+- `TestName`, `TestType`, `TestDescription`
+- `TestGetHookConfigPath`, `TestSupportsHooks`
+- `TestGetSessionID`
+- `TestReadSession`, `TestWriteSession`
+- `TestFormatResumeCommand`, `TestResolveSessionFile`
+- `TestChunkTranscript_SmallContent` (covered by RoundTrip)
+- `TestReassembleTranscript_SingleChunk`, `TestReassembleTranscript_MultipleChunks` (covered by RoundTrip)
+
+### Add:
+1. **`TestExtractPrompts`** — Test prompt extraction from Droid transcript (user messages, IDE tag stripping)
+2. **`TestExtractSummary`** — Test last-assistant-message extraction
+3. **`TestCalculateTotalTokenUsageFromTranscript_WithSubagentFiles`** — Create actual subagent JSONL files and verify tokens are aggregated
+4. **`TestParseDroidTranscript_MalformedLines`** — Verify that a transcript with some broken JSON lines still parses the valid lines correctly
+5. **`TestGetHookNames`** — Validate the hook list contains all expected 9 verbs (protects against accidental removal)
+
+### No changes needed:
+- `lifecycle_test.go` — All useful
+- `hooks_test.go` — All useful
+- `transcript_test.go` — All useful (except note the gaps above)
+- Integration test — Useful as-is
+
+---
+
+## Verification
+After changes:
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.REDACTED.jsonl
+
+---
+
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/transcript_test.go
+
+no changes added to commit (use "git add" and/or "git commit -a")
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+index 2f15b9bb..94f28346 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid_test.go
+@@ -21,57 +21,6 @@ func TestNewFactoryAIDroidAgent(t *testing.T) {
+ 	}
+ }
+ 
+-func TestName(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	if name := ag.Name(); name != agent.AgentNameFactoryAIDroid {
+-		t.Errorf("Name() = %q, want %q", name, agent.AgentNameFactoryAIDroid)
+-	}
+-}
+-
+-func TestType(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	if tp := ag.Type(); tp != agent.AgentTypeFactoryAIDroid {
+-		t.Errorf("Type() = %q, want %q", tp, agent.AgentTypeFactoryAIDroid)
+-	}
+-}
+-
+-func TestDescription(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	desc := ag.Description()
+-	if desc == "" {
+-		t.Error("Description() returned empty string")
+-	}
+-}
+-
+-func TestProtectedDirs(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	dirs := ag.ProtectedDirs()
+-	if len(dirs) != 1 || dirs[0] != ".factory" {
+-		t.Errorf("ProtectedDirs() = %v, want [.factory]", dirs)
+-	}
+-}
+-
+-func TestGetHookConfigPath(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	path := ag.GetHookConfigPath()
+-	if path != ".factory/settings.json" {
+-		t.Errorf("GetHookConfigPath() = %q, want .factory/settings.json", path)
+-	}
+-}
+-
+-func TestSupportsHooks(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	if !ag.SupportsHooks() {
+-		t.Error("SupportsHooks() = false, want true")
+-	}
+-}
+-
+ // TestDetectPresence uses t.Chdir so it cannot be parallel.
+ func TestDetectPresence(t *testing.T) {
+ 	t.Run("factory directory exists", func(t *testing.T) {
+@@ -138,20 +87,6 @@ func TestReadTranscript_MissingFile(t *testing.T) {
+ 	}
+ }
+ 
+-func TestChunkTranscript_SmallContent(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	content := []byte(`{"role":"user","content":"hello"}`)
+-
+-	chunks, err := ag.ChunkTranscript(content, agent.MaxChunkSize)
+-	if err != nil {
+-		t.Fatalf("ChunkTranscript() error = %v", err)
+-	}
+-	if len(chunks) != 1 {
+-		t.Errorf("Expected 1 chunk, got %d", len(chunks))
+-	}
+-}
+-
+ func TestChunkTranscript_LargeContent(t *testing.T) {
+ 	t.Parallel()
+ 	ag := &FactoryAIDroidAgent{}
+@@ -209,39 +144,6 @@ func TestChunkTranscript_RoundTrip(t *testing.T) {
+ 	}
+ }
+ 
+-func TestReassembleTranscript_SingleChunk(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-
+-	chunk := []byte(`{"role":"user","content":"hello"}`)
+-	result, err := ag.ReassembleTranscript([][]byte{chunk})
+-	if err != nil {
+-		t.Fatalf("ReassembleTranscript() error = %v", err)
+-	}
+-	if string(result) != string(chunk) {
+-		t.Errorf("ReassembleTranscript() = %q, want %q", string(result), string(chunk))
+-	}
+-}
+-
+-func TestReassembleTranscript_MultipleChunks(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-
+-	chunk1 := []byte(`{"role":"user","content":"hello"}`)
+-	chunk2 := []byte(`{"role":"assistant","content":"hi"}`)
+-
+-	result, err := ag.ReassembleTranscript([][]byte{chunk1, chunk2})
+-	if err != nil {
+-		t.Fatalf("ReassembleTranscript() error = %v", err)
+-	}
+-
+-	expected := `{"role":"user","content":"hello"}
+-{"role":"assistant","content":"hi"}`
+-	if string(result) != expected {
+-		t.Errorf("ReassembleTranscript() = %q, want %q", string(result), expected)
+-	}
+-}
+-
+ // --- ParseHookInput tests ---
+ 
+ func TestParseHookInput_Valid(t *testing.T) {
+@@ -279,19 +181,6 @@ func TestParseHookInput_InvalidJSON(t *testing.T) {
+ 	}
+ }
+ 
+-// --- Session stub tests ---
+-
+-func TestGetSessionID(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	input := &agent.HookInput{SessionID: "test-session-123"}
+-
+-	id := ag.GetSessionID(input)
+-	if id != "test-session-123" {
+-		t.Errorf("GetSessionID() = %q, want %q", id, "test-session-123")
+-	}
+-}
+-
+ func TestGetSessionDir(t *testing.T) {
+ 	t.Parallel()
+ 	ag := &FactoryAIDroidAgent{}
+@@ -326,43 +215,3 @@ func TestGetSessionDir_EnvOverride(t *testing.T) {
+ 		t.Errorf("GetSessionDir() = %q, want %q (env override)", dir, override)
+ 	}
+ }
+-
+-func TestReadSession(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	_, err := ag.ReadSession(&agent.HookInput{SessionID: "test"})
+-	if err == nil {
+-		t.Error("ReadSession() should return error (not implemented)")
+-	}
+-}
+-
+-func TestWriteSession(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	err := ag.WriteSession(&agent.AgentSession{})
+-	if err == nil {
+-		t.Error("WriteSession() should return error (not implemented)")
+-	}
+-}
+-
+-// --- Other methods ---
+-
+-func TestResolveSessionFile(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	result := ag.ResolveSessionFile("/sessions", "abc-123")
+-	expected := filepath.Join("/sessions", "abc-123.jsonl")
+-	if result != expected {
+-		t.Errorf("ResolveSessionFile() = %q, want %q", result, expected)
+-	}
+-}
+-
+-func TestFormatResumeCommand(t *testing.T) {
+-	t.Parallel()
+-	ag := &FactoryAIDroidAgent{}
+-	cmd := ag.FormatResumeCommand("sess-456")
+-	expected := "droid --session-id sess-456"
+-	if cmd != expected {
+-		t.Errorf("FormatResumeCommand() = %q, want %q", cmd, expected)
+-	}
+-}
+diff --git a/cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go b/cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go
+index c97b991e..0f80394d 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/lifecycle_test.go
+@@ -7,6 +7,39 @@ import (
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
+ )
+ 
++func TestGetHookNames(t *testing.T) {
++	t.Parallel()
++
++	ag := &FactoryAIDroidAgent{}
++	names := ag.GetHookNames()
++
++	expected := []string{
++		"session-start",
++		"session-end",
++		"stop",
++		"user-prompt-submit",
++		"pre-tool-use",
++		"post-tool-use",
++		"subagent-stop",
++		"pre-compact",
++		"notification",
++	}
++
++	if len(names) != len(expected) {
++		t.Fatalf("GetHookNames() returned %d hooks, want %d: got %v", len(names), len(expected), names)
++	}
++
++	nameSet := make(map[string]bool, len(names))
++	for _, n := range names {
++		nameSet[n] = true
++	}
++	for _, want := range expected {
++		if !nameSet[want] {
++			t.Errorf("GetHookNames() missing expected hook %q", want)
++		}
++	}
++}
++
+ func TestParseHookEvent_SessionStart(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/cmd/entire/cli/agent/factoryaidroid/transcript_test.go b/cmd/entire/cli/agent/factoryaidroid/transcript_test.go
+index f05b1150..15f4646a 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/transcript_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/transcript_test.go
+@@ -848,3 +848,292 @@ func makeTaskResultLine(t *testing.T, id, toolUseID, agentID string) string {
+ 	})
+ 	return string(line)
+ }
++
++// makeUserTextLine returns a Droid-format JSONL line with a user text message (array content).
++func makeUserTextLine(t *testing.T, id, text string) string {
++	t.Helper()
++	innerMsg := mustMarshal(t, map[string]interface{}{
++		"role": "user",
++		"content": []map[string]interface{}{
++			{"type": "text", "text": text},
++		},
++	})
++	line := mustMarshal(t, map[string]interface{}{
++		"type":    "message",
++		"id":      id,
++		"message": json.RawMessage(innerMsg),
++	})
++	return string(line)
++}
++
++// makeAssistantTextLine returns a Droid-format JSONL line with an assistant text message.
++func makeAssistantTextLine(t *testing.T, id, text string) string {
++	t.Helper()
++	innerMsg := mustMarshal(t, map[string]interface{}{
++		"role": "assistant",
++		"content": []map[string]interface{}{
++			{"type": "text", "text": text},
++		},
++	})
++	line := mustMarshal(t, map[string]interface{}{
++		"type":    "message",
++		"id":      id,
++		"message": json.RawMessage(innerMsg),
++	})
++	return string(line)
++}
++
++// makeAssistantTokenLine returns a Droid-format JSONL line with an assistant message that has usage data.
++func makeAssistantTokenLine(t *testing.T, id, msgID string, inputTokens, outputTokens int) string {
++	t.Helper()
++	innerMsg := mustMarshal(t, map[string]interface{}{
++		"role": "assistant",
++		"id":   msgID,
++		"usage": map[string]int{
++			"input_tokens":  inputTokens,
++			"output_tokens": outputTokens,
++		},
++	})
++	line := mustMarshal(t, map[string]interface{}{
++		"type":    "message",
++		"id":      id,
++		"message": json.RawMessage(innerMsg),
++	})
++	return string(line)
++}
++
++func TestExtractPrompts(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	transcriptPath := tmpDir + "/transcript.jsonl"
++
++	writeJSONLFile(t, transcriptPath,
++		makeUserTextLine(t, "u1", "Fix the login bug"),
++		makeAssistantTextLine(t, "a1", "I'll fix the login bug."),
++		makeUserTextLine(t, "u2", "Now add tests"),
++	)
++
++	ag := &FactoryAIDroidAgent{}
++	prompts, err := ag.ExtractPrompts(transcriptPath, 0)
++	if err != nil {
++		t.Fatalf("ExtractPrompts() error = %v", err)
++	}
++
++	if len(prompts) != 2 {
++		t.Fatalf("ExtractPrompts() got %d prompts, want 2", len(prompts))
++	}
++	if prompts[0] != "Fix the login bug" {
++		t.Errorf("prompts[0] = %q, want %q", prompts[0], "Fix the login bug")
++	}
++	if prompts[1] != "Now add tests" {
++		t.Errorf("prompts[1] = %q, want %q", prompts[1], "Now add tests")
++	}
++}
++
++func TestExtractPrompts_StripsIDETags(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	transcriptPath := tmpDir + "/transcript.jsonl"
++
++	// User message with IDE context tags injected by VSCode extension
++	promptWithTags := `Fix the bug`
++	writeJSONLFile(t, transcriptPath,
++		makeUserTextLine(t, "u1", promptWithTags),
++	)
++
++	ag := &FactoryAIDroidAgent{}
++	prompts, err := ag.ExtractPrompts(transcriptPath, 0)
++	if err != nil {
++		t.Fatalf("ExtractPrompts() error = %v", err)
++	}
++
++	if len(prompts) != 1 {
++		t.Fatalf("ExtractPrompts() got %d prompts, want 1", len(prompts))
++	}
++	if prompts[0] != "Fix the bug" {
++		t.Errorf("prompts[0] = %q, want %q (IDE tags should be stripped)", prompts[0], "Fix the bug")
++	}
++}
++
++func TestExtractPrompts_WithOffset(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	transcriptPath := tmpDir + "/transcript.jsonl"
++
++	writeJSONLFile(t, transcriptPath,
++		makeUserTextLine(t, "u1", "First prompt"),
++		makeAssistantTextLine(t, "a1", "Done."),
++		makeUserTextLine(t, "u2", "Second prompt"),
++		makeAssistantTextLine(t, "a2", "Done again."),
++	)
++
++	ag := &FactoryAIDroidAgent{}
++	// Skip first 2 lines (first user+assistant turn)
++	prompts, err := ag.ExtractPrompts(transcriptPath, 2)
++	if err != nil {
++		t.Fatalf("ExtractPrompts() error = %v", err)
++	}
++
++	if len(prompts) != 1 {
++		t.Fatalf("ExtractPrompts() got %d prompts, want 1", len(prompts))
++	}
++	if prompts[0] != "Second prompt" {
++		t.Errorf("prompts[0] = %q, want %q", prompts[0], "Second prompt")
++	}
++}
++
++func TestExtractSummary(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	transcriptPath := tmpDir + "/transcript.jsonl"
++
++	writeJSONLFile(t, transcriptPath,
++		makeUserTextLine(t, "u1", "Fix the bug"),
++		makeAssistantTextLine(t, "a1", "Working on it..."),
++		makeUserTextLine(t, "u2", "Thanks"),
++		makeAssistantTextLine(t, "a2", "All done! The login bug is fixed."),
++	)
++
++	ag := &FactoryAIDroidAgent{}
++	summary, err := ag.ExtractSummary(transcriptPath)
++	if err != nil {
++		t.Fatalf("ExtractSummary() error = %v", err)
++	}
++
++	if summary != "All done! The login bug is fixed." {
++		t.Errorf("ExtractSummary() = %q, want %q", summary, "All done! The login bug is fixed.")
++	}
++}
++
++func TestExtractSummary_SkipsToolUseBlocks(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	transcriptPath := tmpDir + "/transcript.jsonl"
++
++	// Last assistant message has tool_use (no text), second-to-last has text
++	writeJSONLFile(t, transcriptPath,
++		makeUserTextLine(t, "u1", "Edit main.go"),
++		makeAssistantTextLine(t, "a1", "I updated the file."),
++		makeWriteToolLine(t, "a2", "/repo/main.go"),
++	)
++
++	ag := &FactoryAIDroidAgent{}
++	summary, err := ag.ExtractSummary(transcriptPath)
++	if err != nil {
++		t.Fatalf("ExtractSummary() error = %v", err)
++	}
++
++	// Should find "I updated the file." since the tool_use message has no text block
++	if summary != "I updated the file." {
++		t.Errorf("ExtractSummary() = %q, want %q", summary, "I updated the file.")
++	}
++}
++
++func TestExtractSummary_EmptyTranscript(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	transcriptPath := tmpDir + "/transcript.jsonl"
++	if err := os.WriteFile(transcriptPath, []byte(""), 0o600); err != nil {
++		t.Fatalf("failed to write file: %v", err)
++	}
++
++	ag := &FactoryAIDroidAgent{}
++	summary, err := ag.ExtractSummary(transcriptPath)
++	if err != nil {
++		t.Fatalf("ExtractSummary() error = %v", err)
++	}
++
++	if summary != "" {
++		t.Errorf("ExtractSummary() = %q, want empty string", summary)
++	}
++}
++
++func TestParseDroidTranscript_MalformedLines(t *testing.T) {
++	t.Parallel()
++
++	// Transcript with some broken JSON lines interspersed with valid ones
++	data := []byte(
++		`{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}` + "\n" +
++			`{"broken json` + "\n" +
++			`not even close to json` + "\n" +
++			`{"type":"message","id":"m2","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}` + "\n" +
++			`{"type":"session_event","data":"ignored"}` + "\n",
++	)
++
++	lines, err := ParseDroidTranscriptFromBytes(data)
++	if err != nil {
++		t.Fatalf("ParseDroidTranscriptFromBytes() error = %v", err)
++	}
++
++	// Only the 2 valid "message" type lines should be parsed
++	if len(lines) != 2 {
++		t.Fatalf("got %d lines, want 2 (malformed lines should be silently skipped)", len(lines))
++	}
++	if lines[0].Type != transcript.TypeUser {
++		t.Errorf("lines[0].Type = %q, want %q", lines[0].Type, transcript.TypeUser)
++	}
++	if lines[1].Type != transcript.TypeAssistant {
++		t.Errorf("lines[1].Type = %q, want %q", lines[1].Type, transcript.TypeAssistant)
++	}
++}
++
++func TestCalculateTotalTokenUsageFromTranscript_WithSubagentFiles(t *testing.T) {
++	t.Parallel()
++
++	tmpDir := t.TempDir()
++	transcriptPath := tmpDir + "/transcript.jsonl"
++	subagentsDir := tmpDir + "/tasks/toolu_task1"
++
++	if err := os.MkdirAll(subagentsDir, 0o755); err != nil {
++		t.Fatalf("failed to create subagents dir: %v", err)
++	}
++
++	// Main transcript: assistant message with tokens + Task spawning subagent "sub1"
++	writeJSONLFile(t, transcriptPath,
++		makeAssistantTokenLine(t, "a1", "msg_main1", 100, 50),
++		makeTaskToolUseLine(t, "a2", "toolu_task2"),
++		makeTaskResultLine(t, "u2", "toolu_task2", "sub99"),
++	)
++
++	// Subagent transcript: assistant message with its own tokens
++	writeJSONLFile(t, subagentsDir+"/agent-sub99.jsonl",
++		makeAssistantTokenLine(t, "sa1", "msg_sub1", 200, 80),
++		makeAssistantTokenLine(t, "sa2", "msg_sub2", 150, 60),
++	)
++
++	usage, err := CalculateTotalTokenUsageFromTranscript(transcriptPath, 0, subagentsDir)
++	if err != nil {
++		t.Fatalf("CalculateTotalTokenUsageFromTranscript() error: %v", err)
++	}
++
++	// Main agent: 100 input, 50 output, 1 API call
++	if usage.InputTokens != 100 {
++		t.Errorf("main InputTokens = %d, want 100", usage.InputTokens)
++	}
++	if usage.OutputTokens != 50 {
++		t.Errorf("main OutputTokens = %d, want 50", usage.OutputTokens)
++	}
++	if usage.APICallCount != 1 {
++		t.Errorf("main APICallCount = %d, want 1", usage.APICallCount)
++	}
++
++	// Subagent tokens should be aggregated
++	if usage.SubagentTokens == nil {
++		t.Fatal("SubagentTokens is nil, expected subagent token data")
++	}
++	if usage.SubagentTokens.InputTokens != 350 {
++		t.Errorf("subagent InputTokens = %d, want 350 (200+150)", usage.SubagentTokens.InputTokens)
++	}
++	if usage.SubagentTokens.OutputTokens != 140 {
++		t.Errorf("subagent OutputTokens = %d, want 140 (80+60)", usage.SubagentTokens.OutputTokens)
++	}
++	if usage.SubagentTokens.APICallCount != 2 {
++		t.Errorf("subagent APICallCount = %d, want 2", usage.SubagentTokens.APICallCount)
++	}
++}
+- Current branch: alisha/factoryai-agent
+- Recent commits: c73ebfba Add AgentTypeFactoryAIDroid to exhaustive switches and extract Droid transcript helper
+c5a1d93d Merge branch 'main' into alisha/factoryai-agent
+94a1d70d Implement GetSessionDir for Factory AI Droid
+ac7c4438 Add Factory AI Droid E2E test runner
+12d2099e Fix Droid "(no prompt)" after commit by adding agent-specific transcript parsing
+56fc2bce Merge pull request #442 from entireio/soph/better-agent-agent-instructions
+7b5f027e Merge pull request #441 from entireio/soph/small-rewind-refactor
+e386c99a Merge pull request #440 from entireio/rwr/streamline-setup
+b7247804 Merge branch 'main' into soph/better-agent-agent-instructions
+f73457db setup: fix test
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

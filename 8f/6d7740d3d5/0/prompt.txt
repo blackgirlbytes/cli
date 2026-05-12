@@ -1,0 +1,327 @@
+can you take a look at https://github.com/entireio/cli/actions/runs/23154135968 and especially at the cursor cli errors
+
+---
+
+Hmm, but this used to work before. I'm a bit surprised, like for example https://github.com/entireio/cli/actions/runs/22959662219
+
+---
+
+yes, let's fix it
+
+---
+
+are there more tests needed?
+
+---
+
+/simplify
+
+---
+
+<task-notification>
+<task-id>a461045f5a85f079b</task-id>
+<tool-use-id>toolu_01HWEXxFWgwxHVgyJ134JVE2</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/4a93df6c-18f9-424f-af2a-6ee3b41ac6aa/tasks/a461045f5a85f079b.output</output-file>
+<status>completed</status>
+<summary>Agent "Code reuse review" completed</summary>
+<result>Here are my findings, organized by the four search criteria:
+
+---
+
+## Findings
+
+### 1. Existing function that re-resolves transcript paths or handles file-not-found-then-retry
+
+**Name collision found.** There is already a function named `resolveTranscriptPath` in `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/transcript.go` (line 24). It is in the `cli` package (not `strategy`), takes different parameters (`ctx`, `sessionID`, `agent`), and uses a different approach: it computes the path from scratch via `agent.GetSessionDir(repoRoot)` + `agent.ResolveSessionFile(sessionDir, sessionID)`. It does not do a "check-then-retry" pattern -- it always computes dynamically.
+
+The new `resolveTranscriptPath` in `strategy/resolve_transcript.go` takes `*SessionState` and uses a stat-then-re-resolve approach. These are two distinct functions with the same name in sibling packages. The `cli` package version computes a transcript path from a session ID and agent; the `strategy` package version tries to fix a stale stored path. They do overlapping work (both call `ResolveSessionFile`) but serve different use cases.
+
+The rewind code in `manual_commit_rewind.go` (lines 700-707 and 840-845) also does transcript path resolution via `agent.GetSessionDir` + `agent.ResolveSessionFile`, but it computes fresh paths (never stat-then-retry). This is similar to the `cli.resolveTranscriptPath` approach.
+
+### 2. Existing `filepath.Dir` + `TrimSuffix(Base, Ext)` pattern for extracting session dir and agent session ID
+
+**No existing utility found.** The `filepath.Dir(state.TranscriptPath)` + `strings.TrimSuffix(filepath.Base(...), filepath.Ext(...))` decomposition at lines 44-46 of `resolve_transcript.go` is new. The rewind code (lines 700-707, 840-845) does the inverse -- it constructs paths from `(sessionDir, sessionID)` via `GetSessionDir` + `ResolveSessionFile`, rather than decomposing a stored path. No other location in the codebase extracts a session ID from a transcript path by stripping the extension.
+
+### 3. Redundant `agent.GetByAgentType` calls in callers
+
+**Yes, redundant lookups exist in 3 of the 5 call sites.**
+
+- **`CondenseSession`** (line 104): Calls `GetByAgentType` at line 104, then `resolveTranscriptPath` at line 127 calls it again internally. The `ag` from line 104 is used later (line 144 for `prepareTranscriptIfNeeded`), so this is a redundant second lookup.
+
+- **`extractSessionDataFromLiveTranscript`** (line 523): Calls `GetByAgentType` at line 523, then `resolveTranscriptPath` at line 526 calls it again. The `ag` from line 523 is used later for token calculation.
+
+- **`hasNewTranscriptWork`** (line 1498): Calls `resolveTranscriptPath` at line 1490, then calls `GetByAgentType` at line 1498. Only one redundant lookup here (inside `resolveTranscriptPath`).
+
+- **`extractModifiedFilesFromLiveTranscript`** (line 1567): Calls `resolveTranscriptPath` at line 1559, then calls `GetByAgentType` at line 1567. Same pattern as `hasNewTranscriptWork`.
+
+- **`finalizeAllTurnCheckpoints`** (line 2191): Calls `resolveTranscriptPath` at line 2191. Does NOT separately call `GetByAgentType` -- this is the cleanest call site with no redundancy.
+
+In total, `GetByAgentType` is called twice (once inside `resolveTranscriptPath`, once by the caller) at 4 of the 5 call sites. The lookup goes through a registry map so it is cheap, but it is technically redundant. An alternative design would be to accept an `agent.Agent` parameter (or return the resolved agent alongside the path) to avoid the double-lookup.
+
+### 4. Existing pattern for mutating `state.TranscriptPath` as a side effect
+
+**Yes, there is an existing precedent.** In `manual_commit_hooks.go` line 1840-1841 (inside the `handleUserPromptSubmit` / turn-start handler), `state.TranscriptPath` is updated from the hook-provided `transcriptPath` parameter:
+
+```go
+if transcriptPath != "" && state.TranscriptPath != transcriptPath {
+    state.TranscriptPath = transcriptPath
+}
+```
+
+This is the only other place that mutates `state.TranscriptPath`. The new `resolveTranscriptPath` adds a second mutation site (line 60). Both mutations follow the same pattern of updating the field and relying on the caller to persist the state afterward. This is consistent with how other `SessionState` fields (e.g., `LastPrompt`, `ModelName`) are mutated by functions and then saved by the caller.</result>
+<usage><total_tokens>41903</total_tokens><tool_uses>17</tool_uses><duration_ms>70149</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/4a93df6c-18f9-424f-af2a-6ee3b41ac6aa/tasks/a461045f5a85f079b.output
+
+---
+
+<task-notification>
+<task-id>ad2347ef1d03b9ff6</task-id>
+<tool-use-id>toolu_01EVoJotsgg3zGDSqaZQNRsC</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/4a93df6c-18f9-424f-af2a-6ee3b41ac6aa/tasks/ad2347ef1d03b9ff6.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>I now have a complete picture. Here is my analysis.
+
+---
+
+## Efficiency Review: `resolveTranscriptPath`
+
+### Finding 1: Redundant `os.Stat` in double-call path (CondenseSession -> extractSessionDataFromLiveTranscript)
+
+**Severity: LOW**
+
+In `CondenseSession` (line 127), `resolveTranscriptPath(state)` is called to eagerly resolve the path. If the code takes the `!hasShadowBranch` branch (line 139), it calls `extractSessionDataFromLiveTranscript` (line 147), which calls `resolveTranscriptPath(state)` again (line 526).
+
+However, the **state mutation design handles this correctly**. The first call either:
+- Succeeds on the fast path (`os.Stat` finds the file), returns immediately. The second call re-Stats the same path, hits the fast path again -- one redundant `os.Stat`.
+- Succeeds on the re-resolution path, updating `state.TranscriptPath`. The second call then hits the fast path on the new path -- one redundant `os.Stat`.
+
+The cost is a single extra `os.Stat` system call (~1-10 microseconds on local filesystems). This is negligible relative to the `os.ReadFile` that follows. Not worth refactoring.
+
+### Finding 2: Redundant `agent.GetByAgentType` calls
+
+**Severity: LOW**
+
+Multiple call sites call `resolveTranscriptPath(state)` (which internally calls `GetByAgentType` on the slow path only -- when the file is missing) and then immediately call `GetByAgentType` themselves:
+
+- `hasNewTranscriptWork`: `resolveTranscriptPath` at line 1490, then `agent.GetByAgentType` at line 1498.
+- `extractModifiedFilesFromLiveTranscript`: `resolveTranscriptPath` at line 1559, then `agent.GetByAgentType` at line 1567.
+- `extractSessionDataFromLiveTranscript`: `resolveTranscriptPath` at line 526, then `agent.GetByAgentType` at line 523 (actually called *before* resolve -- line 523 precedes 526).
+- `CondenseSession`: `agent.GetByAgentType` at line 104, then `resolveTranscriptPath` at line 127.
+
+The code comment on `GetByAgentType` (line 127-134 of `registry.go`) explicitly states it is a linear search with ~400ns worst-case cost. With ~2-20 registered agents and lightweight factory functions, the duplicate call adds sub-microsecond overhead. The alternative -- passing an `Agent` parameter to `resolveTranscriptPath` -- would complicate its API for negligible gain, since `resolveTranscriptPath` only needs the agent on the slow (re-resolution) path.
+
+Not a concern.
+
+### Finding 3: TOCTOU between `os.Stat` and `os.ReadFile`
+
+**Severity: LOW (not a real risk in this context)**
+
+The `os.Stat` in `resolveTranscriptPath` followed by `os.ReadFile` in callers creates a theoretical TOCTOU window. However, this is not a practical concern because:
+
+1. **The transcript file is owned by the agent process.** Agents (Claude Code, Cursor, Gemini CLI, etc.) append to their transcript files. They do not delete or relocate them once written -- the only relocation that occurs is Cursor CLI's one-time flat-to-nested migration, which is exactly what `resolveTranscriptPath` handles.
+
+2. **The callers already handle `os.ReadFile` failure gracefully.** For example, `finalizeAllTurnCheckpoints` (line 2201-2213) logs a warning and returns an error count. `extractSessionDataFromLiveTranscript` (line 531-533) returns an error. There is no security-sensitive operation gated on the Stat result.
+
+3. **Removing the Stat would not help.** The only way to eliminate the TOCTOU is to replace Stat+ReadFile with just ReadFile and check for `os.ErrNotExist` to trigger re-resolution. This would save the Stat syscall but require restructuring the function's purpose (it would need to return the file contents, not just the path). The current design where `resolveTranscriptPath` is a path-resolver and callers do the I/O is cleaner for separation of concerns.
+
+### Finding 4: Hot path impact (git hook invocations)
+
+**Severity: LOW**
+
+The call sites run during `post-commit` and `prepare-commit-msg` git hooks, which are synchronous and block the user's `git commit` command.
+
+The added cost per hook invocation is:
+- **Fast path (file exists at stored location):** 1 `os.Stat` call (~1-10 microseconds). Negligible.
+- **Slow path (re-resolution needed):** 1 `os.Stat` (miss) + 1 `GetByAgentType` (~400ns) + `ResolveSessionFile` (string manipulation, ~100ns) + 1 `os.Stat` (verify) = ~20 microseconds total.
+
+For context, the hook itself does far more expensive work: opening a git repository, reading/writing shadow branches, parsing transcripts, and potentially summarizing content via an API call. The `os.Stat` cost is many orders of magnitude below the dominant I/O costs in these hooks.
+
+### Finding 5: `sessionHasNewContentFromLiveTranscript` calls `hasNewTranscriptWork` then `extractModifiedFilesFromLiveTranscript` -- triple resolve
+
+**Severity: LOW**
+
+At line 1419, `hasNewTranscriptWork` calls `resolveTranscriptPath`. If it returns true and `state.FilesTouched` is empty, `extractModifiedFilesFromLiveTranscript` is called at line 1428, which calls `resolveTranscriptPath` again. Both hit the fast path (first call resolved the path, second call Stats the same path). Two redundant `os.Stat` calls, ~20 microseconds total. Not worth refactoring.
+
+### Finding 6: `CondenseSession` calls `GetByAgentType` when the result may not be used
+
+**Severity: LOW**
+
+Line 104 of `CondenseSession` calls `agent.GetByAgentType(state.AgentType)` unconditionally. The `ag` result is only used at line 144 (`prepareTranscriptIfNeeded`) in the `!hasShadowBranch` path. When the shadow branch exists, the agent lookup is wasted. Cost: ~400ns. Not worth adding a conditional.
+
+---
+
+## Summary
+
+All findings are **LOW** severity. The `resolveTranscriptPath` function is well-designed for its purpose:
+
+- The state mutation (`state.TranscriptPath = resolved`) correctly ensures that repeated calls hit the fast path, making redundant invocations cost only a single `os.Stat` each.
+- The TOCTOU gap is not exploitable in the agent transcript context.
+- The `GetByAgentType` duplication is sub-microsecond cost and only triggered on the slow (re-resolution) path within `resolveTranscriptPath` itself.
+- All of these costs are dwarfed by the dominant I/O operations in the hook paths (git object reads, file parsing, potential network calls).
+
+No changes recommended.</result>
+<usage><total_tokens>54835</total_tokens><tool_uses>17</tool_uses><duration_ms>95895</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/4a93df6c-18f9-424f-af2a-6ee3b41ac6aa/tasks/ad2347ef1d03b9ff6.output
+
+---
+
+<task-notification>
+<task-id>a52204a318dc1a8dd</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/4a93df6c-18f9-424f-af2a-6ee3b41ac6aa/tasks/a52204a318dc1a8dd.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Here is my review with findings organized by the five requested review points.
+
+---
+
+## Review Findings
+
+### 1. Redundant state mutation -- side-effect-only call pattern
+
+**Severity: Low**
+
+In `CondenseSession` (line 127-129 of `manual_commit_condensation.go`):
+
+```go
+if resolved, resolveErr := resolveTranscriptPath(state); resolveErr == nil {
+    _ = resolved // state.TranscriptPath already updated by resolveTranscriptPath
+}
+```
+
+The `_ = resolved` with an explanatory comment is a code smell but is functionally correct. The function serves two purposes: it returns the path AND mutates `state.TranscriptPath`. At this call site, only the mutation matters. The comment makes the intent explicit.
+
+However, the dual-purpose design (return value + side effect) violates the principle of least surprise. A reader must understand that calling this function "just for the side effect" is intentional. Consider either:
+- Splitting into `resolveTranscriptPath(state) (string, error)` (pure, no mutation) and a separate `updateTranscriptPathIfNeeded(state)` (mutation only), or
+- Documenting the side-effect-only call pattern as an acceptable usage in the function's godoc.
+
+The existing godoc does describe the mutation, so this is minor. The pattern is safe because `state` is always a pointer to a mutable struct that gets saved later via `saveSessionState`.
+
+### 2. Copy-paste boilerplate across 3 hooks call sites
+
+**Severity: Medium**
+
+The three call sites in `manual_commit_hooks.go` follow an almost identical pattern:
+
+```go
+// hasNewTranscriptWork (line 1490)
+if _, resolveErr := resolveTranscriptPath(state); resolveErr != nil {
+    logging.Debug(logCtx, "hasNewTranscriptWork: transcript path resolution failed", ...)
+    return false
+}
+
+// extractModifiedFilesFromLiveTranscript (line 1559)
+if _, resolveErr := resolveTranscriptPath(state); resolveErr != nil {
+    logging.Debug(logCtx, "extractModifiedFilesFromLiveTranscript: transcript path resolution failed", ...)
+    return nil
+}
+
+// finalizeAllTurnCheckpoints (line 2191)
+transcriptPath, resolveErr := resolveTranscriptPath(state)
+if resolveErr != nil {
+    logging.Warn(logCtx, "finalize: transcript path resolution failed, skipping", ...)
+    state.TurnCheckpointIDs = nil
+    return 1
+}
+```
+
+These share the same resolve-log-bail structure but differ in:
+- Log message prefix (function name)
+- Log level (Debug vs Warn)
+- Return value type (bool vs []string vs int)
+- Side-effect cleanup (`state.TurnCheckpointIDs = nil` in finalize)
+
+The differences are meaningful enough that a single wrapper would need to accept callbacks or generics, which would arguably be worse. But the resolve+guard-check pair (resolve path, check empty path, resolve agent, call `GetByAgentType`) is duplicated between `resolveTranscriptPath` and the callers -- both `hasNewTranscriptWork` and `extractModifiedFilesFromLiveTranscript` call `agent.GetByAgentType(state.AgentType)` immediately after resolving, repeating the agent lookup that `resolveTranscriptPath` already does internally. This is a minor efficiency concern but mainly a readability issue -- the callers don't know that resolveTranscriptPath already validated the agent type.
+
+### 3. Double resolution -- CondenseSession early resolve then extractSessionDataFromLiveTranscript resolves again
+
+**Severity: Low**
+
+In `CondenseSession`:
+- Line 126-130: Early resolution (error ignored, mutation-only).
+- Line 147: Calls `extractSessionDataFromLiveTranscript(ctx, state)` which calls `resolveTranscriptPath(state)` again (line 526).
+
+The second call is NOT redundant in the worst case -- it is harmless but defensive. If the early resolve succeeds, `state.TranscriptPath` is updated, and the second call hits the fast path (`os.Stat` succeeds, returns immediately). The cost is one extra `os.Stat` syscall.
+
+The early resolve serves a different purpose: it updates `state.TranscriptPath` before the `extractSessionData` branch (line 135), which uses `state.TranscriptPath` directly without going through `resolveTranscriptPath`. So the early resolve is needed for the `hasShadowBranch=true` path, and happens to also run on the `hasShadowBranch=false` path where it will be resolved again.
+
+One minor concern: if the early resolve fails (error ignored), and then a TOCTOU race causes the file to appear before the second resolve, the second call would succeed. This is fine -- it makes the code more resilient. But it means the "errors are ignored" comment on line 125 is slightly misleading; errors aren't just ignored, they're retried.
+
+### 4. Error wrapping -- double-wrapped os.ErrNotExist
+
+**Severity: Medium**
+
+In `extractSessionDataFromLiveTranscript` (line 527-528):
+
+```go
+transcriptPath, resolveErr := resolveTranscriptPath(state)
+if resolveErr != nil {
+    return nil, fmt.Errorf("failed to read live transcript: %w", resolveErr)
+}
+```
+
+When `resolveTranscriptPath` returns an error, it already includes context like:
+- `"transcript not found at /path/to/file: file does not exist"`
+- `"transcript not found at /path/to/file (also tried /other/path): file does not exist"`
+
+The caller wraps this again with `"failed to read live transcript"`, and then `CondenseSession` wraps it once more (line 149):
+
+```go
+return nil, fmt.Errorf("failed to extract session data from live transcript: %w", extractErr)
+```
+
+This produces error messages like:
+```
+failed to extract session data from live transcript: failed to read live transcript: transcript not found at /foo/bar.jsonl: file does not exist
+```
+
+Three layers of wrapping where two would suffice. The middle layer `"failed to read live transcript"` is misleading when the actual failure is path resolution, not reading. The caller in `extractSessionDataFromLiveTranscript` could just pass through the error from `resolveTranscriptPath` directly, or use a more accurate wrapper like `"transcript path resolution failed"`.
+
+Additionally, `resolveTranscriptPath` wraps `os.ErrNotExist` as a sentinel, but callers never check `errors.Is(err, os.ErrNotExist)` -- they just propagate. So the sentinel wrapping adds no value at the current call sites.
+
+### 5. `strings.TrimSuffix(base, filepath.Ext(base))` with multi-dot filenames
+
+**Severity: Medium**
+
+At line 46 of `resolve_transcript.go`:
+
+```go
+base := filepath.Base(state.TranscriptPath)
+agentSessionID := strings.TrimSuffix(base, filepath.Ext(base))
+```
+
+`filepath.Ext` returns the extension from the *last* dot. For `session.backup.jsonl`, `filepath.Ext` returns `.jsonl`, so `TrimSuffix` produces `session.backup`. This is passed to `ag.ResolveSessionFile(sessionDir, "session.backup")`.
+
+Looking at the actual agent implementations:
+- **Claude Code**: `sessionDir + "/" + agentSessionID + ".jsonl"` -- would produce `session.backup.jsonl` (correct, same as input)
+- **Cursor**: Same pattern, plus nested check with `sessionDir/session.backup/session.backup.jsonl`
+- **Copilot CLI**: `sessionDir + "/" + agentSessionID + "/events.jsonl"` -- completely different filename, so the session ID is used as a directory name, not a file stem. Multi-dot is safe.
+- **Gemini CLI**: Takes first 8 chars of agentSessionID and searches for `session-*-<8chars>.json`. Multi-dot IDs would still work.
+
+In practice, agent session IDs are UUIDs (e.g., `87874108-eff2-47a0-b260-183961dd6cb0`) or date-prefixed UUIDs. They never contain dots. So this is not a real bug today.
+
+However, the code has an implicit assumption that transcript filenames have a single-dot extension. If a future agent used a format like `session-2026.03.16.jsonl`, this would break -- `filepath.Ext` returns `.jsonl`, `TrimSuffix` produces `session-2026.03.16`, which is fine. But if the format were `session.2026-03-16.jsonl.gz` (double extension), `filepath.Ext` returns `.gz`, and the resulting ID `session.2026-03-16.jsonl` would be wrong.
+
+The more defensive approach would be `strings.TrimSuffix(base, ".jsonl")` with a known-extension check, or using `strings.Cut` to split at the first dot. But given current agent ID formats, this is a latent concern rather than an active bug.
+
+---
+
+## Summary
+
+| # | Finding | Severity |
+|---|---------|----------|
+| 1 | Side-effect-only call (`_ = resolved`) is clear but the dual-purpose function design adds cognitive load | Low |
+| 2 | Three nearly-identical resolve-log-bail blocks in hooks; not easily unified due to differing return types/behavior, but the duplicated `GetByAgentType` call after resolve is wasteful | Medium |
+| 3 | Double resolution is harmless (second call hits fast path after first succeeds); the early resolve is needed for the shadow-branch code path | Low |
+| 4 | Triple error wrapping produces verbose, misleading messages; middle wrapper says "failed to read" when it was actually a resolution failure | Medium |
+| 5 | `filepath.Ext` handles multi-dot filenames correctly for current agent ID formats (UUIDs), but the code has an implicit single-extension assumption that could break with future formats | Medium |</result>
+<usage><total_tokens>54344</total_tokens><tool_uses>22</tool_uses><duration_ms>128505</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/4a93df6c-18f9-424f-af2a-6ee3b41ac6aa/tasks/a52204a318dc1a8dd.output
+
+---
+
+can you summarize the changes

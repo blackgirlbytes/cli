@@ -1,0 +1,77 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "ebcdd95bfa32",
+  "session_id": "d38e7bf6-e498-4038-aa48-b1c6455dadc0",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-02T18:13:38.720576Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "cmd/entire/cli/settings/settings.go",
+    "cmd/entire/cli/settings/settings_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "4bdc82fd19c7",
+  "checkpoint_transcript_start": 122,
+  "token_usage": {
+    "input_tokens": 31,
+    "cache_creation_tokens": 14463,
+    "cache_read_tokens": 4343662,
+    "output_tokens": 8772,
+    "api_call_count": 29
+  },
+  "session_metrics": {
+    "turn_count": 4
+  },
+  "summary": {
+    "intent": "Fix hardcoded 'main'/'master' branch names in the TUI filter and ensure the TUI receives all queried sessions rather than a pre-filtered cap.",
+    "outcome": "Dynamic default branch detection via existing `getDefaultBranchFromRemote` was exposed publicly and wired into the TUI; the 10-row output cap was removed for TUI mode so all 200 queried sessions are passed through.",
+    "learnings": {
+      "repo": [
+        "getDefaultBranchFromRemote already existed in git_operations.go — checks refs/remotes/origin/HEAD first, then probes origin/main and origin/master as fallbacks.",
+        "outputLimit (default 10 via --last flag) was silently capping rows before they reached the TUI, masking the TUI's own Repo/CurrentBranch/All filter. The query limit (maxSummaryRecentSessions=200) and the TUI display limit were conflated.",
+        "RunWithCurrentBranch in summarytui/root.go accepts the defaultBranch string and threads it into the rootModel for use in applyFilter."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/git_operations.go",
+          "finding": "Added public GetDefaultBranch wrapper around existing private getDefaultBranchFromRemote."
+        },
+        {
+          "path": "cmd/entire/cli/summary_cmd.go",
+          "line": 180,
+          "end_line": 180,
+          "finding": "outputLimit cap was applied here before passing rows to TUI; now skipped when no CLI filters are active."
+        },
+        {
+          "path": "cmd/entire/cli/summarytui/root.go",
+          "finding": "rootModel now carries defaultBranch field; applyFilter uses it instead of hardcoded string literals."
+        }
+      ],
+      "workflow": [
+        "When a function already exists privately, prefer exposing it via a thin public wrapper rather than duplicating logic.",
+        "TUI components with their own filtering should receive the full dataset; pre-filtering before the TUI defeats the purpose of in-TUI filter controls."
+      ]
+    },
+    "friction": [
+      "Multiple test call sites for newRootModel needed updating after adding the defaultBranch parameter — required several sequential edits across root_test.go and summary_cmd_test.go.",
+      "The --last flag was doing double duty (query limit + display cap) which was non-obvious and caused the bug in the first place."
+    ],
+    "open_items": [
+      "The --last flag behavior is now split: it controls query count but not TUI display count. This asymmetry may confuse users or future contributors; consider renaming or documenting the distinction.",
+      "Files listed as modified in the transcript footer (settings.go, settings_test.go) don't match the changes described — may indicate the footer was stale or from a different change set; worth verifying."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-02T18:13:18.414927Z",
+    "agent_lines": 128,
+    "agent_removed": 0,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 128,
+    "total_lines_changed": 0,
+    "agent_percentage": 100
+  }
+}

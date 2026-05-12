@@ -1,0 +1,20 @@
+Resolve these two issues:
+
+---
+
+Unused resolver field allocated in every FetchingTree
+Low Severity
+
+The resolver field (*BlobResolver) is allocated via NewBlobResolver(s) in every NewFetchingTree call and propagated in Tree(), but no FetchingTree method ever reads it. File() uses t.inner.File() as the existence check and t.fetch for fetching—t.resolver.HasBlob() and t.resolver.ReadBlob() are never called. This is dead code that wastes a heap allocation per FetchingTree instance.
+
+Additional Locations (2)
+cmd/entire/cli/checkpoint/fetching_tree.go#L44-L45
+cmd/entire/cli/checkpoint/fetching_tree.go#L160-L161
+
+
+cmd/entire/cli/checkpoint/fetching_tree.go
+
+Per-blob fetching misses intended batch optimization
+Medium Severity
+
+FetchingTree.File() calls t.fetch with a single-element slice for every blob miss, triggering one git fetch origin <hash> subprocess per file. During resume, reading root metadata plus N session metadata files generates N+1 separate network round-trips, each spawning a subprocess. FetchBlobsByHash accepts a batch of hashes and CollectTranscriptBlobHashes was built to collect them, but neither is used to pre-fetch blobs before tree reads. The stated "targeted subtree blobs fetch" optimization is built but never wired into the resume flow.

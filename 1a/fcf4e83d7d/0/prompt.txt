@@ -1,0 +1,78 @@
+Implement the following plan:
+
+# Fix Cursor transcript path: always compute from WorktreeRoot
+
+## Context
+
+Cursor's `transcript_path` in hook events is buggy (sometimes null). Instead of trusting it, always compute the path from `paths.WorktreeRoot()` + session ID, same pattern as Claude Code.
+
+Format: `~/.cursor/projects/<sanitized-repo-path>/<conversation_id>.jsonl`
+
+## Changes
+
+### 1. Add `resolveSessionRef` helper in `lifecycle.go`
+
+```go
+func resolveSessionRef(conversationID string) string
+```
+
+- Calls `paths.WorktreeRoot()` to get repo path
+- Calls `GetSessionDir(repoRoot)` + `ResolveSessionFile(sessionDir, conversationID)`
+- Returns the computed path (or empty string if WorktreeRoot fails)
+
+### 2. Update all 7 parse functions in `lifecycle.go`
+
+Replace `SessionRef: raw.TranscriptPath` with `SessionRef: resolveSessionRef(raw.ConversationID)` in: `parseSessionStart`, `parseTurnStart`, `parseTurnEnd`, `parseSessionEnd`, `parsePreCompact`, `parseSubagentStart`, `parseSubagentStop`.
+
+### 3. Add tests in `lifecycle_test.go`
+
+- `TestResolveSessionRef` — verifies computed path uses env override
+- `TestParseHookEvent_IgnoresTranscriptPath` — verifies hook-provided `transcript_path` is not used
+
+## Files to modify
+
+- `cmd/entire/cli/agent/cursor/lifecycle.go`
+- `cmd/entire/cli/agent/cursor/lifecycle_test.go`
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-old-prs/8a51f98a-c9e7-4b67-ac6d-0499b70b88eb.jsonl
+
+---
+
+sorry, the path is like:
+/Users/gtrrz-victor/.cursor/projects/Users-gtrrz-victor-wks-entirely-tested/agent-transcripts/0433ccc8-171d-4c00-9b0b-e4e4c0028041.jsonl we are missing agent-transcripts
+
+---
+
+log the raw content
+
+---
+
+log any hook call
+
+---
+
+log all the loaded hooks and agents
+
+---
+
+I want to emualte a hook call, entire cursor hook stop with this content:
+{"conversation_id":"030c0b3c-00cf-4c31-a736-016e3403ce5e","generation_id":"61aff71e-a308-47b3-856b-9a88aef02020","model":"default","status":"completed","loop_count":0,"hook_event_name":"stop","cursor_version":"2026.02.13-41ac335","workspace_roots":["/Users/gtrrz-victor/wks/entirely-tested"],"user_email":"victor@entire.io","transcript_path":null}
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+the transcript path is broken, we are generating this:
+/Users/gtrrz-victor/.cursor/projects/-Users-gtrrz-victor-wks-entirely-tested/agent-transcripts/030c0b3c-00cf-4c31-a736-016e3403ce5e.jsonl
+
+the good one is:
+/Users/gtrrz-victor/.cursor/projects/Users-gtrrz-victor-wks-entirely-tested/agent-transcripts/030c0b3c-00cf-4c31-a736-016e3403ce5e.jsonl

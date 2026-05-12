@@ -1,0 +1,90 @@
+Implement the following plan:
+
+# Plan: Add `kiroAgent.trustedCommands` to `.vscode/settings.json` during Kiro enable
+
+## Context
+
+When `entire enable` installs Kiro hooks, the IDE hook files (`.kiro/hooks/*.kiro.hook`) run shell commands like `entire hooks kiro stop`. The Kiro IDE requires these commands to be explicitly trusted via `kiroAgent.trustedCommands` in `.vscode/settings.json`, otherwise the user gets prompted for approval on every hook invocation. This change makes `entire enable` automatically configure this trust setting.
+
+## Files to modify
+
+1. **`cmd/entire/cli/agent/kiro/hooks.go`** — Add trusted commands logic to `InstallHooks`, `UninstallHooks`, idempotency check, and `AreHooksInstalled`
+2. **`cmd/entire/cli/agent/kiro/hooks_test.go`** — Add tests for the new behavior
+
+## Implementation
+
+### 1. Add constants and helpers in `hooks.go`
+
+- Add `vscodeSettingsDir = ".vscode"` and `vscodeSettingsFile = "settings.json"` constants
+- Add `trustedCommandsKey = "kiroAgent.trustedCommands"` constant
+- Add `prodTrustedCommand = "entire hooks *"` constant
+- Add `localDevTrustedCommand = "go run ${KIRO_PROJECT_DIR}/cmd/entire/main.go hooks *"` constant (or just use localDevCmdPrefix + "hooks *" dynamically)
+
+### 2. Update `InstallHooks` in `hooks.go`
+
+After installing CLI + IDE hooks, also:
+- Read `.vscode/settings.json` using raw `map[string]json.RawMessage` to preserve unknown fields (same pattern as Claude Code's `hooks.go`)
+- Parse `kiroAgent.trustedCommands` as `[]string`
+- Check if the appropriate trusted command pattern is already present (`"entire hooks *"` for prod, local-dev prefix + `"hooks *"` for local-dev)
+- If not present, append it and write back
+- Return count should NOT change (trusted commands are a side effect, not hooks themselves)
+
+### 3. Update idempotency check in `InstallHooks`
+
+The early-return check at line 76-81 currently verifies `allHooksPresent && allIDEHooksPresent`. Add `trustedCommandsPresent(worktreeRoot, localDev)` to this check so that if the trusted command is missing (but hooks exist), it still proceeds with the install.
+
+### 4. Update `UninstallHooks` in `hooks.go`
+
+After removing CLI agent file and IDE hook files:
+- Read `.vscode/settings.json`
+- Remove the `"entire hooks *"` and local-dev variant from `kiroAgent.trustedCommands` array
+- If the array becomes empty, remove the key entirely
+- If the settings object becomes empty, remove the file (or leave it — safer to leave it since other settings may exist)
+- Preserve all other settings in the file
+
+### 5. Update `AreHooksInstalled` (no change needed)
+
+The current logic checks CLI or IDE hooks. The trusted commands setting is supplementary — hooks are "installed" based on the hook files, not the trust setting. No change needed here.
+
+### 6. Add tests in `hooks_test.go`
+
+- `TestInstallHooks_CreatesTrustedCommands` — fresh install creates `.vscode/settings.json` with correct trusted command
+- `TestInstallHooks_TrustedCommands_PreservesExistingSettings` — existing `.vscode/settings.json` with other settings is preserved
+- `TestInstallHooks_TrustedCommands_LocalDevMode` — local-dev mode uses the local-dev prefix pattern
+- `TestInstallHooks_TrustedCommands_Idempotent` — second install doesn't duplicate the entry
+- `TestInstallHooks_TrustedCommands_PreservesExistingTrustedCommands` — existing user-added trusted commands are preserved
+- `TestUninstallHooks_RemovesTrustedCommands` — uninstall removes the entry
+- `TestUninstallHooks_TrustedCommands_PreservesOtherSettings` — other settings remain after uninstall
+- `TestUninstallHooks_TrustedCommands_PreservesUserTrustedCommands` — user's other trusted commands survive uninstall
+
+## Key design decisions
+
+- **Round-trip preservation**: Use `map[string]json.RawMessage` to preserve unknown VS Code settings (same pattern as Claude Code's `hooks.go` lines 62-94)
+- **Trusted command pattern**: `"entire hooks *"` covers all hook verbs with a single wildcard entry
+- **Idempotency**: Check before adding; don't duplicate entries
+- **Don't modify hook count**: The return value from `InstallHooks` counts hooks, not settings changes — trusted commands are an ancillary configuration
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Specifically verify:
+- `go test ./cmd/entire/cli/agent/kiro/ -run TestInstallHooks_CreatesTrustedCommands -v`
+- `go test ./cmd/entire/cli/agent/kiro/ -run TestUninstallHooks_RemovesTrustedCommands -v`
+- Full test suite passes: `mise run test:ci`
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/3962da63-dcfe-4785-8e7e-ad2a32b724d5.jsonl
+
+---
+
+getting this error again from kiro ide Run Command Hook
+
+entire-prompt-submit
+Command timed out with no output captured.
+
+---
+
+[Request interrupted by user for tool use]

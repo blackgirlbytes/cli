@@ -1,0 +1,427 @@
+can you start implementing PLAN.md
+
+---
+
+ok, continue with Phase 2
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. The user asked to start implementing PLAN.md
+2. I read PLAN.md which is a detailed 5-phase plan to redesign the agent interface around explicit lifecycle events
+3. I launched an Explore agent to understand the current architecture
+4. I created a task list for Phase 1 (5 tasks)
+5. I implemented Phase 1 step by step:
+   - Task 1: Created event.go with EventType enum and Event struct
+   - Task 2: Modified agent.go to add new methods to Agent interface
+   - Task 3: Created claudecode/lifecycle.go with ParseHookEvent, ReadTranscript, etc.
+   - Task 4: Created geminicli/lifecycle.go with ParseHookEvent, ReadTranscript, etc.
+   - Task 5: Fixed lint errors and ran tests
+
+6. Key errors during Phase 1:
+   - Deprecated comments needed separate paragraphs (gocritic lint)
+   - Identical interface warnings (iface lint) for SessionResumer, TranscriptChunker, HookInstaller overlapping with Agent
+   - Missing `errors` import in both lifecycle.go files
+   - staticcheck catching deprecated method usage throughout codebase
+   - Fixed by: removing redundant interfaces, removing Deprecated markers, adding errors import
+
+7. User said "ok, continue with Phase 2"
+8. I created tasks for Phase 2 (tasks 6-9)
+9. I started reading state.go, hook_registry.go, and hooks_claudecode_handlers.go
+10. The summary was requested while I was in the middle of reading these files for Phase 2
+
+Let me make sure I capture all the important code details, especially the files created and modified.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to implement PLAN.md, a 5-phase plan to redesign the CLI's agent interface. The plan evolves the agent integration from a 17-method interface with stringly-typed hook registry to an event-based lifecycle dispatcher. Phase 1 defines event types and a new Agent interface. Phase 2 builds a generic lifecycle dispatcher. Phases 3-5 migrate agents, clean up old code, and update docs. The user explicitly said "can you start implementing PLAN.md" and later "ok, continue with Phase 2".
+
+2. Key Technical Concepts:
+   - **Event-based lifecycle**: Agents are passive data providers; framework dispatches actions based on normalized Events (SessionStart, TurnStart, TurnEnd, Compaction, SessionEnd, SubagentStart, SubagentEnd)
+   - **Step vs Checkpoint terminology**: Step = saved to shadow branch (temporary); Checkpoint = persisted to `entire/checkpoints/v1` (permanent)
+   - **TranscriptAnalyzer optional interface**: Agents that implement it get richer checkpoints; agents that don't use git-status-only file detection
+   - **TranscriptPreparer**: Claude-specific flush-wait logic before reading transcripts
+   - **TokenCalculator**: Optional token usage computation
+   - **ParseHookEvent as contribution surface**: Each agent translates native hooks to normalized Events
+   - **normalizeHookInput**: Framework-level handling for agents delivering payloads via argv vs stdin
+   - **PrePromptState unification**: Merging Claude's `StepTranscriptStart` and Gemini's `StartMessageIndex` into a single `TranscriptOffset`
+   - **Generic readAndParse[T]**: Go generics helper for deserializing hook input JSON
+   - Branch: `soph/agent-refactor`
+
+3. Files and Code Sections:
+
+   - **`PLAN.md`** (read, 678 lines)
+     - Complete 5-phase plan with design rationale, agent validation addendum, and caveats
+     - Defines Event types, new Agent interface, lifecycle dispatcher, migration strategy
+
+   - **`cmd/entire/cli/agent/event.go`** (CREATED)
+     - New file defining EventType enum and Event struct
+     - Core of the new event-based architecture
+     ```go
+     type EventType int
+     const (
+         SessionStart EventType = iota + 1
+         TurnStart
+         TurnEnd
+         Compaction
+         SessionEnd
+         SubagentStart
+         SubagentEnd
+     )
+     type Event struct {
+         Type              EventType
+         SessionID         string
+         PreviousSessionID string
+         SessionRef        string
+         Prompt            string
+         Timestamp         time.Time
+         ToolUseID         string
+         SubagentID        string
+         ToolInput         json.RawMessage
+         ResponseMessage   string
+         Metadata          map[string]string
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/agent.go`** (MODIFIED)
+     - Added 5 new methods to core Agent interface: HookNames, ParseHookEvent, ReadTranscript, ChunkTranscript, ReassembleTranscript
+     - Added optional interfaces: TranscriptAnalyzer (with ExtractPrompts, ExtractSummary added to existing GetTranscriptPosition, ExtractModifiedFilesFromOffset), TranscriptPreparer, TokenCalculator
+     - Removed redundant interfaces: TranscriptChunker, SessionResumer, HookInstaller (methods still on Agent as legacy)
+     - Removed Deprecated markers from legacy methods to avoid staticcheck noise
+     - Legacy methods kept intact: GetHookConfigPath, SupportsHooks, ParseHookInput, GetSessionID, GetSessionDir, ResolveSessionFile, ReadSession, WriteSession, FormatResumeCommand
+     ```go
+     type Agent interface {
+         // Identity (5)
+         Name() AgentName
+         Type() AgentType
+         Description() string
+         DetectPresence() (bool, error)
+         ProtectedDirs() []string
+         // Event Mapping (2)
+         HookNames() []string
+         ParseHookEvent(hookName string, stdin io.Reader) (*Event, error)
+         // Transcript Storage (3)
+         ReadTranscript(sessionRef string) ([]byte, error)
+         ChunkTranscript(content []byte, maxSize int) ([][]byte, error)
+         ReassembleTranscript(chunks [][]byte) ([]byte, error)
+         // Legacy (8) - kept for backward compat
+         // ...
+     }
+     type TranscriptAnalyzer interface {
+         Agent
+         GetTranscriptPosition(path string) (int, error)
+         ExtractModifiedFilesFromOffset(path string, startOffset int) (files []string, currentPosition int, err error)
+         ExtractPrompts(sessionRef string, fromOffset int) ([]string, error)
+         ExtractSummary(sessionRef string) (string, error)
+     }
+     type TranscriptPreparer interface {
+         Agent
+         PrepareTranscript(sessionRef string) error
+     }
+     type TokenCalculator interface {
+         Agent
+         CalculateTokenUsage(sessionRef string, fromOffset int) (*TokenUsage, error)
+     }
+     ```
+
+   - **`cmd/entire/cli/agent/claudecode/lifecycle.go`** (CREATED)
+     - Implements ParseHookEvent mapping Claude hook names to Event types
+     - Implements HookNames (delegates to GetHookNames), ReadTranscript, ExtractPrompts, ExtractSummary
+     - Implements TranscriptPreparer (PrepareTranscript wrapping sentinel flush logic)
+     - Implements TokenCalculator (wrapping CalculateTotalTokenUsage)
+     - Contains readAndParse[T] generic helper and transcript flush sentinel logic (duplicated from cli package for now)
+     - Compile-time interface assertions for TranscriptAnalyzer, TranscriptPreparer, TokenCalculator
+     - Key hook mappings: session-start→SessionStart, user-prompt-submit→TurnStart, stop→TurnEnd, session-end→SessionEnd, pre-task→SubagentStart, post-task→SubagentEnd, post-todo→nil
+
+   - **`cmd/entire/cli/agent/geminicli/lifecycle.go`** (CREATED)
+     - Implements ParseHookEvent mapping Gemini hook names to Event types
+     - Implements HookNames, ReadTranscript, ExtractPrompts, ExtractSummary, CalculateTokenUsage
+     - Uses `msg.Content` (not `msg.Text`) for Gemini user messages
+     - Compile-time assertions for TranscriptAnalyzer, TokenCalculator
+     - Key hook mappings: session-start→SessionStart, before-agent→TurnStart, after-agent→TurnEnd, session-end→SessionEnd, pre-compress→Compaction, before-tool/after-tool/before-model/after-model/before-tool-selection/notification→nil
+
+   - **`cmd/entire/cli/agent/agent_test.go`** (MODIFIED)
+     - Updated mockAgent to implement new interface methods: HookNames, ParseHookEvent, ReadTranscript, ChunkTranscript, ReassembleTranscript
+     - Removed `TransformSessionID` method that was on mock but not in interface
+
+   - **`cmd/entire/cli/agent/chunking.go`** (MODIFIED)
+     - Updated ChunkTranscript and ReassembleTranscript functions to call `ag.ChunkTranscript()` directly instead of type-asserting to TranscriptChunker interface
+
+   - **`cmd/entire/cli/agent/claudecode/claude.go`** (MODIFIED - minor)
+     - Removed "TranscriptChunker interface implementation" comment
+
+   - **`cmd/entire/cli/agent/geminicli/gemini.go`** (MODIFIED - minor)
+     - Removed "TranscriptChunker interface implementation" comment
+
+   - **Files READ but not modified (important for Phase 2 context):**
+     - `cmd/entire/cli/state.go` - Contains PrePromptState struct with `StepTranscriptStart` (Claude) and `StartMessageIndex` (Gemini), CapturePrePromptState(), CaptureGeminiPrePromptState(), LoadPrePromptState(), PreTaskState, DetectFileChanges(), FilterAndNormalizePaths()
+     - `cmd/entire/cli/hook_registry.go` - Contains hookRegistry map, RegisterHookHandler, GetHookHandler, init() with all 20+ handler registrations, newAgentHookVerbCmdWithLogging(), newAgentHooksCmd()
+     - `cmd/entire/cli/hooks_claudecode_handlers.go` - Contains commitWithMetadata() (main TurnEnd logic ~300 lines), captureInitialState(), handleClaudeCodePreTask/PostTask/PostTodo, handleClaudeCodeSessionStart/End, transitionSessionTurnEnd(), markSessionEnded(), waitForTranscriptFlush()/checkStopSentinel()
+     - `cmd/entire/cli/hooks_geminicli_handlers.go` (referenced but not fully read yet)
+     - `cmd/entire/cli/transcript.go` - Contains extractUserPrompts(), extractLastAssistantMessage(), extractModifiedFiles()
+     - `cmd/entire/cli/agent/claudecode/hooks.go` - Claude hook names, InstallHooks, UninstallHooks
+     - `cmd/entire/cli/agent/geminicli/hooks.go` - Gemini hook names
+     - `cmd/entire/cli/agent/claudecode/types.go` - sessionInfoRaw, userPromptSubmitRaw, taskHookInputRaw, postToolHookInputRaw
+     - `cmd/entire/cli/agent/geminicli/types.go` - sessionInfoRaw, agentHookInputRaw, toolHookInputRaw
+     - `cmd/entire/cli/agent/geminicli/transcript.go` - GeminiTranscript, GeminiMessage (Content field, not Text), ParseTranscript, ExtractAllUserPrompts, ExtractLastAssistantMessage, CalculateTokenUsage
+     - `cmd/entire/cli/strategy/strategy.go` - Strategy interface with SaveChanges(SaveContext), SaveTaskCheckpoint(TaskCheckpointContext)
+     - `cmd/entire/cli/session/phase.go` - Phase state machine with EventTurnStart, EventTurnEnd, EventGitCommit, EventSessionStart, EventSessionStop
+
+4. Errors and fixes:
+   - **gocritic deprecatedComment**: `Deprecated:` notices must be in a dedicated paragraph separated by a blank comment line. Fixed by initially reformatting with blank line, then ultimately removing Deprecated markers entirely.
+   - **iface identical**: New optional interfaces (SessionResumer, TranscriptChunker, HookInstaller) had methods identical to Agent interface. Fixed by removing these redundant interfaces—they'll be properly introduced in Phase 4 when legacy methods leave Agent.
+   - **undefined errors**: Both lifecycle.go files used `errors.New()` but didn't import `errors`. Fixed by adding `"errors"` to imports.
+   - **staticcheck SA1019**: After adding Deprecated markers, all existing callers triggered deprecation warnings (29 issues). Fixed by removing Deprecated markers from legacy methods—they're documented as "Legacy" in comments instead.
+   - **GeminiMessage field name**: Initially used `msg.Text` for user prompts but the correct field is `msg.Content`. Fixed in geminicli/lifecycle.go.
+   - **gofmt formatting**: Auto-fixed by `mise run fmt` (collapsed some blank lines in agent_test.go).
+
+5. Problem Solving:
+   - Phase 1 fully completed: event types, new Agent interface, both agents implement new methods, all tests pass (fmt + lint + test:ci)
+   - Key design decisions: keeping old interface methods during migration, using compile-time interface assertions, duplicating sentinel logic in agent package (will be cleaned up in Phase 4)
+
+6. All user messages:
+   - "can you start implementing PLAN.md"
+   - "ok, continue with Phase 2"
+
+7. Pending Tasks (from task tracker):
+   - Task #6: Phase 2a: Unify PrePromptState capture (in_progress)
+   - Task #7: Phase 2b: Build generic lifecycle dispatcher (pending, blocked by #6)
+   - Task #8: Phase 2c: Hook command integration (pending, blocked by #7)
+   - Task #9: Phase 2: Verify fmt, lint, test pass (pending, blocked by #8)
+
+8. Current Work:
+   I had just started Phase 2 after the user said "ok, continue with Phase 2". I created tasks 6-9, set task 6 to in_progress, and read three key files needed for Phase 2:
+   - `cmd/entire/cli/state.go` (full file - contains PrePromptState with agent-specific fields to unify)
+   - `cmd/entire/cli/hook_registry.go` (full file - contains hookRegistry and 20+ handler registrations to replace)
+   - `cmd/entire/cli/hooks_claudecode_handlers.go` (full file - contains commitWithMetadata() which is the main TurnEnd logic to extract into the generic dispatcher)
+   
+   The summary was requested immediately after these reads completed. I had not yet started writing any Phase 2 code. The next step is Phase 2a: unifying `CapturePrePromptState()` and `CaptureGeminiPrePromptState()` in state.go.
+
+9. Optional Next Step:
+   Continue with Phase 2a: Unify PrePromptState capture. Per the plan: "Unify into a single function that uses the Agent interface... The `PrePromptState` struct already has both `StepTranscriptStart` (used by Claude) and `StartMessageIndex` (used by Gemini) — unify these into a single `TranscriptOffset int` field."
+   
+   I need to also read `cmd/entire/cli/hooks_geminicli_handlers.go` (not yet read) to understand Gemini's handler logic before building the generic dispatcher. Then proceed to Phase 2b (lifecycle.go dispatcher) and 2c (hook_registry.go integration).
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. This is a continuation of a previous conversation that ran out of context. The summary provided indicates:
+   - Phase 1 of PLAN.md was fully completed (event types, new Agent interface, both agents implement new methods)
+   - Phase 2 was just starting when context ran out
+   - Tasks 6-9 were created for Phase 2
+
+2. In the current conversation:
+   - The assistant resumed work on Phase 2a (Unify PrePromptState capture)
+   - Read multiple files to understand the current architecture:
+     - PLAN.md (Phase 2 section)
+     - hooks_geminicli_handlers.go (full Gemini handler implementations)
+     - hooks_claudecode_handlers.go (full Claude handler implementations)
+     - state.go (PrePromptState struct and capture functions)
+     - hook_registry.go (hook registration and dispatch)
+   - Searched for usage of StepTranscriptIdentifier, LastTranscriptIdentifier, StartMessageIndex
+   - Researched GetTranscriptPosition and TranscriptPosition in transcript.go
+
+3. Implementation of Phase 2a:
+   - Modified state.go:
+     - Added `agent` import
+     - Added `TranscriptOffset` field to PrePromptState struct
+     - Updated `normalizePrePromptState()` to migrate all deprecated fields to TranscriptOffset
+     - Unified `CapturePrePromptState` to take `ag agent.Agent` parameter
+     - Deleted `CaptureGeminiPrePromptState`
+   - Modified hooks_claudecode_handlers.go:
+     - Updated `captureInitialState()` to pass agent
+     - Updated `commitWithMetadata()` to use `preState.TranscriptOffset`
+   - Modified hooks_geminicli_handlers.go:
+     - Updated `handleGeminiBeforeAgent()` to use unified CapturePrePromptState
+     - Updated `commitGeminiSession()` to use `preState.TranscriptOffset`
+   - Modified state_test.go:
+     - Added claudecode import
+     - Updated backward compat test to verify TranscriptOffset migration (4 sub-tests)
+     - Updated 3 capture tests to pass Claude agent and verify TranscriptOffset
+
+4. Build passed successfully.
+
+5. Tests partially failed:
+   - `TestPrePromptState_WithTranscriptPosition`: Expected TranscriptOffset=3, got 2
+   - `TestPrePromptState_WithSummaryOnlyTranscript`: Expected TranscriptOffset=2, got 1
+   - Root cause identified: `ClaudeCodeAgent.GetTranscriptPosition()` doesn't count the last line when there's no trailing newline (differs from CLI-level `GetTranscriptPosition()`)
+   - The assistant was about to fix this when the summary was requested
+
+Let me now capture all the code details precisely.
+
+Summary:
+1. Primary Request and Intent:
+   The user asked to implement PLAN.md, a 5-phase plan to redesign the CLI's agent interface around explicit lifecycle events. Phase 1 was completed in a previous session. The user then said "ok, continue with Phase 2". Phase 2 has three sub-tasks:
+   - **2a**: Unify PrePromptState capture (merge `CapturePrePromptState` and `CaptureGeminiPrePromptState`)
+   - **2b**: Build generic lifecycle dispatcher (`lifecycle.go`)
+   - **2c**: Hook command integration (simplify `hook_registry.go`)
+   
+   The current session is a continuation after context ran out. The instruction was: "Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on."
+
+2. Key Technical Concepts:
+   - **Event-based lifecycle**: Agents are passive data providers; framework dispatches actions based on normalized Events
+   - **TranscriptAnalyzer optional interface**: Provides `GetTranscriptPosition()`, `ExtractModifiedFilesFromOffset()`, `ExtractPrompts()`, `ExtractSummary()`
+   - **PrePromptState unification**: Merging Claude's `StepTranscriptStart` (JSONL line count) and Gemini's `StartMessageIndex` (JSON message count) into a single `TranscriptOffset int` field
+   - **Backward compatibility**: `normalizePrePromptState()` migrates deprecated JSON fields on load
+   - **Step vs Checkpoint terminology**: Step = shadow branch (temporary); Checkpoint = `entire/checkpoints/v1` (permanent)
+   - Branch: `soph/agent-refactor`
+
+3. Files and Code Sections:
+
+   - **`PLAN.md`** (read, lines 1-400)
+     - Phase 2 specification: unify PrePromptState, build dispatcher, hook command integration
+     - Key quote: "Unify into a single function that uses the Agent interface... The `PrePromptState` struct already has both `StepTranscriptStart` (used by Claude) and `StartMessageIndex` (used by Gemini) — unify these into a single `TranscriptOffset int` field."
+
+   - **`cmd/entire/cli/state.go`** (MODIFIED)
+     - Core file for Phase 2a changes
+     - Added `"github.com/entireio/cli/cmd/entire/cli/agent"` import
+     - **PrePromptState struct** — added `TranscriptOffset` field, marked old fields as deprecated:
+       ```go
+       type PrePromptState struct {
+           SessionID      string   `json:"session_id"`
+           Timestamp      string   `json:"timestamp"`
+           UntrackedFiles []string `json:"untracked_files"`
+           TranscriptOffset int `json:"transcript_offset,omitempty"`
+           LastTranscriptIdentifier string `json:"last_transcript_identifier,omitempty"`
+           // Deprecated fields kept for backward compat:
+           StartMessageIndex       int    `json:"start_message_index,omitempty"`
+           StepTranscriptStart     int    `json:"step_transcript_start,omitempty"`
+           LastTranscriptLineCount int    `json:"last_transcript_line_count,omitempty"`
+       }
+       ```
+     - **normalizePrePromptState()** — updated to migrate all deprecated fields to TranscriptOffset:
+       ```go
+       func (s *PrePromptState) normalizePrePromptState() {
+           if s.StepTranscriptStart == 0 && s.LastTranscriptLineCount > 0 {
+               s.StepTranscriptStart = s.LastTranscriptLineCount
+           }
+           s.LastTranscriptLineCount = 0
+           if s.TranscriptOffset == 0 {
+               if s.StepTranscriptStart > 0 {
+                   s.TranscriptOffset = s.StepTranscriptStart
+               } else if s.StartMessageIndex > 0 {
+                   s.TranscriptOffset = s.StartMessageIndex
+               }
+           }
+           s.StepTranscriptStart = 0
+           s.StartMessageIndex = 0
+       }
+       ```
+     - **CapturePrePromptState** — signature changed from `(sessionID, transcriptPath string)` to `(ag agent.Agent, sessionID, sessionRef string)`, now uses `TranscriptAnalyzer.GetTranscriptPosition()`:
+       ```go
+       func CapturePrePromptState(ag agent.Agent, sessionID, sessionRef string) error {
+           // ... setup (tmp dir, untracked files) ...
+           var transcriptOffset int
+           if analyzer, ok := ag.(agent.TranscriptAnalyzer); ok && sessionRef != "" {
+               pos, posErr := analyzer.GetTranscriptPosition(sessionRef)
+               if posErr != nil {
+                   fmt.Fprintf(os.Stderr, "Warning: failed to get transcript position: %v\n", posErr)
+               } else {
+                   transcriptOffset = pos
+               }
+           }
+           state := PrePromptState{
+               SessionID:        sessionID,
+               Timestamp:        time.Now().UTC().Format(time.RFC3339),
+               UntrackedFiles:   untrackedFiles,
+               TranscriptOffset: transcriptOffset,
+           }
+           // ... marshal and write ...
+       }
+       ```
+     - **CaptureGeminiPrePromptState** — DELETED entirely (merged into unified version)
+
+   - **`cmd/entire/cli/hooks_claudecode_handlers.go`** (MODIFIED)
+     - `captureInitialState()` line 75: changed `CapturePrePromptState(hookData.sessionID, hookData.input.SessionRef)` → `CapturePrePromptState(hookData.agent, hookData.sessionID, hookData.input.SessionRef)`
+     - `commitWithMetadata()`: changed `preState.StepTranscriptStart` → `preState.TranscriptOffset` (two locations: transcript offset determination and transcript lines at start)
+
+   - **`cmd/entire/cli/hooks_geminicli_handlers.go`** (MODIFIED)
+     - `handleGeminiBeforeAgent()` line 432: changed `CaptureGeminiPrePromptState(input.SessionID, input.SessionRef)` → `CapturePrePromptState(ag, input.SessionID, input.SessionRef)`
+     - `commitGeminiSession()`: changed `preState.StartMessageIndex` → `preState.TranscriptOffset` and updated log message
+
+   - **`cmd/entire/cli/state_test.go`** (MODIFIED)
+     - Added `"github.com/entireio/cli/cmd/entire/cli/agent/claudecode"` import
+     - `TestPrePromptState_BackwardCompat_LastTranscriptLineCount` — expanded to 4 sub-tests covering migration from all deprecated formats to `TranscriptOffset`
+     - `TestPrePromptState_WithTranscriptPosition` — updated to pass `claudecode.NewClaudeCodeAgent()` and verify `TranscriptOffset` (not `StepTranscriptStart`)
+     - `TestPrePromptState_WithEmptyTranscriptPath` — updated to pass agent and verify `TranscriptOffset`
+     - `TestPrePromptState_WithSummaryOnlyTranscript` — updated to pass agent and verify `TranscriptOffset`
+
+   - **Files READ but not modified (context for Phase 2b/2c):**
+     - `cmd/entire/cli/hook_registry.go` — Contains `hookRegistry` map, `RegisterHookHandler`, `GetHookHandler`, `init()` with 20+ handler registrations, `newAgentHookVerbCmdWithLogging()`. Will be simplified in Phase 2c.
+     - `cmd/entire/cli/agent/agent.go` — Agent interface with new methods from Phase 1
+     - `cmd/entire/cli/agent/claudecode/lifecycle.go` — Claude's ParseHookEvent, ReadTranscript, etc.
+     - `cmd/entire/cli/agent/geminicli/lifecycle.go` — Gemini's ParseHookEvent, ReadTranscript, etc.
+     - `cmd/entire/cli/agent/claudecode/claude.go` — ClaudeCodeAgent struct and methods including `GetTranscriptPosition()`
+     - `cmd/entire/cli/agent/geminicli/gemini.go` — GeminiCLIAgent struct and methods
+     - `cmd/entire/cli/transcript.go` — `TranscriptPosition` struct, `GetTranscriptPosition()` function (CLI-level)
+
+4. Errors and fixes:
+   - **Test failure: TranscriptOffset off by one**
+     - `TestPrePromptState_WithTranscriptPosition`: Expected `TranscriptOffset=3`, got `2`
+     - `TestPrePromptState_WithSummaryOnlyTranscript`: Expected `TranscriptOffset=2`, got `1`
+     - **Root cause identified**: `ClaudeCodeAgent.GetTranscriptPosition()` in `claude.go:364-373` only counts lines that end with `\n`. When the last line has no trailing newline, it's not counted. The test transcripts don't have trailing newlines.
+     - The CLI-level `GetTranscriptPosition()` in `transcript.go` handles this correctly by checking `len(lineBytes) > 0` before incrementing, even when `err == io.EOF`.
+     - **Not yet fixed** — the assistant was reading the agent code to fix it when the summary was requested.
+     - Agent code with the bug:
+       ```go
+       for {
+           _, err := reader.ReadBytes('\n')
+           if err != nil {
+               if err == io.EOF {
+                   break  // BUG: doesn't count the last line without trailing \n
+               }
+               return 0, ...
+           }
+           lineCount++
+       }
+       ```
+
+5. Problem Solving:
+   - **PrePromptState unification design** — Significant analysis was done on how to handle `LastTranscriptIdentifier` (UUID for Claude, message ID for Gemini). Decision: keep the field in PrePromptState for backward compat but don't extract it in the unified capture function (it's informational metadata, not used for logic decisions). Consumers that read `preState.LastTranscriptIdentifier` will get empty string for new captures.
+   - **TranscriptAnalyzer vs core Agent interface** — `GetTranscriptPosition` is on `TranscriptAnalyzer` (optional interface), not core `Agent`. The unified function type-asserts: `if analyzer, ok := ag.(agent.TranscriptAnalyzer)`.
+   - **Build passes** but two tests fail due to the off-by-one bug in `ClaudeCodeAgent.GetTranscriptPosition()`.
+
+6. All user messages:
+   - "This session is being continued from a previous conversation that ran out of context. [detailed summary of previous session]... Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on."
+
+7. Pending Tasks (from task tracker):
+   - **#6** [in_progress]: Phase 2a: Unify PrePromptState capture — nearly complete, need to fix the off-by-one bug
+   - **#7** [pending, blocked by #6]: Phase 2b: Build generic lifecycle dispatcher
+   - **#8** [pending, blocked by #7]: Phase 2c: Hook command integration
+   - **#9** [pending, blocked by #8]: Phase 2: Verify fmt, lint, test pass
+
+8. Current Work:
+   Working on Phase 2a (task #6). All code changes are made. The build passes but two tests fail due to a bug in `ClaudeCodeAgent.GetTranscriptPosition()` — it doesn't count the last JSONL line when the file doesn't end with a trailing newline. The assistant had just read the agent code at `cmd/entire/cli/agent/claudecode/claude.go:346-376` and identified the exact bug (the `ReadBytes('\n')` loop breaks on EOF without counting the final partial line). The fix needs to be applied to `ClaudeCodeAgent.GetTranscriptPosition()` to handle the EOF case with remaining data.
+
+9. Optional Next Step:
+   Fix the off-by-one bug in `cmd/entire/cli/agent/claudecode/claude.go` `GetTranscriptPosition()` method (lines 364-373). The loop needs to count the last line even when it doesn't end with `\n`. After the fix, the `ReadBytes('\n')` EOF case should check if data was returned and increment `lineCount` accordingly:
+   ```go
+   for {
+       line, err := reader.ReadBytes('\n')
+       if err != nil {
+           if err == io.EOF {
+               if len(line) > 0 {
+                   lineCount++ // Count final line without trailing newline
+               }
+               break
+           }
+           return 0, fmt.Errorf("failed to read transcript: %w", err)
+       }
+       lineCount++
+   }
+   ```
+   Then re-run tests, complete task #6, and proceed to Phase 2b (build generic lifecycle dispatcher in `cmd/entire/cli/lifecycle.go`).
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/soph/.REDACTED.jsonl
+Please continue the conversation from where we left it off without asking the user any further questions. Continue with the last task that you were asked to work on.

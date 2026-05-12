@@ -1,0 +1,332 @@
+/simplify
+
+---
+
+<task-notification>
+<task-id>a24500c1266a23d7d</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/tasks/a24500c1266a23d7d.output</output-file>
+<status>completed</status>
+<summary>Agent "Code quality review" completed</summary>
+<result>Now I have all the source files. Let me analyze them for code quality issues:
+
+Based on my analysis of the code, here are the key code quality issues found:
+
+## Code Quality Issues
+
+### 1. **Redundant State & Duplicated Settings Parsing**
+
+**Location:** `setup.go` and `checkpoint_remote.go`
+
+In `setup.go`, the `applyStrategyOptions()` method builds the `checkpoint_remote` by parsing the flag and constructing the structured object (provider + repo). However, in `checkpoint_remote.go:resolvePushSettings()`, the same `checkpoint_remote` is retrieved from settings and must be unpacked again.
+
+This creates a round-trip through settings just to extract what was already parsed:
+- Flag input: `"github:org/checkpoints"` → Parse into provider/repo → Store as structured object in settings
+- Push time: Load from settings → Extract provider/repo again → Use to derive URL
+
+**Better approach:** Store the raw flag value directly as a string in settings (or a dedicated type), then parse it once in `resolvePushSettings()` where it's needed. This eliminates the extra object construction and unpacking.
+
+---
+
+### 2. **Parameter Sprawl - Push Target Abstraction**
+
+**Location:** `push_common.go`
+
+Multiple functions accept both "remote names" and "URLs" as the same `target` parameter:
+- `pushBranchIfNeeded(ctx, target, branchName)`
+- `doPushBranch(ctx, target, branchName)`
+- `tryPushSessionsCommon(ctx, remote, branchName)`
+- `fetchAndMergeSessionsCommon(ctx, target, branchName)`
+
+The functions then use `isURL(target)` to branch behavior. This is parameter polymorphism that should be represented as a type:
+
+```go
+type PushTarget interface {
+    String() string
+    IsURL() bool
+}
+```
+
+Or simpler: a dedicated struct wrapping the target with metadata (already computed `isURL` result), rather than recomputing it in every function.
+
+---
+
+### 3. **Stringly-Typed Configuration**
+
+**Location:** `checkpoint_remote.go` and `setup.go`
+
+The `CheckpointRemoteConfig` hardcodes `Provider` as a string field. Only "github" is supported, but this is validated at parse time in `setup.go` (lines 78-82) and never validated again.
+
+Better: Use a typed enum or a marker interface:
+
+```go
+type Provider string
+const ProviderGithub Provider = "github"
+
+type CheckpointRemoteConfig struct {
+    Provider Provider  // Can't be invalid
+    Repo string
+}
+```
+
+This makes invalid states unrepresentable at the type level instead of relying on string validation.
+
+---
+
+### 4. **Leaky Abstractions - URL Parsing Internals**
+
+**Location:** `checkpoint_remote.go`
+
+The `parseGitRemoteURL()` function returns a `gitRemoteInfo` struct (lines 128-134) that exposes internal parsing details to callers. Then `extractOwnerFromRemoteURL()` and `deriveCheckpointURL()` both parse the same URL independently.
+
+This is wasteful and error-prone. Better: Have a single `parseGitRemoteURL()` that returns all needed info (owner, protocol, host), and callers use that result directly without reparsing.
+
+---
+
+### 5. **Copy-Paste with Slight Variation**
+
+**Location:** `push_common.go` and `manual_commit_push.go`
+
+In `manual_commit_push.go:PrePush()`, the function calls:
+- `pushBranchIfNeeded(ctx, ps.pushTarget(), paths.MetadataBranchName)`
+- `pushBranchIfNeeded(ctx, ps.remote, paths.TrailsBranchName)`
+
+Both branches of logic are nearly identical except for the target and branch name. The checkpoint branch uses `ps.pushTarget()` (which may return a URL), but trails always use `ps.remote`.
+
+The distinction is valid (trails stay on the user's remote), but the repeated structure suggests the two operations could be unified:
+
+```go
+pushBranchIfNeeded(ctx, CheckpointBranch, ps.pushTarget())
+pushBranchIfNeeded(ctx, TrailsBranch, ps.remote)
+```
+
+Or: define a push operation struct to capture the (branch, target) pair.
+
+---
+
+### 6. **Redundant URL Detection**
+
+**Location:** `push_common.go` and `checkpoint_remote.go`
+
+The `isURL()` function (line 236) checks `strings.Contains(target, "://")` or `strings.Contains(target, "@")`. This same logic is embedded in `parseGitRemoteURL()` (lines 144-145, 168).
+
+The heuristic is duplicated rather than centralized. Move the logic to a single source of truth.
+
+---
+
+### 7. **Settings Loading Overhead**
+
+**Location:** `checkpoint_remote.go:resolvePushSettings()`
+
+The function unconditionally calls `settings.Load(ctx)` every time `PrePush()` is called, even though settings are unlikely to change mid-push. For high-volume scenarios, this is wasteful. Consider:
+- Caching the result in the strategy instance (if settings are immutable per session)
+- Or passing settings explicitly to avoid the reload
+
+---
+
+### 8. **Hardcoded Branch Names**
+
+**Location:** `checkpoint_remote.go` line 116 and `push_common.go` line 242
+
+Branch names are referenced as string literals (`paths.MetadataBranchName`, `paths.TrailsBranchName`) but only fetched in one place (line 116 of `checkpoint_remote.go`). The loop is specific to checkpoint remote fetching but should apply to all pushes.
+
+Better: Define a constant list of session-tracking branches that all push operations iterate over consistently.
+
+---
+
+## Summary Table
+
+| Issue | Severity | Location | Type |
+|-------|----------|----------|------|
+| Redundant state in checkpoint remote config | Medium | `setup.go` + `checkpoint_remote.go` | Redundant state |
+| URL/remote name polymorphism without types | Medium | `push_common.go` | Parameter sprawl |
+| Provider hardcoded as string | Low | `checkpoint_remote.go` | Stringly-typed |
+| URL parsing exposed, reparsed in multiple places | Medium | `checkpoint_remote.go` | Leaky abstraction |
+| Checkpoint vs trails push logic near-duplicate | Low | `manual_commit_push.go` | Copy-paste variation |
+| URL detection heuristic duplicated | Low | `push_common.go` + `checkpoint_remote.go` | Duplicated logic |
+| Unconditional settings reload on every push | Low | `checkpoint_remote.go` | Redundant state |
+| Branch names not centralized | Low | `checkpoint_remote.go` | Stringly-typed |</result>
+<usage><total_tokens>57685</total_tokens><tool_uses>11</tool_uses><duration_ms>30673</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/tasks/a24500c1266a23d7d.output
+
+---
+
+<task-notification>
+<task-id>a488557b64fe27a24</task-id>
+<tool-use-id>toolu_01J8uDiGPqJPKu6iKU4xWmaU</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/tasks/a488557b64fe27a24.output</output-file>
+<status>completed</status>
+<summary>Agent "Efficiency review" completed</summary>
+<result>Now I have enough context. Let me compile my findings:
+
+## Efficiency Review: Go CLI Checkpoint Remote Feature
+
+Based on my analysis of the git diff changes (reviewed through the source files), here are the key efficiency issues:
+
+### 1. **Redundant JSON Parsing in `mergeJSON()` - SIGNIFICANT**
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/settings/settings.go` lines 159-264
+
+**Issue:** The function parses the same JSON data **twice**:
+- Line 163-166: Parses with `DisallowUnknownFields` to validate
+- Line 172: Parses again with `json.Unmarshal()` into a raw map
+
+Then for each of ~8 fields, it:
+- Checks if key exists in the map
+- Unmarshals the field value individually
+- Performs type assertion and validation
+
+**Impact:** N+1 decoding pattern. For a 14-field settings object, this performs 1 + 1 + N (where N ≈ 8-10 additional unmarshals) = ~10-12 JSON unmarshals per `Load()` call.
+
+**Recommendation:** Parse once into the struct, then use reflection or a single map unmarshal to detect present fields, rather than individual field unmarshals.
+
+---
+
+### 2. **Unnecessary `AbsPath()` Calls with Fallback Pattern**
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/settings/settings.go` lines 90-99 and setup.go
+
+**Issue:** 
+```go
+settingsFileAbs, err := paths.AbsPath(ctx, EntireSettingsFile)
+if err != nil {
+    settingsFileAbs = EntireSettingsFile  // Fallback to relative
+}
+localSettingsFileAbs, err := paths.AbsPath(ctx, EntireSettingsLocalFile)
+if err != nil {
+    localSettingsFileAbs = EntireSettingsLocalFile  // Fallback to relative
+}
+```
+
+Each `AbsPath()` calls `WorktreeRoot()`, which runs `git rev-parse --show-toplevel` (a subprocess). When errors occur (e.g., outside repo), this subprocess runs unnecessarily only to be discarded.
+
+**Impact:** Subprocess overhead in error paths. The fallback pattern makes the subprocess call redundant when not in a git repo.
+
+**Recommendation:** Check git repo status first before calling `AbsPath()`, or accept relative paths directly for settings loading.
+
+---
+
+### 3. **Repeated File Existence Checks (TOCTOU Anti-pattern)**
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/settings/settings.go` lines 269-276 and setup.go
+
+**Issue:** 
+```go
+func IsSetUp(ctx context.Context) bool {
+    settingsFileAbs, err := paths.AbsPath(ctx, EntireSettingsFile)
+    if err != nil {
+        return false
+    }
+    _, err = os.Stat(settingsFileAbs)
+    return err == nil
+}
+```
+
+Then `IsSetUpAndEnabled()` (lines 281-290) calls `IsSetUp()` AND `Load()`:
+- `IsSetUp()` does `os.Stat()` 
+- `Load()` does `os.ReadFile()`
+
+Two filesystem operations for the same file in rapid succession.
+
+Similarly in setup.go line 123, `IsEmptyRepository()` is called; then if needed, `OpenRepository()` is called again.
+
+**Impact:** Unnecessary filesystem round-trips; potential TOCTOU race (file could change between check and use, though generally benign here).
+
+**Recommendation:** Combine into single operation: `os.ReadFile()` already returns an error if file doesn't exist.
+
+---
+
+### 4. **Hot-Path Settings Loading in `PrePush` Hook**
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/strategy/checkpoint_remote.go` lines 63-126
+
+**Issue:** `resolvePushSettings()` calls `settings.Load()` which:
+1. Reads `.entire/settings.json` from disk
+2. Parses JSON
+3. Then attempts to read and merge `.entire/settings.local.json` (even if not needed)
+4. For each checkpoint URL, runs `git remote get-url` (subprocess)
+5. Parses the URL
+6. Calls `fetchBranchIfMissing()` twice (lines 116-123), which:
+   - Opens the git repository
+   - Checks if branches exist
+   - Runs `git fetch` (with 30-second timeout)
+
+**Impact:** Pre-push hook runs on every `git push`. The subprocess calls and fetch operations are expensive. The fetch is only a "one-time" optimization, but if the branch doesn't exist locally AND doesn't exist remotely, this is 30 seconds of timeout per push.
+
+**Recommendation:** 
+- Cache settings per process lifetime (or shorter TTL)
+- Move branch fetch to only when push fails, not speculatively
+- Consider skipping fetch entirely if remote is unreachable (the comment says push handles it gracefully)
+
+---
+
+### 5. **Inefficient Settings Merging Logic**
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/settings/settings.go` lines 159-264
+
+**Issue:** The mergeJSON function handles 11 separate fields with individual validation. Each field follows the same pattern:
+- Check if key exists (hash map lookup)
+- Unmarshal that field
+- Validate
+
+For `strategy_options` (a map), it merges by iterating: "if settings.StrategyOptions is nil, assign, else iterate and merge" (lines 220-227). But `strategy_options` can be modified multiple times if loading from multiple sources.
+
+**Impact:** Unnecessary allocations and iterations; quadratic behavior if settings are loaded and merged repeatedly in a session.
+
+**Recommendation:** Use a helper function to unmarshal and validate a single field, or redesign to unmarshal the entire struct once and only override explicitly-set fields.
+
+---
+
+### 6. **Subprocess in Critical Loop (Fork Detection)**
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/strategy/checkpoint_remote.go` lines 79-87
+
+**Issue:**
+```go
+pushRemoteURL, err := getRemoteURL(ctx, pushRemoteName)  // Runs git remote get-url
+```
+
+This subprocess runs every time `resolvePushSettings()` is called, even if checkpoint_remote is not configured. It's not conditional on the config existing.
+
+**Impact:** Unnecessary subprocess overhead when checkpoint_remote is not configured (the common case).
+
+**Recommendation:** Move `getRemoteURL()` call inside the `if config != nil` block.
+
+---
+
+### 7. **Unused Repository Handle in `fetchBranchIfMissing`**
+**Location:** `/Users/soph/Work/entire/devenv/cli/cmd/entire/cli/strategy/checkpoint_remote.go` lines 263-312
+
+**Issue:** 
+- Opens repository (line 264)
+- Checks if branch exists locally (line 271)
+- **Returns early** (line 272) if it exists
+- Only **after** return does it attempt fetch
+
+But if fetch happens:
+- Repository is opened **again** inside `fetchAndMergeSessionsCommon()` (line 154 in push_common.go)
+
+**Impact:** Repository opened twice when fetch is needed; once unnecessarily if branch exists locally.
+
+**Recommendation:** In `fetchBranchIfMissing()`, keep the repo handle and reuse it for the fetch operation if needed.
+
+---
+
+### Summary of Severity:
+
+| Issue | Severity | Impact |
+|-------|----------|--------|
+| Redundant JSON parsing in mergeJSON | **HIGH** | 10-12 unmarshals per Load() call |
+| Settings loading in PrePush hook | **HIGH** | Runs on every git push; includes expensive fetches |
+| Fork detection getRemoteURL unconditional | **MEDIUM** | Subprocess runs even when feature not configured |
+| Merged file existence checks | **LOW-MEDIUM** | Extra filesystem ops; minor regression only |
+| Redundant AbsPath calls with errors | **LOW** | Only impacts error paths |
+| Repository handle duplication | **LOW** | Affects only checkpoint fetch path |
+
+**Most critical fix:** Simplify `mergeJSON()` to avoid N+1 parsing, and move `getRemoteURL()` inside the config check in `resolvePushSettings()`.</result>
+<usage><total_tokens>66587</total_tokens><tool_uses>14</tool_uses><duration_ms>36411</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-soph-Work-entire-devenv-cli/tasks/a488557b64fe27a24.output
+
+---
+
+can you now review if it's worth adding more tests
+
+---
+
+let's add
