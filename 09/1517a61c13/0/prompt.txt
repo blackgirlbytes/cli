@@ -253,3 +253,229 @@ None. Every new comment in the diff earns its place.
 ---
 
 do you think we should fix all?
+
+---
+
+okay go ahead
+
+---
+
+can you review 1184 with /pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>a421368da302a1d1a</task-id>
+<tool-use-id>toolu_01G3Wqdg363kBJaaLdeRXuf5</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-fix-2--worktrees-review-fix-local/a15672a4-e3dc-456e-b0fd-c521cad18358/tasks/a421368da302a1d1a.output</output-file>
+<status>completed</status>
+<summary>Agent "Test coverage analysis of PR 1184" completed</summary>
+<result>I have enough context now to write the analysis.
+
+---
+
+# Test Coverage Analysis: PR 1184
+
+## Summary
+
+Strong overall. The PR's test-heavy diff (~460 LOC) is mostly load-bearing pinning of behavioral contracts, not coverage padding. The most important new behavior — `wasAtBottom` auto-tail, viewport delegation, double-Ctrl+C, post-finish access — has explicit end-to-end assertions on state effects (viewport `YOffset()`, `AtBottom()`, `m.cancelling`, `tea.QuitMsg`), not just delegation. CLAUDE.md compliance is clean: every test calls `t.Parallel()`, no `t.Chdir`, no filesystem or TTY touches.
+
+## Critical Gaps (8-10)
+
+None. The four highest-risk behaviors are pinned end-to-end:
+
+- **Mouse-wheel delegation** (`TestTUIModel_DelegatesMouseWheelToViewport`, lines 266-286) asserts `m.detail.YOffset()` actually advances after `tea.MouseWheelMsg{Button: MouseWheelDown}` — exactly the assertion that would have failed before commit 5. Not delegation-only.
+- **Second Ctrl+C force-quit** (`TestTUIModel_SecondCtrlCForceQuits`, 518-542) asserts both `tea.QuitMsg` and that the `CancelFunc` still fires once.
+- **Auto-tail preserves user scroll** (`TestTUIModel_AutoFollow_PreservesUserScroll`, 701-739) covers both branches: scrolled-up event does NOT yank to bottom; at-bottom event DOES auto-follow.
+- **Resize while tailing** (`TestTUIModel_AutoFollow_ResizePreservesBottomWhenTailing`, 571-595) closes the regression where `SetHeight/SetWidth` changes wrap math.
+
+## Important Gaps (5-7)
+
+1. **Rating 7 — Mouse delegation only covers `MouseWheelMsg`.** The `Update` switch at `tui_model.go:190` also routes `MouseClickMsg`, `MouseReleaseMsg`, `MouseMotionMsg`. None of those three are exercised. If a future refactor narrows the switch back to wheel-only, the regression slips. Add `TestTUIModel_DelegatesMouseClickToViewport` with `tea.MouseClickMsg{}` asserting no panic and a return cmd path. Cheap.
+2. **Rating 7 — Race: Ctrl+C between agent done and `runFinishedMsg`.** `TestTUIModel_CtrlCMarksAgentsCancelling` (468) tests Ctrl+C while running; `TestTUIModel_PostFinishQuitsOnExplicitKeys` (379) tests Ctrl+C after `runFinishedMsg`. The middle case — all rows have `Finished` status but `runFinishedMsg` hasn't arrived — is unpinned. The code path at `tui_model.go:316` (`m.finished &amp;&amp; !m.detailMode`) uses the `finished` flag, not row status, so this currently goes the "set cancelling" branch. Add a test asserting that intended behavior so a future "auto-set finished when all rows done" change doesn't silently change semantics.
+3. **Rating 6 — Keyboard delegation is single-key.** `TestTUIModel_DelegatesScrollKeysToViewport` (291-316) only exercises PgDn. The PR description lists PgUp/Home/End/g/G/u/d/j/k. Drop them into a table-test with the same `YOffset()` assertion (`g`/Home → 0; PgUp from middle → smaller offset). The current single-key test catches "switch swallows pager keys" but not "j/k or g/G omitted from passthrough."
+4. **Rating 6 — `wrapDisplayWidth` has no direct unit tests.** It's exercised transitively via `renderDetailViaModel`, but edge cases (`width &lt;= 0` → nil, empty string → nil, single-char width=1, ANSI in mid-paragraph, word longer than width, blank-line preservation between paragraphs) are not asserted at the function boundary. `tui_text.go:67` is small and pure — direct tests in `tui_text_test.go` (which doesn't exist) would catch regressions cheaply and document the contract in the doc comment.
+5. **Rating 5 — Cancellation status update.** `TestTUIModel_CtrlCMarksAgentsCancelling` checks the rendered row contains "cancel" and drops "running", and `TestTUIModel_FooterDuringCancellation` checks "Cancelling agents" + "Ctrl+C again". Good. Missing: that the indicator only applies to rows still running (not already-Finished rows). Add an assertion that a row with `status == Succeeded` retains "succeeded" after Ctrl+C.
+
+## Suggestions
+
+- `TestTUIModel_PostFinishIgnoresRandomKeys` only covers `x`, `Right`, `Left`. Add `j`/`k`/Space to harden against future "any printable key quits" regressions.
+- `wrapDisplayWidth` doc comment says width=1 is fine, but `truncateDisplayWidth` (called via `padDisplayWidthWith`) has a `width == 1` special case. Worth a 3-line test.
+
+## Strengths
+
+- Effect-based assertions (`YOffset()`, `AtBottom()`, `tea.QuitMsg`, `cancelOnce` count) rather than implementation snooping — refactor-resilient.
+- `renderDetailViaModel` helper composes the real model path; tests will catch breakage anywhere along wrap → viewport → frame.
+- Table tests for explicit-exit keys cover `q`, two flavors of Esc, Enter, Ctrl+C — completeness without sprawl.
+- DAMP test names with "pins that..." comments explaining the bug they guard against (266, 350, 464, 498, 515, 544, 568, 697, 779). Future readers will know what each test defends.
+
+Files: `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_model_test.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_detail_test.go`, `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_text.go` (untested directly), `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_model.go:190` (mouse switch), `:316` (post-finish gate).</result>
+<usage><total_tokens>68317</total_tokens><tool_uses>13</tool_uses><duration_ms>76904</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a204d7bc791a5c257</task-id>
+<tool-use-id>toolu_01Sy15bMpmjbS8KVpAUAJuxu</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-fix-2--worktrees-review-fix-local/a15672a4-e3dc-456e-b0fd-c521cad18358/tasks/a204d7bc791a5c257.output</output-file>
+<status>completed</status>
+<summary>Agent "Comment analysis of PR 1184" completed</summary>
+<result>I have enough to assess. Note one important finding regarding the `cancelOnce` anti-pattern flag from CLAUDE.md.
+
+---
+
+## Comment Quality Analysis — PR 1184
+
+### Summary
+The PR cleanly retires the "press any key" wording, documents the viewport change well, and adds a strong WHY-focused comment on the new `cancelling` field. The doc-comment commit (6fb988b43) is complete: no stale "any key", "detailScroll", "buildBodyLines", "maxDetailScroll", or "clampScroll" references survive in production code. One genuine comment-rot risk on `tui_sink.go:26-30`, and one inconsistency about pageable keys.
+
+### Critical Issues
+
+**`cmd/entire/cli/review/tui_sink.go:26-30`** — `cancelOnce` description on the `TUISink` doc.
+The struct doc still says "*KeyCtrlC in the dashboard calls this function (gated by a sync.Once in the model)*." That's now factually thin: post-PR, the first Ctrl+C calls `cancel` (guarded by `cancelOnce`) but does NOT quit; only the second Ctrl+C quits. The phrasing predates the double-press semantic introduced in commit 27fd1baca and reads like a "single press cancels and quits" mental model. Suggest: "*The first KeyCtrlC fires the shared CancelFunc (guarded by sync.Once) and leaves the TUI up to show the cancelling indicator; a second KeyCtrlC force-quits.*"
+
+**`cmd/entire/cli/review/tui_detail.go:101` (and 77)** — Footer text and doc say "*PgUp/PgDn scroll*", but the viewport's default keymap also binds ↑/↓, Home/End, half-page, and mouse wheel. Doc lists only two of the actually-supported keys, and `tui_model.go:383-385` correctly says "*PgUp/PgDn/Home/End/↑/↓*". The user-facing footer is the bigger issue (under-promises); the doc comment at line 77 is at least technically accurate but feels stale. Consider aligning both to "scroll keys (PgUp/PgDn/↑/↓/Home/End)" or noting mouse-wheel support.
+
+### Improvement Opportunities
+
+**`cmd/entire/cli/review/tui_model.go:64`** — `cancelOnce *sync.Once` field has no inline comment. Per the task brief, CLAUDE.md's "Anti-Features (do NOT recreate)" section explicitly lists "*sync.Once-guarded onCancel + parallel signal.Notify goroutine*" as a forbidden combo. The use here is *not* the anti-pattern (there's no parallel signal.Notify; cobra owns SIGINT via `tea.WithoutSignalHandler`), but a future reviewer comparing this code to that doc rule will rightly flinch. Suggest a single-line WHY: "*Guards against the second Ctrl+C double-firing cancel; pairs with the cancelling-bool to give a force-quit affordance. Not the forbidden anti-pattern — cobra owns SIGINT.*"
+
+**`cmd/entire/cli/review/tui_model.go:312-320`** — Post-finish branch reads well, but the conditional `msg.Code == 'c' &amp;&amp; msg.Mod == tea.ModCtrl` is duplicated three lines later in the main switch. A one-line "WHY here too" comment would prevent a maintainer from "DRY-ing" them and breaking the post-finish path.
+
+### Recommended Removals
+
+**`cmd/entire/cli/review/tui_model.go:121-125`** — `tickCmd` doc "*schedules the next tick for duration/spinner refresh*" restates a 3-line function whose name says the same. Pre-existing; not introduced by this PR, but worth flagging.
+
+**`cmd/entire/cli/review/tui_detail.go:18-21`** — `eventLines` doc is the function signature restated, then a useful sentence about AssistantText. Tighten to just the AssistantText note — that's the only non-obvious part.
+
+### Positive Findings
+
+- **`tui_model.go:73-78`** (`cancelling` field): textbook WHY comment — explains the double-Ctrl+C semantic that's invisible from the type.
+- **`tui_model.go:190-201`** (mouse routing): explicitly preempts the "simplify into the catch-all" temptation by spelling out the View.MouseMode dependency. Exactly the comment the task brief was worried about.
+- **`tui_model.go:411-419`** (`View` doc on MouseMode): rare case of explaining a library quirk (per-view vs Program option) that a maintainer would otherwise hit by trial-and-error.
+- **`tui_text.go:60-66`** (`wrapDisplayWidth`): documents the load-bearing newline-preservation behavior and the width&lt;=0 edge case. Meets the bar.
+- **`tui_sink.go:121-131`** + `139-141`: doc-comment commit is thorough; both the head comment and the inline `Wait()` comment are in sync.
+
+### Files Reviewed
+- /Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_sink.go
+- /Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_model.go
+- /Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_detail.go
+- /Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_text.go</result>
+<usage><total_tokens>58846</total_tokens><tool_uses>12</tool_uses><duration_ms>61671</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>a9bd8cb77e0769cb0</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-fix-2--worktrees-review-fix-local/a15672a4-e3dc-456e-b0fd-c521cad18358/tasks/a9bd8cb77e0769cb0.output</output-file>
+<status>completed</status>
+<summary>Agent "Code review of PR 1184" completed</summary>
+<result>All checks pass. Summary follows.
+
+---
+
+# Code Review: PR 1184 — feat(review): improve drill-in scrolling and post-run access
+
+Reviewed 7 files across 6 commits (~730 lines added) on `feat/review-detail-viewport`. Build is clean, vet is clean, `mise run lint` reports 0 issues, and the relevant TUI tests pass. Critical scrutiny areas validated below.
+
+## Critical
+None.
+
+## Important
+None.
+
+## Suggestions
+
+**1. `wrapDisplayWidth` silently strips ANSI even though `ansi.Wrap` preserves it** — `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_text.go:74`
+
+`sanitizeDisplayText` strips ANSI sequences before `ansi.Wrap` runs, so any colorized output from an agent (e.g. Codex's syntax highlighting) loses formatting in drill-in. This is intentional per the doc string and consistent with `truncateDisplayWidth`, but it's a small UX downgrade vs. what `ansi.Wrap` natively supports. Non-blocking — log if you want richer drill-in later.
+
+**2. Post-finish Ctrl+C handler short-circuits before `cancelOnce.Do(m.cancel)`** — `tui_model.go:316-320`
+
+After `m.finished=true`, Ctrl+C calls `tea.Quit` without firing the shared `CancelFunc`. This is correct in practice (the orchestrator has already returned and cancel is a no-op), but if `RunFinished`'s `s.Wait()` blocks on something downstream that depends on context cancellation, the user-visible quit could race. Today this isn't reachable because `runFinishedMsg` arrives strictly after the orchestrator exits. Worth noting if downstream sinks ever start observing the run context.
+
+## Strengths
+
+1. **`cancelOnce` is NOT the anti-pattern.** The CLAUDE.md anti-feature is "`sync.Once`-guarded onCancel + parallel `signal.Notify` goroutine". `cancelOnce` already existed on `main` (`tui_model.go:64`); this PR only adds the `cancelling bool` flag. There is no `signal.Notify` in the review package (`grep -rn "signal.Notify" cmd/entire/cli/review/` is empty), and `tea.WithoutSignalHandler` in `tui_sink.go:62` keeps SIGINT on cobra's single handler. `cancelOnce` guards only the in-loop double-press path, which is exactly what the anti-feature note permits.
+
+2. **Mouse routing is complete.** `tui_model.go:190-202` routes wheel/click/release/motion to the viewport only when `m.detailMode`. `View()` at `tui_model.go:420-433` sets `v.MouseMode = tea.MouseModeCellMotion` only inside detail mode; when Esc flips `detailMode=false`, the next `View()` returns the default `MouseModeNone`, so the terminal exits mouse-capture and text selection is restored. Tests at `tui_model_test.go:196-218` pin both directions.
+
+3. **`detailScroll` removal is clean.** `grep -rn detailScroll cmd/ e2e/` returns no matches; no JSON tags, no stringly-typed references.
+
+4. **`eventLine → eventLines` rename is complete.** Only callers are `buildEventLines` (`tui_detail.go:66`) and the function doc. No fixed-height iteration assumptions; `buildEventLines` flattens with `append(out, eventLines(...)...)` and feeds into `viewport.SetContentLines`, which handles variable-line content natively.
+
+5. **`tui_sink.go` doc comment** (`tui_sink.go:121-131`) accurately describes the new behavior: explicit exit keys (q/Esc/Enter/Ctrl+C), Ctrl+O for post-mortem, `RunFinished` blocks on dismissal so `DumpSink` renders below.
+
+6. **Auto-tail-on-resize follow-up** in `cc9017396` correctly samples `AtBottom()` before mutating the viewport in the `WindowSizeMsg` handler (`tui_model.go:179-185`) — previously a resize that changed wrap would compute `AtBottom` against the post-resize state and incorrectly drop tailing users out of tail mode. The new test `TestTUIModel_AutoFollow_ResizePreservesBottomWhenTailing` pins this.
+
+7. **Cancellation visibility** (`27fd1baca`) is well-layered: `m.cancelling` only affects rendering (status column + footer), the underlying `cancelOnce.Do(m.cancel)` mechanism is unchanged, and the post-finish branch in `dashboardView` (`tui_model.go:446-454`) correctly prioritizes finish state over cancelling state so the footer doesn't stick on "Cancelling agents...".
+
+Relevant files:
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_model.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_detail.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_text.go`
+- `/Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_sink.go`
+
+Recommendation: **approve**. No blocking issues found; two minor optional suggestions above.</result>
+<usage><total_tokens>73811</total_tokens><tool_uses>34</tool_uses><duration_ms>137059</duration_ms></usage>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>af7e84c8f03a93234</task-id>
+<tool-use-id>toolu_016SkeLtJhC3sQ6VViPPfQr1</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-peytonmontei-Documents-entire-devenv-entireio-cli--worktrees-review-fix-2--worktrees-review-fix-local/a15672a4-e3dc-456e-b0fd-c521cad18358/tasks/af7e84c8f03a93234.output</output-file>
+<status>completed</status>
+<summary>Agent "Silent-failure hunt in PR 1184" completed</summary>
+<result>Pre-existing. Skip.
+
+I have enough to write the report.
+
+---
+
+## Error-Handling Audit — PR 1184
+
+Scope: `cmd/entire/cli/review/tui_*.go` on `feat/review-detail-viewport`. Most "errors" here are UX silent failures; the absolute file paths reviewed are:
+
+- /Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_model.go
+- /Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_detail.go
+- /Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_sink.go
+- /Users/peytonmontei/Documents/entire/devenv/entireio/cli/.worktrees/review-fix-2/.worktrees/review-fix-local/cmd/entire/cli/review/tui_text.go
+
+### Critical
+
+None. The Commit 5 fix is properly generalised — `tui_model.go:190-202` forwards `MouseWheelMsg/MouseClickMsg/MouseReleaseMsg/MouseMotionMsg` to the viewport while in detail mode, and `tui_model.go:386-390` forwards remaining keypresses, so PgUp/PgDn/Home/End/arrow keys reach the viewport's keymap (test at `tui_model_test.go:DelegatesScrollKeysToViewport`).
+
+### Important
+
+1. **"Cancelling agents..." flashes when there's nothing to cancel** — `tui_model.go:331-339`. On the dashboard while `!m.finished`, first Ctrl+C unconditionally sets `cancelling=true` and shows the cancellation footer. If agents are already mostly drained or the run is winding down, the user sees "Cancelling agents..." even though the CancelFunc is effectively a no-op (context already cancelled or agents already finishing). The misleading footer can persist for a noticeable moment if `runFinishedMsg` hasn't yet been processed. Suggest gating cancelling state on whether any agent row is still in `AgentStatusUnknown` with non-zero `runStart`. Post-finish Ctrl+C is correctly bypassed at `tui_model.go:316-320`.
+
+2. **Two-step dismissal post-finish in detail mode is undocumented and silent** — `tui_model.go:316-320` guards the post-finish exit-key shortcut behind `!m.detailMode`. If the user drilled in after the run finished (a flow the PR explicitly enables), q/Enter no longer dismisses; they fall through to `tui_model.go:386-389` and are forwarded to the viewport, which ignores them. The user must Esc out of detail first, then press q/Esc/Enter. The footer in `tui_detail.go:101` says "Esc back" so this is discoverable, but there's no signal that q/Enter is inert here. Either also accept q/Enter as "exit detail then quit" post-finish, or update the footer text.
+
+3. **Status column truncates silently if any future status string exceeds 10 chars** — `tui_model.go:521` (`statusWidth = 10`) and `tui_text.go:47-58` (truncates to "...". "cancelling" exactly fits at 10 chars (verified). Any future status name &gt;10 chars (e.g. "cancelled?", "force-quit") would be truncated mid-word with no error, no log, no test pinning the column width. Add a startup or compile-time assertion (e.g. table-driven test enumerating every `statusStr` literal and asserting `ansi.StringWidth(s) &lt;= statusWidth`).
+
+### Suggestions
+
+4. **`refreshDetailContent` on every event** — `tui_model.go:303-304` calls `buildEventLines` over the full buffer on every agent event when in detail mode, and `SetContentLines` then walks the slice again to split newlines (`viewport.go:241-253`). Bursty end-of-run event floods will rebuild the whole buffer on each event (O(n) per event, O(n^2) per burst). Most agents buffer their output so this rarely fires, but if a burst lands while the user is in detail mode the redraw will visibly stutter. Consider building incrementally (append new lines to existing slice) or batching multiple `agentEventMsg`s before refreshing.
+
+5. **`wrapDisplayWidth("", width)` returns `nil`** — `tui_text.go:67-83`. Combined with `eventLines` for any unknown event type returning `wrapDisplayWidth(raw, maxWidth)` where `raw` is "[unknown event]" (non-empty), this is fine. But if a future event variant produced an empty `raw` string by oversight, that event would contribute zero lines to the viewport with no indication. Add a comment in `eventLines` documenting that every branch must produce non-empty `raw` (the current `default` does).
+
+6. **Bubble Tea program error swallowed** — `tui_sink.go:83-89`. The comment justifies swallowing as "non-actionable in background goroutine," but for diagnostic value it should log to the `.entire/logs/` debug log via `logging.Debug(ctx, "review tui program exited with error", "err", err)`. Six months from now, a terminal-resize race or transport error here is invisible.
+
+### Strengths
+
+- `cancelOnce` correctness verified — test `SecondCtrlCForceQuits` (`tui_model_test.go:518-542`) pins exactly-once invocation across two Ctrl+Cs.
+- MouseMode reset on exit from detail mode is implicit but correct — `tui_model.go:427-432` only sets `v.MouseMode` when `m.detailMode`, so the dashboard frame returns `MouseModeNone` and the cursed_renderer (vendored at `cursed_renderer.go:350-353`) actively disables mouse capture on the transition. Test at `tui_model_test.go:216-218` pins it. Issue 6 is handled.
+- No `signal.Notify` goroutine reintroduced (`grep` confirms only a comment at `tui_sink.go:30`). The CLAUDE.md anti-feature stays excluded.
+- Viewport seeded with non-zero defaults (`tui_model.go:100-107`) so immediate Ctrl+O before a WindowSizeMsg doesn't divide by zero or render an empty frame — pinned by `TestTUIModel_InitializesDetailViewport`.
+- `splitBodyToHeight` (`tui_detail.go:118-135`) handles empty body and short content gracefully — pads with spaces, never panics on zero-line input.</result>
+<usage><total_tokens>84465</total_tokens><tool_uses>28</tool_uses><duration_ms>307998</duration_ms></usage>
+</task-notification>
+
+---
+
+okay proceed with this please
