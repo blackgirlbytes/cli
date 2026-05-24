@@ -1,0 +1,117 @@
+name: WeAreDevelopers Countdown Slack
+
+on:
+  schedule:
+    # 7:00 AM Eastern during daylight saving time.
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wearedevelopers-countdown-slack
+  cancel-in-progress: false
+
+env:
+  EVENT_DATE: "2026-07-08"
+  PROGRESS_TOTAL_DAYS: "45"
+  TIMEZONE: "America/New_York"
+
+jobs:
+  post-countdown:
+    name: Post countdown
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post Slack countdown message
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: |
+          python3 <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import sys
+          import urllib.request
+          from zoneinfo import ZoneInfo
+
+          event_date = dt.date.fromisoformat(os.environ["EVENT_DATE"])
+          progress_total_days = int(os.environ["PROGRESS_TOTAL_DAYS"])
+          today = dt.datetime.now(ZoneInfo(os.environ["TIMEZONE"])).date()
+          days_left = (event_date - today).days
+
+          if days_left < 0:
+              print(f"Countdown complete; event date was {event_date}.")
+              sys.exit(0)
+
+          bar_width = 20
+          progress_total_days = max(1, progress_total_days)
+          elapsed_days = min(progress_total_days, max(0, progress_total_days - days_left))
+          filled = (elapsed_days * bar_width) // progress_total_days
+          if elapsed_days > 0:
+              filled = max(1, filled)
+          if days_left > 0:
+              filled = min(bar_width - 1, filled)
+          filled = min(bar_width, max(0, filled))
+          bar = ("█" * filled) + ("░" * (bar_width - filled))
+
+          if days_left == 0:
+              headline = "Today is WeAreDevelopers. We launch there. Get hype!"
+              count = "launch day"
+          elif days_left == 1:
+              headline = "T-1 day left until WeAreDevelopers. Our product launch is soon. Get hype!"
+              count = "1 day left"
+          else:
+              headline = f"T-{days_left} days left until WeAreDevelopers. Our product launch is soon. Get hype!"
+              count = f"{days_left} days left"
+
+          message = f"{headline}\n\n`[{bar}]` {count}"
+          blocks = [
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": message,
+                  },
+              }
+          ]
+
+          slack_token = os.environ["SLACK_BOT_TOKEN"]
+          slack_channel = os.environ["SLACK_CHANNEL_ID"]
+
+          def slack_api(method, payload):
+              body = json.dumps(payload).encode()
+              request = urllib.request.Request(
+                  f"https://slack.com/api/{method}",
+                  data=body,
+                  headers={
+                      "Authorization": f"Bearer {slack_token}",
+                      "Content-Type": "application/json; charset=utf-8",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(request) as response:
+                  return json.loads(response.read().decode())
+
+          payload = {
+              "channel": slack_channel,
+              "text": message,
+              "blocks": blocks,
+              "unfurl_links": False,
+              "unfurl_media": False,
+              "metadata": {
+                  "event_type": "wearedevelopers_launch_countdown",
+                  "event_payload": {
+                      "event_date": event_date.isoformat(),
+                      "progress_total_days": progress_total_days,
+                  },
+              },
+          }
+
+          post_response = slack_api("chat.postMessage", payload)
+          if not post_response.get("ok"):
+              raise SystemExit(f"Slack post failed: {post_response.get('error')}")
+
+          print(f"Posted Slack countdown message {post_response['ts']}.")
+          PY
