@@ -35,6 +35,7 @@ jobs:
           import os
           import struct
           import sys
+          import time
           import urllib.parse
           import urllib.request
           import zlib
@@ -155,6 +156,12 @@ jobs:
                   return f"{error}: {'; '.join(messages)}"
               return error
 
+          def is_invalid_slack_file(response):
+              if response.get("error") != "invalid_blocks":
+                  return False
+              messages = response.get("response_metadata", {}).get("messages", [])
+              return any("invalid slack file" in message for message in messages)
+
           def slack_form_api(method, payload):
               body = urllib.parse.urlencode(payload).encode()
               request = urllib.request.Request(
@@ -250,38 +257,51 @@ jobs:
           if not complete_response.get("ok"):
               raise SystemExit(f"Slack file post failed: {format_slack_error(complete_response)}")
 
-          post_response = slack_json_api(
-              "chat.postMessage",
-              {
-                  "channel": slack_channel,
-                  "text": message,
-                  "blocks": [
-                      {
-                          "type": "section",
-                          "text": {
-                              "type": "mrkdwn",
-                              "text": message,
-                          },
-                      },
-                      {
-                          "type": "image",
-                          "slack_file": {
-                              "id": upload_response["file_id"],
-                          },
-                          "alt_text": alt_text,
-                      },
-                  ],
-                  "unfurl_links": False,
-                  "unfurl_media": False,
-                  "metadata": {
-                      "event_type": "wearedevelopers_launch_countdown",
-                      "event_payload": {
-                          "event_date": event_date.isoformat(),
-                          "progress_total_days": progress_total_days,
+          completed_file_id = complete_response.get("files", [{}])[0].get("id", upload_response["file_id"])
+          message_payload = {
+              "channel": slack_channel,
+              "text": message,
+              "blocks": [
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": message,
                       },
                   },
+                  {
+                      "type": "image",
+                      "slack_file": {
+                          "id": completed_file_id,
+                      },
+                      "alt_text": alt_text,
+                  },
+              ],
+              "unfurl_links": False,
+              "unfurl_media": False,
+              "metadata": {
+                  "event_type": "wearedevelopers_launch_countdown",
+                  "event_payload": {
+                      "event_date": event_date.isoformat(),
+                      "progress_total_days": progress_total_days,
+                  },
               },
-          )
+          }
+
+          post_response = None
+          for attempt, delay_seconds in enumerate([0, 2, 5, 10, 20], start=1):
+              if delay_seconds:
+                  print(f"Slack file not ready for image block; retrying in {delay_seconds}s.")
+                  time.sleep(delay_seconds)
+
+              post_response = slack_json_api("chat.postMessage", message_payload)
+              if post_response.get("ok"):
+                  break
+              if not is_invalid_slack_file(post_response):
+                  break
+              if attempt == 5:
+                  break
+
           if not post_response.get("ok"):
               raise SystemExit(f"Slack message post failed: {format_slack_error(post_response)}")
 
