@@ -169,6 +169,20 @@ jobs:
               with urllib.request.urlopen(request) as response:
                   return json.loads(response.read().decode())
 
+          def slack_json_api(method, payload):
+              body = json.dumps(payload).encode()
+              request = urllib.request.Request(
+                  f"https://slack.com/api/{method}",
+                  data=body,
+                  headers={
+                      "Authorization": f"Bearer {slack_token}",
+                      "Content-Type": "application/json; charset=utf-8",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(request) as response:
+                  return json.loads(response.read().decode())
+
           def upload_bytes(upload_url, data):
               request = urllib.request.Request(
                   upload_url,
@@ -225,8 +239,6 @@ jobs:
           complete_response = slack_form_api(
               "files.completeUploadExternal",
               {
-                  "channel_id": slack_channel,
-                  "initial_comment": message,
                   "files": json.dumps([
                       {
                           "id": upload_response["file_id"],
@@ -238,5 +250,40 @@ jobs:
           if not complete_response.get("ok"):
               raise SystemExit(f"Slack file post failed: {format_slack_error(complete_response)}")
 
-          print(f"Posted Slack countdown image {upload_response['file_id']}.")
+          post_response = slack_json_api(
+              "chat.postMessage",
+              {
+                  "channel": slack_channel,
+                  "text": message,
+                  "blocks": [
+                      {
+                          "type": "section",
+                          "text": {
+                              "type": "mrkdwn",
+                              "text": message,
+                          },
+                      },
+                      {
+                          "type": "image",
+                          "slack_file": {
+                              "id": upload_response["file_id"],
+                          },
+                          "alt_text": alt_text,
+                      },
+                  ],
+                  "unfurl_links": False,
+                  "unfurl_media": False,
+                  "metadata": {
+                      "event_type": "wearedevelopers_launch_countdown",
+                      "event_payload": {
+                          "event_date": event_date.isoformat(),
+                          "progress_total_days": progress_total_days,
+                      },
+                  },
+              },
+          )
+          if not post_response.get("ok"):
+              raise SystemExit(f"Slack message post failed: {format_slack_error(post_response)}")
+
+          print(f"Posted Slack countdown image block {post_response['ts']}.")
           PY
