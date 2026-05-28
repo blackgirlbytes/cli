@@ -35,6 +35,7 @@ jobs:
           import os
           import struct
           import sys
+          import urllib.parse
           import urllib.request
           import zlib
           from zoneinfo import ZoneInfo
@@ -150,14 +151,21 @@ jobs:
 
               write_png(path, IMAGE_WIDTH, IMAGE_HEIGHT, pixels)
 
-          def slack_api(method, payload):
-              body = json.dumps(payload).encode()
+          def format_slack_error(response):
+              error = response.get("error", "unknown_error")
+              messages = response.get("response_metadata", {}).get("messages", [])
+              if messages:
+                  return f"{error}: {'; '.join(messages)}"
+              return error
+
+          def slack_form_api(method, payload):
+              body = urllib.parse.urlencode(payload).encode()
               request = urllib.request.Request(
                   f"https://slack.com/api/{method}",
                   data=body,
                   headers={
                       "Authorization": f"Bearer {slack_token}",
-                      "Content-Type": "application/json; charset=utf-8",
+                      "Content-Type": "application/x-www-form-urlencoded",
                   },
                   method="POST",
               )
@@ -169,7 +177,7 @@ jobs:
                   upload_url,
                   data=data,
                   headers={
-                      "Content-Type": "image/png",
+                      "Content-Type": "application/octet-stream",
                   },
                   method="POST",
               )
@@ -200,7 +208,7 @@ jobs:
           slack_token = os.environ["SLACK_BOT_TOKEN"]
           slack_channel = os.environ["SLACK_CHANNEL_ID"]
 
-          upload_response = slack_api(
+          upload_response = slack_form_api(
               "files.getUploadURLExternal",
               {
                   "filename": f"wearedevelopers-countdown-{filename_count}.png",
@@ -209,25 +217,25 @@ jobs:
               },
           )
           if not upload_response.get("ok"):
-              raise SystemExit(f"Slack upload URL failed: {upload_response.get('error')}")
+              raise SystemExit(f"Slack upload URL failed: {format_slack_error(upload_response)}")
 
           upload_bytes(upload_response["upload_url"], image_bytes)
 
-          complete_response = slack_api(
+          complete_response = slack_form_api(
               "files.completeUploadExternal",
               {
                   "channel_id": slack_channel,
                   "initial_comment": message,
-                  "files": [
+                  "files": json.dumps([
                       {
                           "id": upload_response["file_id"],
                           "title": "WeAreDevelopers launch countdown",
                       }
-                  ],
+                  ]),
               },
           )
           if not complete_response.get("ok"):
-              raise SystemExit(f"Slack file post failed: {complete_response.get('error')}")
+              raise SystemExit(f"Slack file post failed: {format_slack_error(complete_response)}")
 
           print(f"Posted Slack countdown image {upload_response['file_id']}.")
           PY
