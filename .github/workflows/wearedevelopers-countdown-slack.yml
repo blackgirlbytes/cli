@@ -15,6 +15,7 @@ concurrency:
 
 env:
   EVENT_DATE: "2026-07-08"
+  PROGRESS_TOTAL_DAYS: "45"
   TIMEZONE: "America/New_York"
 
 jobs:
@@ -28,15 +29,38 @@ jobs:
           SLACK_CHANNEL_ID: ${{ secrets.ENTIRE_SLACK_CHANNEL_ID }}
         run: |
           python3 <<'PY'
+          import binascii
           import datetime as dt
           import json
           import os
+          import struct
           import sys
           import urllib.request
+          import zlib
           from zoneinfo import ZoneInfo
 
+          BAR_IMAGE_PATH = "/tmp/wearedevelopers-countdown.png"
+          IMAGE_WIDTH = 1200
+          IMAGE_HEIGHT = 86
+          CARD_RECT = (18, 8, 1182, 78)
+          CARD_RADIUS = 18
+          BAR_X = 40
+          BAR_Y = 22
+          BAR_WIDTH = 1120
+          BAR_HEIGHT = 42
+          SEGMENT_GAP = 5
+
+          COLOR_CARD = (248, 250, 252, 255)
+          COLOR_EMPTY = (229, 231, 235, 255)
+          COLOR_GREEN = (22, 163, 74, 255)
+          COLOR_YELLOW = (234, 179, 8, 255)
+          COLOR_RED = (220, 38, 38, 255)
+
           event_date = dt.date.fromisoformat(os.environ["EVENT_DATE"])
+          progress_total_days = max(1, int(os.environ["PROGRESS_TOTAL_DAYS"]))
           today = dt.datetime.now(ZoneInfo(os.environ["TIMEZONE"])).date()
+          if os.environ.get("TODAY"):
+              today = dt.date.fromisoformat(os.environ["TODAY"])
           days_left = (event_date - today).days
 
           if days_left < 0:
@@ -51,18 +75,80 @@ jobs:
               headline = f"T-{days_left} days left until WeAreDevelopers. Our product launch is soon. Get hype!"
 
           message = headline
-          blocks = [
-              {
-                  "type": "section",
-                  "text": {
-                      "type": "mrkdwn",
-                      "text": message,
-                  },
-              }
-          ]
 
-          slack_token = os.environ["SLACK_BOT_TOKEN"]
-          slack_channel = os.environ["SLACK_CHANNEL_ID"]
+          def bar_color(days):
+              if days < 7:
+                  return COLOR_RED, "red"
+              if days < 30:
+                  return COLOR_YELLOW, "yellow"
+              return COLOR_GREEN, "green"
+
+          def in_rounded_rect(x, y, x0, y0, x1, y1, radius):
+              if x < x0 or x >= x1 or y < y0 or y >= y1:
+                  return False
+
+              corners = (
+                  (x0 + radius, y0 + radius, x < x0 + radius and y < y0 + radius),
+                  (x1 - radius - 1, y0 + radius, x >= x1 - radius and y < y0 + radius),
+                  (x0 + radius, y1 - radius - 1, x < x0 + radius and y >= y1 - radius),
+                  (x1 - radius - 1, y1 - radius - 1, x >= x1 - radius and y >= y1 - radius),
+              )
+              for cx, cy, active in corners:
+                  if active:
+                      return ((x - cx) ** 2) + ((y - cy) ** 2) <= radius**2
+              return True
+
+          def draw_rounded_rect(pixels, x0, y0, x1, y1, radius, color):
+              x0 = max(0, int(round(x0)))
+              y0 = max(0, int(round(y0)))
+              x1 = min(IMAGE_WIDTH, int(round(x1)))
+              y1 = min(IMAGE_HEIGHT, int(round(y1)))
+              radius = max(0, int(round(radius)))
+              for y in range(y0, y1):
+                  row = y * IMAGE_WIDTH * 4
+                  for x in range(x0, x1):
+                      if in_rounded_rect(x, y, x0, y0, x1, y1, radius):
+                          offset = row + x * 4
+                          pixels[offset : offset + 4] = bytes(color)
+
+          def png_chunk(chunk_type, data):
+              return (
+                  struct.pack(">I", len(data))
+                  + chunk_type
+                  + data
+                  + struct.pack(">I", binascii.crc32(chunk_type + data) & 0xFFFFFFFF)
+              )
+
+          def write_png(path, width, height, pixels):
+              raw = bytearray()
+              stride = width * 4
+              for y in range(height):
+                  raw.append(0)
+                  row_start = y * stride
+                  raw.extend(pixels[row_start : row_start + stride])
+
+              ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+              with open(path, "wb") as image_file:
+                  image_file.write(b"\x89PNG\r\n\x1a\n")
+                  image_file.write(png_chunk(b"IHDR", ihdr))
+                  image_file.write(png_chunk(b"IDAT", zlib.compress(bytes(raw), 9)))
+                  image_file.write(png_chunk(b"IEND", b""))
+
+          def render_countdown_bar(path):
+              pixels = bytearray([0, 0, 0, 0] * IMAGE_WIDTH * IMAGE_HEIGHT)
+              draw_rounded_rect(pixels, *CARD_RECT, CARD_RADIUS, COLOR_CARD)
+
+              filled_segments = min(progress_total_days, max(1, days_left))
+              segment_width = (BAR_WIDTH - (progress_total_days - 1) * SEGMENT_GAP) / progress_total_days
+              fill_color, _ = bar_color(days_left)
+
+              for segment in range(progress_total_days):
+                  x0 = BAR_X + segment * (segment_width + SEGMENT_GAP)
+                  x1 = x0 + segment_width
+                  color = fill_color if segment < filled_segments else COLOR_EMPTY
+                  draw_rounded_rect(pixels, x0, BAR_Y, x1, BAR_Y + BAR_HEIGHT, 8, color)
+
+              write_png(path, IMAGE_WIDTH, IMAGE_HEIGHT, pixels)
 
           def slack_api(method, payload):
               body = json.dumps(payload).encode()
@@ -78,23 +164,70 @@ jobs:
               with urllib.request.urlopen(request) as response:
                   return json.loads(response.read().decode())
 
-          payload = {
-              "channel": slack_channel,
-              "text": message,
-              "blocks": blocks,
-              "unfurl_links": False,
-              "unfurl_media": False,
-              "metadata": {
-                  "event_type": "wearedevelopers_launch_countdown",
-                  "event_payload": {
-                      "event_date": event_date.isoformat(),
+          def upload_bytes(upload_url, data):
+              request = urllib.request.Request(
+                  upload_url,
+                  data=data,
+                  headers={
+                      "Content-Type": "image/png",
                   },
+                  method="POST",
+              )
+              with urllib.request.urlopen(request) as response:
+                  response.read()
+
+          render_countdown_bar(BAR_IMAGE_PATH)
+          with open(BAR_IMAGE_PATH, "rb") as image_file:
+              image_bytes = image_file.read()
+
+          _, color_name = bar_color(days_left)
+          if days_left == 0:
+              alt_count = "launch day"
+              filename_count = "launch-day"
+          elif days_left == 1:
+              alt_count = "1 day remaining"
+              filename_count = "t-1"
+          else:
+              alt_count = f"{days_left} days remaining"
+              filename_count = f"t-{days_left}"
+          alt_text = f"WeAreDevelopers launch countdown: {alt_count}; {color_name} progress bar."
+
+          if os.environ.get("DRY_RUN") == "1":
+              print(f"Dry run: wrote {BAR_IMAGE_PATH} ({len(image_bytes)} bytes).")
+              print(message)
+              sys.exit(0)
+
+          slack_token = os.environ["SLACK_BOT_TOKEN"]
+          slack_channel = os.environ["SLACK_CHANNEL_ID"]
+
+          upload_response = slack_api(
+              "files.getUploadURLExternal",
+              {
+                  "filename": f"wearedevelopers-countdown-{filename_count}.png",
+                  "length": len(image_bytes),
+                  "alt_txt": alt_text,
               },
-          }
+          )
+          if not upload_response.get("ok"):
+              raise SystemExit(f"Slack upload URL failed: {upload_response.get('error')}")
 
-          post_response = slack_api("chat.postMessage", payload)
-          if not post_response.get("ok"):
-              raise SystemExit(f"Slack post failed: {post_response.get('error')}")
+          upload_bytes(upload_response["upload_url"], image_bytes)
 
-          print(f"Posted Slack countdown message {post_response['ts']}.")
+          complete_response = slack_api(
+              "files.completeUploadExternal",
+              {
+                  "channel_id": slack_channel,
+                  "initial_comment": message,
+                  "files": [
+                      {
+                          "id": upload_response["file_id"],
+                          "title": "WeAreDevelopers launch countdown",
+                      }
+                  ],
+              },
+          )
+          if not complete_response.get("ok"):
+              raise SystemExit(f"Slack file post failed: {complete_response.get('error')}")
+
+          print(f"Posted Slack countdown image {upload_response['file_id']}.")
           PY
