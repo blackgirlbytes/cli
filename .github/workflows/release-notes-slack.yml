@@ -45,6 +45,7 @@ jobs:
       has_repos: ${{ steps.build.outputs.has_repos }}
       last_dispatch_date: ${{ steps.dispatch.outputs.date }}
       last_dispatch_file: ${{ steps.dispatch.outputs.file }}
+      current_date: ${{ steps.dispatch.outputs.current_date }}
 
     steps:
       - name: Clone entire.io for dispatch info
@@ -56,13 +57,23 @@ jobs:
       - name: Get last dispatch info
         id: dispatch
         run: |
+          CURRENT_DATE=$(TZ=America/New_York date +%F)
+          CURRENT_DATE_NUM=$(printf '%s' "$CURRENT_DATE" | tr -d '-')
           DISPATCH_DIR="/tmp/entire-io/website/src/routes/_content/blog/-content"
           
-          # Get latest dispatch file
-          LATEST_DISPATCH=$(ls -1 "$DISPATCH_DIR"/*dispatch*.md 2>/dev/null | sort | tail -1)
+          # Get latest dispatch file. Current dispatch posts may be .md or .mdx.
+          find "$DISPATCH_DIR" -maxdepth 1 -type f \( -iname '*dispatch*.md' -o -iname '*dispatch*.mdx' \) | sort | while read -r f; do
+            FILE_DATE=$(basename "$f" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}' || true)
+            FILE_DATE_NUM=$(printf '%s' "$FILE_DATE" | tr -d '-')
+            if [ -n "$FILE_DATE" ] && [ "$FILE_DATE_NUM" -le "$CURRENT_DATE_NUM" ]; then
+              echo "$f"
+            fi
+          done > /tmp/dispatch-files.txt
+
+          LATEST_DISPATCH=$(tail -1 /tmp/dispatch-files.txt)
           
           if [ -z "$LATEST_DISPATCH" ]; then
-            echo "::error::No dispatch files found"
+            echo "::error::No dispatch files dated on or before ${CURRENT_DATE} found"
             exit 1
           fi
           
@@ -70,9 +81,10 @@ jobs:
           # Extract date from filename (e.g., 2026-04-06-entire-dispatch-0x0008.md -> 2026-04-06)
           DISPATCH_DATE=$(echo "$FILENAME" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
           
-          echo "file=$LATEST_DISPATCH" >> $GITHUB_OUTPUT
-          echo "date=$DISPATCH_DATE" >> $GITHUB_OUTPUT
-          echo "::notice::Last dispatch: $FILENAME (date: $DISPATCH_DATE)"
+          echo "file=$LATEST_DISPATCH" >> "$GITHUB_OUTPUT"
+          echo "date=$DISPATCH_DATE" >> "$GITHUB_OUTPUT"
+          echo "current_date=${CURRENT_DATE}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Last dispatch: $FILENAME (date: $DISPATCH_DATE); current date: ${CURRENT_DATE}"
           
           # Save dispatch content for later use
           cp "$LATEST_DISPATCH" /tmp/last_dispatch.md
@@ -239,6 +251,7 @@ jobs:
           REPO: ${{ matrix.repo }}
           RECIPE_TYPE: ${{ matrix.recipe_type }}
           LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+          CURRENT_DATE: ${{ needs.prepare.outputs.current_date }}
           GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
         run: |
           mkdir -p $HOME/.local/share/goose/sessions
@@ -273,6 +286,7 @@ jobs:
             Context:
             - Repository: entirehq/entire.io
             - Last Dispatch Date: DATE_PLACEHOLDER
+            - Current Date: CURRENT_DATE_PLACEHOLDER
             - You are in the cloned repository directory
             - The last dispatch content is at /tmp/last_dispatch.md
             - PostHog feature flags data is at /tmp/posthog_flags.json
@@ -280,13 +294,13 @@ jobs:
 
             Process:
             1. Read /tmp/last_dispatch.md to see what was already covered - DO NOT include those items
-            2. Get all commits/merges to main since DATE_PLACEHOLDER:
-               git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
+            2. Get all commits/merges to main from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER:
+               git log --since="DATE_PLACEHOLDER" --until="CURRENT_DATE_PLACEHOLDER 23:59:59" --first-parent main --oneline
             3. For each commit, get the associated PR number from the commit message or use:
-               git log --since="DATE_PLACEHOLDER" --first-parent main --format="%s" | grep -oE '#[0-9]+'
+               git log --since="DATE_PLACEHOLDER" --until="CURRENT_DATE_PLACEHOLDER 23:59:59" --first-parent main --format="%s" | grep -oE '#[0-9]+'
             4. Read /tmp/posthog_flags.json to get current feature flag states
             5. Read feature-flags.json in the repo to see which flags are defined
-            6. For each merged PR/commit since DATE_PLACEHOLDER:
+            6. For each merged PR/commit from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER:
                - Search the codebase for whether this change references a feature flag
                - Look up that flag's status in posthog_flags.json
             7. Categorize and determine "Public" status:
@@ -331,6 +345,7 @@ jobs:
 
             Rules:
             - ALWAYS include BOTH sections with their tables
+            - Do not include future-dated items after CURRENT_DATE_PLACEHOLDER
             - If a section has no items, include the table header with a single row: | _None this period_ | - | - | - | - |
             - DO NOT mention feature flag names - users don't know about them
             - Keep change descriptions concise (under 60 chars) and user-focused
@@ -342,7 +357,7 @@ jobs:
             - Return the final result as JSON with a single "markdown" field containing ONLY the markdown tables
 
           prompt: |
-            Generate dispatch notes for entirehq/entire.io showing changes since DATE_PLACEHOLDER.
+            Generate dispatch notes for entirehq/entire.io showing changes from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
             Return JSON with a single "markdown" field whose value is the markdown tables.
             Check /tmp/last_dispatch.md to avoid duplicates.
             For each PR, look up the author and check if they are an org member.
@@ -374,31 +389,32 @@ jobs:
             Context:
             - Repository: REPO_PLACEHOLDER
             - Last Dispatch Date: DATE_PLACEHOLDER
+            - Current Date: CURRENT_DATE_PLACEHOLDER
             - You are in the cloned repository directory
             - The last dispatch content is at /tmp/last_dispatch.md
 
             Process:
             1. Read /tmp/last_dispatch.md to see what was already covered (releases mentioned, PRs linked)
-            2. Get all releases/tags since DATE_PLACEHOLDER, including stable, prerelease, and nightly tags:
+            2. Get all releases/tags from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER, including stable, prerelease, and nightly tags:
                git tag --sort=-creatordate | head -20
                git log --tags --simplify-by-decoration --pretty="format:%ai %d" | head -20
                gh release list --limit 30
             3. Separate release tags into:
                - "Released": stable tags only (for example v0.5.5)
                - "Nightly release": nightly/prerelease tags (for example v0.5.6-nightly.202604170646.96867cdc)
-            4. Get all merges to main/master since DATE_PLACEHOLDER:
-               git log --since="DATE_PLACEHOLDER" --merges --first-parent main --oneline
+            4. Get all merges to main/master from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER:
+               git log --since="DATE_PLACEHOLDER" --until="CURRENT_DATE_PLACEHOLDER 23:59:59" --merges --first-parent main --oneline
                Or for commits:
-               git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
+               git log --since="DATE_PLACEHOLDER" --until="CURRENT_DATE_PLACEHOLDER 23:59:59" --first-parent main --oneline
             5. Extract PR numbers from commit messages (look for #NNN patterns)
             6. Get open PRs that are candidates for "Not merged yet":
                gh pr list --repo REPO_PLACEHOLDER --state open --limit 50 --json number,title,author,updatedAt,url
             7. Cross-reference with the last dispatch - exclude anything already mentioned
             8. Categorize:
-               - "Released": Changes that are part of stable release tags since DATE_PLACEHOLDER
-               - "Nightly release": Changes that are part of nightly/prerelease tags since DATE_PLACEHOLDER
+               - "Released": Changes that are part of stable release tags from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER
+               - "Nightly release": Changes that are part of nightly/prerelease tags from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER
                - "Not merged yet": Open PRs that are not represented in either the Released or Nightly release sections
-            9. For "Not merged yet", prefer open PRs updated since DATE_PLACEHOLDER and keep only the most relevant, user-facing items
+            9. For "Not merged yet", prefer open PRs updated from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER and keep only the most relevant, user-facing items
 
             Determining PR Author and External Contributor Status:
             For each PR or open PR candidate, get the author and their email using:
@@ -440,6 +456,7 @@ jobs:
 
             Rules:
             - ALWAYS include ALL THREE sections with their tables
+            - Do not include future-dated items after CURRENT_DATE_PLACEHOLDER
             - If a section has no items, include the table header with a single row: | _None this period_ | - | - |
             - EVERY item in "Released" MUST start with a stable release tag (e.g., `v5.13.0` - description)
             - EVERY item in "Nightly release" MUST start with a nightly/prerelease tag (e.g., `v0.5.6-nightly.202604170646.96867cdc` - description)
@@ -453,7 +470,7 @@ jobs:
             - Return the final result as JSON with a single "markdown" field containing ONLY the markdown tables
 
           prompt: |
-            Generate dispatch notes for REPO_PLACEHOLDER showing changes since DATE_PLACEHOLDER.
+            Generate dispatch notes for REPO_PLACEHOLDER showing changes from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
             Return JSON with a single "markdown" field whose value is the markdown tables.
             Check /tmp/last_dispatch.md to avoid duplicates.
             For each PR, look up the author and check if they are an org member.
@@ -485,31 +502,32 @@ jobs:
             Context:
             - Repository: go-git/go-git
             - Last Dispatch Date: DATE_PLACEHOLDER
+            - Current Date: CURRENT_DATE_PLACEHOLDER
             - You are in the cloned repository directory
             - The last dispatch content is at /tmp/last_dispatch.md
 
             Process:
             1. Read /tmp/last_dispatch.md to see what was already covered (releases mentioned, PRs linked)
-            2. Get all releases/tags since DATE_PLACEHOLDER, including stable, prerelease, and nightly tags:
+            2. Get all releases/tags from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER, including stable, prerelease, and nightly tags:
                git tag --sort=-creatordate | head -20
                git log --tags --simplify-by-decoration --pretty="format:%ai %d" | head -20
                gh release list --limit 30
             3. Separate release tags into:
                - "Released": stable tags only
                - "Nightly release": nightly/prerelease tags
-            4. Get all merges to main/master since DATE_PLACEHOLDER:
-               git log --since="DATE_PLACEHOLDER" --merges --first-parent main --oneline
+            4. Get all merges to main/master from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER:
+               git log --since="DATE_PLACEHOLDER" --until="CURRENT_DATE_PLACEHOLDER 23:59:59" --merges --first-parent main --oneline
                Or for commits:
-               git log --since="DATE_PLACEHOLDER" --first-parent main --oneline
+               git log --since="DATE_PLACEHOLDER" --until="CURRENT_DATE_PLACEHOLDER 23:59:59" --first-parent main --oneline
             5. Extract PR numbers from commit messages (look for #NNN patterns)
             6. Get open PRs that are candidates for "Not merged yet":
                gh pr list --repo go-git/go-git --state open --limit 50 --json number,title,author,updatedAt,url
             7. Cross-reference with the last dispatch - exclude anything already mentioned
             8. Categorize:
-               - "Released": Changes that are part of stable release tags since DATE_PLACEHOLDER
-               - "Nightly release": Changes that are part of nightly/prerelease tags since DATE_PLACEHOLDER
+               - "Released": Changes that are part of stable release tags from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER
+               - "Nightly release": Changes that are part of nightly/prerelease tags from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER
                - "Not merged yet": Open PRs that are not represented in either the Released or Nightly release sections
-            9. For "Not merged yet", prefer open PRs updated since DATE_PLACEHOLDER and keep only the most relevant, user-facing items
+            9. For "Not merged yet", prefer open PRs updated from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER and keep only the most relevant, user-facing items
 
             Determining PR Author Status:
             - For go-git/go-git, treat all contributors as external contributors
@@ -538,6 +556,7 @@ jobs:
 
             Rules:
             - ALWAYS include ALL THREE sections with their tables
+            - Do not include future-dated items after CURRENT_DATE_PLACEHOLDER
             - If a section has no items, include the table header with a single row: | _None this period_ | - | - |
             - EVERY item in "Released" MUST start with a stable release tag
             - EVERY item in "Nightly release" MUST start with a nightly/prerelease tag
@@ -551,7 +570,7 @@ jobs:
             - Return the final result as JSON with a single "markdown" field containing ONLY the markdown tables
 
           prompt: |
-            Generate dispatch notes for go-git/go-git showing changes since DATE_PLACEHOLDER.
+            Generate dispatch notes for go-git/go-git showing changes from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
             Return JSON with a single "markdown" field whose value is the markdown tables.
             Check /tmp/last_dispatch.md to avoid duplicates.
             Treat all contributors as external contributors.
@@ -565,6 +584,7 @@ jobs:
 
           sed -i "s|REPO_PLACEHOLDER|${REPO}|g" /tmp/recipe.yaml
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
+          sed -i "s|CURRENT_DATE_PLACEHOLDER|${CURRENT_DATE}|g" /tmp/recipe.yaml
           goose run --recipe /tmp/recipe.yaml 2>&1 | tee /tmp/goose_output.log
 
           GOOSE_RESULT=$(awk 'NF { line = $0 } END { print line }' /tmp/goose_output.log)
@@ -637,20 +657,17 @@ jobs:
         id: combine
         env:
           LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+          CURRENT_DATE: ${{ needs.prepare.outputs.current_date }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          TODAY=$(date -u +"%Y-%m-%d")
-          echo "today=$TODAY" >> $GITHUB_OUTPUT
-          DISPLAY_TODAY=$(date -u -d '4 hours ago' +"%B %-d, %Y")
+          TODAY="${CURRENT_DATE}"
+          echo "today=$TODAY" >> "$GITHUB_OUTPUT"
+          DISPLAY_TODAY=$(date -d "${CURRENT_DATE}" +"%B %-d, %Y")
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             INTRO_TITLE="📋 *Test Daily Dispatch* — ${DISPLAY_TODAY}"
           else
             INTRO_TITLE="📋 *Today's Daily Dispatch* — ${DISPLAY_TODAY}"
           fi
-          
-          # Calculate work week range (Monday to Friday)
-          WEEK_START=$(date -d "${LAST_DISPATCH_DATE}" +"%B %-d, %Y")
-          WEEK_END=$(date -d "${LAST_DISPATCH_DATE} + 4 days" +"%B %-d, %Y")
           
           cat > /tmp/dispatch-notes-${TODAY}.md << EOF
           ${INTRO_TITLE}
@@ -659,8 +676,6 @@ jobs:
           Engineers, please review these notes for accuracy. :pray:
 
           # Dispatch Notes
-
-          _For the week of ${WEEK_START} – ${WEEK_END}_
 
           ---
 
@@ -693,67 +708,36 @@ jobs:
             fi
           done
 
-          echo "::notice::Combined notes file created"
-          cat /tmp/dispatch-notes-${TODAY}.md
+          echo "::notice::Combined notes file created at /tmp/dispatch-notes-${TODAY}.md"
 
-      - name: Post combined notes to Slack
+      - name: Upload combined notes markdown to Slack
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           TODAY: ${{ steps.combine.outputs.today }}
         run: |
           MD_FILE="/tmp/dispatch-notes-${TODAY}.md"
-          MAX_CHARS=3800
-          export MD_FILE MAX_CHARS
+          SLACK_FILE_TITLE="Dispatch Notes — ${TODAY}"
+          SLACK_INITIAL_COMMENT="Dispatch notes attached as a Markdown file."
+          export MD_FILE SLACK_FILE_TITLE SLACK_INITIAL_COMMENT
 
           python3 <<'PY'
           import json
           import os
           import pathlib
-          import time
           import urllib.request
 
           token = os.environ["SLACK_BOT_TOKEN"]
           channel = os.environ["SLACK_CHANNEL_ID"]
           path = pathlib.Path(os.environ["MD_FILE"])
-          max_chars = int(os.environ["MAX_CHARS"])
-          text = path.read_text()
+          title = os.environ["SLACK_FILE_TITLE"]
+          initial_comment = os.environ["SLACK_INITIAL_COMMENT"]
+          data = path.read_bytes()
 
-          chunks = []
-          remaining = text
-          while remaining:
-              if len(remaining) <= max_chars:
-                  chunks.append(remaining)
-                  break
-              split_at = remaining.rfind("\n\n", 0, max_chars)
-              if split_at == -1:
-                  split_at = remaining.rfind("\n", 0, max_chars)
-              if split_at == -1:
-                  split_at = max_chars
-              chunk = remaining[:split_at].rstrip()
-              if not chunk:
-                  chunk = remaining[:max_chars]
-                  split_at = len(chunk)
-              chunks.append(chunk)
-              remaining = remaining[split_at:].lstrip()
-
-          for idx, chunk in enumerate(chunks, start=1):
-              if len(chunks) > 1:
-                  header = f"*Dispatch Notes ({idx}/{len(chunks)})*\n\n"
-                  body = header + chunk
-              else:
-                  body = chunk
-
-              payload = json.dumps({
-                  "channel": channel,
-                  "text": body,
-                  "unfurl_links": False,
-                  "unfurl_media": False,
-              }).encode()
-
+          def slack_api(method, payload):
               req = urllib.request.Request(
-                  "https://slack.com/api/chat.postMessage",
-                  data=payload,
+                  f"https://slack.com/api/{method}",
+                  data=json.dumps(payload).encode(),
                   headers={
                       "Authorization": f"Bearer {token}",
                       "Content-Type": "application/json; charset=utf-8",
@@ -763,8 +747,30 @@ jobs:
               with urllib.request.urlopen(req) as resp:
                   response = json.loads(resp.read().decode())
               if not response.get("ok"):
-                  raise SystemExit(f"Slack API error: {response.get('error')}")
-              time.sleep(1.1)
+                  raise SystemExit(f"Slack API error from {method}: {response.get('error')}")
+              return response
+
+          upload = slack_api("files.getUploadURLExternal", {
+              "filename": path.name,
+              "length": len(data),
+              "snippet_type": "markdown",
+          })
+
+          req = urllib.request.Request(
+              upload["upload_url"],
+              data=data,
+              headers={"Content-Type": "application/octet-stream"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req) as resp:
+              if resp.status < 200 or resp.status >= 300:
+                  raise SystemExit(f"Slack file upload failed with HTTP {resp.status}")
+
+          slack_api("files.completeUploadExternal", {
+              "channel_id": channel,
+              "initial_comment": initial_comment,
+              "files": [{"id": upload["file_id"], "title": title}],
+          })
           PY
 
   # Generate a draft dispatch post in Marvin's voice
@@ -789,14 +795,30 @@ jobs:
       - name: Clone entire.io for dispatch examples
         env:
           GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT }}
+          CURRENT_DATE: ${{ needs.prepare.outputs.current_date }}
         run: |
           git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/entirehq/entire.io.git" /tmp/entire-io
           
-          # Copy last 3 dispatches as style examples
+          # Copy the latest dispatches as style references only.
           DISPATCH_DIR="/tmp/entire-io/website/src/routes/_content/blog/-content"
-          ls -1 "$DISPATCH_DIR"/*dispatch*.md | sort | tail -3 | while read f; do
-            cp "$f" /tmp/
-          done
+          CURRENT_DATE_NUM=$(printf '%s' "$CURRENT_DATE" | tr -d '-')
+          mkdir -p /tmp/dispatch-style-references
+          find "$DISPATCH_DIR" -maxdepth 1 -type f \( -iname '*dispatch*.md' -o -iname '*dispatch*.mdx' \) | sort | while read -r f; do
+            FILE_DATE=$(basename "$f" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}' || true)
+            FILE_DATE_NUM=$(printf '%s' "$FILE_DATE" | tr -d '-')
+            if [ -n "$FILE_DATE" ] && [ "$FILE_DATE_NUM" -le "$CURRENT_DATE_NUM" ]; then
+              echo "$f"
+            fi
+          done | tail -3 > /tmp/dispatch-style-files.txt
+
+          if [ ! -s /tmp/dispatch-style-files.txt ]; then
+            echo "::error::No dispatch files found"
+            exit 1
+          fi
+
+          while read -r f; do
+            cp "$f" /tmp/dispatch-style-references/
+          done < /tmp/dispatch-style-files.txt
 
       - name: Download all repo notes
         uses: actions/download-artifact@v4
@@ -808,6 +830,7 @@ jobs:
       - name: Generate dispatch draft
         env:
           LAST_DISPATCH_DATE: ${{ needs.prepare.outputs.last_dispatch_date }}
+          CURRENT_DATE: ${{ needs.prepare.outputs.current_date }}
         run: |
           mkdir -p $HOME/.local/share/goose/sessions
           mkdir -p $HOME/.config/goose
@@ -847,13 +870,18 @@ jobs:
 
             Context:
             - The collected notes from all repos are in /tmp/all_notes.md (in table format)
-            - Example dispatches for voice/style reference are in /tmp/*.md (files like 2026-04-06-entire-dispatch-0x0008.md)
-            - This dispatch covers changes since DATE_PLACEHOLDER
+            - The latest published dispatch examples are in /tmp/dispatch-style-references for voice/style reference only
+            - This dispatch covers changes from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER
+            - The current date is CURRENT_DATE_PLACEHOLDER
             - Past dispatch intros usually open with momentum, a product/theme, or the strongest visible ships
             - They do NOT open by saying a repo/team "didn't ship" or by contrasting one team shipping against another not shipping
             - They should not frame one repo or team as "leading the charge" while another repo/team merely follows; present the dispatch as a cohesive set of parallel improvements
 
             IMPORTANT:
+            - Use /tmp/all_notes.md as the only factual source for the new dispatch
+            - Use /tmp/dispatch-style-references only for style, voice, and frontmatter structure
+            - Do not copy, summarize, quote, rewrite, or include content from the published dispatch references
+            - Do not include future-dated items after CURRENT_DATE_PLACEHOLDER
             - For entireio/cli, include items from both the "📦 Released" and "🌙 Nightly release" tables
             - For entirehq/entire.io, entirehq/entiredb, entirehq/git-sync, and go-git/go-git, include items only from the "📦 Released" tables
             - For entire.io specifically, only include released items where Public = Y; exclude all Public = N rows, including feature flagged, partial rollout, internal-only, and disabled items
@@ -875,7 +903,7 @@ jobs:
               go-git/go-git -> "Go Git"
 
             Process:
-            1. Read the example dispatch files in /tmp/ to understand:
+            1. Read /tmp/dispatch-style-references to understand:
                - The voice (Marvin, a robot with personality - "Beep, boop", dry humor)
                - The structure (frontmatter, intro paragraph, sections with ## headings, closing)
                - How features are described (user-focused, mentions contributors)
@@ -1022,8 +1050,8 @@ jobs:
             Write the complete dispatch draft to /tmp/dispatch_draft.md
 
           prompt: |
-            Generate a dispatch draft covering changes since DATE_PLACEHOLDER.
-            Read the example dispatches in /tmp/ for voice and style.
+            Generate a dispatch draft covering changes from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
+            Read /tmp/dispatch-style-references for voice and style.
             Read /tmp/all_notes.md for the table content to include.
             Include Released items for all repositories, and also include Nightly release items for entireio/cli only. For entire.io, only include Released items where Public = Y; exclude Public = N, feature flagged, partial rollout, internal-only, and disabled rows. Never include Not merged yet items.
             Structure the body by repository sections first using this exact mapping: entireio/cli = Entire CLI, entirehq/entire.io = Entire Web, entirehq/entiredb = Entire DB, entirehq/git-sync = Git Sync, go-git/go-git = Go Git. Use ### category subheadings inside each repository section, and for Entire CLI separate stable versus nightly when useful.
@@ -1032,6 +1060,7 @@ jobs:
           RECIPE_EOF
 
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
+          sed -i "s|CURRENT_DATE_PLACEHOLDER|${CURRENT_DATE}|g" /tmp/recipe.yaml
           goose run --recipe /tmp/recipe.yaml
 
       - name: Save dispatch draft
@@ -1058,14 +1087,15 @@ jobs:
           name: dispatch-draft
           path: /tmp
 
-      - name: Post dispatch draft to Slack
+      - name: Upload dispatch draft markdown to Slack
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
         run: |
           MD_FILE="/tmp/dispatch-draft-output.md"
-          MAX_CHARS=3800
-          export MD_FILE MAX_CHARS
+          SLACK_FILE_TITLE="Dispatch Draft"
+          SLACK_INITIAL_COMMENT="Dispatch draft attached as a Markdown file."
+          export MD_FILE SLACK_FILE_TITLE SLACK_INITIAL_COMMENT
 
           if [ ! -f "$MD_FILE" ]; then
             echo "::error::Dispatch draft not found"
@@ -1076,50 +1106,19 @@ jobs:
           import json
           import os
           import pathlib
-          import time
           import urllib.request
 
           token = os.environ["SLACK_BOT_TOKEN"]
           channel = os.environ["SLACK_CHANNEL_ID"]
           path = pathlib.Path(os.environ["MD_FILE"])
-          max_chars = int(os.environ["MAX_CHARS"])
-          text = path.read_text()
+          title = os.environ["SLACK_FILE_TITLE"]
+          initial_comment = os.environ["SLACK_INITIAL_COMMENT"]
+          data = path.read_bytes()
 
-          chunks = []
-          remaining = text
-          while remaining:
-              if len(remaining) <= max_chars:
-                  chunks.append(remaining)
-                  break
-              split_at = remaining.rfind("\n\n", 0, max_chars)
-              if split_at == -1:
-                  split_at = remaining.rfind("\n", 0, max_chars)
-              if split_at == -1:
-                  split_at = max_chars
-              chunk = remaining[:split_at].rstrip()
-              if not chunk:
-                  chunk = remaining[:max_chars]
-                  split_at = len(chunk)
-              chunks.append(chunk)
-              remaining = remaining[split_at:].lstrip()
-
-          for idx, chunk in enumerate(chunks, start=1):
-              if len(chunks) > 1:
-                  header = f"*Dispatch Draft ({idx}/{len(chunks)})*\n\n"
-                  body = header + chunk
-              else:
-                  body = chunk
-
-              payload = json.dumps({
-                  "channel": channel,
-                  "text": body,
-                  "unfurl_links": False,
-                  "unfurl_media": False,
-              }).encode()
-
+          def slack_api(method, payload):
               req = urllib.request.Request(
-                  "https://slack.com/api/chat.postMessage",
-                  data=payload,
+                  f"https://slack.com/api/{method}",
+                  data=json.dumps(payload).encode(),
                   headers={
                       "Authorization": f"Bearer {token}",
                       "Content-Type": "application/json; charset=utf-8",
@@ -1129,6 +1128,28 @@ jobs:
               with urllib.request.urlopen(req) as resp:
                   response = json.loads(resp.read().decode())
               if not response.get("ok"):
-                  raise SystemExit(f"Slack API error: {response.get('error')}")
-              time.sleep(1.1)
+                  raise SystemExit(f"Slack API error from {method}: {response.get('error')}")
+              return response
+
+          upload = slack_api("files.getUploadURLExternal", {
+              "filename": path.name,
+              "length": len(data),
+              "snippet_type": "markdown",
+          })
+
+          req = urllib.request.Request(
+              upload["upload_url"],
+              data=data,
+              headers={"Content-Type": "application/octet-stream"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req) as resp:
+              if resp.status < 200 or resp.status >= 300:
+                  raise SystemExit(f"Slack file upload failed with HTTP {resp.status}")
+
+          slack_api("files.completeUploadExternal", {
+              "channel_id": channel,
+              "initial_comment": initial_comment,
+              "files": [{"id": upload["file_id"], "title": title}],
+          })
           PY
