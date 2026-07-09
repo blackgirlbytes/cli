@@ -165,21 +165,10 @@ jobs:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
-      - name: Checkout CLI repo
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4
-
       - name: Install dependencies
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
-          mkdir -p "$HOME/.local/bin"
-          go build -o "$HOME/.local/bin/entire" ./cmd/entire/
-          which entire
-          entire version
 
       - name: Clone target repository
         env:
@@ -189,59 +178,6 @@ jobs:
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" /tmp/repo
           cd /tmp/repo
           git fetch --tags
-
-      - name: Run entire dispatch
-        env:
-          ENTIRE_AUTH_TOKEN: ${{ secrets.ENTIRE_AUTH_TOKEN }}
-          REPO: ${{ matrix.repo }}
-          SINCE: ${{ needs.prepare.outputs.since }}
-        run: |
-          if [ -z "${ENTIRE_AUTH_TOKEN}" ]; then
-            echo "::error::Missing ENTIRE_AUTH_TOKEN secret for entire dispatch."
-            exit 1
-          fi
-
-          TOKEN_LENGTH=$(printf '%s' "${ENTIRE_AUTH_TOKEN}" | wc -c | tr -d ' ')
-          TOKEN_SHA256_PREFIX=$(printf '%s' "${ENTIRE_AUTH_TOKEN}" | sha256sum | awk '{print substr($1, 1, 12)}')
-          if [[ "${ENTIRE_AUTH_TOKEN}" == ent_* ]]; then
-            TOKEN_PREFIX_OK=true
-          else
-            TOKEN_PREFIX_OK=false
-          fi
-          echo "::notice::ENTIRE_AUTH_TOKEN length=${TOKEN_LENGTH} starts_with_ent=${TOKEN_PREFIX_OK} sha256_prefix=${TOKEN_SHA256_PREFIX}"
-          if [ "${TOKEN_PREFIX_OK}" != "true" ]; then
-            echo "::error::ENTIRE_AUTH_TOKEN must be a raw Entire API token starting with ent_."
-            exit 1
-          fi
-
-          echo "ENTIRE_API_BASE_URL=${ENTIRE_API_BASE_URL:-<default>}"
-          entire auth status | tee /tmp/entire-auth-status.txt
-          if grep -q "Not logged in" /tmp/entire-auth-status.txt; then
-            echo "::error::ENTIRE_AUTH_TOKEN was present but not selected by the CLI."
-            exit 1
-          fi
-          if grep -q "no longer valid" /tmp/entire-auth-status.txt; then
-            echo "::error::ENTIRE_AUTH_TOKEN was found but rejected by Entire."
-            exit 1
-          fi
-          entire auth list --json > /tmp/entire-auth-list.json
-
-          cd /tmp/repo
-          for attempt in 1 2 3; do
-            if entire dispatch --repos "$REPO" --since "$SINCE" --until now --voice neutral > /tmp/entire-dispatch.md 2> /tmp/entire-dispatch.err; then
-              break
-            fi
-
-            if grep -q "429\\|503\\|Rate limit exceeded\\|Dispatch generation unavailable" /tmp/entire-dispatch.err && [ "$attempt" -lt 3 ]; then
-              echo "::warning::entire dispatch failed with a retryable service response for ${REPO}; waiting 70 seconds before retry ${attempt}/2."
-              sleep 70
-              continue
-            fi
-
-            cat /tmp/entire-dispatch.err >&2
-            exit 1
-          done
-          cat /tmp/entire-dispatch.md
 
       - name: Collect GitHub release and PR data
         env:
@@ -341,11 +277,7 @@ jobs:
             echo "- Through: ${CURRENT_DATE}"
             echo "- Feature flag review required: ${FEATURE_FLAGS}"
             echo
-            echo "## Entire Dispatch Output"
-            echo
-            cat /tmp/entire-dispatch.md
-            echo
-            echo "## GitHub Data Files"
+            echo "## Collected GitHub Data Files"
             echo
             echo "- releases.json"
             echo "- release-prs.json"
