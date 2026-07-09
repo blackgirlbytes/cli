@@ -316,7 +316,7 @@ jobs:
 
     steps:
       - name: Install dependencies
-        run: apt-get update && apt-get install -y jq
+        run: apt-get update && apt-get install -y jq python3
 
       - name: Download repo collections
         uses: actions/download-artifact@v4
@@ -344,6 +344,68 @@ jobs:
         run: |
           mkdir -p "$HOME/.local/share/goose/sessions" "$HOME/.config/goose"
 
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          source_path = Path("/tmp/dispatch-source.md")
+          lines = ["# Dispatch source brief", ""]
+
+          for collection in sorted(Path("/tmp/collections").iterdir()):
+              if not collection.is_dir():
+                  continue
+
+              summary = collection / "summary.md"
+              if summary.exists():
+                  lines.extend([summary.read_text().strip(), ""])
+
+              release_prs = json.loads((collection / "release-prs.json").read_text())
+              lines.append("## Releases")
+              if release_prs:
+                  for release in release_prs:
+                      lines.append(
+                          f"- {release['tagName']} ({release.get('publishedAt', 'unknown date')}): "
+                          + ", ".join(f"#{number}" for number in release.get("pullRequests", []))
+                      )
+              else:
+                  lines.append("- None in this window")
+              lines.append("")
+
+              merged_prs = json.loads((collection / "merged-prs.json").read_text())
+              lines.append("## Merged pull requests")
+              for pr in merged_prs[:50]:
+                  author = pr.get("author") or {}
+                  lines.append(
+                      f"- #{pr['number']} | {pr['title']} | {pr['url']} | "
+                      f"merged {pr.get('mergedAt', 'unknown')} | by {author.get('login', 'unknown')} | "
+                      f"labels: {', '.join(label['name'] for label in pr.get('labels', [])) or 'none'}"
+                  )
+              if not merged_prs:
+                  lines.append("- None in this window")
+              lines.append("")
+
+              flags_path = collection / "feature-flags.json"
+              if flags_path.exists():
+                  flags = json.loads(flags_path.read_text())
+                  lines.append("## Repository feature flags")
+                  lines.append(json.dumps(flags, separators=(",", ":")))
+                  lines.append("")
+
+          posthog_path = Path("/tmp/posthog_flags.json")
+          if posthog_path.exists():
+              lines.extend(["## Current PostHog feature flags", posthog_path.read_text().strip(), ""])
+
+          source_path.write_text("\n".join(lines))
+          PY
+
+          {
+            for example in /tmp/dispatch-examples/*; do
+              echo "# Style reference: $(basename "$example")"
+              head -60 "$example"
+              echo
+            done
+          } > /tmp/dispatch-style.md
+
           cat > /tmp/recipe.yaml <<'RECIPE_EOF'
           version: "1.0.0"
           title: "Release Summary Dispatch V2"
@@ -353,14 +415,24 @@ jobs:
             - type: builtin
               name: developer
 
+          response:
+            json_schema:
+              type: object
+              properties:
+                markdown:
+                  type: string
+                  description: "Complete dispatch post in Markdown"
+              required:
+                - markdown
+
           instructions: |
-            Draft a complete Entire Dispatch blog post using only the files already collected in /tmp/collections and /tmp/dispatch-examples.
-            Do not run GitHub, git, curl, or repository investigation commands. The goal is synthesis, categorization, and writing.
+            Draft a complete Entire Dispatch blog post from the prepared source brief.
+            Read /tmp/dispatch-source.md once for factual content and /tmp/dispatch-style.md once for voice and frontmatter style. Do not inspect /tmp/collections, /tmp/dispatch-examples, GitHub, git, curl, or any other source.
+            After those two reads, write the dispatch immediately. Do not narrate your analysis, enumerate your plan, or run further investigation commands.
 
             Inputs:
-            - /tmp/collections contains one folder per repository with summary.md, releases.json, release-prs.json, merged-prs.json, open-prs.json, and sometimes feature-flags.json.
-            - /tmp/posthog_flags.json contains current PostHog feature flag state when available.
-            - /tmp/dispatch-examples contains the three latest published dispatch blog posts for Marvin's voice and frontmatter style.
+            - /tmp/dispatch-source.md contains the release and pull-request data, plus feature-flag state.
+            - /tmp/dispatch-style.md contains excerpts of the latest published dispatch posts for voice and frontmatter style.
             - The window runs from SINCE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
 
             Repositories and section headings:
@@ -389,22 +461,29 @@ jobs:
             - Keep feature-flagged work out of the public/released prose unless explicitly labeled as feature flagged.
             - Preserve release/nightly distinction for Entire CLI and Git-Sync.
             - If a repo has no useful material, omit its section instead of announcing absence.
-            - Write the final markdown to /tmp/dispatch-draft.md.
+            - Return the complete final post as JSON with a single "markdown" field. The field must contain only the dispatch Markdown, not commentary about the task.
 
           prompt: |
-            Read /tmp/collections and use /tmp/dispatch-examples only as a style reference, then draft the dispatch.
-            Organize it by repository section and categorize the work as released, nightly, merged, or feature flagged where relevant.
-            Keep PR numbers attached to the items.
+            Read the prepared source brief and style reference, then return the complete dispatch now.
+            Keep PR numbers and links attached to the relevant items.
           RECIPE_EOF
 
           sed -i "s|SINCE_PLACEHOLDER|${SINCE}|g" /tmp/recipe.yaml
           sed -i "s|CURRENT_DATE_PLACEHOLDER|${CURRENT_DATE}|g" /tmp/recipe.yaml
-          goose run --recipe /tmp/recipe.yaml
+          goose run --recipe /tmp/recipe.yaml 2>&1 | tee /tmp/goose_output.log
 
-          if [ ! -s /tmp/dispatch-draft.md ]; then
-            echo "::error::Goose did not write /tmp/dispatch-draft.md"
+          GOOSE_RESULT=$(awk 'NF { line = $0 } END { print line }' /tmp/goose_output.log)
+          printf '%s\n' "$GOOSE_RESULT" > /tmp/goose_response.json
+
+          if ! jq -e '.markdown | type == "string" and length > 0' /tmp/goose_response.json > /dev/null; then
+            echo "::error::Goose did not return a valid markdown payload"
+            echo "::group::Goose raw output"
+            cat /tmp/goose_output.log || true
+            echo "::endgroup::"
             exit 1
           fi
+
+          jq -r '.markdown' /tmp/goose_response.json > /tmp/dispatch-draft.md
 
       - name: Upload dispatch draft
         uses: actions/upload-artifact@v4
