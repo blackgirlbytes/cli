@@ -872,6 +872,16 @@ jobs:
             - type: builtin
               name: developer
 
+          response:
+            json_schema:
+              type: object
+              properties:
+                markdown:
+                  type: string
+                  description: "The complete dispatch draft in markdown"
+              required:
+                - markdown
+
           instructions: |
             Generate a draft dispatch blog post for the Entire project.
 
@@ -1054,7 +1064,7 @@ jobs:
             - Instead of "Modal agent connect token support", write "Hosted agents can now connect more securely"
             - Instead of "Improved transcript parsing for Codex sessions", write "Session logs and code snippets now load more accurately"
 
-            Write the complete dispatch draft to /tmp/dispatch_draft.md
+            Return the final result as JSON with a single "markdown" field containing the complete dispatch draft in markdown.
 
           prompt: |
             Generate a dispatch draft covering changes from DATE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
@@ -1064,11 +1074,28 @@ jobs:
             Structure the body by repository sections first using this exact mapping: entireio/cli = Entire CLI, entirehq/entire.io = Entire Web, entirehq/entiredb = Entire DB, entirehq/git-sync = Git Sync, go-git/go-git = Go Git. Use ### category subheadings inside each repository section, and for Entire CLI separate stable versus nightly when useful.
             Preserve strong coverage of the eligible items and avoid compressing several distinct shipped changes into one vague bullet.
             Preserve the source PR markdown links in the final draft bullets.
+            Return JSON with a single "markdown" field whose value is the complete dispatch draft in markdown.
           RECIPE_EOF
 
           sed -i "s|DATE_PLACEHOLDER|${LAST_DISPATCH_DATE}|g" /tmp/recipe.yaml
           sed -i "s|CURRENT_DATE_PLACEHOLDER|${CURRENT_DATE}|g" /tmp/recipe.yaml
-          goose run --recipe /tmp/recipe.yaml
+          goose run --recipe /tmp/recipe.yaml 2>&1 | tee /tmp/goose_output.log
+
+          GOOSE_RESULT=$(awk 'NF { line = $0 } END { print line }' /tmp/goose_output.log)
+          printf '%s\n' "$GOOSE_RESULT" > /tmp/goose_response.json
+
+          if ! jq -e '.markdown | type == "string" and length > 0' /tmp/goose_response.json > /dev/null; then
+            echo "::error::Goose did not return a valid draft markdown payload"
+            echo "::group::Goose raw output"
+            cat /tmp/goose_output.log || true
+            echo "::endgroup::"
+            echo "::group::Goose response"
+            cat /tmp/goose_response.json || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          jq -r '.markdown' /tmp/goose_response.json > /tmp/dispatch_draft.md
 
       - name: Save dispatch draft
         run: |
