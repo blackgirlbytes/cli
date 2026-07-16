@@ -1,0 +1,446 @@
+## Context
+
+- Current git status: On branch alisha/factoryai-agent
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/lifecycle.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/transcript.go
+	modified:   cmd/entire/cli/agent/factoryaidroid/transcript_test.go
+	modified:   cmd/entire/cli/e2e_test/resume_relocated_repo_test.go
+	modified:   cmd/entire/cli/strategy/manual_commit_condensation.go
+	modified:   cmd/entire/cli/strategy/manual_commit_condensation_test.go
+	modified:   cmd/entire/cli/summarize/summarize.go
+- Current git diff (staged and unstaged changes): diff --git a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+index 9c15e73a..cfcb26a4 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
++++ b/cmd/entire/cli/agent/factoryaidroid/factoryaidroid.go
+@@ -142,7 +142,7 @@ func (f *FactoryAIDroidAgent) ReadSession(input *agent.HookInput) (*agent.AgentS
+ 		return nil, fmt.Errorf("failed to read transcript: %w", err)
+ 	}
+ 
+-	lines, err := ParseDroidTranscriptFromBytes(data)
++	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to parse transcript: %w", err)
+ 	}
+diff --git a/cmd/entire/cli/agent/factoryaidroid/lifecycle.go b/cmd/entire/cli/agent/factoryaidroid/lifecycle.go
+index eacd7eea..9f8def34 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/lifecycle.go
++++ b/cmd/entire/cli/agent/factoryaidroid/lifecycle.go
+@@ -97,7 +97,7 @@ func (f *FactoryAIDroidAgent) ExtractSummary(sessionRef string) (string, error)
+ 	if err != nil {
+ 		return "", fmt.Errorf("failed to read transcript: %w", err)
+ 	}
+-	lines, err := ParseDroidTranscriptFromBytes(data)
++	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+ 	if err != nil {
+ 		return "", fmt.Errorf("failed to parse transcript: %w", err)
+ 	}
+diff --git a/cmd/entire/cli/agent/factoryaidroid/transcript.go b/cmd/entire/cli/agent/factoryaidroid/transcript.go
+index 4fc02a52..a3d52b59 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/transcript.go
++++ b/cmd/entire/cli/agent/factoryaidroid/transcript.go
+@@ -47,8 +47,11 @@ func ParseDroidTranscript(path string, startLine int) ([]transcript.Line, int, e
+ }
+ 
+ // ParseDroidTranscriptFromBytes parses Droid JSONL content from a byte slice.
+-func ParseDroidTranscriptFromBytes(content []byte) ([]transcript.Line, error) {
+-	lines, _, err := parseDroidTranscriptFromReader(bytes.NewReader(content), 0)
++// startLine skips the first N raw JSONL lines before parsing (0 = parse all).
++// This mirrors ParseDroidTranscript's startLine parameter, applying the offset
++// at the raw line level before filtering out non-message entries.
++func ParseDroidTranscriptFromBytes(content []byte, startLine int) ([]transcript.Line, error) {
++	lines, _, err := parseDroidTranscriptFromReader(bytes.NewReader(content), startLine)
+ 	return lines, err
+ }
+ 
+@@ -111,20 +114,6 @@ func parseDroidLine(lineBytes []byte) (transcript.Line, bool) {
+ 	}, true
+ }
+ 
+-// SerializeTranscript converts transcript lines back to JSONL bytes.
+-func SerializeTranscript(lines []TranscriptLine) ([]byte, error) {
+-	var buf bytes.Buffer
+-	for _, line := range lines {
+-		data, err := json.Marshal(line)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to marshal line: %w", err)
+-		}
+-		buf.Write(data)
+-		buf.WriteByte('\n')
+-	}
+-	return buf.Bytes(), nil
+-}
+-
+ // ExtractModifiedFiles extracts files modified by tool calls from transcript.
+ func ExtractModifiedFiles(lines []TranscriptLine) []string {
+ 	fileSet := make(map[string]bool)
+diff --git a/cmd/entire/cli/agent/factoryaidroid/transcript_test.go b/cmd/entire/cli/agent/factoryaidroid/transcript_test.go
+index 29bd18e9..8ce3abc3 100644
+--- a/cmd/entire/cli/agent/factoryaidroid/transcript_test.go
++++ b/cmd/entire/cli/agent/factoryaidroid/transcript_test.go
+@@ -9,30 +9,6 @@ import (
+ 	"github.com/entireio/cli/cmd/entire/cli/transcript"
+ )
+ 
+-func TestSerializeTranscript(t *testing.T) {
+-	t.Parallel()
+-
+-	lines := []TranscriptLine{
+-		{Type: "user", UUID: "u1"},
+-		{Type: "assistant", UUID: "a1"},
+-	}
+-
+-	data, err := SerializeTranscript(lines)
+-	if err != nil {
+-		t.Fatalf("SerializeTranscript() error = %v", err)
+-	}
+-
+-	// Parse back to verify round-trip
+-	parsed, err := transcript.ParseFromBytes(data)
+-	if err != nil {
+-		t.Fatalf("ParseFromBytes(serialized) error = %v", err)
+-	}
+-
+-	if len(parsed) != 2 {
+-		t.Errorf("Round-trip got %d lines, want 2", len(parsed))
+-	}
+-}
+-
+ func TestParseDroidTranscript_NormalizesEnvelope(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -43,7 +19,7 @@ func TestParseDroidTranscript_NormalizesEnvelope(t *testing.T) {
+ 			`{"type":"message","id":"m2","message":{"role":"assistant","content":[{"type":"text","text":"hi there"}]}}` + "\n",
+ 	)
+ 
+-	lines, err := ParseDroidTranscriptFromBytes(data)
++	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+ 	if err != nil {
+ 		t.Fatalf("ParseDroidTranscriptFromBytes() error = %v", err)
+ 	}
+@@ -108,6 +84,67 @@ func TestParseDroidTranscript_StartLineOffset(t *testing.T) {
+ 	}
+ }
+ 
++func TestParseDroidTranscriptFromBytes_StartLineSkipsNonMessageEntries(t *testing.T) {
++	t.Parallel()
++
++	// Transcript: session_start(0), message(1), session_event(2), message(3), message(4)
++	// Raw line indices:  0            1            2                3            4
++	data := []byte(
++		`{"type":"session_start","id":"s1"}` + "\n" +
++			`{"type":"message","id":"m1","message":{"role":"user","content":"hello"}}` + "\n" +
++			`{"type":"session_event","data":"some event"}` + "\n" +
++			`{"type":"message","id":"m2","message":{"role":"assistant","content":"hi"}}` + "\n" +
++			`{"type":"message","id":"m3","message":{"role":"user","content":"bye"}}` + "\n",
++	)
++
++	// With startLine=0, all 3 messages should be returned
++	allLines, err := ParseDroidTranscriptFromBytes(data, 0)
++	if err != nil {
++		t.Fatalf("ParseDroidTranscriptFromBytes(0) error = %v", err)
++	}
++	if len(allLines) != 3 {
++		t.Fatalf("startLine=0: got %d lines, want 3", len(allLines))
++	}
++
++	// With startLine=2, skip raw lines 0-1 (session_start + m1).
++	// Lines 2 (session_event) is skipped by filter, lines 3-4 (m2, m3) are messages.
++	fromLine2, err := ParseDroidTranscriptFromBytes(data, 2)
++	if err != nil {
++		t.Fatalf("ParseDroidTranscriptFromBytes(2) error = %v", err)
++	}
++	if len(fromLine2) != 2 {
++		t.Fatalf("startLine=2: got %d lines, want 2", len(fromLine2))
++	}
++	if fromLine2[0].UUID != "m2" {
++		t.Errorf("startLine=2: lines[0].UUID = %q, want \"m2\"", fromLine2[0].UUID)
++	}
++	if fromLine2[1].UUID != "m3" {
++		t.Errorf("startLine=2: lines[1].UUID = %q, want \"m3\"", fromLine2[1].UUID)
++	}
++
++	// With startLine=3, skip raw lines 0-2 (session_start + m1 + session_event).
++	// Lines 3-4 (m2, m3) are messages.
++	fromLine3, err := ParseDroidTranscriptFromBytes(data, 3)
++	if err != nil {
++		t.Fatalf("ParseDroidTranscriptFromBytes(3) error = %v", err)
++	}
++	if len(fromLine3) != 2 {
++		t.Fatalf("startLine=3: got %d lines, want 2", len(fromLine3))
++	}
++	if fromLine3[0].UUID != "m2" {
++		t.Errorf("startLine=3: lines[0].UUID = %q, want \"m2\"", fromLine3[0].UUID)
++	}
++
++	// With startLine beyond end, should return no lines
++	beyondEnd, err := ParseDroidTranscriptFromBytes(data, 100)
++	if err != nil {
++		t.Fatalf("ParseDroidTranscriptFromBytes(100) error = %v", err)
++	}
++	if len(beyondEnd) != 0 {
++		t.Fatalf("startLine=100: got %d lines, want 0", len(beyondEnd))
++	}
++}
++
+ func TestParseDroidTranscript_RealDroidFormat(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -120,7 +157,7 @@ func TestParseDroidTranscript_RealDroidFormat(t *testing.T) {
+ 			`{"type":"message","id":"msg-4","message":{"role":"assistant","content":[{"type":"text","text":"Done!"}]}}` + "\n",
+ 	)
+ 
+-	lines, err := ParseDroidTranscriptFromBytes(data)
++	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+ 	if err != nil {
+ 		t.Fatalf("ParseDroidTranscriptFromBytes() error = %v", err)
+ 	}
+@@ -149,7 +186,7 @@ func TestExtractModifiedFiles(t *testing.T) {
+ {"type":"message","id":"a4","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"foo.go"}}]}}
+ `)
+ 
+-	lines, err := ParseDroidTranscriptFromBytes(data)
++	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+ 	if err != nil {
+ 		t.Fatalf("ParseDroidTranscriptFromBytes() error = %v", err)
+ 	}
+@@ -183,7 +220,7 @@ func TestExtractModifiedFiles_NotebookEdit(t *testing.T) {
+ 	data := []byte(`{"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"tool_use","name":"NotebookEdit","input":{"notebook_path":"/repo/analysis.ipynb"}}]}}
+ `)
+ 
+-	lines, err := ParseDroidTranscriptFromBytes(data)
++	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+ 	if err != nil {
+ 		t.Fatalf("ParseDroidTranscriptFromBytes() error = %v", err)
+ 	}
+@@ -204,7 +241,7 @@ func TestExtractModifiedFiles_CreateAndMultiEdit(t *testing.T) {
+ {"type":"message","id":"a2","message":{"role":"assistant","content":[{"type":"tool_use","name":"MultiEdit","input":{"file_path":"existing_file.go"}}]}}
+ `)
+ 
+-	lines, err := ParseDroidTranscriptFromBytes(data)
++	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+ 	if err != nil {
+ 		t.Fatalf("ParseDroidTranscriptFromBytes() error = %v", err)
+ 	}
+@@ -1100,7 +1137,7 @@ func TestParseDroidTranscript_MalformedLines(t *testing.T) {
+ 			`{"type":"session_event","data":"ignored"}` + "\n",
+ 	)
+ 
+-	lines, err := ParseDroidTranscriptFromBytes(data)
++	lines, err := ParseDroidTranscriptFromBytes(data, 0)
+ 	if err != nil {
+ 		t.Fatalf("ParseDroidTranscriptFromBytes() error = %v", err)
+ 	}
+diff --git a/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go b/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go
+index b6978fb7..791e2fa9 100644
+--- a/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go
++++ b/cmd/entire/cli/e2e_test/resume_relocated_repo_test.go
+@@ -11,10 +11,10 @@ import (
+ 	"testing"
+ 
+ 	"github.com/entireio/cli/cmd/entire/cli/agent"
+-	_ "github.com/entireio/cli/cmd/entire/cli/agent/claudecode" // Register claude-code agent
++	_ "github.com/entireio/cli/cmd/entire/cli/agent/claudecode"     // Register claude-code agent
+ 	_ "github.com/entireio/cli/cmd/entire/cli/agent/factoryaidroid" // Register factoryai-droid agent
+-	_ "github.com/entireio/cli/cmd/entire/cli/agent/geminicli"  // Register gemini agent
+-	_ "github.com/entireio/cli/cmd/entire/cli/agent/opencode"   // Register opencode agent
++	_ "github.com/entireio/cli/cmd/entire/cli/agent/geminicli"      // Register gemini agent
++	_ "github.com/entireio/cli/cmd/entire/cli/agent/opencode"       // Register opencode agent
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ )
+diff --git a/cmd/entire/cli/strategy/manual_commit_condensation.go b/cmd/entire/cli/strategy/manual_commit_condensation.go
+index 8cc0db6e..e5533d4a 100644
+--- a/cmd/entire/cli/strategy/manual_commit_condensation.go
++++ b/cmd/entire/cli/strategy/manual_commit_condensation.go
+@@ -550,7 +550,7 @@ func extractUserPrompts(agentType agent.AgentType, content string) []string {
+ 
+ 	// Droid has its own envelope format — use its parser to normalize first
+ 	if agentType == agent.AgentTypeFactoryAIDroid {
+-		lines, err := factoryaidroid.ParseDroidTranscriptFromBytes([]byte(content))
++		lines, err := factoryaidroid.ParseDroidTranscriptFromBytes([]byte(content), 0)
+ 		if err != nil {
+ 			return nil
+ 		}
+@@ -616,15 +616,14 @@ func calculateTokenUsage(agentType agent.AgentType, data []byte, startOffset int
+ 		return &agent.TokenUsage{}
+ 	}
+ 
+-	// Droid has its own envelope format — use its parser to normalize first
++	// Droid has its own envelope format — use its parser to normalize first.
++	// startOffset is a raw JSONL line count, so pass it to the parser which
++	// applies the offset before filtering non-message entries.
+ 	if agentType == agent.AgentTypeFactoryAIDroid {
+-		lines, err := factoryaidroid.ParseDroidTranscriptFromBytes(data)
++		lines, err := factoryaidroid.ParseDroidTranscriptFromBytes(data, startOffset)
+ 		if err != nil || len(lines) == 0 {
+ 			return &agent.TokenUsage{}
+ 		}
+-		if startOffset > 0 && startOffset < len(lines) {
+-			lines = lines[startOffset:]
+-		}
+ 		return factoryaidroid.CalculateTokenUsage(lines)
+ 	}
+ 	// OpenCode uses JSONL with token info on assistant messages (different schema from Claude Code)
+diff --git a/cmd/entire/cli/strategy/manual_commit_condensation_test.go b/cmd/entire/cli/strategy/manual_commit_condensation_test.go
+index ad150973..4f7a9d75 100644
+--- a/cmd/entire/cli/strategy/manual_commit_condensation_test.go
++++ b/cmd/entire/cli/strategy/manual_commit_condensation_test.go
+@@ -1,9 +1,12 @@
+ package strategy
+ 
+ import (
++	"encoding/json"
+ 	"strings"
+ 	"testing"
+ 	"unicode/utf8"
++
++	"github.com/entireio/cli/cmd/entire/cli/agent"
+ )
+ 
+ func TestGenerateContextFromPrompts_CJKTruncation(t *testing.T) {
+@@ -85,3 +88,112 @@ func TestGenerateContextFromPrompts_ShortCJKNotTruncated(t *testing.T) {
+ 		t.Error("short CJK prompt should not be truncated")
+ 	}
+ }
++
++// droidMessage builds a Droid JSONL "message" line with the given id, role, and optional usage.
++func droidMessage(t *testing.T, id, role string, usage map[string]int) string {
++	t.Helper()
++	inner := map[string]interface{}{
++		"role":    role,
++		"content": []interface{}{},
++	}
++	if usage != nil {
++		inner["id"] = id
++		inner["usage"] = usage
++	}
++	msg, err := json.Marshal(inner)
++	if err != nil {
++		t.Fatalf("failed to marshal inner message: %v", err)
++	}
++	line := map[string]interface{}{
++		"type":    "message",
++		"id":      id,
++		"message": json.RawMessage(msg),
++	}
++	b, err := json.Marshal(line)
++	if err != nil {
++		t.Fatalf("failed to marshal droid line: %v", err)
++	}
++	return string(b)
++}
++
++func TestCalculateTokenUsage_DroidStartOffsetSkipsNonMessageLines(t *testing.T) {
++	t.Parallel()
++
++	// Build a Droid transcript with non-message entries interspersed:
++	// Line 0: session_start (non-message)
++	// Line 1: user message (no tokens)
++	// Line 2: assistant message with 10 input, 20 output tokens
++	// Line 3: session_event (non-message)
++	// Line 4: assistant message with 5 input, 30 output tokens
++	transcript := "" +
++		`{"type":"session_start","id":"s1"}` + "\n" +
++		droidMessage(t, "m1", "user", nil) + "\n" +
++		droidMessage(t, "m2", "assistant", map[string]int{
++			"input_tokens": 10, "output_tokens": 20,
++		}) + "\n" +
++		`{"type":"session_event","data":"heartbeat"}` + "\n" +
++		droidMessage(t, "m3", "assistant", map[string]int{
++			"input_tokens": 5, "output_tokens": 30,
++		}) + "\n"
++
++	data := []byte(transcript)
++
++	// With startOffset=0: should count all messages (m2 + m3)
++	usageAll := calculateTokenUsage(agent.AgentTypeFactoryAIDroid, data, 0)
++	if usageAll.InputTokens != 15 {
++		t.Errorf("startOffset=0: InputTokens = %d, want 15", usageAll.InputTokens)
++	}
++	if usageAll.OutputTokens != 50 {
++		t.Errorf("startOffset=0: OutputTokens = %d, want 50", usageAll.OutputTokens)
++	}
++	if usageAll.APICallCount != 2 {
++		t.Errorf("startOffset=0: APICallCount = %d, want 2", usageAll.APICallCount)
++	}
++
++	// With startOffset=3: skip lines 0-2 (session_start, m1, m2).
++	// Only line 3 (session_event, filtered) and line 4 (m3) remain.
++	// Should count only m3's tokens.
++	usageFrom3 := calculateTokenUsage(agent.AgentTypeFactoryAIDroid, data, 3)
++	if usageFrom3.InputTokens != 5 {
++		t.Errorf("startOffset=3: InputTokens = %d, want 5", usageFrom3.InputTokens)
++	}
++	if usageFrom3.OutputTokens != 30 {
++		t.Errorf("startOffset=3: OutputTokens = %d, want 30", usageFrom3.OutputTokens)
++	}
++	if usageFrom3.APICallCount != 1 {
++		t.Errorf("startOffset=3: APICallCount = %d, want 1", usageFrom3.APICallCount)
++	}
++
++	// Regression: using the OLD buggy code would have parsed all messages (ignoring
++	// non-message entries), producing [m1, m2, m3], then sliced at index 3 which
++	// is out of bounds — returning all tokens instead of just m3's.
++	// With startOffset=1: skip only line 0 (session_start).
++	// Lines 1 (m1), 2 (m2), 3 (session_event, filtered), 4 (m3) remain.
++	usageFrom1 := calculateTokenUsage(agent.AgentTypeFactoryAIDroid, data, 1)
++	if usageFrom1.InputTokens != 15 {
++		t.Errorf("startOffset=1: InputTokens = %d, want 15", usageFrom1.InputTokens)
++	}
++	if usageFrom1.APICallCount != 2 {
++		t.Errorf("startOffset=1: APICallCount = %d, want 2", usageFrom1.APICallCount)
++	}
++}
++
++// Verify that startOffset beyond transcript length returns empty usage.
++func TestCalculateTokenUsage_DroidStartOffsetBeyondEnd(t *testing.T) {
++	t.Parallel()
++
++	data := []byte(
++		`{"type":"session_start","id":"s1"}` + "\n" +
++			droidMessage(t, "m1", "assistant", map[string]int{
++				"input_tokens": 10, "output_tokens": 20,
++			}) + "\n",
++	)
++
++	usage := calculateTokenUsage(agent.AgentTypeFactoryAIDroid, data, 100)
++	if usage.InputTokens != 0 {
++		t.Errorf("InputTokens = %d, want 0", usage.InputTokens)
++	}
++	if usage.APICallCount != 0 {
++		t.Errorf("APICallCount = %d, want 0", usage.APICallCount)
++	}
++}
+diff --git a/cmd/entire/cli/summarize/summarize.go b/cmd/entire/cli/summarize/summarize.go
+index 16ad3317..0c00ee9c 100644
+--- a/cmd/entire/cli/summarize/summarize.go
++++ b/cmd/entire/cli/summarize/summarize.go
+@@ -218,7 +218,7 @@ func buildCondensedTranscriptFromOpenCode(content []byte) ([]Entry, error) {
+ 
+ // buildCondensedTranscriptFromDroid parses Droid transcript and extracts a condensed view.
+ func buildCondensedTranscriptFromDroid(content []byte) ([]Entry, error) {
+-	droidLines, err := factoryaidroid.ParseDroidTranscriptFromBytes(content)
++	droidLines, err := factoryaidroid.ParseDroidTranscriptFromBytes(content, 0)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to parse Droid transcript: %w", err)
+ 	}
+- Current branch: alisha/factoryai-agent
+- Recent commits: ffb79f97 Add droid to condense session switch
+632f98d1 Merge branch 'main' into alisha/factoryai-agent
+8c608ebe Merge pull request #468 from entireio/dependabot/github_actions/goreleaser/goreleaser-action-7
+d16345d3 Merge pull request #410 from entireio/soph/agent-integration-instructions
+80695ef9 Merge pull request #484 from entireio/soph/changelog-0-4-7
+2e8f1300 Merge pull request #478 from entireio/docs/opencode-agent-documentation
+2dfbc359 ln -s CLAUDE.md AGENTS.md
+6538cf2d Merge pull request #481 from entireio/soph/opencode-acknowledgment
+9c6efe19 CHANGELOG.md for 0.4.7
+a6bb4c11 Merge pull request #482 from entireio/soph/unnecessary-wait-fix
+
+## Your task
+
+Based on the above changes, create a single git commit.
+
+You have the capability to call multiple tools in a single response. Stage and create the commit using a single message. Do not use any other tools or do anything else. Do not send any other text or messages besides these tool calls.

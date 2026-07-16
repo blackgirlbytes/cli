@@ -1,0 +1,79 @@
+Implement the following plan:
+
+# Plan: Fix Kiro IDE Hook `then.type` — `"command"` → `"runCommand"`
+
+## Context
+
+The Kiro IDE hooks installed by `entire enable` silently fail because `then.type` is set to `"command"`, but the Kiro IDE expects `"runCommand"`. The IDE ignores hooks with unrecognized action types without logging any error — which is why there are no logs in `.entire/`.
+
+**Root cause (from comparing working vs broken hook):**
+```
+Broken (ours):   "then": { "type": "command",    "command": "entire hooks kiro ..." }
+Working (manual): "then": { "type": "runCommand", "command": "ls -a" }
+```
+
+## Changes
+
+### 1. `cmd/entire/cli/agent/kiro/hooks.go` — Fix the action type constant
+
+In `installIDEHooks()`, change `Type: "command"` → `Type: "runCommand"`:
+
+```go
+// Before:
+Then: kiroIDEHookThen{
+    Type:    "command",          // ← WRONG
+    Command: cmdPrefix + def.CLIVerb,
+},
+
+// After:
+Then: kiroIDEHookThen{
+    Type:    "runCommand",       // ← CORRECT
+    Command: cmdPrefix + def.CLIVerb,
+},
+```
+
+### 2. `cmd/entire/cli/agent/kiro/hooks_test.go` — Update test assertion
+
+In `TestInstallHooks_IDEHooksValidJSON`, update the assertion:
+```go
+// Before:
+if hook.Then.Type != "command" {
+
+// After:
+if hook.Then.Type != "runCommand" {
+```
+
+### 3. `cmd/entire/cli/agent/kiro/AGENT.md` — Fix documented format
+
+Update the example JSON in the "IDE Hook Configuration" section:
+```json
+"then": {
+    "type": "runCommand",
+    "command": "entire hooks kiro user-prompt-submit"
+}
+```
+
+## Files Modified
+
+- `cmd/entire/cli/agent/kiro/hooks.go` (1 line)
+- `cmd/entire/cli/agent/kiro/hooks_test.go` (1 line)
+- `cmd/entire/cli/agent/kiro/AGENT.md` (1 line in example)
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+After deploying: run `entire enable --force` in the test repo to regenerate the hook files, then verify the IDE hooks fire by chatting in the Kiro IDE.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/f99ad6f8-76a8-4008-9fe1-81f1ba469547.jsonl
+
+---
+
+great its working but its asks permission before running each hook command how to let it auto accept. should happen by defualt when user does entire enable
+
+---
+
+[Request interrupted by user for tool use]

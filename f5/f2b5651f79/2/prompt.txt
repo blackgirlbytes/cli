@@ -1,0 +1,156 @@
+Implement the following plan:
+
+# Audit: Agent Integration Skills (Post One-Pager Refactor)
+
+## Context
+
+The one-pager refactor was just implemented. This audit reviews the changes for correctness and identifies further improvements — bugs, inconsistencies, and structural issues across all four skill files.
+
+## Audit of Implemented Changes
+
+### Correct
+
+- **researcher.md**: Clean rewrite. Phase 1 reads only `agent-guide.md`, explicit "Do NOT read" callout. One-pager template is well-structured with all sections the other phases need.
+- **test-writer.md**: Prerequisites, Step 4, and summary line updated to reference `AGENT.md`. Fallback instruction ("search external docs, update AGENT.md") is good.
+- **implementer.md**: Steps 2, 3, 10 reference one-pager. Standing instruction before Step 4 is well-placed. All "research report" references replaced.
+- **SKILL.md**: Phase descriptions accurately describe the one-pager handoff.
+
+### Issues Found
+
+7 concrete issues, roughly ordered by severity:
+
+---
+
+## Issues to Fix
+
+### 1. `implementer.md` Step 3 references nonexistent `config.go`
+
+**File:** `implementer.md:47`
+**Problem:** Says "Add the agent to the config map in `cmd/entire/cli/agent/config.go`" — this file doesn't exist. Agent wiring uses blank imports in `cmd/entire/cli/hooks_cmd.go`.
+**Fix:** Replace with: "Ensure the blank import `_ "github.com/entireio/cli/cmd/entire/cli/agent/$AGENT_SLUG"` exists in `cmd/entire/cli/hooks_cmd.go`"
+
+### 2. `researcher.md` Phase 4 asks for info the researcher can't produce
+
+**File:** `researcher.md:67`
+**Problem:** Phase 4 says "Field coverage: which `Event` struct fields can be populated per event" — but the researcher was told NOT to read `event.go` where `Event` struct fields are defined. The researcher can't assess field coverage without knowing the struct.
+**Fix:** Remove the "Field coverage" bullet from Phase 4. The implementer handles field mapping when reading `event.go`.
+
+### 3. One-pager template missing "Static Checks" section
+
+**File:** `researcher.md:81-122`
+**Problem:** Phase 2 runs 7 static checks (binary, help, version, hook keywords, session keywords, config dir, docs). These results aren't captured in the one-pager template. The verdict (COMPATIBLE/PARTIAL/INCOMPATIBLE) depends on these checks, but there's no place to record the detailed results.
+**Fix:** Add a `## Static Checks` section to the template between `## Verdict` and `## Binary`:
+```markdown
+## Static Checks
+| Check | Result | Notes |
+|-------|--------|-------|
+| Binary present | PASS/FAIL | path |
+| Help available | PASS/FAIL | |
+| ... | ... | ... |
+```
+
+### 4. `implementer.md` Step 13 partially redundant with Step 3
+
+**File:** `implementer.md:227-231`
+**Problem:** Step 13 says "Register hook commands: Search `cmd/entire/cli/` for where hook subcommands are registered and add the new agent" — but Step 3 already says to wire up blank imports in `hooks_cmd.go`. Step 13 also says "Verify registration: The `init()` function..." which Step 3 also covers.
+**Fix:** Simplify Step 13 to just verification: "Verify registration by running `mise run test:ci`. The `init()` in `${AGENT_SLUG}.go` and blank import in `hooks_cmd.go` (from Step 3) should be sufficient."
+
+### 5. `test-writer.md` Step 1 reads 8 files — no priority guidance
+
+**File:** `test-writer.md:12-23`
+**Problem:** Step 1 lists 8 infrastructure files to read. This is a lot of context to load. The most critical files for writing a new agent runner are `agent.go` (interface) and one existing agent (e.g., `claude.go`), not all 8.
+**Fix:** Add a note: "**Most critical:** Focus on items 3 (`agent.go` — the interface you must implement) and read one existing agent implementation (e.g., `e2e/agents/claude.go`) as a reference. Skim the rest for context."
+
+### 6. One-pager template doesn't list valid EventType values
+
+**File:** `researcher.md:95-99`
+**Problem:** The hook mapping table has an "Entire EventType" column, but the researcher needs to know the valid values. They learned them from `agent-guide.md` in Phase 1, but by Phase 5 they need to recall them. A reference list would prevent incorrect mappings.
+**Fix:** Add a comment after the table: "Valid Entire EventTypes: `SessionStart`, `TurnStart`, `TurnEnd`, `Compaction`, `SessionEnd`, `SubagentStart`, `SubagentEnd`"
+
+### 7. `SKILL.md` doesn't mention AGENT.md lifecycle
+
+**File:** `SKILL.md:36-62`
+**Problem:** The one-pager is created by Phase 1 and consumed by Phases 2 and 3, but SKILL.md doesn't explicitly state that Phases 2/3 may update it. The implementer.md has the standing instruction, but the orchestration doc should also note this.
+**Fix:** Add a brief note after Phase 3: "**Note:** `AGENT.md` is a living document — Phases 2 and 3 update it when they discover new information during testing."
+
+---
+
+## Files to Modify
+
+1. **`.claude/skills/agent-integration/researcher.md`** — Issues #2, #3, #6
+2. **`.claude/skills/agent-integration/test-writer.md`** — Issue #5
+3. **`.claude/skills/agent-integration/implementer.md`** — Issues #1, #4
+4. **`.claude/skills/agent-integration/SKILL.md`** — Issue #7
+
+## Verification
+
+After applying fixes:
+1. Grep for `config.go` — should not appear in any skill file
+2. Grep for `Field coverage` — should not appear in researcher.md
+3. Read researcher.md one-pager template — should have Static Checks section and EventType reference
+4. Read implementer.md Step 13 — should be verification-only, not re-registration
+5. Read test-writer.md Step 1 — should have priority note
+6. Read SKILL.md — should mention AGENT.md lifecycle after Phase 3
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/46c073e8-9109-4faf-bd0b-fe9c0209ac96.jsonl
+
+---
+
+verify these findings
+
+• Findings (highest severity first)
+
+  1. High: implementer instructions are out of sync with the current Agent/TranscriptAnalyzer interfaces.
+     Evidence: implementer.md:38 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/implementer.md#L38), implementer.md:91 (/Users/
+     alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/implementer.md#L91), implementer.md:105 (/Users/alisha/Projects/wt/kiro-
+     oneshot/.claude/skills/agent-integration/implementer.md#L105) vs current interface definitions agent.go:59 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/
+     entire/cli/agent/agent.go#L59), agent.go:69 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/entire/cli/agent/agent.go#L69), agent.go:72 (/Users/alisha/
+     Projects/wt/kiro-oneshot/cmd/entire/cli/agent/agent.go#L72), agent.go:75 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/entire/cli/agent/agent.go#L75),
+     agent.go:131 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/entire/cli/agent/agent.go#L131), agent.go:137 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/
+     entire/cli/agent/agent.go#L137), agent.go:146 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/entire/cli/agent/agent.go#L146), agent.go:149 (/Users/alisha/
+     Projects/wt/kiro-oneshot/cmd/entire/cli/agent/agent.go#L149).
+     Impact: Following the skill literally can generate non-compiling stubs and incorrect unit-test targets.
+  2. High: event naming mixes hook names with normalized EventType names, which can miswire lifecycle logic.
+     Evidence: implementer.md:65 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/implementer.md#L65), implementer.md:79 (/Users/
+     alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/implementer.md#L79), implementer.md:88 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/
+     skills/agent-integration/implementer.md#L88) vs canonical event types event.go:19 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/entire/cli/agent/
+     event.go#L19), event.go:22 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/entire/cli/agent/event.go#L22), event.go:29 (/Users/alisha/Projects/wt/kiro-
+     oneshot/cmd/entire/cli/agent/event.go#L29), event.go:33 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/entire/cli/agent/event.go#L33).
+     Impact: easy to assert on Stop/UserPromptSubmit instead of TurnEnd/TurnStart.
+  3. Medium: identifier model is ambiguous (AGENT_SLUG is used for too many distinct identities).
+     Evidence: parameter model in SKILL.md:21 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/SKILL.md#L21) and usage in
+     implementer.md:38 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/implementer.md#L38), implementer.md:70 (/Users/alisha/
+     Projects/wt/kiro-oneshot/.claude/skills/agent-integration/implementer.md#L70), test-writer.md:69 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/
+     agent-integration/test-writer.md#L69), test-writer.md:79 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/test-writer.md#L79),
+     test-writer.md:227 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/test-writer.md#L227).
+     Real-world mismatch example: e2e agent name vs Entire agent key differ in Gemini (e2e/agents/gemini.go:25 (/Users/alisha/Projects/wt/kiro-oneshot/e2e/
+     agents/gemini.go#L25), e2e/agents/gemini.go:27 (/Users/alisha/Projects/wt/kiro-oneshot/e2e/agents/gemini.go#L27)).
+     Impact: wrong E2E_AGENT filters, wrong entire enable value, or invalid Go package naming for hyphenated agent names.
+  4. Medium: workflow is effectively hook-only, but scope is presented as generic “agent integration.”
+     Evidence: mandatory hooks.go and hook-focused Tier 1 in implementer.md:41 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/
+     implementer.md#L41), implementer.md:58 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/implementer.md#L58), while architecture
+     supports file-watcher agents agent.go:111 (/Users/alisha/Projects/wt/kiro-oneshot/cmd/entire/cli/agent/agent.go#L111).
+     Impact: users may pick this skill for agents that should follow a FileWatcher path and get forced into the wrong implementation strategy.
+  5. Low: internal guidance conflict on checklist usage in research phase.
+     Evidence: orchestrator points to checklist SKILL.md:31 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/SKILL.md#L31), but
+     researcher says not to read it researcher.md:11 (/Users/alisha/Projects/wt/kiro-oneshot/.claude/skills/agent-integration/researcher.md#L11).
+     Impact: mild confusion on expected inputs for compatibility verdict.
+
+  Suggested improvements
+
+  1. Replace Step 3 method list in implementer.md with an explicit, source-of-truth checklist copied from current agent.Agent and optional interfaces
+     (including exact method names/signatures).
+  2. Add a glossary section: “native hook names” vs “normalized EventType values,” with a concrete mapping example (stop -> TurnEnd, user-prompt-submit ->
+     TurnStart).
+  3. Split parameters into:
+      - AGENT_PACKAGE (Go dir/package slug)
+      - ENTIRE_AGENT_NAME (registry key / entire enable value)
+      - E2E_AGENT_NAME (runner filter / gate key)
+      - keep AGENT_BIN and LIVE_COMMAND.
+  4. Add an early branch in SKILL.md: HookSupport path vs FileWatcher path; or explicitly scope this skill to hook-capable agents only.
+  5. Align research instructions: either allow checklist read for terminology consistency, or remove checklist from the research phase references.
+
+---
+
+[Request interrupted by user for tool use]

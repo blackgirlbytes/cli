@@ -1,0 +1,92 @@
+in common.go we have a GetWorkTreePath function that i think shoudl be able to be acached like RepoRoot and GetCommonDir functions. Look at thos and update the GetworktreePath function:
+
+
+
+// GetWorktreePath returns the absolute path to the current worktree root.
+// This is the working directory path, not the git directory.
+func GetWorktreePath() (string, error) {
+    ctx := context.Background()
+    cmd := exec.CommandContext(ctx, "git", "rev-parse", "--show-toplevel")
+    output, err := cmd.Output()
+    if err != nil {
+        return "", fmt.Errorf("failed to get worktree path: %w", err)
+    }
+    return strings.TrimSpace(string(output)), nil
+}
+
+---
+
+commit this
+
+---
+
+push it to github
+
+---
+
+the OpenRepository() that we call to open a git repository using go-git - does that read the entire git repo into memory first or is it mmapp() or how does it work under the ccovers? i see that we're often calling it several times in the call stack and im trying to evaluate if it's worth just passing that down or if it's so lightweight that it won't make a big performance impact?
+
+---
+
+we need to imoplement some fixes based on feeddback:
+
+If os.Getwd() fails, cwd is set to "" and the function can still populate/consult the cache under an empty key. That can return a stale worktree path in later calls where Getwd continues to fail (e.g., deleted/unreadable CWD), potentially pointing operations at the wrong repo. Consider skipping both cache read and cache write when Getwd fails (treat it as an uncachable call), or return an explicit error instead of using "" as a cache key.
+
+This introduces a second, independent cache for git rev-parse --show-toplevel even though paths.RepoRoot() already implements the same cwd-keyed caching and is already used in this package (e.g., OpenRepository). To avoid duplicated logic/state (and avoid running the same git command once per cache), consider implementing GetWorktreePath in terms of paths.RepoRoot (wrapping the error message if needed) and removing this separate cache.
+
+The new caching behavior in GetWorktreePath isn't covered by tests. Since this file already has unit tests, it would be useful to add one that proves the second call is served from cache (e.g., call once in a temp repo, then modify PATH so invoking git would fail, and verify the second call still succeeds; use ClearWorktreePathCache for isolation).
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+yeah we can do that - but ensure that getworktree path and reporoot funcitonally do the same thing, but in the simple use-case and in the use-case where it's being used inside of a worktree with other potential worktrees
+
+---
+
+commit and push this
+
+---
+
+we udpated this in this PR but I want you to double check it:
+
+
+// GetWorktreePath returns the absolute path to the current worktree root.
+// This is the working directory path, not the git directory.
+// In a worktree, this returns the worktree's own root (not the main repo).
+// The result is cached per working directory via paths.RepoRoot().
+func GetWorktreePath() (string, error) {
+    root, err := paths.RepoRoot()
+    if err != nil {
+        return "", fmt.Errorf("failed to get worktree path: %w", err)
+    }
+    return root, nil
+}
+
+
+
+the comment says that this should return the absolute path to the current worktree root - it's the wortking directory not the git direcotyr. The RepoRoot returns the git root directory. These two things aren't alwys teh same. 
+
+Review the existing test and ensure that we can cover both situaitons. One where we get the git root directory and another where we get the wortktree directory.
+
+---
+
+Okay that sounds good. now that getworktree path is just a wrapper on RepoRoot, shouldn't we just call reporoot directly? Why do we have a layer of indirection?
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+before you make any changes, i need this clarified. repoRoot returns the git repository root. worktreeroot should return the git worktree root which is not the git repository root. is there a use case when you would need the git repository root while you're in a worktree? if so, then we need two seeparate functions to handle that situation. Unless git rev-pase --show-toplevel is able to handle both by recogniziing it's in a worktree. But even if it does that, then we still need to be able to return the git repositroy root and the worktree root while in a worktree?
+
+---
+
+we want clarity - so let's rename and update so that it's clear. we can keep getgitcommondir() as-is
+
+---
+
+[Request interrupted by user for tool use]

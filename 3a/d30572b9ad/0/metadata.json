@@ -1,0 +1,138 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "3ad30572b9ad",
+  "session_id": "a41f4669-6677-41da-a864-dbef451ac8ff",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-16T19:20:29.297374Z",
+  "branch": "feat/explain-stream-progress",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "cmd/entire/cli/agent/claudecode/generate.go",
+    "cmd/entire/cli/agent/claudecode/response.go",
+    "cmd/entire/cli/agent/claudecode/response_test.go",
+    "cmd/entire/cli/explain.go"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "dc5228dad15a",
+  "token_usage": {
+    "input_tokens": 571,
+    "cache_creation_tokens": 3511920,
+    "cache_read_tokens": 155398568,
+    "output_tokens": 299788,
+    "api_call_count": 418
+  },
+  "session_metrics": {
+    "turn_count": 36
+  },
+  "summary": {
+    "intent": "Investigate whether the 30s timeout for AI summary generation in PR 876 was appropriate, and replace the ambiguous timeout failure with actionable, specific error messages that explain why summary generation failed.",
+    "outcome": "Created two stacked PRs: PR 963 (typed Claude CLI error classification covering auth/rate-limit/config/cli-missing) and PR 964 (stream-driven progress display with event-based phase reporting, TTY-gated deadline, idle watchdog, and legacy CLI fallback), replacing the silent wait + generic timeout with rich real-time progress and specific error messages.",
+    "learnings": {
+      "repo": [
+        "Claude CLI returns is_error:true on exit 0 for operational errors (auth 401/403, rate-limit 429, invalid model 400/404) — gating typed-error extraction on non-zero exit misses every common failure case",
+        "Auto-summarize runs through strategy/manual_commit_condensation.go::generateSummary and calls GenerateFromTranscript directly, completely separate from the 30s timeout in explain.go — it has no timeout at all",
+        "statusStyles helper at cmd/entire/cli/status_style.go already provides isTerminalWriter, shouldUseColor, formatTokenCount, newStatusStyles for consistent CLI progress rendering",
+        "Tests that modify package-level vars (e.g. defaultTextGeneratorFactory) must not call t.Parallel() — existing tests in summarize package already had this pattern",
+        "The project uses nolint:wrapcheck on bare error returns where typed errors must survive errors.As across package boundaries",
+        "settings.Load() is called per-invocation with no caching — each call reads and parses JSON files from disk, making multiple calls per code path expensive",
+        "claude --output-format stream-json --include-partial-messages --verbose emits NDJSON with distinct phase events: system/status:requesting, stream_event/message_start (carries ttft_ms at outer envelope level), content_block_delta, and a final result event with the same is_error/api_error_status shape as json mode"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/agent/claudecode/response.go",
+          "line": 37,
+          "end_line": 37,
+          "finding": "ttft_ms is emitted by Claude CLI on the OUTER stream_event envelope (sibling to type/event), not inside the nested event object — placing it on StreamInnerEvent caused TTFT to always read as 0 in production"
+        },
+        {
+          "path": "cmd/entire/cli/agent/claudecode/generate.go",
+          "line": 86,
+          "end_line": 91,
+          "finding": "PhaseDone is intentionally emitted outside makeProgressDispatcher because it requires data from the final parsed envelope (OutputTokens, DurationMs) — this asymmetry must be documented or future streaming implementations will miss it"
+        },
+        {
+          "path": "cmd/entire/cli/explain.go",
+          "line": 562,
+          "end_line": 598,
+          "finding": "Idle watchdog cancels via context.WithCancel which produces context.Canceled, not DeadlineExceeded — the idleFired atomic.Bool must be checked BEFORE the Canceled sentinel or idle timeout is silently misreported as user cancellation"
+        },
+        {
+          "path": "cmd/entire/cli/explain.go",
+          "line": 533,
+          "end_line": 538,
+          "finding": "summaryDeadlineResolver and settingsTimeoutUnset each independently called settings.Load — up to 3 loads per generation; consolidated into a single resolveSummaryDeadlineInputs that returns deadlineMode enum"
+        },
+        {
+          "path": "cmd/entire/cli/explain.go",
+          "line": 2087,
+          "end_line": 2098,
+          "finding": "newSummaryProgressWriter(nil) panics on first fmt.Fprintln call — requires nil guard at generateCheckpointAISummary entry: if errW == nil { errW = io.Discard }"
+        },
+        {
+          "path": "cmd/entire/cli/summarize/summarize.go",
+          "line": 56,
+          "end_line": 57,
+          "finding": "GenerateFromTranscript was mutating the caller's *ClaudeGenerator to inject the progress callback — must clone the struct first to avoid side-effects persisting across reuse"
+        },
+        {
+          "path": "cmd/entire/cli/agent/claudecode/response.go",
+          "line": 68,
+          "end_line": 71,
+          "finding": "Malformed NDJSON lines are silently skipped; when the stream ends without a result event the error should include the malformed line count for diagnostics"
+        },
+        {
+          "path": "cmd/entire/cli/summarize/summarize_test.go",
+          "line": 697,
+          "end_line": 697,
+          "finding": "t.Parallel() on a test that mutates defaultTextGeneratorFactory is a data race — tests modifying process-global state cannot be parallelized per CLAUDE.md"
+        }
+      ],
+      "workflow": [
+        "Amend should not be used after push — the user caught an in-session amend and required a new commit instead; git reset --mixed HEAD~1 + re-commit was used to recover cleanly",
+        "When a PR branch has diverged from an advanced origin/main, rebase onto origin/main before creating the PR to avoid a dirty diff with stale history commits",
+        "Splitting a large PR by force-pushing a scoped branch onto the existing PR number avoids closing and reopening — the second scope becomes a new stacked PR on top",
+        "The subagent-driven-development pattern (implementer → spec-reviewer → code-quality-reviewer per task) catches bugs but adds overhead; review agents found the ttft_ms placement bug that implementer missed",
+        "Test consolidation (multiple single-case functions → table-driven) saves ~140 lines with identical coverage; test auditor skill identifies candidates systematically",
+        "Running mise run check before committing catches both lint and test failures in a single command per CLAUDE.md requirements"
+      ]
+    },
+    "friction": [
+      "Tests were silently hanging for 10+ minutes due to idle watchdog's `if ts > 0` guard — when no progress events ever fire, lastActivity stays 0 and the watchdog loops forever waiting for a first event before starting the idle clock",
+      "The legacy fallback (generateTextLegacy) required re-adding parseGenerateTextResponse which had been deleted in the streaming rewrite — caused a compile failure mid-fix",
+      "git amend was used on a pushed commit when a new commit was required — required git reset --mixed HEAD~1 and a clean recommit to recover",
+      "PR 963 initial push included 58 stale commits from an unrebased branch — required force-push after rebase onto current origin/main",
+      "PR 964 was initially a single massive commit (+1607/-210) that needed to be split; the split itself required careful cherry-pick and overlay work because the two scopes were interleaved in the original commit history",
+      "goconst lint flagged string literal 'result' appearing 3+ times after the legacy response parser was re-added, requiring a constant to be extracted in test file"
+    ],
+    "open_items": [
+      "Auto-summarize hang protection: strategy/manual_commit_condensation.go::generateSummary calls GenerateFromTranscript with no timeout at all — separate bug, separate PR",
+      "summary_timeout_seconds: 0 is treated as 'unset' (applies 5min watchdog default) not 'disable' — the semantics should be documented clearly; -1 for disable was considered but not implemented",
+      "humanizeBytes panics on inputs > ~1PB (suffix array index out of bounds) — practically unreachable given transcript sizes are memory-bounded, but not guarded",
+      "Progress callback is silently ignored for non-ClaudeGenerator Generator implementations in GenerateFromTranscript — acceptable now (only one production implementation) but misleading API contract",
+      "Per-summary token cost surfacing: DurationMs and OutputTokens are available from the final envelope and could be shown as a cost summary after generation",
+      "PR 963 and PR 964 are stacked — PR 964 base branch must be updated to main after PR 963 merges before PR 964 can be merged"
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-16T19:20:29.204407Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 120,
+    "human_modified": 7,
+    "human_removed": 0,
+    "total_committed": 120,
+    "total_lines_changed": 127,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 0,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0
+    }
+  ]
+}

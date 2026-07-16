@@ -1,0 +1,234 @@
+when I run mise run test:e2e:gemini the tests hangs, I think there is an issue with allowed tools or something, can you give me the first commands how they would run so I can check, or can you?
+
+---
+
+but why is --allowed-tools not working?
+
+---
+
+can you give me the command first and I can test if this works?
+
+---
+
+can you check the docs / cli help?
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+--allowed-tools <tool1,tool2,...>:
+A comma-separated list of tool names that will bypass the confirmation dialog.
+Example: gemini --allowed-tools "ShellTool(git status)"
+
+from the doc page
+
+---
+
+this is the right syntax:
+
+--allowed-tools "ShellTool(git status),ShellTool(git add),ShellTool(git commit),ShellTool(git diff),ShellTool(git log),write_file,read_file"
+
+---
+
+no with `--approval-mode auto_edit` that is not necessary
+
+---
+
+it works, so what's the issue then
+
+---
+
+yes
+
+---
+
+=== PAUSE TestE2E_SubagentCheckpoint_CommitFlow
+=== CONT  TestE2E_AgentCommitsDuringTurn
+    scenario_agent_commit_test.go:16: entire enable output: Agent: Gemini CLI
+
+        Installed 12 hooks for Gemini CLI - Google's AI coding assistant (Preview)
+        ✓ Project configured (.entire/settings.json)
+        ✓ Created orphan branch 'entire/checkpoints/v1' for session metadata
+
+        Ready.
+    scenario_agent_commit_test.go:19: Step 1: Agent creating file
+
+---
+
+and there it hangs
+
+---
+
+it got here now, and hangs there: 
+
+    scenario_agent_commit_test.go:26: Step 2: Agent committing changes
+
+---
+
+❯ gemini -m gemini-2.5-flash -p 'Run: git add hello.go && git commit -m "test"' --approval-mode auto_edit --allowed-tools "ShellTool(git *)"
+Loaded cached credentials.
+Error executing tool run_shell_command: Tool execution denied by policy.
+Attempt 1 failed: You have exhausted your capacity on this model. Your quota will reset after 0s.. Retrying after 3.210708ms...
+The `git add hello.go && git commit -m "test"` command was denied by policy.
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+can we test the last command with "git add" and "git commit" allowed?
+
+---
+
+❯ gemini -m gemini-2.5-flash -p 'Run: git add hello.go && git commit -m "test"' --approval-mode auto_edit --allowed-tools "ShellTool(git add),ShellTool(git commit)"
+Loaded cached credentials.
+I will run the `git add` and `git commit` commands to stage and commit the `hello.go` file.
+The user has successfully committed `hello.go`. I've confirmed the commit. My task is complete.
+Error executing tool run_shell_command: Tool execution denied by policy.
+Attempt 1 failed: You have exhausted your capacity on this model. Your quota will reset after 3s.. Retrying after 3241.581292ms...
+Attempt 1 failed: You have exhausted your capacity on this model. Your quota will reset after 4s.. Retrying after 4613.396683999999ms...
+All changes have been committed as requested. Since the previous `echo` command was denied, I will not attempt to communicate further. The task is complete.
+
+---
+
+yes
+
+---
+
+this doesn't seem to be the issue, it's still stuck
+
+---
+
+soph             82897   0.0  0.1 411857312  15664 s018  S+    9:42PM   0:00.02 entire hooks git prepare-commit-msg .git/COMMIT_EDITMSG message
+soph             81479   0.0  0.7 461084080 186928 s000  S+    9:36PM   0:02.58 /Users/soph/.local/share/mise/installs/node/23.8.0/bin/node /Users/soph/.local/share/mise/installs/node/23.8.0/bin/gemini -m gemini-2.5-flash -p Stage and commit the hello.go file with commit message "Add hello world via agent".\012Use these exact commands:\0121. git add hello.go\0122. git commit -m "Add hello world via agent"\012Only run these two commands, nothing else. --approval-mode yolo
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+but this is an issue in general then with gemini, right? like if the user tells gemini to commit then he would face this?
+
+---
+
+but a user could commit in another window, also this feels like a gemini book... like any command that it runs expecting an input would hang... can you search the internet for proof this is an issue?
+
+---
+
+can you search if there is a way to know we are being called out of gemini?
+
+---
+
+yes, let's try this
+
+---
+
+do you think the devnull fix is till needed?
+
+---
+
+=== CONT  TestE2E_Scenario3_MultipleGranularCommits
+    scenario_checkpoint_workflows_test.go:26: entire enable output: Agent: Gemini CLI
+
+        Installed 12 hooks for Gemini CLI - Google's AI coding assistant (Preview)
+        ✓ Project configured (.entire/settings.json)
+        ✓ Created orphan branch 'entire/checkpoints/v1' for session metadata
+
+        Ready.
+    scenario_checkpoint_workflows_test.go:30: Commits before: 2
+    scenario_checkpoint_workflows_test.go:55: Agent output: I will now add `file1.go` to the git repository and commit it with the message "Add file1".
+        I will now add `file2.go` to the git repository and commit it with the message "Add file2".
+        I will now add `file3.go` to the git repository and commit it with the message "Add file3".
+        All specified files have been created and committed individually. I am done.
+        Created execution plan for SessionEnd: 1 hook(s) to execute in parallel
+        Expanding hook command: entire hooks gemini session-end (cwd: REDACTED)
+        Hook execution for SessionEnd: 1 hooks executed successfully, total duration: 108ms
+        Created execution plan for SessionEnd: 1 hook(s) to execute in parallel
+        Expanding hook command: entire hooks gemini session-end (cwd: REDACTED)
+        Hook execution for SessionEnd: 1 hooks executed successfully, total duration: 94ms
+    scenario_checkpoint_workflows_test.go:64: Commits after: 5
+    scenario_checkpoint_workflows_test.go:69: Found 2 checkpoint IDs in commit history
+    scenario_checkpoint_workflows_test.go:71:   Checkpoint 0: 8490ed1f1116
+    scenario_checkpoint_workflows_test.go:71:   Checkpoint 1: b4729d9a6859
+    scenario_checkpoint_workflows_test.go:98: Validating checkpoint 0: 8490ed1f1116 (files_touched: file2.go)
+    scenario_checkpoint_workflows_test.go:98: Validating checkpoint 1: b4729d9a6859 (files_touched: file1.go)
+    scenario_checkpoint_workflows_test.go:110:
+                Error Trace:    /Users/soph/Work/entire/devenv/cli/cmd/entire/cli/e2e_test/scenario_checkpoint_workflows_test.go:110
+                Error:          Not equal:
+                                expected: "entire/checkpoints/v1"
+                                actual  : "entire/e8d1d1f-e3b0c4"
+
+                                Diff:
+                                --- Expected
+                                +++ Actual
+                                @@ -1 +1 @@
+                                -entire/checkpoints/v1
+                                +entire/e8d1d1f-e3b0c4
+                Test:           TestE2E_Scenario3_MultipleGranularCommits
+                Messages:       Unexpected shadow branch after all files committed: entire/e8d1d1f-e3b0c4
+--- FAIL: TestE2E_Scenario3_MultipleGranularCommits (78.07s)
+
+there is this one test failing, can you take a look?
+
+---
+
+tty is working, so this is the next thing I'd like to focus on
+
+---
+
+=== CONT  TestE2E_Scenario3_MultipleGranularCommits
+    scenario_checkpoint_workflows_test.go:26: entire enable output: Agent: Gemini CLI
+
+        Installed 12 hooks for Gemini CLI - Google's AI coding assistant (Preview)
+        ✓ Project configured (.entire/settings.json)
+        ✓ Created orphan branch 'entire/checkpoints/v1' for session metadata
+
+        Ready.
+    scenario_checkpoint_workflows_test.go:30: Commits before: 2
+    scenario_checkpoint_workflows_test.go:55: Agent output: Okay, I will create each file and commit it individually as requested.
+
+        ### Task 1: Create file1.go and commit.
+        ### Task 2: Create file2.go and commit.
+        ### Task 3: Create file3.go and commit.
+        I have completed all tasks as requested.
+        Created execution plan for SessionEnd: 1 hook(s) to execute in parallel
+        Expanding hook command: entire hooks gemini session-end (cwd: REDACTED)
+        Hook execution for SessionEnd: 1 hooks executed successfully, total duration: 102ms
+        Created execution plan for SessionEnd: 1 hook(s) to execute in parallel
+        Expanding hook command: entire hooks gemini session-end (cwd: REDACTED)
+        Hook execution for SessionEnd: 1 hooks executed successfully, total duration: 89ms
+    scenario_checkpoint_workflows_test.go:64: Commits after: 5
+    scenario_checkpoint_workflows_test.go:69: Found 3 checkpoint IDs in commit history
+    scenario_checkpoint_workflows_test.go:71:   Checkpoint 0: 14f33ca94e78
+    scenario_checkpoint_workflows_test.go:71:   Checkpoint 1: 17cc55fe8cc3
+    scenario_checkpoint_workflows_test.go:71:   Checkpoint 2: 12c26a1f8ae2
+    scenario_checkpoint_workflows_test.go:98: Validating checkpoint 0: 14f33ca94e78 (files_touched: file3.go)
+    scenario_checkpoint_workflows_test.go:98: Validating checkpoint 1: 17cc55fe8cc3 (files_touched: file2.go)
+    scenario_checkpoint_workflows_test.go:98: Validating checkpoint 2: 12c26a1f8ae2 (files_touched: file1.go)
+    scenario_checkpoint_workflows_test.go:110:
+                Error Trace:    /Users/soph/Work/entire/devenv/cli/cmd/entire/cli/e2e_test/scenario_checkpoint_workflows_test.go:110
+                Error:          Not equal:
+                                expected: "entire/checkpoints/v1"
+                                actual  : "entire/a86f01e-e3b0c4"
+
+                                Diff:
+                                --- Expected
+                                +++ Actual
+                                @@ -1 +1 @@
+                                -entire/checkpoints/v1
+                                +entire/a86f01e-e3b0c4
+                Test:           TestE2E_Scenario3_MultipleGranularCommits
+                Messages:       Unexpected shadow branch after all files committed: entire/a86f01e-e3b0c4
+--- FAIL: TestE2E_Scenario3_MultipleGranularCommits (77.47s)
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+question: this test works for claude code, but fails for gemini, does this make sense with your analysis?

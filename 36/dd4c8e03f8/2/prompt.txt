@@ -1,0 +1,125 @@
+Implement the following plan:
+
+# Fix: Forward AWS SIGV4 env vars through tmux for Kiro E2E tests
+
+## Context
+
+All Kiro E2E tests in CI fail with a login prompt timeout:
+```
+waiting for kiro startup: timed out waiting for "!>" after 30s
+--- pane content ---
+You are not logged in. Login now?
+```
+
+**Root cause:** Kiro authenticates via AWS SIGV4 env vars (`AMAZON_Q_SIGV4`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`). These are set in the Go test process but **don't propagate through tmux** — tmux sessions inherit the server's environment, not the client's. All other agents (Claude, Droid, Gemini) store credentials in files, so they aren't affected.
+
+**Existing pattern:** Claude Code's `StartSession` already solves this by wrapping the command with `env KEY=VALUE ...` (see `e2e/agents/claude.go:192-194`). Kiro needs to follow the same pattern.
+
+## Changes
+
+### File: `e2e/agents/kiro.go` (only file modified)
+
+1. **Add `kiroAuthEnvArgs()` helper** — collects non-empty AWS auth env vars as `KEY=VALUE` strings
+   ```go
+   func kiroAuthEnvArgs() []string {
+       var args []string
+       for _, key := range []string{"AMAZON_Q_SIGV4", "AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+           if v := os.Getenv(key); v != "" {
+               args = append(args, key+"="+v)
+           }
+       }
+       return args
+   }
+   ```
+
+2. **Update `RunPrompt()`** (line 141) — wrap kiro-cli command with `env`:
+   ```go
+   // Before:
+   s, err := NewTmuxSession(name, dir, []string{"ENTIRE_TEST_TTY"}, k.Binary(), args...)
+
+   // After:
+   cmdArgs := append([]string{"env"}, kiroAuthEnvArgs()...)
+   cmdArgs = append(cmdArgs, k.Binary())
+   cmdArgs = append(cmdArgs, args...)
+   s, err := NewTmuxSession(name, dir, []string{"ENTIRE_TEST_TTY"}, cmdArgs[0], cmdArgs[1:]...)
+   ```
+
+3. **Update `StartSession()`** (line 180) — same pattern:
+   ```go
+   // Before:
+   s, err := NewTmuxSession(name, dir, []string{"ENTIRE_TEST_TTY"}, k.Binary(), "chat", "-a", "--agent", "entire")
+
+   // After:
+   cmdArgs := append([]string{"env"}, kiroAuthEnvArgs()...)
+   cmdArgs = append(cmdArgs, k.Binary(), "chat", "-a", "--agent", "entire")
+   s, err := NewTmuxSession(name, dir, []string{"ENTIRE_TEST_TTY"}, cmdArgs[0], cmdArgs[1:]...)
+   ```
+
+### No other files changed
+
+- `tmux.go` — no changes needed; `shellQuote` already handles all args
+- `Bootstrap()` — already reads env vars directly, works fine
+- Tests — existing E2E tests will validate the fix; `kiroAuthEnvArgs()` is trivial (loop over `os.Getenv`)
+
+## Why this is safe locally
+
+On a dev machine where AWS vars aren't set, `kiroAuthEnvArgs()` returns nil. The command becomes `env kiro-cli chat ...`, which is equivalent to `kiro-cli chat ...` (POSIX standard behavior).
+
+## Verification
+
+1. `mise run fmt && mise run lint` — ensure code passes formatting and linting
+2. `mise run test:ci` — run unit + integration tests
+3. CI E2E tests with `--agent kiro` should now pass (Kiro receives the SIGV4 credentials)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/830ca3a0-928a-48b3-b00a-63e0c8a420fd.jsonl
+
+---
+
+commit and push
+
+---
+
+same issue
+
+Run mkdir -p "$E2E_ARTIFACT_DIR"
+artifacts: /home/runner/work/cli/cli/e2e-artifacts
+[e2e/tests]✖✖
+=== Failed
+=== FAIL: e2e/tests TestAttributionOnAgentCommit/kiro (15.19s)
+    attribution_test.go:54: start session: waiting for kiro startup prompt: timed out waiting for "!>" after 15s
+        --- pane content ---
+          You are not logged in. Login now?
+        ❯ Yes
+          No
+        --- end pane content ---
+
+=== FAIL: e2e/tests TestAttributionOnAgentCommit (15.19s)
+
+DONE 2 tests, 2 failures in 15.208s
+E2E Test Report
+═══════════════
+
+Total: 1  Passed: 0  Failed: 1  Skipped: 0
+
+✗ TestAttributionOnAgentCommit (15.2s)
+  ✗ kiro                 15.2s
+      attribution_test.go:54: start session: waiting for kiro startup prompt: timed out waiting for "!>" after 15s
+      --- pane content ---
+      You are not logged in. Login now?
+      ❯ Yes
+      No
+      --- end pane content ---
+ do I need to use --no-interactive? but that says hooks don't run. can you verify that hooks don't run
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+look at how its done in /Users/alisha/Projects/setup-kiro-action
+
+---
+
+[Request interrupted by user for tool use]

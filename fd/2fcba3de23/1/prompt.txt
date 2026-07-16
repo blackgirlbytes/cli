@@ -1,0 +1,119 @@
+Implement the following plan:
+
+# Plan: Realistic Commit Hook Performance Test
+
+## Context
+
+A user with ~95 sessions experienced 25.5s commit time vs 0.335s without Entire. Our current perf test only reaches ~1.8s for 100 sessions because it uses a shallow clone with minimal refs/objects. We need a test that measures the real overhead by comparing a control commit (no Entire) against a commit with Entire hooks active, using a realistic repo and hundreds of sessions.
+
+## File to Modify
+
+**`cmd/entire/cli/strategy/commit_hook_perf_test.go`** — complete rewrite, keeps `hookperf` build tag
+
+## Approach
+
+### Test Structure
+
+```
+TestCommitHookPerformance
+├── One-time setup:
+│   ├── Clone entireio/cli (--depth 1)
+│   └── Load session templates from current repo's .git/entire-sessions/
+│
+├── For each scenario (100, 200, 500 sessions):
+│   ├── Local clone from source
+│   ├── Seed 200 branches + git pack-refs --all (realistic packed refs)
+│   │
+│   ├── CONTROL (no Entire):
+│   │   ├── Stage a file change
+│   │   └── Time `git commit -m "..."` wall clock
+│   │
+│   ├── git reset HEAD~1 + re-stage (back to same starting state)
+│   │
+│   ├── TEST (Entire enabled):
+│   │   ├── Create .entire/settings.json (enabled, commit_linking=always)
+│   │   ├── Seed N session state files (from templates)
+│   │   ├── Create IDLE/ACTIVE sessions with shadow branches
+│   │   ├── Stage same file change
+│   │   ├── Time PrepareCommitMsg (Go call)
+│   │   ├── Inject trailer if needed, git commit -m <msg>
+│   │   └── Time PostCommit (Go call)
+│   │
+│   └── Record results
+│
+└── Print comparison table
+```
+
+### Session Seeding
+
+Read real `.git/entire-sessions/*.json` files from the **current repo** at test time as templates. For each template:
+- Adjust `base_commit` → test repo HEAD
+- Adjust `worktree_path` → test repo dir
+- Adjust `worktree_id` → `""`
+- Set `last_checkpoint_id` if ENDED (keeps it alive in `listAllSessionStates`)
+
+Duplicate templates round-robin to reach target count. Phase distribution: ~88% ENDED, ~11% IDLE (with shadow branch via `SaveStep`), ~1% ACTIVE (shadow branch + live transcript).
+
+### Ref Seeding
+
+Create 200 branches via go-git (`repo.Storer.SetReference`), then `git pack-refs --all`. This follows the pattern in `benchutil.SeedBranches` + `benchutil.PackRefs` (`cmd/entire/cli/benchutil/benchutil.go:555-576`).
+
+### Control vs Test
+
+**Control** (Entire disabled — no `.entire/` dir):
+- `git add <file>` + time `git commit -m "test commit"` via `exec.Command`
+
+**Test** (Entire enabled):
+- Set `ENTIRE_TEST_TTY=1` + create `.entire/settings.json`
+- Write `.git/COMMIT_EDITMSG`, time `PrepareCommitMsg()` direct call
+- Inject `Entire-Checkpoint` trailer if content-aware check skipped it
+- `git commit -m <msg>` via CLI
+- Time `PostCommit()` direct call
+- Overhead = PrepareCommitMsg + PostCommit
+
+### Reused Code
+
+| Helper | File | Purpose |
+|--------|------|---------|
+| `session.NewStateStoreWithDir()` | `session/state.go:247` | Write state files |
+| `id.Generate()` | `checkpoint/id/id.go:44` | Generate checkpoint IDs |
+| `paths.ClearWorktreeRootCache()` | `paths/paths.go` | Clear cache between runs |
+| `session.ClearGitCommonDirCache()` | `session/state.go:396` | Clear cache |
+| `ManualCommitStrategy.SaveStep()` | `manual_commit_hooks.go` | Create shadow branches |
+| `ManualCommitStrategy.PrepareCommitMsg()` | `manual_commit_hooks.go:295` | Timed hook |
+| `ManualCommitStrategy.PostCommit()` | `manual_commit_hooks.go:705` | Timed hook |
+| `trailers.CheckpointTrailerKey` | `trailers/trailers.go:41` | Trailer injection |
+| Pattern: `repo.Storer.SetReference()` | `benchutil/benchutil.go:555` | Seed branches |
+
+### Expected Output
+
+```
+Session templates: 10 loaded from .git/entire-sessions/
+
+========== COMMIT HOOK PERFORMANCE ==========
+Scenario     | Sessions | Control  | Prepare    | PostCommit | Total+Hooks  | Overhead
+---------------------------------------------------------------------------------------
+100sessions  |      100 |   280ms  |     950ms  |     870ms  |      2.100s  |   1.820s
+200sessions  |      200 |   285ms  |    1.800s  |    1.700s  |      3.785s  |   3.500s
+500sessions  |      500 |   290ms  |    4.500s  |    4.200s  |      8.990s  |   8.700s
+```
+
+## Verification
+
+```bash
+go test -v -run TestCommitHookPerformance -tags hookperf -timeout 10m ./cmd/entire/cli/strategy/
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/evisdrenova/.claude/projects/-Users-evisdrenova-code-entire-devenv-cli/20bfcd4a-f133-4981-8712-228da5357d19.jsonl
+
+---
+
+okay let's run it
+
+---
+
+what are the main scaling dimensions here that impact the latency and by how much?
+
+
+write up your findings in a .md file and commit to the branch

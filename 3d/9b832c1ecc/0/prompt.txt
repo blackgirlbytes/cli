@@ -1,0 +1,171 @@
+Map all locations that checkpoint metadata is fetched
+
+---
+
+Create a new package checkpoint/remote add a Fetch method to it. Let's create Golang functional options for it (i.e. fetch v1/v2). The method should be able to accommodate all the current uses of Fetch. Do not wire it in yet.
+
+---
+
+What's the difference between Destination/Advance and Promote?
+
+---
+
+Scrap this idea, let's start small. Let's create a new Remote (checkpoint/remote) which has its own options: WithToken, WithURL. A util.go may introduce a ResolveUrl (or perhaps something with a better name) which will evaluate current Git repository and the existance of a Checkpoint Remote being set and return the correct URL.
+
+Then lets create tests that actually go fetch the specific repository (in this case we can rely solely on file:// paths from test repos we create).
+The ResolveUrl should be thoroughly tested as well.
+
+---
+
+Change remote_test to be table driven tests
+
+---
+
+In util, let's create a table driven test approach, key behaviours to confirm:
+- When token is provided (ENTIRE_CHECKPOINT_TOKEN) and Checkpoint Remote is configured, an HTTPS URL should be returned (regardless if current repo is configured via SSH)
+- When token is not provided, Checkpoint Remote should follow current origin protocol - so that it can reuse auth.
+- When no Checkpoint Remote is provided, the origin URL is returned (regardless of the protocol used).
+
+In case of protocol agnostic cases, we should have test cases for both HTTPS and SSH.
+
+---
+
+Replace existing locations whereby URL is produced, to use the new remote.ResolveURL.
+
+---
+
+The existing code, distinguishes fetch and push and derives them separately. Expand the tests and logic in remote/util to align to that.
+
+---
+
+Let's rename it to PushURL and FetchURL. Review any existing code that is no longer needed based on these changes - e.g. small wrappers that didn't add much apart from callint the new helper funcs.
+
+---
+
+Token use must force HTTPS for both Fetch and Push
+
+---
+
+The PushURL should fallback to the origin remote.
+
+---
+
+1. `resolveCheckpointFetchTarget` no longer matches its contract (and breaks a test)
+
+  The comment on resolveCheckpointFetchTarget still says: when no checkpoint_remote, fall back to "origin". The old implementation only substituted a
+   URL when ResolveCheckpointRemoteURL reported a configured checkpoint remote.
+
+  The new code uses FetchURL unconditionally; with no checkpoint_remote, FetchURL returns the literal git remote get-url origin (e.g.
+  git@github.com:org/repo.git), not the name origin.
+
+
+The above is no longer needed - remote is the source of truth for remote URL
+
+---
+
+Review FetchURL and PushURL, it should only return an error when no URL can be found (e.g. no origins and no checkpoint remote set). Other errors (e.g. loading settings) should just be logged instead.
+
+---
+
+• Duplicated URL logic: checkpoint/remote/util.go and strategy/checkpoint_remote.go both implement overlapping remote URL parsing and derivation.
+     Drift between them is a real risk over time; consider sharing one implementation or a thin wrapper.
+
+Remove the duplicated logic from checkpoint_remote.go
+
+---
+
+The "fork push" test cases aren't clear. Rephrase them without using the word fork.
+
+---
+
+Review the CheckpointGitCommand logic as that seems to no longer take into account the new code
+
+---
+
+Remote.New should receive an URL, and then opts as the former is required. Any tests related to Remote should be in remote_test not in util_test.
+
+---
+
+Fix the test TestParseGitRemoteURL
+
+---
+
+Remove the checkpointremote alias - keeping it just remote is OK.
+
+---
+
+Before: ResolveCheckpointRemoteURL treated settings.Load failure as “not configured” (no error).
+
+  After: Configured and the explicit fetch helpers in git_operations.go return errors on settings load failure (stricter).
+
+---
+
+The FetchURL does not seem correct, quite a few error scenarios would completely ignore the fact that a token was provided. Add tests to ensure that is not the case, then make them pass.
+
+---
+
+What if the settings fail to load? Make those tests table driven for additional clarity
+
+---
+
+Any error in settings.Load within FetchURL would fallback to originURL, which if it was an SSH URL would not take into account the token provided.
+
+---
+
+Calls to FetchURL should check for err as it only errs when there is no URL (from origin nor settings)
+
+---
+
+commit staged changes
+
+---
+
+Add to the README information about how the ENTIRE_CHECKPOINT_TOKEN works
+
+---
+
+Add to the README information about how the ENTIRE_CHECKPOINT_TOKEN works
+
+---
+
+Add information on README.md on `ENTIRE_CHECKPOINT_TOKEN` and how to use it (and its effects).
+
+---
+
+Fix the linter issues below:
+  Running [/home/runner/golangci-lint-2.11.3-linux-amd64/golangci-lint run] in [/home/runner/work/cli/cli] ...
+  Error: cmd/entire/cli/checkpoint/remote/util.go:122:13: Error return value is not checked (errcheck)
+  	originURL, _ := GetRemoteURL(ctx, originRemote)
+  	           ^
+  Error: cmd/entire/cli/doctor.go:434:16: string `origin` has 7 occurrences, but such constant `migrateRemoteName` already exists (goconst)
+  	remoteName := "origin"
+  	              ^
+  Error: cmd/entire/cli/strategy/manual_commit.go:89:12: string `origin` has 5 occurrences, make it a constant (goconst)
+  			v2URL = "origin"
+  			        ^
+  Error: cmd/entire/cli/explain.go:223:1: Function name: runExplainCheckpoint, Cyclomatic Complexity: 40, Halstead Volume: 4614.15, Maintainability Index: 19 (maintidx)
+  func runExplainCheckpoint(ctx context.Context, w, errW io.Writer, checkpointIDPrefix string, noPager, verbose, full, rawTranscript, generate, force, searchAll bool) error {
+  ^
+  Error: cmd/entire/cli/checkpoint/remote/util_test.go:355:21: os/exec.Command must not be called. use os/exec.CommandContext (noctx)
+  	cmd := exec.Command("git", "rev-parse", "--git-dir")
+  	                   ^
+  Error: cmd/entire/cli/checkpoint/remote/util_test.go:364:21: os/exec.Command must not be called. use os/exec.CommandContext (noctx)
+  	cmd := exec.Command("git", args...)
+  	                   ^
+  Error: cmd/entire/cli/checkpoint/remote/util.go:26:6: exported: type name will be used as remote.RemoteInfo by other packages, and that stutters; consider calling this Info (revive)
+  type RemoteInfo struct {
+       ^
+  Error: cmd/entire/cli/checkpoint/remote/util.go:201:45: Configured - result 1 (error) is always nil (unparam)
+  func Configured(ctx context.Context) (bool, error) {
+                                              ^
+  Error: cmd/entire/cli/strategy/checkpoint_token.go:143:9: error returned from external package is unwrapped: sig: func github.com/entireio/cli/cmd/entire/cli/checkpoint/remote.GetRemoteURL(ctx context.Context, remoteName string) (string, error) (wrapcheck)
+  	return remote.GetRemoteURL(ctx, target)
+  	       ^
+
+Make sure to check again after these are fixed
+
+---
+
+The abstraction and handling of remotes does not seem correct. checkpoint/remote is solely for the handling of checkpoint remote. And things like trail_cmd calls ResolveRemoteRepo which eventually ends up calling checkpoint/remote. 
+
+A new abstraction/package should exist to provide the handling/interfacing with the primary repository, as opposed to the checkpoint repository.

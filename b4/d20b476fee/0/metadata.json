@@ -1,0 +1,122 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "b4d20b476fee",
+  "session_id": "af734be5-6421-4df4-a91c-5ad790462491",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-26T01:26:27.810136Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "cmd/entire/cli/insights/insights.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "986766868300",
+  "token_usage": {
+    "input_tokens": 4217,
+    "cache_creation_tokens": 305377,
+    "cache_read_tokens": 56609546,
+    "output_tokens": 96248,
+    "api_call_count": 302
+  },
+  "session_metrics": {
+    "turn_count": 17
+  },
+  "summary": {
+    "intent": "Improve the `entire insights` and `entire improve` CLI commands to be more useful: fix zero scores, add on-demand summary backfill, fix improve's pattern detection, and add tool/skill usage tracking to insights.",
+    "outcome": "All goals achieved: scores now have meaningful variance (6.7–47.3), backfill generates summaries on demand, improve uses keyword-theme matching instead of exact-match SQL, tool call tracking was added to insights, and all tests pass.",
+    "learnings": {
+      "repo": [
+        "Summarization runs as a post-commit hook via `summarize/claude.go` and stores structured JSON (intent, outcome, friction, learnings) in checkpoint metadata on `entire/checkpoints/v1` branch.",
+        "The insights SQLite cache is populated from checkpoint metadata; friction and learnings only exist if summarize ran, making backfill necessary for older sessions.",
+        "`QueryRecurringFriction` uses exact-text SQL matching — it never finds duplicates because friction strings are unique sentences. `AnalyzePatterns` uses keyword-theme grouping and is the correct approach for `entire improve`.",
+        "`nullableFloat` was used for score columns, making 0.0 indistinguishable from NULL (not computed) — replaced with direct float storage + `has_summary` boolean.",
+        "Token efficiency score was broken: formula assumed ~8k tokens/file but real sessions use 300k–6M tokens/file, causing the dimension to always score 0. Fixed by basing efficiency on tokens-per-turn with a log curve.",
+        "`gofmt` repeatedly strips trailing `//nolint:ireturn` comments from function signatures in `agent/capabilities.go` — these must be placed on the line above the return statement.",
+        "The `nolint` directive requires the specific linter name and an explanation text to satisfy `nolintlint` (e.g., `//nolint:ireturn // interface needed for capability registry`).",
+        "Condensed transcripts have `Entry.ToolName` and `Entry.ToolDetail` fields usable for extracting per-session tool call counts during cache refresh.",
+        "`llmcli.Runner` shells out to `claude --print` and the JSON response includes `total_cost_usd` and `usage` fields — these were previously discarded but now returned as `UsageInfo`."
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/insights/scorer.go",
+          "line": 1,
+          "end_line": 80,
+          "finding": "All four scoring dimensions were recalibrated: token efficiency now uses log(tokens)/turns, first-pass baseline is 90 with turn-based penalties, friction penalty is 15 per point, and focus uses a gaussian curve on files/turns ratio."
+        },
+        {
+          "path": "cmd/entire/cli/llmcli/llmcli.go",
+          "line": 1,
+          "end_line": 60,
+          "finding": "Execute now returns (string, *UsageInfo, error) where UsageInfo contains InputTokens, OutputTokens, and TotalCostUSD parsed from the claude CLI JSON response."
+        },
+        {
+          "path": "cmd/entire/cli/improve_cmd.go",
+          "line": 1,
+          "end_line": 300,
+          "finding": "runImprove now uses AnalyzePatterns (keyword themes) for both dry-run and full-run instead of QueryRecurringFriction (exact match). attachTranscriptExcerpts now uses AffectedSessions from the pattern directly."
+        },
+        {
+          "path": "cmd/entire/cli/insightsdb/cache.go",
+          "line": 1,
+          "end_line": 200,
+          "finding": "InsertSession now calls insertToolCalls to store per-session tool usage counts. UpdateSessionSummary added for backfill path. has_summary column tracks which sessions have been summarized."
+        },
+        {
+          "path": "cmd/entire/cli/insights_cmd.go",
+          "line": 1,
+          "end_line": 400,
+          "finding": "backfillSummaries function added: queries sessions without summaries, generates them via Claude, and updates the cache. metadataToSessionRow now calls extractToolCounts to count tool usage from condensed transcript entries."
+        },
+        {
+          "path": "cmd/entire/cli/insights/trends.go",
+          "line": 1,
+          "end_line": 150,
+          "finding": "ComputeAgentComparisons now aggregates tool call counts across sessions and computes TopTools and AvgToolCalls per agent comparison."
+        },
+        {
+          "path": "cmd/entire/cli/improve/analyzer.go",
+          "line": 1,
+          "end_line": 100,
+          "finding": "Theme keywords expanded with real-world patterns (api_error, ci_failure, merge_conflict, test_flake, lint, compile, auth, timeout, review, context). maxFrictionExamples = 10 cap added."
+        }
+      ],
+      "workflow": [
+        "When gofmt strips nolint comments from long lines, place the directive on the line above rather than inline on the function signature.",
+        "Exact-match SQL grouping is the wrong approach for natural language friction strings — keyword-theme classification is needed to surface recurring problems.",
+        "When adding a new DB column, always bump the schema version and handle the migration so existing caches don't break.",
+        "The `nullableFloat` pattern for scores creates an ambiguity between 'scored zero' and 'not scored' — use a separate boolean column instead.",
+        "Test scorer formulas against real data distributions before shipping — abstract unit tests can pass while the formula is broken against actual values."
+      ]
+    },
+    "friction": [
+      "`gofmt` repeatedly stripped `//nolint:ireturn` comments from `agent/capabilities.go`, requiring multiple re-add attempts across commits.",
+      "The simplify commit (`4c095d6e`) did not actually include the `capabilities.go` nolint fix, causing lint failures to resurface in the next session.",
+      "`replace_all` on a function name accidentally renamed the function definition itself in addition to call sites, requiring a manual fix.",
+      "Recent sessions had no summaries (summarization was just enabled), so initial `entire insights` and `entire improve` runs returned all zeros and no patterns — required implementing backfill before the feature could be tested.",
+      "`entire improve --dry-run` returned 0 patterns even with 21 friction points because `QueryRecurringFriction` used exact-text SQL matching on unique natural language strings.",
+      "Merge conflict in `manual_commit_condensation.go` between branch's session scoring block and main's `writeOpts` variable + v2 dual-write required manual resolution."
+    ],
+    "open_items": [
+      "`SessionRow.CacheTokens` field is declared but never populated.",
+      "Stringly-typed status/priority/direction values across packages would benefit from typed constants.",
+      "N+1 query pattern in `insightsdb/queries.go` (`populateDenormalized`) — 3 extra queries per session row.",
+      "`TotalTokens` lives in `termstyle` (presentation package) but is a data computation — ideally should live in `agent` or a utility package.",
+      "`statusStyles` wrapper in `status_style.go` adds indirection over `termstyle.Styles` — could be removed but requires refactoring `status.go`.",
+      "Trend computation compares arbitrary halves of sessions which isn't statistically meaningful for small N — needs minimum session count guard.",
+      "Tool call tracking was added to the DB and insights display, but `UpdateSessionSummary` (backfill path) does not re-extract tool counts for backfilled sessions — only new sessions get tool counts.",
+      "The `improve` friction theme keywords are manually maintained — consider deriving them from actual friction data or using embedding-based clustering."
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-26T01:25:33.441029Z",
+    "agent_lines": 5,
+    "agent_removed": 0,
+    "human_added": 41,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 46,
+    "total_lines_changed": 0,
+    "agent_percentage": 10.869565217391305
+  }
+}

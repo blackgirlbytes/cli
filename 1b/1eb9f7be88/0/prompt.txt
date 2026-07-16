@@ -1,0 +1,178 @@
+Implement the following plan:
+
+# Plan: Make Agent Integration Skill Resilient to Codebase Drift
+
+## Context
+
+The agent-integration skill (`.claude/skills/agent-integration/`) contains ~40 hardcoded file paths, enumerated names (event types, runner classes, test files), and inline code examples with method signatures. These already drifted once (PR #498 review caught 10 issues). The root cause is that the skill prompts duplicate information that lives in source code and docs, creating multiple places that must stay in sync.
+
+Additionally, `docs/architecture/agent-guide.md` — which the skill prompts reference as authoritative — is itself severely drifted: it lists deleted methods (`HookHandler`, `GetSupportedHooks`, `SupportsHooks`, `GetHookConfigPath`, `ParseHookInput`), says "19 methods" when there are 15, and uses the renamed `paths.RepoRoot()` instead of `paths.WorktreeRoot()`.
+
+**Approach: "Anchor + Discover"** — Keep stable file paths as entry points, but replace enumerated details with instructions for the AI agent to discover them from source code using its tools (Read, Glob, Grep).
+
+## Scope Decision
+
+The skill prompts and `agent-guide.md` are tightly coupled — the prompts delegate to the guide as the authoritative source. Fixing only the prompts while the guide remains wrong would leave the agent following incorrect instructions.
+
+**In scope:**
+- `.claude/skills/agent-integration/probe-prompt.md` — replace enumerations with discovery
+- `.claude/skills/agent-integration/e2e-test-prompt.md` — replace enumerations with discovery
+- `.claude/skills/agent-integration/implement-prompt.md` — replace code examples with "read the interface" + remove duplicate template code (the guide already has full templates)
+- `.claude/skills/agent-integration/README.md` — minor: make agent listing discoverable
+- `docs/architecture/agent-guide.md` — fix stale method table, remove deleted interfaces, update `paths.RepoRoot()` → `paths.WorktreeRoot()`, add caveat about verifying signatures
+
+**Out of scope:**
+- `SKILL.md` — no volatile references
+- `docs/architecture/agent-integration-checklist.md` — not inspected, may need separate pass
+
+## Changes
+
+### 1. `docs/architecture/agent-guide.md` — Fix drift (prerequisite for other changes)
+
+**Quick Reference table (lines 19-42):** The table lists methods that no longer exist on the Agent interface.
+- Remove `GetHookConfigPath()`, `SupportsHooks()`, `ParseHookInput()` — these are legacy/removed
+- Remove `HookNames()` and `ParseHookEvent()` — these are on `HookSupport`, not `Agent`
+- Add `IsPreview()` — exists on Agent but missing from table
+- Change "19 methods" to "15 methods" or remove count entirely
+- Regroup to match actual interface: Identity (6) + Transcript (3) + Legacy (6)
+
+**Optional Interfaces table (lines 45-53):**
+- Remove `HookHandler` row (interface doesn't exist) and `GetSupportedHooks` from `HookSupport` row
+- Move `HookNames` and `ParseHookEvent` into the `HookSupport` row (that's where they live)
+- Update `HookSupport` method list to: `HookNames`, `ParseHookEvent`, `InstallHooks`, `UninstallHooks`, `AreHooksInstalled`
+
+**Code templates (lines 123-223, 230-312, 374-406):**
+- Replace all `paths.RepoRoot()` with `paths.WorktreeRoot()`
+- Remove `HookHandler` compile-time assertion (line 365)
+- Remove `GetSupportedHooks` method from Step 8 code (line 405)
+- Add caveat at top of guide: "Method signatures shown here are illustrative. Always verify against the actual interface in `cmd/entire/cli/agent/agent.go`."
+
+**Test file references (lines 726-731):** Replace enumeration of specific test files with:
+```
+Run `Glob("cmd/entire/cli/agent/*/lifecycle_test.go")` and similar patterns to find reference test files.
+```
+
+### 2. `probe-prompt.md` — 4 changes
+
+**Required reading (lines 12-18):** Remove inline enumerations, keep file anchors.
+```
+1. `cmd/entire/cli/agent/agent.go` — Read to find the `Agent` interface and all optional capability interfaces
+2. `cmd/entire/cli/agent/event.go` — Read to find all `EventType` constants (the normalized lifecycle events agents must map to)
+3. `cmd/entire/cli/hook_registry.go` — How native hook names are registered and routed
+4. `cmd/entire/cli/lifecycle.go` — `DispatchLifecycleEvent` handler
+5. `docs/architecture/agent-guide.md` — Full implementation guide
+6. `docs/architecture/agent-integration-checklist.md` — Validation criteria
+```
+
+**Reference implementations (lines 21-26):** Replace specific agent listings with discovery.
+```
+**Reference implementations:** Run `Glob("cmd/entire/cli/agent/*/")` to discover all existing agent packages. Pick 1-2 as reference. In each, focus on `lifecycle.go` (ParseHookEvent), `hooks.go` (HookSupport), and `types.go` (hook input structs).
+```
+
+**Compatibility report template — EventType table (lines 110-118):** Replace hardcoded rows with dynamic instruction.
+```
+## Lifecycle Event Mapping
+
+For each EventType constant found in `cmd/entire/cli/agent/event.go`, create a row:
+
+| Entire EventType | Native Hook | Status | Fields Available |
+|-----------------|-------------|--------|-----------------|
+| (one row per EventType from event.go) | ? | MAPPED/PARTIAL/MISSING | |
+```
+
+**Compatibility report template — Interface feasibility table (lines 122-131):** Replace hardcoded rows with dynamic instruction.
+```
+## Required Interface Feasibility
+
+For each interface defined in `cmd/entire/cli/agent/agent.go`, assess feasibility:
+
+| Interface | Feasible | Complexity | Notes |
+|-----------|----------|------------|-------|
+| Agent (core) | Yes/No/Partial | Low/Med/High | |
+| (one row per optional interface from agent.go) | ... | ... | |
+```
+
+### 3. `e2e-test-prompt.md` — 3 changes
+
+**Step 1 — infrastructure files (lines 15-20):** Keep the 5 structural file names (stable infrastructure), but remove inline enumeration of runner class names.
+```
+3. `cmd/entire/cli/e2e_test/agent_runner.go` — `AgentRunner` interface and existing runner implementations. Read the file to discover all current runners and the `NewAgentRunner` factory.
+```
+
+**Step 2 — scenario tests (lines 24-31):** Replace exhaustive file list with glob discovery.
+```
+### Step 2: Read Existing E2E Scenario Tests
+
+Run `Glob("cmd/entire/cli/e2e_test/scenario_*_test.go")` to find all existing scenario tests. Read each to understand the patterns:
+- How scenarios use `TestEnv` and `AgentRunner`
+- How prompts are structured for determinism
+- How assertions validate checkpoints, rewind, etc.
+```
+
+**Step 4 — Create AgentRunner (lines 58-59):** Replace hardcoded constant/switch naming with discovery.
+```
+- Add an agent name constant following the pattern of existing constants in `agent_runner.go`
+- Register in the `NewAgentRunner` factory (search for `func NewAgentRunner` to find it)
+```
+
+### 4. `implement-prompt.md` — 5 changes
+
+**Step 1 — required reading (lines 16-20):** Remove inline content descriptions that enumerate specifics.
+```
+1. `docs/architecture/agent-guide.md` — Authoritative implementation guide with code templates. Read thoroughly.
+2. `docs/architecture/agent-integration-checklist.md` — Validation criteria for completeness.
+3. `cmd/entire/cli/agent/agent.go` — Read to find the exact `Agent` interface and all optional interfaces.
+4. `cmd/entire/cli/agent/event.go` — Read to find `EventType` constants and shared parsing helpers.
+```
+
+**Step 2 — reference implementation table (lines 25-31):** Replace with discovery.
+```
+### Step 2: Read Reference Implementation
+
+Run `Glob("cmd/entire/cli/agent/*/")` to find all existing agent packages. Pick the closest match based on probe findings — read a few agents' `hooks.go` files to find one with a similar hook mechanism to your target. Read all `*.go` files (skip `*_test.go` on first pass) in the chosen reference.
+```
+
+**Steps 4-9 — TDD cycles (lines 43-221):** Replace inline code examples with "read the interface + reference" instructions. The `agent-guide.md` already has comprehensive code templates — the skill prompts should not duplicate them.
+
+For each TDD step, the pattern becomes:
+```
+**Green**: Create `${file}.go`. Read the relevant interface in `cmd/entire/cli/agent/agent.go` for exact method signatures. Read the corresponding file in a reference agent (find via `Glob("cmd/entire/cli/agent/*/${file}.go")`) for the implementation pattern. The `agent-guide.md` has a complete code template if needed.
+```
+
+Specifically:
+- Step 5 (core agent): Remove the `init()` + struct + method stub code block. Replace with: "Read Agent interface in agent.go for all methods. Read agent-guide.md Step 3 for the full code template. Use `agent.Register(agent.AgentName("$AGENT_SLUG"), New)` in init()."
+- Step 6 (lifecycle): Remove the ParseHookEvent code block. Replace with: "Read HookSupport interface in agent.go. Read agent-guide.md Step 4 for the switch-case pattern."
+- Step 7 (hooks): Remove the InstallHooks/UninstallHooks/AreHooksInstalled stubs. Replace with: "Read HookSupport interface in agent.go for exact signatures. Read agent-guide.md Step 8 for installation pattern."
+- Step 8 (transcript): Remove code block. Replace with: "Read TranscriptAnalyzer interface in agent.go. Read agent-guide.md Transcript Format Guide for JSONL vs JSON patterns."
+- Step 9 (optional interfaces): Remove bullet list of interface names. Replace with: "Read agent.go for all optional interfaces. For each one the probe report marked as feasible, follow the same TDD cycle."
+
+**Step 10 — register (lines 223-226):** Already uses discovery ("Search cmd/entire/cli/ for..."). Keep as-is.
+
+### 5. `README.md` — 1 change
+
+**Line 50:** Replace hardcoded agent list with discovery pattern.
+```
+- Existing agents: Discover via `Glob("cmd/entire/cli/agent/*/")`
+```
+
+## Files to Modify
+
+| File | Changes | Risk |
+|------|---------|------|
+| `docs/architecture/agent-guide.md` | Fix stale methods, update paths, add caveat | Medium — large file, many code blocks |
+| `.claude/skills/agent-integration/probe-prompt.md` | Replace 4 enumerated sections with discovery | Low |
+| `.claude/skills/agent-integration/e2e-test-prompt.md` | Replace 3 enumerated sections with discovery | Low |
+| `.claude/skills/agent-integration/implement-prompt.md` | Remove 6 code blocks, replace with read-the-source instructions | Medium — largest structural change |
+| `.claude/skills/agent-integration/README.md` | 1-line change | Low |
+
+## Verification
+
+1. `grep -rn 'factoryaidroid\|FactoryAIDroid' .claude/skills/ docs/architecture/agent-guide.md` — should return nothing
+2. `grep -rn 'paths\.RepoRoot' docs/architecture/agent-guide.md` — should return nothing after fix
+3. `grep -rn 'HookHandler\|GetSupportedHooks' docs/architecture/agent-guide.md` — should return nothing after fix
+4. `grep -rn '19 method' docs/architecture/agent-guide.md .claude/skills/` — should return nothing
+5. Read each modified file end-to-end to verify markdown renders correctly (no unclosed fences)
+6. Verify each skill prompt still has enough structure to guide implementation (not too vague)
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/e3b9b251-e322-4a6b-b48d-361a9097e77a.jsonl

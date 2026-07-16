@@ -1,0 +1,51 @@
+Implement the following plan:
+
+# Fix: Shadow branch commit message hardcodes "Claude Code" for all agents
+
+## Context
+
+When Cursor (or any agent that doesn't implement `TranscriptAnalyzer`) creates shadow branch checkpoints, the commit message subject is always "Claude Code session updates". This is because:
+
+1. Cursor doesn't implement `TranscriptAnalyzer`, so `ExtractPrompts()` is never called
+2. `allPrompts` remains empty → `lastPrompt` is `""`
+3. `generateCommitMessage("")` falls through to the hardcoded fallback: `"Claude Code session updates"`
+
+The condensation works correctly because it reads the agent type from session state, not from the commit message.
+
+## Fix
+
+Make `generateCommitMessage` agent-aware by passing the agent type and using it in the fallback message.
+
+### Files to modify
+
+1. **`cmd/entire/cli/commit_message.go`** (primary fix)
+   - Change `generateCommitMessage(originalPrompt string)` → `generateCommitMessage(originalPrompt string, agentType agent.AgentType)`
+   - Update fallback from `"Claude Code session updates"` to `fmt.Sprintf("%s session updates", agentType)`
+   - Handle empty `agentType` gracefully (use `"Agent"` as default, matching `AgentTypeUnknown`)
+
+2. **`cmd/entire/cli/lifecycle.go`** (~line 273)
+   - `agentType` is already available via `ag.Type()` (line 344), but it's computed *after* `generateCommitMessage` is called (line 273)
+   - Move `agentType := ag.Type()` earlier (before line 273), or compute it inline at line 273
+   - Pass `agentType` to `generateCommitMessage(lastPrompt, agentType)`
+
+3. **`cmd/entire/cli/commit_message_test.go`** (update tests)
+   - Update existing tests to pass an agent type parameter
+   - Add test case for empty prompt with different agent types (Cursor, Gemini, etc.)
+   - Add test case for empty agent type (should fall back to "Agent")
+
+## Verification
+
+1. `mise run fmt && mise run lint && mise run test:ci`
+2. Check that `TestGenerateCommitMessage` passes with updated signatures
+3. Verify the fallback message uses the agent name, not hardcoded "Claude Code"
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/gtrrz-victor/.claude/projects/-Users-gtrrz-victor-wks-cli-cli/81ba4d3a-97a9-4f92-885c-692a94e6fd67.jsonl
+
+---
+
+why was it working for other agents implementations ?
+
+---
+
+commit this changes

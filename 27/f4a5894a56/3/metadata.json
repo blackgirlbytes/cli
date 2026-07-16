@@ -1,0 +1,84 @@
+{
+  "cli_version": "dev",
+  "checkpoint_id": "27f4a5894a56",
+  "session_id": "74813a37-66da-41b9-9b0c-37d0664378fb",
+  "strategy": "manual-commit",
+  "created_at": "2026-04-02T18:44:51.394709Z",
+  "branch": "agent-improvements",
+  "checkpoints_count": 3,
+  "files_touched": [
+    "cmd/entire/cli/summarize/claude_test.go",
+    "cmd/entire/cli/summarize/summarize_test.go"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-opus-4-6[1m]",
+  "turn_id": "d8f6881f305d",
+  "token_usage": {
+    "input_tokens": 33,
+    "cache_creation_tokens": 59427,
+    "cache_read_tokens": 1363250,
+    "output_tokens": 10216,
+    "api_call_count": 27
+  },
+  "session_metrics": {
+    "turn_count": 3
+  },
+  "summary": {
+    "intent": "Debug why manual memory injection wasn't injecting any memories into agent prompts.",
+    "outcome": "Root cause was partially misdiagnosed (initially blamed candidate status, but user had 4 active records). Final fix was simply enabling the debug flag in memory-loop.json to get visibility into selection reports.",
+    "learnings": {
+      "repo": [
+        "injectionRejectionReason (memoryloop.go:1548) rejects records with non-empty status that isn't 'active' — candidate records are silently filtered out",
+        "Manual mode path in lifecycle.go:358-365 does an early return nil that skips RecordInjectionActivity at lines 388-408, so manual injections are never tracked",
+        "When PreviewSelection returns 0 matches in manual mode, no hook response is written — the agent gets zero feedback that the system ran",
+        "Debug mode in memory-loop.json (store-level flag) controls whether a debug prompt is written when no memories match"
+      ],
+      "code": [
+        {
+          "path": "cmd/entire/cli/memoryloop/memoryloop.go",
+          "line": 1548,
+          "end_line": 1550,
+          "finding": "injectionRejectionReason rejects any record where Status != '' && Status != StatusActive, silently blocking candidate records from injection"
+        },
+        {
+          "path": "cmd/entire/cli/lifecycle.go",
+          "line": 358,
+          "end_line": 365,
+          "finding": "Manual mode returns nil early, before RecordInjectionActivity is called, so manual injections are never tracked in activity log"
+        },
+        {
+          "path": "cmd/entire/cli/lifecycle.go",
+          "line": 347,
+          "end_line": 354,
+          "finding": "When PreviewSelection returns 0 matches in manual mode, function returns nil silently — no hook response written unless debug:true is set"
+        }
+      ],
+      "workflow": [
+        "Enabling a debug flag in a JSON config file (.entire/memory-loop.json) is a quick way to get selection report visibility without code changes",
+        "Screenshots from the user provided ground truth that contradicted the initial diagnosis — always verify assumptions against user-visible state"
+      ]
+    },
+    "friction": [
+      "Initial diagnosis was incorrect: blamed candidate status for blocking injection, but user actually had 4 active records — wasted investigation time",
+      "Silent failure mode (no feedback on no-match) made the bug very hard to reproduce and diagnose without debug logging",
+      "The debug flag exists but wasn't documented or surfaced to the user, requiring code archaeology to discover"
+    ],
+    "open_items": [
+      "Manual mode skips RecordInjectionActivity — manual injections are never tracked, understating injection counts for those records",
+      "Manual mode gives no user-facing feedback when no memories match — should write a 'no memories matched' hook response",
+      "Consider whether manual mode should allow candidate records (it already gates on user confirmation, so status gating is double-gating)",
+      "Files cmd/entire/cli/summarize/claude_test.go and summarize_test.go were modified — unclear why these were touched given the debug flag fix"
+    ]
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-04-02T18:44:27.339969Z",
+    "agent_lines": 112,
+    "agent_removed": 0,
+    "human_added": 14,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 126,
+    "total_lines_changed": 0,
+    "agent_percentage": 88.88888888888889
+  }
+}

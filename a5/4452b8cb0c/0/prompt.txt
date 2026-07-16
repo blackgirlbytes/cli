@@ -1,0 +1,225 @@
+/pr-review-toolkit:review-pr
+
+---
+
+<task-notification>
+<task-id>a618c979acf0721e8</task-id>
+<tool-use-id>toolu_01LuKXWig8ym5CTyk6bLXXn4</tool-use-id>
+<status>completed</status>
+<summary>Agent "Analyze test coverage" completed</summary>
+<result>Here is my analysis:
+
+---
+
+## Test Coverage Analysis: ETXTBSY Retry Helper in `external_test.go`
+
+### Summary
+
+This is a well-scoped, low-risk change that introduces a `newExternalAgent` test helper to work around the ETXTBSY race condition that occurs when the kernel has not finished closing the file descriptor from `os.WriteFile` before `exec` tries to run the same file. The refactoring is mechanical and correct. No test coverage is lost. The three error-path tests that still call `New()` directly are intentionally excluded from the helper, which is the right decision.
+
+---
+
+### 1. ETXTBSY Retry Logic Adequacy
+
+The retry logic in `newExternalAgent` (lines 39-55 of the test file) is sound for its purpose:
+
+**What it does right:**
+- Retries up to 3 times, which is sufficient -- ETXTBSY is a transient race that clears within microseconds to low milliseconds on typical systems.
+- Sleeps 10ms between retries, which is generous for this race (the kernel just needs to release the inode's write reference).
+- Breaks out immediately on non-ETXTBSY errors, so it does not mask real failures.
+- Uses `strings.Contains(err.Error(), "text file busy")` which matches the standard `syscall.ETXTBSY` string representation on Linux and macOS.
+- Uses `t.Helper()` so failure stack traces point to the calling test, not the helper.
+- Uses `t.Fatalf` on failure, which is the correct behavior for a setup helper -- if agent creation fails, the test cannot proceed.
+
+**One minor observation on the retry timing:** The sleep happens after every failed attempt including the last one before the loop exits. Looking at the `for range 3` construct: if attempt 1 fails with ETXTBSY, it sleeps and retries; if attempt 2 fails with ETXTBSY, it sleeps and retries; if attempt 3 fails (ETXTBSY or not), it falls through to `t.Fatalf`. The sleep on attempt 2 (before the final retry 3) is still useful. The only wasted sleep would be if all 3 fail with ETXTBSY -- but actually, on the third iteration, when `err` is ETXTBSY and the `strings.Contains` check passes, the loop simply ends (since `range 3` is exhausted) and falls through to `t.Fatalf`. The last sleep (after attempt 2, before attempt 3) is not wasted. This is correct behavior.
+
+**Criticality: N/A** -- this is a test infrastructure fix, not a behavioral test gap.
+
+---
+
+### 2. Test Coverage Preservation
+
+The refactoring is a pure mechanical replacement. Every call site that previously had:
+
+```go
+ea, err := New(context.Background(), binPath)
+if err != nil {
+    t.Fatalf("New: %v", err)
+}
+```
+
+now has:
+
+```go
+ea := newExternalAgent(t, binPath)
+```
+
+The behavioral contract is identical: if `New()` fails with a non-ETXTBSY error, `t.Fatalf` is called and the test aborts. The only difference is that ETXTBSY errors get retried, which is strictly additive resilience.
+
+I verified that every replacement site was in a "success path" context -- tests that expect `New()` to succeed so they can exercise subsequent methods. No test was converted that previously inspected the error value from `New()`.
+
+The variable re-declarations (e.g., `_, err = ea.run(...)` becoming `_, err := ea.run(...)`) at lines 170, 208, and 440 are a natural consequence of removing the prior `err` declaration from the `New()` call. These are syntactically required and semantically identical.
+
+**No coverage was lost or weakened.**
+
+---
+
+### 3. Error-Path Tests Still Calling `New()` Directly
+
+The three error-path tests correctly call `New()` directly:
+
+- **`TestNew_WrongProtocolVersion`** (line 236): Tests that `New()` returns an error when the binary reports protocol version 99. This MUST call `New()` directly because it expects failure. Wrapping it in `newExternalAgent` would cause `t.Fatalf` on the expected error, breaking the test.
+
+- **`TestNew_BinaryNotFound`** (line 253): Tests that `New()` returns an error for a nonexistent binary path. No file is written here, so ETXTBSY cannot occur. Calling `New()` directly is correct.
+
+- **`TestNew_InvalidJSON`** (line 262): Tests that `New()` returns an error when the binary outputs non-JSON. This writes a script and executes it, so it could theoretically hit ETXTBSY. However, this test expects failure from `New()`, so retrying would be wrong -- a retry that succeeds (impossible in this case, since the script always outputs invalid JSON) would incorrectly pass. And a retry that fails with the expected JSON error would just waste time. The current direct call is correct.
+
+**All three error-path tests are properly structured.** They exercise the three distinct failure modes of `New()`: protocol mismatch, binary not found, and invalid JSON output.
+
+---
+
+### 4. `t.Helper()` Usage
+
+`t.Helper()` is correctly called at line 40 in `newExternalAgent`. This ensures that when `t.Fatalf` fires at line 53, the test failure message points to the test function that called `newExternalAgent`, not to line 53 inside the helper itself. This is good practice.
+
+The existing `testBinaryDir` helper (line 19) also correctly uses `t.Helper()`.
+
+---
+
+### 5. Edge Cases in the Retry Logic
+
+**Covered adequately:**
+- Non-ETXTBSY error on first attempt: breaks immediately, reports the real error.
+- ETXTBSY on all 3 attempts: reports the last ETXTBSY error via `t.Fatalf`.
+- ETXTBSY then success: returns the agent on the successful attempt.
+- Success on first attempt: returns immediately, no sleep.
+
+**Not concerning but worth noting:**
+- The `"text file busy"` string match is not locale-dependent in Go -- `syscall.ETXTBSY.Error()` always returns the English string on Unix systems. This is safe.
+- On Windows, ETXTBSY does not exist, and the test already has Windows-specific binary naming (`.bat` extension in `testBinaryDir`). The retry logic is harmless on Windows since the error string will never match.
+- The error is checked via `err.Error()` string matching rather than `errors.Is(err, syscall.ETXTBSY)`. This is necessary because the error is wrapped by `exec.Command.Run()` and then further wrapped by the `run()` method (which formats it as `"info: <stderr or error>"`), so `errors.Is` would not unwrap through the string formatting. The string match is the pragmatic and correct approach here.
+
+---
+
+### Positive Observations
+
+1. **Clean separation of concerns**: The helper handles only the ETXTBSY retry, delegating all real validation to `New()`. Error-path tests remain untouched.
+2. **Good documentation**: The comment on `newExternalAgent` explains both what it does and why (CI machines under load).
+3. **Minimal blast radius**: The change touches only test infrastructure, not production code. The `New()` function itself is unchanged.
+4. **Correct `t.Helper()` usage** for clean failure reporting.
+5. **The three error-path tests** (`TestNew_WrongProtocolVersion`, `TestNew_BinaryNotFound`, `TestNew_InvalidJSON`) are correctly left calling `New()` directly, preserving their purpose of testing failure modes.
+
+### Verdict
+
+This is a clean, well-reasoned fix with no test coverage regression. The retry parameters (3 attempts, 10ms delay) are appropriate for the ETXTBSY race condition. No changes needed.</result>
+<usage><total_tokens>37182</total_tokens><tool_uses>7</tool_uses><duration_ms>67493</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli/tasks/a618c979acf0721e8.output
+
+---
+
+<task-notification>
+<task-id>a733092cedb3cc861</task-id>
+<tool-use-id>toolu_01P1PUfUxX2uUbhQKFvmEFKs</tool-use-id>
+<status>completed</status>
+<summary>Agent "Simplify changed code" completed</summary>
+<result>Good, confirmed. Now I have all the information needed for a thorough analysis.
+
+Here are my findings:
+
+---
+
+## Analysis of `newExternalAgent` helper on `alex/fix-flaky-test`
+
+**File:** `/Users/alex/workspace/cli/cmd/entire/cli/agent/external/external_test.go`
+
+### 1. The helper can be simplified: use `errors.Is` instead of string matching
+
+The current ETXTBSY detection uses `strings.Contains(err.Error(), "text file busy")`, which is a fragile string match. Since `New()` uses `%w` wrapping throughout (`run()` wraps with `fmt.Errorf("%s: %w", ...)` and `New()` wraps with `fmt.Errorf("info: %w", ...)`), the `syscall.ETXTBSY` errno is preserved in the error chain. I verified that `errors.Is(wrappedErr, syscall.ETXTBSY)` returns `true` through the full wrapping chain.
+
+Replacing the string check with `errors.Is(err, syscall.ETXTBSY)` would:
+- Eliminate the `"strings"` import (it is not used elsewhere in the file)
+- Be more idiomatic Go (structured error matching vs. string matching)
+- Be more robust against error message changes or localization
+
+The import would change from `"strings"` to `"syscall"`.
+
+### 2. The retry logic is clean but has one minor issue
+
+The retry loop sleeps *after* the last failed attempt even though the loop is about to break. Specifically, on the third iteration (final `range 3` pass), if the error is ETXTBSY, it sleeps 10ms and then exits the loop, hitting `t.Fatalf`. The sleep on the final iteration is wasted time. This is a very minor point (10ms) and arguably not worth complicating the code for, but it is worth noting.
+
+The overall structure -- early return on success, break on non-ETXTBSY error, sleep-and-retry on ETXTBSY -- is clear and appropriate.
+
+### 3. Remaining direct `New()` calls are intentional
+
+Three tests still call `New()` directly: `TestNew_WrongProtocolVersion`, `TestNew_BinaryNotFound`, and `TestNew_InvalidJSON`. All three are testing `New()` error paths where the error is expected and is NOT ETXTBSY. These should NOT use the helper -- they need direct access to the error value to assert on it. The helper was applied correctly and consistently to all 13 call sites that previously used the `New()` + `t.Fatalf` boilerplate pattern.
+
+### 4. The approach strikes the right balance
+
+The helper is well-scoped: it solves a real CI flakiness problem (ETXTBSY race between `os.WriteFile` and `exec`) with a targeted retry, and it simultaneously eliminates 13 instances of identical 4-line boilerplate. The comment explaining *why* the retry exists is valuable since the race condition is non-obvious. The 10ms sleep and 3-attempt cap are reasonable for a transient kernel-level race.
+
+---
+
+### Summary of recommended changes (all optional, no functional issues)
+
+| Priority | Finding | Suggestion |
+|----------|---------|------------|
+| Medium | String-based ETXTBSY detection is fragile | Use `errors.Is(err, syscall.ETXTBSY)` instead of `strings.Contains(err.Error(), "text file busy")`. This removes the `"strings"` import and adds `"syscall"`. |
+| Low | Sleep on final retry iteration is wasted | Could be avoided but would add complexity not worth the 10ms savings. No change recommended. |
+
+The only change I would actively recommend is switching from string matching to `errors.Is(err, syscall.ETXTBSY)`. Everything else is solid.</result>
+<usage><total_tokens>35488</total_tokens><tool_uses>12</tool_uses><duration_ms>75823</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli/tasks/a733092cedb3cc861.output
+
+---
+
+<task-notification>
+<task-id>a3233bf6a0f63644b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<status>completed</status>
+<summary>Agent "Review code quality" completed</summary>
+<result>Linter passes with 0 issues for Go code, and all 18 tests pass. The gofmt warnings are from worktrees on other branches, unrelated to this change.
+
+---
+
+Here is my review of the changes on the `alex/fix-flaky-test` branch.
+
+## Files Reviewed
+
+- `/Users/alex/workspace/cli/cmd/entire/cli/agent/external/external_test.go` (+40/-63 lines)
+
+## Summary
+
+The change introduces a `newExternalAgent` test helper at lines 36-55 that retries `New()` up to 3 times when encountering ETXTBSY ("text file busy") errors, then replaces 12 call sites that previously had a 4-line `New()` + error check boilerplate with a single call to this helper. The net result is a 23-line reduction.
+
+**No high-confidence issues found (confidence >= 80).** The code meets project standards.
+
+## Detailed Assessment
+
+**Project guidelines compliance:**
+- `t.Helper()` is correctly used in the helper function, ensuring error locations point to the calling test.
+- Negative test cases (`TestNew_WrongProtocolVersion`, `TestNew_BinaryNotFound`, `TestNew_InvalidJSON`) correctly remain with direct `New()` calls since they test error paths.
+- `for range 3` syntax is valid for Go 1.26 (introduced in Go 1.22).
+- Variable re-declarations (`err :=` instead of `err =`) at call sites are correct since `err` is no longer declared in the outer scope.
+- Linter passes with 0 issues. All 18 tests pass.
+
+**Retry logic correctness:**
+- Retries only on ETXTBSY (the `"text file busy"` string check), breaks immediately on any other error -- correct.
+- 3 attempts with 10ms sleep between each -- reasonable for a kernel-level race condition where the inode write lock is held briefly.
+- There is a wasted 10ms sleep after the third failed attempt before calling `t.Fatalf`, but this is negligible and not worth complicating the loop logic to avoid.
+
+**Approach appropriateness:**
+- ETXTBSY is a well-known race condition when executing a just-written file, particularly under high I/O load on CI. A test-level retry is the standard mitigation since the root cause is in the kernel's file locking, not in application code. The alternative (adding `fsync` + close-reopen in production code) would be over-engineering for a CI-only issue.
+- Centralizing the retry in a helper rather than sprinkling retry loops at each call site is the right call -- it reduces duplication and makes the intent clear.
+
+**Minor observations (below reporting threshold):**
+- The helper uses `context.Background()` rather than accepting a context parameter. This is consistent with the pre-existing pattern throughout the file and is fine for test code.
+- The `return nil` after `t.Fatalf` is unreachable but required by the compiler -- standard Go test pattern.</result>
+<usage><total_tokens>34820</total_tokens><tool_uses>14</tool_uses><duration_ms>105942</duration_ms></usage>
+</task-notification>
+Full transcript available at: /private/tmp/claude-501/-Users-alex-workspace-cli/tasks/a3233bf6a0f63644b.output
+
+---
+
+yep, let's simplify! 🌈

@@ -1,0 +1,64 @@
+Implement the following plan:
+
+# Fix: `claude -p` prompt parsing + tighten allowed tools
+
+## Context
+Two issues in the e2e-triage workflow's "Run triage" step:
+
+1. **Prompt not received:** The `--allowedTools` flag is variadic — it consumes the trailing prompt string as a tool name, so `claude -p` sees no prompt and errors with "Input must be provided either through stdin or as a prompt argument when using --print". **Fix:** pipe prompt via stdin heredoc.
+
+2. **Overly broad permissions:** `Bash(gh *)` and `Bash(git *)` grant the agent access to destructive commands it doesn't need (e.g., `gh repo delete`, `git push --force`). **Fix:** restrict to the specific subcommands the triage skill actually uses.
+
+## Changes
+
+**File: `.github/workflows/e2e-triage.yml`** (lines 81-95)
+
+### 1. Pipe prompt via stdin (already applied)
+
+Use `cat <<PROMPT | claude -p ...` instead of passing prompt as positional arg.
+
+### 2. Tighten `--allowedTools` to least privilege
+
+Replace the broad wildcards with specific subcommand patterns.
+
+**Before:** `Bash(mise run *),Bash(gh *),Bash(git *),Read,Write,Edit,Glob,Grep`
+
+**After:**
+```
+Read,Glob,Grep,Write,Edit,Bash(mise run test:e2e*),Bash(mise run fmt*),Bash(mise run lint*),Bash(gh workflow run *),Bash(gh run list *),Bash(gh run view *),Bash(gh run download *),Bash(gh pr create *),Bash(gh issue list *),Bash(gh issue create *),Bash(gh issue comment *),Bash(git checkout *),Bash(git add *),Bash(git commit *),Bash(git push *),Bash(git diff *),Bash(git log *),Bash(git status*)
+```
+
+**Rationale from SKILL.md CI mode steps:**
+
+| Permission | Used for |
+|---|---|
+| `Read,Glob,Grep` | Artifact analysis (reports, logs, test source) |
+| `Write` | Write `triage-summary.json` |
+| `Edit` | Apply flaky fixes to test files |
+| `mise run test:e2e*` | Run E2E tests (canary verification + specific test re-runs) |
+| `mise run fmt*` / `mise run lint*` | Pre-PR checks |
+| `gh workflow run *` | Trigger e2e-isolated re-runs (Step C3) |
+| `gh run list/view/download *` | Poll + download re-run results |
+| `gh pr create *` | Create flaky-fix PRs (Step 4b) |
+| `gh issue list/create/comment *` | Manage real-bug issues (Step 4b) |
+| `git checkout/add/commit/push *` | Branch + commit + push for PRs |
+| `git diff/log/status*` | Inspect repo state during analysis |
+
+**What's excluded:** `gh repo *`, `gh release *`, `git reset *`, `git rebase *`, `git merge *`, `git branch -D *`, and any other destructive operations.
+
+## Verification
+```bash
+git push
+gh workflow run e2e-triage.yml --ref alisha/e2e-triage -f run_id=22772950740
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-devenv-cli/d78a956d-b1f9-4dcc-8055-ac01eb1a9769.jsonl
+
+---
+
+Tool loaded.
+
+---
+
+Tool loaded.

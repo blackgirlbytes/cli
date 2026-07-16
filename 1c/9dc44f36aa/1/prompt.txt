@@ -1,0 +1,52 @@
+Implement the following plan:
+
+# Plan: Fix Kiro IDE stop hook exit code 1 on empty repos
+
+## Context
+
+After the TranscriptAnalyzer changes and the stdin fix (d01bbc6a), the Kiro IDE stop hook now progresses further in the execution path — far enough to hit the empty repository check in `handleLifecycleTurnEnd`. This check returns `NewSilentError(strategy.ErrEmptyRepository)`, which causes `os.Exit(1)` in `main.go:44-45`. The Kiro IDE reports this as "Hook execution failed with exit code 1. No output was captured."
+
+This is a regression: the stop hook should exit 0 when skipping an empty repo, since it's a benign skip condition (not an error).
+
+## Root Cause
+
+`cmd/entire/cli/lifecycle.go:179-181`:
+```go
+if repo, err := strategy.OpenRepository(ctx); err == nil && strategy.IsEmptyRepository(repo) {
+    logging.Info(logCtx, "skipping checkpoint - will activate after first commit")
+    return NewSilentError(strategy.ErrEmptyRepository)  // ← causes os.Exit(1)
+}
+```
+
+`cmd/entire/main.go:44-45`:
+```go
+cancel()
+os.Exit(1)  // ← any non-nil error, including SilentError, triggers exit code 1
+```
+
+## Fix
+
+Change `lifecycle.go:181` from `return NewSilentError(strategy.ErrEmptyRepository)` to `return nil`.
+
+The log message already communicates the skip. Returning nil gives exit code 0, which is the correct behavior for a hook that successfully decided "nothing to do."
+
+## File to Modify
+
+| File | Change |
+|------|--------|
+| `cmd/entire/cli/lifecycle.go:181` | `return NewSilentError(...)` → `return nil` |
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+Then test in the Kiro IDE with an empty repo — the stop hook should exit 0 with no error.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/alisha/.claude/projects/-Users-alisha-Projects-wt-kiro-oneshot/8ff7050d-1d9f-42fa-9893-4a3ce065bc04.jsonl
+
+---
+
+commit

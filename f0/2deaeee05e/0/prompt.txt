@@ -1,0 +1,486 @@
+# Checkpoints v2 migration validation: metadata loss investigation
+
+## Context
+
+Repository being validated: `/Users/pfleidi/entire/marvin`
+CLI source inspected: `/Users/pfleidi/entire/cli`
+Manual test plan referenced: `/Users/pfleidi/entire/cli/.worktrees/feat/checkpoints-v2-validation/docs/guides/checkpoints-v2-manual-test-plan.md`
+
+The user had already manually run:
+
+```bash
+entire migrate --checkpoints v2
+```
+
+The task was read-only validation that all checkpoints from the legacy v1 branch were migrated into checkpoints v2 refs correctly.
+
+Relevant v2 layout from the test plan and CLI source:
+
+- Permanent metadata and compact transcripts live at `refs/entire/checkpoints/v2/main`
+- Active raw resumable transcripts live at `refs/entire/checkpoints/v2/full/current`
+- Archived raw transcript generations live at `refs/entire/checkpoints/v2/full/<generation>`
+- v1 compatibility/source branch is `entire/checkpoints/v1`, which in this repo was present locally only as remote-tracking ref `refs/remotes/origin/entire/checkpoints/v1`
+
+Local ref state in `marvin`:
+
+```text
+refs/remotes/origin/entire/checkpoints/v1 f5cf27b4c412201b413f9a3b32e00b313bacdf0f
+refs/entire/checkpoints/v2/main baa75b10b105a5b129b488462caccf169d7e7753
+refs/entire/checkpoints/v2/full/0000000000001 792cee7a537027b828fe79ae5a4a5877cde98587
+refs/entire/checkpoints/v2/full/0000000000002 b9c21595ef9d70de613659cc5bf8225f1a70b4c6
+refs/entire/checkpoints/v2/full/current 41182eedfe434cc0fd706a4d0285c4c47bfa10cb
+```
+
+There is no local `refs/heads/entire/checkpoints/v1`; validation used `refs/remotes/origin/entire/checkpoints/v1` as the v1 source.
+
+## Validation Results
+
+A read-only validation script compared v1 checkpoint IDs and session artifacts against the v2 refs. The refined validation treated only semantically meaningful differences as mismatches, ignoring expected rewrite differences like new `created_at`, `cli_version`, and v2 compact transcript offsets. It also normalized zero-value fields that appear in newly marshaled structs.
+
+Final validation output:
+
+```text
+checkpoint migration validation
+  source v1 ref: refs/remotes/origin/entire/checkpoints/v1
+  v2 main ref:   refs/entire/checkpoints/v2/main
+  v2 full refs:  3 (refs/entire/checkpoints/v2/full/0000000000001, refs/entire/checkpoints/v2/full/0000000000002, refs/entire/checkpoints/v2/full/current)
+
+counts
+  v1 checkpoints:             243
+  v2 /main checkpoints:       243
+  v2 /full union checkpoints: 243
+    refs/entire/checkpoints/v2/full/0000000000001: 100
+    refs/entire/checkpoints/v2/full/0000000000002: 100
+    refs/entire/checkpoints/v2/full/current: 44
+  sessions checked:           291
+
+artifact checks
+  session metadata matched:   291/291
+  prompts matched:            291/291
+  raw transcript hashes:      291/291
+  compact transcripts:        291 present, 0 missing
+  compact hash verified:      291/291
+  task metadata trees:        0/0
+  prompt_attributions dropped by migrator: 71
+
+effective raw session locations
+  refs/entire/checkpoints/v2/full/0000000000001: 104
+  refs/entire/checkpoints/v2/full/0000000000002: 132
+  refs/entire/checkpoints/v2/full/current: 55
+  split checkpoint sessions across full refs: 1
+    036174639290: refs/entire/checkpoints/v2/full/0000000000002, refs/entire/checkpoints/v2/full/current
+
+warnings: 0
+issues: 2
+  - summary-field-mismatch: 42f37164cf06: combined_attribution: v1=... v2=None
+  - summary-field-mismatch: ce03dc7f0f83: combined_attribution: v1=... v2=None
+```
+
+Important interpretation:
+
+- Checkpoint ID parity is good: 243 v1 checkpoints, 243 v2 `/main` checkpoints, 243 v2 `/full` union checkpoints.
+- Session count is good: 291 sessions checked.
+- Functional resumability artifacts look good:
+  - all prompts matched
+  - all raw transcript hashes matched v1 `content_hash.txt`
+  - every compact `transcript.jsonl` exists on `/main`
+  - every compact transcript hash was valid
+- There are no task metadata trees in this repo’s v1 checkpoint data, so task migration was not exercised here (`0/0`).
+- One checkpoint, `036174639290`, is split across v2 full refs: session 0 is in archived `full/0000000000002`, session 1 is in `full/current`. This is acceptable because the v2 reader searches per-session across `/full/current` then archived generation refs. It is not a data loss issue.
+
+## Actual Problems Found
+
+There are two metadata preservation bugs:
+
+1. Session-level `prompt_attributions` are dropped during v1-to-v2 migration.
+2. Root-level `combined_attribution` is dropped during v1-to-v2 migration.
+
+These are not transcript/content migration failures. They are metadata preservation failures in the migration/write path.
+
+## Problem 1: `prompt_attributions` dropped during migration
+
+Observed data:
+
+```text
+prompt_attributions present in v1 but absent in v2: 71
+first 12: 00b224ccb5bc:0, 04db417f5b30:0, 06890de21aaa:0, 10143022c68f:0, 102ceb78db1d:0, 112f87b830e8:0, 15e0a76461f0:0, 1daf2c82e2ec:0, 1f395ba22b6f:0, 2131afd783a6:0, 22fcf3b298de:0, 26785907b1c1:0
+```
+
+Root cause:
+
+The v2 store supports writing prompt attributions, but the migrator does not pass them through.
+
+Relevant source:
+
+`cmd/entire/cli/checkpoint/checkpoint.go` defines `WriteCommittedOptions.PromptAttributionsJSON`:
+
+```go
+// PromptAttributionsJSON is the raw PromptAttributions data, JSON-encoded.
+// Persisted for diagnostic purposes — shows exactly which prompt recorded
+// which "user" lines, enabling root cause analysis of attribution bugs.
+// Uses json.RawMessage to avoid importing session package.
+PromptAttributionsJSON json.RawMessage
+```
+
+Normal v1/v2 checkpoint writes populate it from session state in `cmd/entire/cli/strategy/manual_commit_condensation.go`:
+
+```go
+writeOpts := cpkg.WriteCommittedOptions{
+    ...
+    InitialAttribution:          attribution,
+    PromptAttributionsJSON:      marshalPromptAttributionsIncludingPending(state),
+    Summary:                     summary,
+}
+```
+
+Both v1 and v2 committed writers know how to write it:
+
+`cmd/entire/cli/checkpoint/committed.go`:
+
+```go
+sessionMetadata := CommittedMetadata{
+    ...
+    InitialAttribution:          opts.InitialAttribution,
+    PromptAttributions:          opts.PromptAttributionsJSON,
+    Summary:                     redactSummary(opts.Summary),
+    CLIVersion:                  versioninfo.Version,
+}
+```
+
+`cmd/entire/cli/checkpoint/v2_committed.go`:
+
+```go
+sessionMetadata := CommittedMetadata{
+    ...
+    InitialAttribution:          opts.InitialAttribution,
+    PromptAttributions:          opts.PromptAttributionsJSON,
+    Summary:                     redactSummary(opts.Summary),
+    CLIVersion:                  versioninfo.Version,
+}
+```
+
+But migration constructs write options in `cmd/entire/cli/migrate.go` using `buildMigrateWriteOpts`, and it omits `PromptAttributionsJSON`:
+
+```go
+func buildMigrateWriteOpts(content *checkpoint.SessionContent, info checkpoint.CommittedInfo) checkpoint.WriteCommittedOptions {
+    m := content.Metadata
+
+    prompts := checkpoint.SplitPromptContent(content.Prompts)
+
+    return checkpoint.WriteCommittedOptions{
+        CheckpointID: info.CheckpointID,
+        SessionID:    m.SessionID,
+        Strategy:     m.Strategy,
+        Branch:       m.Branch,
+        Transcript:                  redact.AlreadyRedacted(content.Transcript),
+        Prompts:                     prompts,
+        FilesTouched:                m.FilesTouched,
+        CheckpointsCount:            m.CheckpointsCount,
+        Agent:                       m.Agent,
+        Model:                       m.Model,
+        TurnID:                      m.TurnID,
+        TokenUsage:                  m.TokenUsage,
+        SessionMetrics:              m.SessionMetrics,
+        InitialAttribution:          m.InitialAttribution,
+        Summary:                     m.Summary,
+        CheckpointTranscriptStart:   m.GetTranscriptStart(),
+        TranscriptIdentifierAtStart: m.TranscriptIdentifierAtStart,
+        IsTask:                      m.IsTask,
+        ToolUseID:                   m.ToolUseID,
+        AuthorName:                  "Entire Migration",
+        AuthorEmail:                 "migration@entire.dev",
+    }
+}
+```
+
+Expected migration fix:
+
+Add this field to `buildMigrateWriteOpts`:
+
+```go
+PromptAttributionsJSON: m.PromptAttributions,
+```
+
+That should preserve the 71 dropped session-level diagnostic payloads.
+
+Test gap:
+
+Existing migration tests do not seed or assert `PromptAttributionsJSON`, so this bug was untested.
+
+A regression test should:
+
+- write a v1 checkpoint with non-empty `PromptAttributionsJSON`
+- run `migrateCheckpointsV2`
+- read the v2 session metadata
+- assert `PromptAttributions` matches exactly
+
+## Problem 2: `combined_attribution` dropped during migration
+
+Observed data:
+
+Only two v1 checkpoint root summaries have `combined_attribution`, and both lost it in v2:
+
+```text
+v1 summaries with combined_attribution: 2
+42f37164cf06 sessions=2 v2_has=False
+ce03dc7f0f83 sessions=2 v2_has=False
+```
+
+For `42f37164cf06`, v1 root summary contains:
+
+```json
+"combined_attribution": {
+  "calculated_at": "2026-04-15T00:18:47.149463Z",
+  "agent_lines": 119,
+  "agent_removed": 94,
+  "human_added": 3,
+  "human_modified": 0,
+  "human_removed": 1,
+  "total_committed": 122,
+  "total_lines_changed": 217,
+  "agent_percentage": 98.15668202764977,
+  "metric_version": 2
+}
+```
+
+The corresponding v2 root summary lacks `combined_attribution` entirely.
+
+For `ce03dc7f0f83`, v1 root summary contains:
+
+```json
+"combined_attribution": {
+  "calculated_at": "2026-04-17T04:28:39.540946Z",
+  "agent_lines": 281,
+  "agent_removed": 30,
+  "human_added": 0,
+  "human_modified": 0,
+  "human_removed": 0,
+  "total_committed": 281,
+  "total_lines_changed": 311,
+  "agent_percentage": 100,
+  "metric_version": 2
+}
+```
+
+The corresponding v2 root summary also lacks `combined_attribution`.
+
+Root cause:
+
+The root checkpoint summary is regenerated during v2 writes. The shared summary writer preserves `CombinedAttribution` only from an already-existing summary in the target ref. During first-time migration, the target v2 summary does not exist yet, so there is no source for that field.
+
+Relevant source in `cmd/entire/cli/checkpoint/committed.go`:
+
+```go
+func (s *GitStore) writeCheckpointSummary(opts WriteCommittedOptions, basePath string, entries map[string]object.TreeEntry, sessions []SessionFilePaths) error {
+    checkpointsCount, filesTouched, tokenUsage, err := s.reaggregateFromEntries(basePath, len(sessions), entries)
+    if err != nil {
+        return fmt.Errorf("failed to aggregate session stats: %w", err)
+    }
+
+    var combinedAttribution *InitialAttribution
+    rootMetadataPath := basePath + paths.MetadataFileName
+    if entry, exists := entries[rootMetadataPath]; exists {
+        existingSummary, readErr := s.readSummaryFromBlob(entry.Hash)
+        if readErr == nil {
+            combinedAttribution = existingSummary.CombinedAttribution
+        }
+    }
+
+    summary := CheckpointSummary{
+        CheckpointID:        opts.CheckpointID,
+        CLIVersion:          versioninfo.Version,
+        Strategy:            opts.Strategy,
+        Branch:              opts.Branch,
+        CheckpointsCount:    checkpointsCount,
+        FilesTouched:        filesTouched,
+        Sessions:            sessions,
+        TokenUsage:          tokenUsage,
+        CombinedAttribution: combinedAttribution,
+    }
+    ...
+}
+```
+
+This preserves `CombinedAttribution` only if the target checkpoint already had root metadata. For a fresh migration, it is nil.
+
+There is also no `CombinedAttribution` field on `WriteCommittedOptions`, so `buildMigrateWriteOpts` cannot currently pass the v1 root summary value into `WriteCommitted`.
+
+Current migration flow in `cmd/entire/cli/migrate.go`:
+
+- `migrateOneCheckpoint` reads the v1 root summary with `v1Store.ReadCommitted`
+- it iterates each session and reads v1 session content
+- it calls `buildMigrateWriteOpts(content, info)` for each session
+- it calls `v2Store.WriteCommitted(ctx, opts)`
+- there is no code that copies `summary.CombinedAttribution` into v2 root metadata after the session writes
+
+Expected migration fix options:
+
+Option A, narrow migration-only repair:
+
+- Add a v2 method to update root checkpoint summary `CombinedAttribution` after migration writes all sessions.
+- In `migrateOneCheckpoint`, after migrating all sessions, if `summary.CombinedAttribution != nil`, call that v2 update method.
+
+Option B, broader writer-level fix:
+
+- Add `CombinedAttribution *InitialAttribution` to `checkpoint.WriteCommittedOptions`.
+- Update `writeCheckpointSummary` so it uses `opts.CombinedAttribution` when non-nil, otherwise preserves from existing summary.
+- But this shared writer is used by both v1 and v2 paths, so this must be done carefully to avoid clobbering existing combined attribution on ordinary single-session rewrites.
+
+Option A is likely lower risk for migration. However, normal v2-only post-commit behavior has another related gap, described below.
+
+Test gap:
+
+Existing migration tests do not seed root `CombinedAttribution`, so this bug was untested.
+
+A regression test should:
+
+- write or surgically update a v1 checkpoint root `metadata.json` with non-empty `CombinedAttribution`
+- run `migrateCheckpointsV2`
+- read v2 root summary
+- assert `CombinedAttribution` matches v1 exactly, except perhaps `CalculatedAt` if the implementation recomputes rather than copies; copy-preserving is preferred for migration
+
+## Related broader v2 gap: normal combined attribution update appears v1-only
+
+This is adjacent to the migration bug and may matter for new v2-only checkpoints.
+
+Combined attribution is computed after commits in `cmd/entire/cli/strategy/manual_commit_hooks.go`:
+
+```go
+func (s *ManualCommitStrategy) updateCombinedAttributionForCheckpoint(
+    ctx context.Context,
+    repo *git.Repository,
+    checkpointID id.CheckpointID,
+    headTree, parentTree *object.Tree,
+    repoDir string,
+) error {
+    logCtx := logging.WithComponent(ctx, "attribution")
+    store := checkpoint.NewGitStore(repo)
+
+    summary, err := store.ReadCommitted(ctx, checkpointID)
+    ...
+
+    if err := store.UpdateCheckpointSummary(ctx, checkpointID, combined); err != nil {
+        return fmt.Errorf("persisting combined attribution: %w", err)
+    }
+
+    return nil
+}
+```
+
+This function constructs `checkpoint.NewGitStore(repo)`, which is the v1 store, and calls `UpdateCheckpointSummary` on v1. I did not find a v2 equivalent update path in the inspected source. That means new v2-only checkpoints may also fail to get root-level `combined_attribution`, even outside migration, unless another path handles it elsewhere.
+
+Potential broader fix:
+
+- Add `UpdateCheckpointSummary` or a narrower `UpdateCombinedAttribution` method to `V2GitStore`.
+- In post-commit combined attribution update, use v2 store when checkpoints v2/version 2 is enabled, or update both stores in dual-write mode.
+- Add tests for v2 post-commit combined attribution persistence, not just migration.
+
+## Why initial validation reported many session metadata mismatches, then narrowed to two issues
+
+The first raw metadata comparison showed many mismatches because v2 migration rewrites some metadata structurally:
+
+- `created_at` changes to migration time because write code creates new session metadata.
+- `cli_version` changes to the current CLI version (`0.5.6` in the migrated v2 refs).
+- `checkpoint_transcript_start` is different in v2 because v2 `/main` stores compact transcript offsets, while v1 stored raw transcript line offsets. This is expected from migration code using `CompactTranscriptStart`.
+- Some newly marshaled structs include zero-value fields that older v1 JSON omitted, such as `model: ""`, `agent_removed: 0`, or `total_lines_changed: 0`.
+
+After normalizing those expected differences, all 291 session metadata entries matched semantically except the explicitly tracked dropped `prompt_attributions` field.
+
+## Source lines that matter
+
+Primary migration bug location:
+
+- `cmd/entire/cli/migrate.go`
+- function: `buildMigrateWriteOpts`
+- issue: does not set `PromptAttributionsJSON: m.PromptAttributions`
+- issue: has no way to pass root `summary.CombinedAttribution`
+
+v2 writer supports prompt attribution:
+
+- `cmd/entire/cli/checkpoint/v2_committed.go`
+- function: `writeMainSessionToSubdirectory`
+- writes `PromptAttributions: opts.PromptAttributionsJSON`
+
+v1 writer supports prompt attribution:
+
+- `cmd/entire/cli/checkpoint/committed.go`
+- function: `writeSessionToSubdirectory`
+- writes `PromptAttributions: opts.PromptAttributionsJSON`
+
+Root summary writer preserves combined attribution only from existing target summary:
+
+- `cmd/entire/cli/checkpoint/committed.go`
+- function: `writeCheckpointSummary`
+- issue: `combinedAttribution` comes only from `entries[rootMetadataPath]`, not from migration source data
+
+Normal condensation populates prompt attribution correctly:
+
+- `cmd/entire/cli/strategy/manual_commit_condensation.go`
+- function/path around construction of `WriteCommittedOptions`
+- sets `PromptAttributionsJSON: marshalPromptAttributionsIncludingPending(state)`
+
+Normal post-commit combined attribution update appears v1-only:
+
+- `cmd/entire/cli/strategy/manual_commit_hooks.go`
+- function: `updateCombinedAttributionForCheckpoint`
+- creates `checkpoint.NewGitStore(repo)` and calls v1 `UpdateCheckpointSummary`
+
+## Recommended fix plan
+
+1. Add a regression test for session-level prompt attribution migration.
+   - Seed v1 checkpoint with `PromptAttributionsJSON`.
+   - Run `migrateCheckpointsV2`.
+   - Assert v2 session metadata `PromptAttributions` matches v1.
+
+2. Fix prompt attribution migration.
+   - In `buildMigrateWriteOpts`, add:
+
+   ```go
+   PromptAttributionsJSON: m.PromptAttributions,
+   ```
+
+3. Add a regression test for root `CombinedAttribution` migration.
+   - Seed a v1 checkpoint root summary with non-empty `CombinedAttribution`.
+   - Run migration.
+   - Assert v2 root summary preserves `CombinedAttribution`.
+
+4. Implement a v2 root-summary update/copy path.
+   - Add a method on `V2GitStore` to update root `CheckpointSummary.CombinedAttribution` for a checkpoint.
+   - Or add a generic option path, but a targeted method is probably lower risk.
+   - In `migrateOneCheckpoint`, after all sessions are written, copy `summary.CombinedAttribution` to v2 when non-nil.
+
+5. Investigate and likely fix normal v2 post-commit combined attribution persistence.
+   - Current code appears to update only v1 via `checkpoint.NewGitStore(repo)`.
+   - Add/route to `V2GitStore.UpdateCombinedAttribution` when checkpoints v2 is enabled or when `checkpoints_version: 2` is active.
+   - In dual-write mode, update both v1 and v2 if both are written.
+
+6. Run focused tests first:
+
+```bash
+go test ./cmd/entire/cli -run 'TestMigrateCheckpointsV2'
+```
+
+Then, per repo Go instructions, after editing Go files run:
+
+```bash
+go build ./...
+go vet ./...
+golangci-lint run ./...
+```
+
+## Bottom line
+
+The migration succeeded for the functional checkpoint data needed by resume/explain/raw transcript recovery:
+
+- all checkpoint IDs exist in v2
+- all sessions exist
+- all prompts match
+- all raw transcript hashes match v1
+- all compact transcripts exist and hash correctly
+
+But migration is lossy for attribution metadata:
+
+- 71 session-level `prompt_attributions` payloads were dropped because `buildMigrateWriteOpts` fails to pass `m.PromptAttributions` into `PromptAttributionsJSON`.
+- 2 root-level `combined_attribution` summaries were dropped because v2 root summaries are regenerated and the writer only preserves combined attribution from an existing target summary, not from the v1 source summary.
+
+These are real bugs in migration metadata preservation and should be fixed with regression tests.

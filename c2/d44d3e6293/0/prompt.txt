@@ -1,0 +1,116 @@
+Implement the following plan:
+
+# Plan: Replace combinatorial wrapper types with CapabilityDeclarer pattern
+
+## Context
+
+The `Wrap()` function in `external/capabilities.go` manually defines wrapper types for each combination of capabilities an external agent can declare. With 7 capability flags, this doesn't scale (128 possible combinations; currently only 9 are covered). The fix: introduce a `CapabilityDeclarer` interface and `As*` helper functions so a single wrapper type can implement all interfaces, with capability gating done at the call site via helpers.
+
+Built-in agents are unaffected — they don't implement `CapabilityDeclarer`, so the helpers fall through to direct type assertions.
+
+## Implementation Steps
+
+### 1. Create `cmd/entire/cli/agent/capabilities.go` (new file)
+
+Define:
+- `CapabilityDeclarer` interface with `DeclaredCapabilities() DeclaredCaps`
+- `DeclaredCaps` struct (7 bool fields matching `external.Capabilities`)
+- 7 helper functions: `AsHookSupport`, `AsTranscriptAnalyzer`, `AsTranscriptPreparer`, `AsTokenCalculator`, `AsTextGenerator`, `AsHookResponseWriter`, `AsSubagentAwareExtractor`
+
+Each helper:
+```go
+func AsHookSupport(ag Agent) (HookSupport, bool) {
+    hs, ok := ag.(HookSupport)
+    if !ok { return nil, false }
+    if cd, ok := ag.(CapabilityDeclarer); ok {
+        return hs, cd.DeclaredCapabilities().Hooks
+    }
+    return hs, true
+}
+```
+
+### 2. Create `cmd/entire/cli/agent/capabilities_test.go` (new file)
+
+Test each helper with 4 scenarios:
+1. Mock agent NOT implementing the interface → `false`
+2. Mock built-in agent implementing the interface (no `CapabilityDeclarer`) → `true`
+3. Mock agent with `CapabilityDeclarer` + capability=`true` → `true`
+4. Mock agent with `CapabilityDeclarer` + capability=`false` → `false`
+
+### 3. Rewrite `cmd/entire/cli/agent/external/capabilities.go`
+
+Replace all 9 wrapper types (`baseAgent`, `hooksAgent`, `analyzerAgent`, `preparerAgent`, `analyzerPreparerAgent`, `hooksPreparerAgent`, `hooksAnalyzerPreparerAgent`, `hooksAnalyzerAgent`, `fullAgent`) with a single `wrappedAgent` that:
+- Forwards all `agent.Agent` methods to `ea`
+- Implements ALL optional interface methods (forwarding to `ea`)
+- Implements `CapabilityDeclarer`, returning caps converted from `ea.info.Capabilities`
+
+`Wrap()` becomes:
+```go
+func Wrap(ea *Agent) agent.Agent {
+    caps := ea.info.Capabilities
+    return &wrappedAgent{
+        ea: ea,
+        caps: agent.DeclaredCaps{
+            Hooks:                  caps.Hooks,
+            TranscriptAnalyzer:     caps.TranscriptAnalyzer,
+            TranscriptPreparer:     caps.TranscriptPreparer,
+            TokenCalculator:        caps.TokenCalculator,
+            TextGenerator:          caps.TextGenerator,
+            HookResponseWriter:     caps.HookResponseWriter,
+            SubagentAwareExtractor: caps.SubagentAwareExtractor,
+        },
+    }
+}
+```
+
+### 4. Update call sites (mechanical — 22 production sites)
+
+Replace `ag.(agent.X)` with `agent.AsX(ag)`:
+
+| File | Sites | Interfaces |
+|------|-------|-----------|
+| `setup.go` | 5 | HookSupport |
+| `lifecycle.go` | 5 | HookResponseWriter, TranscriptPreparer, TranscriptAnalyzer, SubagentAwareExtractor |
+| `strategy/manual_commit_hooks.go` | 4 | TranscriptPreparer, TranscriptAnalyzer |
+| `agent/token_usage.go` | 2 | SubagentAwareExtractor, TokenCalculator (no `agent.` prefix — same package) |
+| `config.go` | 1 | HookSupport |
+| `hook_registry.go` | 1 | HookSupport |
+| `hooks_cmd.go` | 1 | HookSupport |
+| `state.go` | 1 | TranscriptAnalyzer |
+| `strategy/common.go` | 1 | TranscriptPreparer |
+| `setup_test.go` | 2 | HookSupport |
+
+### 5. Update `cmd/entire/cli/agent/external/external_test.go`
+
+Change all direct type assertions (`wrapped.(agent.HookSupport)`) to use `agent.AsHookSupport(wrapped)` etc. The wrapped agent now always satisfies all interfaces — correctness is gated by the `As*` helpers.
+
+### 6. Update integration tests (`integration_test/agent_test.go`) — ~15 sites
+
+These use built-in agents, so they'll work either way. Update for consistency: `agent.AsHookSupport(ag)` instead of `ag.(agent.HookSupport)`.
+
+## Files Modified
+
+- **New:** `cmd/entire/cli/agent/capabilities.go`
+- **New:** `cmd/entire/cli/agent/capabilities_test.go`
+- **Rewritten:** `cmd/entire/cli/agent/external/capabilities.go`
+- **Edited:** `cmd/entire/cli/agent/external/external_test.go`
+- **Edited:** `cmd/entire/cli/agent/token_usage.go` (2 sites)
+- **Edited:** `cmd/entire/cli/setup.go` (5 sites)
+- **Edited:** `cmd/entire/cli/lifecycle.go` (5 sites)
+- **Edited:** `cmd/entire/cli/strategy/manual_commit_hooks.go` (4 sites)
+- **Edited:** `cmd/entire/cli/strategy/common.go` (1 site)
+- **Edited:** `cmd/entire/cli/config.go` (1 site)
+- **Edited:** `cmd/entire/cli/hook_registry.go` (1 site)
+- **Edited:** `cmd/entire/cli/hooks_cmd.go` (1 site)
+- **Edited:** `cmd/entire/cli/state.go` (1 site)
+- **Edited:** `cmd/entire/cli/setup_test.go` (2 sites)
+- **Edited:** `cmd/entire/cli/integration_test/agent_test.go` (~15 sites)
+
+## Verification
+
+```bash
+mise run fmt && mise run lint && mise run test:ci
+```
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/nodo/.claude/projects/-Users-nodo-work-cli/323f78c7-a406-44fa-bc2f-8aef24edceec.jsonl
