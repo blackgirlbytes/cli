@@ -1,8 +1,0 @@
-# Session Context
-
-## User Prompts
-
-### Prompt 1
-
-this branch Fix byte-based string slicing that produced garbled text (mojibake) when truncating prompts containing CJK characters or emoji. is there a go linter we can enable to pick these kinds of issues up automatically?
-
