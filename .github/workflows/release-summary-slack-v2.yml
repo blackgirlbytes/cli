@@ -14,6 +14,9 @@ on:
           - go-git/go-git
           - entirehq/entiredb
           - entireio/git-sync
+          - entireio/external-agents
+          - entireio/go-nuts
+          - entireio/forgemark
   schedule:
     # Weekdays at 10am PT during daylight time (17:00 UTC).
     - cron: "0 17 * * 1-5"
@@ -65,9 +68,11 @@ jobs:
             exit 1
           fi
 
-          echo "since=${SINCE}" >> "$GITHUB_OUTPUT"
-          echo "github_since=${SINCE}" >> "$GITHUB_OUTPUT"
-          echo "current_date=${CURRENT_DATE}" >> "$GITHUB_OUTPUT"
+          {
+            echo "since=${SINCE}"
+            echo "github_since=${SINCE}"
+            echo "current_date=${CURRENT_DATE}"
+          } >> "$GITHUB_OUTPUT"
           echo "::notice::Using latest dispatch ${FILENAME}; collecting changes from ${SINCE} through ${CURRENT_DATE}."
 
           mkdir -p /tmp/dispatch-examples
@@ -98,6 +103,15 @@ jobs:
               "entireio/git-sync")
                 printf '{"repo":"%s","name":"Git-Sync","feature_flags":false}\n' "$1"
                 ;;
+              "entireio/external-agents")
+                printf '{"repo":"%s","name":"External Agent Integrations","feature_flags":false}\n' "$1"
+                ;;
+              "entireio/go-nuts")
+                printf '{"repo":"%s","name":"go-nuts","feature_flags":false}\n' "$1"
+                ;;
+              "entireio/forgemark")
+                printf '{"repo":"%s","name":"ForgeMark","feature_flags":false}\n' "$1"
+                ;;
               *)
                 echo "::error::Unsupported repo: $1"
                 exit 1
@@ -105,7 +119,7 @@ jobs:
             esac
           }
 
-          ALL_REPOS="entirehq/entire.io entireio/cli go-git/go-git entirehq/entiredb entireio/git-sync"
+          ALL_REPOS="entirehq/entire.io entireio/cli entireio/external-agents go-git/go-git entirehq/entiredb entireio/git-sync entireio/go-nuts entireio/forgemark"
           REPOS=()
 
           if [ "$EVENT_NAME" = "schedule" ] || [ "$INPUT_REPOS" = "all" ]; then
@@ -193,12 +207,41 @@ jobs:
 
           gh pr list --repo "$REPO" --state merged --limit 100 \
             --search "merged:>=${GITHUB_SINCE}" \
-            --json number,title,author,mergedAt,url,labels \
+            --json number,title,body,author,mergedAt,url,labels \
             > /tmp/github-data/merged-prs.json
 
           gh pr list --repo "$REPO" --state open --limit 50 \
             --json number,title,author,updatedAt,url,labels \
             > /tmp/github-data/open-prs.json
+
+          {
+            gh api --paginate "orgs/entireio/members?per_page=100" --jq '.[].login' || true
+            gh api --paginate "orgs/entirehq/members?per_page=100" --jq '.[].login' || true
+          } | jq -R -s 'split("\n") | map(select(length > 0)) | unique' \
+            > /tmp/github-data/entire-org-members.json
+
+          : > /tmp/github-data/contributor-metadata.jsonl
+          jq -r '.[].number' /tmp/github-data/merged-prs.json | while read -r PR_NUMBER; do
+            PR_METADATA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+              --jq '{number, author: .user.login, authorAssociation: .author_association, body: (.body // ""), url: .html_url}')
+            PR_METADATA=$(jq -c \
+              --slurpfile members /tmp/github-data/entire-org-members.json \
+              '. as $pr | $pr + {entireMember: (($members[0] | index($pr.author)) != null)}' \
+              <<< "$PR_METADATA")
+            COMMIT_AUTHORS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits?per_page=100" \
+              --jq '[.[] | {login: (.author.login // null), name: .commit.author.name}] | unique_by([.login, .name])')
+            COMMIT_AUTHORS=$(jq -c \
+              --slurpfile members /tmp/github-data/entire-org-members.json \
+              '$members[0] as $memberLogins | map(. as $author | $author + {entireMember: ($author.login != null and (($memberLogins | index($author.login)) != null))})' \
+              <<< "$COMMIT_AUTHORS")
+            jq -nc \
+              --argjson metadata "$PR_METADATA" \
+              --argjson commitAuthors "$COMMIT_AUTHORS" \
+              '$metadata + {commitAuthors: $commitAuthors}' \
+              >> /tmp/github-data/contributor-metadata.jsonl
+          done
+          jq -s '.' /tmp/github-data/contributor-metadata.jsonl > /tmp/github-data/contributor-metadata.json
+          rm /tmp/github-data/contributor-metadata.jsonl /tmp/github-data/entire-org-members.json
 
           cd /tmp/repo
           python3 <<'PY'
@@ -283,6 +326,7 @@ jobs:
             echo "- release-prs.json"
             echo "- merged-prs.json"
             echo "- open-prs.json"
+            echo "- contributor-metadata.json"
             if [ "${FEATURE_FLAGS}" = "true" ]; then
               echo "- feature-flags.json"
               echo "- posthog_flags.json"
@@ -316,7 +360,18 @@ jobs:
 
     steps:
       - name: Install dependencies
-        run: apt-get update && apt-get install -y jq python3
+        run: apt-get update && apt-get install -y git jq python3
+
+      - name: Checkout dispatch writer skill
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: workflow-source
+
+      - name: Stage dispatch writer skill
+        run: |
+          mkdir -p /tmp/skills/entire-dispatch-writer
+          cp "$GITHUB_WORKSPACE/workflow-source/.agents/skills/entire-dispatch-writer/SKILL.md" \
+            /tmp/skills/entire-dispatch-writer/SKILL.md
 
       - name: Download repo collections
         uses: actions/download-artifact@v4
@@ -375,14 +430,36 @@ jobs:
               lines.append("## Merged pull requests")
               for pr in merged_prs[:50]:
                   author = pr.get("author") or {}
+                  body = " ".join((pr.get("body") or "").split())[:1500]
                   lines.append(
                       f"- #{pr['number']} | {pr['title']} | {pr['url']} | "
                       f"merged {pr.get('mergedAt', 'unknown')} | by {author.get('login', 'unknown')} | "
                       f"labels: {', '.join(label['name'] for label in pr.get('labels', [])) or 'none'}"
                   )
+                  if body:
+                      lines.append(f"  Pull request details: {body}")
               if not merged_prs:
                   lines.append("- None in this window")
               lines.append("")
+
+              contributors_path = collection / "contributor-metadata.json"
+              if contributors_path.exists():
+                  contributors = json.loads(contributors_path.read_text())
+                  lines.append("## Contributor metadata")
+                  for item in contributors:
+                      commit_authors = ", ".join(
+                          (
+                              f"@{author['login']}" if author.get("login") else author.get("name", "unknown")
+                          ) + f" (Entire org member: {'yes' if author.get('entireMember') else 'no'})"
+                          for author in item.get("commitAuthors", [])
+                      )
+                      lines.append(
+                          f"- #{item['number']} | PR author @{item.get('author', 'unknown')} | "
+                          f"association {item.get('authorAssociation', 'unknown')} | "
+                          f"Entire org member: {'yes' if item.get('entireMember') else 'no'} | "
+                          f"commit authors: {commit_authors or 'unknown'}"
+                      )
+                  lines.append("")
 
               flags_path = collection / "feature-flags.json"
               if flags_path.exists():
@@ -426,48 +503,46 @@ jobs:
                 - markdown
 
           instructions: |
-            Draft a complete Entire Dispatch blog post from the prepared source brief.
-            Read /tmp/dispatch-source.md once for factual content and /tmp/dispatch-style.md once for voice and frontmatter style. Do not inspect /tmp/collections, /tmp/dispatch-examples, GitHub, git, curl, or any other source.
-            After those two reads, write the dispatch immediately. Do not narrate your analysis, enumerate your plan, or run further investigation commands.
+            Draft a complete Entire Dispatch blog post by following the Entire Dispatch Writer skill.
+
+            Read these files in order:
+            1. /tmp/skills/entire-dispatch-writer/SKILL.md — required editorial workflow and voice rules
+            2. /tmp/dispatch-source.md — the only factual source for this dispatch
+            3. /tmp/dispatch-style.md — excerpts from the latest three dispatches, for structure and length only
+
+            Do not inspect /tmp/collections, /tmp/dispatch-examples, GitHub, git, curl, or any other source. After reading the three files, write the dispatch immediately. Do not narrate your analysis or enumerate your plan.
 
             Inputs:
-            - /tmp/dispatch-source.md contains the release and pull-request data, plus feature-flag state.
-            - /tmp/dispatch-style.md contains excerpts of the latest published dispatch posts for voice and frontmatter style.
+            - /tmp/dispatch-source.md contains releases, merged pull requests, pull-request descriptions, contributor metadata, and feature-flag state.
+            - /tmp/dispatch-style.md contains excerpts of the latest published dispatch posts. The newest example is authoritative when older examples disagree.
             - The window runs from SINCE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
 
             Product placement in the dispatch hierarchy:
-            - CLI -> Entire CLI (entireio/cli)
+            - CLI -> Entire CLI (entireio/cli and entireio/external-agents)
             - Web -> Entire.io (entirehq/entire.io) and EntireDB (entirehq/entiredb)
-            - OSS Projects -> git-sync (entireio/git-sync) and go-git (go-git/go-git)
+            - OSS Projects -> git-sync (entireio/git-sync), go-git (go-git/go-git), go-nuts (entireio/go-nuts), and ForgeMark (entireio/forgemark)
 
-            Categorize source material into:
-            - Released: stable release items and publicly shipped web work
-            - Nightly: prerelease/nightly items
-            - Merged: merged work that is not clearly in a stable or nightly release
-            - Feature flagged: Entire Web work that is merged but hidden, partially rolled out, internal-only, or disabled
-
-            Requirements:
-            - Use /tmp/collections as the only factual source for the new dispatch.
+            Workflow-specific requirements:
+            - Follow the skill unless one of these workflow constraints is more specific.
+            - Use /tmp/dispatch-source.md as the only factual source for the new dispatch.
             - Use the chronologically newest published dispatch example as the authority for heading hierarchy and frontmatter structure. Use older examples only for voice.
             - Do not copy, summarize, quote, rewrite, or include content from published dispatch examples in the new dispatch.
             - Do not include future-dated items after CURRENT_DATE_PLACEHOLDER.
-            - Include PR numbers and links whenever the collection data provides them.
-            - Prefer concrete user-facing changes over raw implementation titles.
-            - Use the dispatch examples to match Marvin: dry, mildly weary, clear, and restrained. No generic robot noise.
+            - Cover every repository with meaningful eligible activity; omit repositories with no notable changes without announcing their absence.
+            - Include stable release items and clearly label nightly or prerelease CLI work. Merged public work may be included when it is not tied to a release.
+            - For Entire.io, exclude work that the feature-flag data shows is disabled, internal-only, partially rolled out, or otherwise not public. If public visibility cannot be established, omit the item.
+            - Exclude open pull requests, private work, dependency-only updates, cleanup-only changes, and implementation plumbing without a defensible reader benefit.
+            - Include PR numbers and links whenever the source provides them. If one bullet combines several source items, retain every relevant PR link.
+            - Every bullet must state the concrete change and its practical benefit in approachable language.
+            - Preserve broad coverage. Do not compress several distinct changes into one vague bullet.
+            - Use contributor metadata and pull-request descriptions to find external contributors, including original authors whose work was carried by a maintainer-owned PR.
+            - Treat MEMBER, OWNER, and COLLABORATOR pull-request authors as project members rather than external contributors. For Entire repositories, an `Entire org member: yes` marker also means the person is not external. Treat NONE and CONTRIBUTOR as external candidates, then verify against the PR description and commit authors.
+            - Put contributor thank-yous immediately below the relevant bullet using the wording in the skill.
             - Include frontmatter with title, description, category: Dispatch, author: Marvin.
-            - Include an intro, then organize the body using the same three-level hierarchy as the newest published dispatch:
-              - `## CLI`, `## Web`, and `## OSS Projects` are the only top-level body headings. Omit an empty platform area.
-              - Under each platform area, use `###` product headings: `Entire CLI`, `Entire.io`, `EntireDB`, `git-sync`, and `go-git`. Omit products with no useful material.
-              - Under each product, use benefit-oriented `####` feature-theme headings such as `Mirroring Your Repo with the CLI` or `Mirror Performance and Reliability`.
-              - Never put a product directly at `##`, and never put a feature theme directly at `###`.
-            - Keep feature-flagged work out of the public/released prose unless explicitly labeled as feature flagged.
-            - Preserve release/nightly distinction for Entire CLI and Git-Sync.
-            - If a repo has no useful material, omit its section instead of announcing absence.
             - Return the complete final post as JSON with a single "markdown" field. The field must contain only the dispatch Markdown, not commentary about the task.
 
           prompt: |
-            Read the prepared source brief and style reference, then return the complete dispatch now.
-            Keep PR numbers and links attached to the relevant items.
+            Read the Entire Dispatch Writer skill, factual source brief, and style reference in that order. Then return the complete dispatch now, preserving source links and contributor credits.
           RECIPE_EOF
 
           sed -i "s|SINCE_PLACEHOLDER|${SINCE}|g" /tmp/recipe.yaml
