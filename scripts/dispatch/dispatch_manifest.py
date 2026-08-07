@@ -342,7 +342,7 @@ def render_source(manifest: dict[str, Any]) -> str:
                     f"by @{candidate.get('author', 'unknown')}; labels: {labels}"
                 )
                 if candidate.get("body"):
-                    summary = " ".join(candidate["body"].split())[:500]
+                    summary = " ".join(candidate["body"].split())[:180]
                     lines.append(f"  PR context: {summary}")
             lines.append("")
         if repo.get("feature_flag_definitions"):
