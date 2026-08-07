@@ -389,6 +389,99 @@ def combine(collections: Path, previous_path: Path, posthog_path: Path | None) -
     return manifest
 
 
+def split_projects(manifest: dict[str, Any], output: Path) -> list[dict[str, str]]:
+    output.mkdir(parents=True, exist_ok=True)
+    projects: list[dict[str, str]] = []
+    for index, repository in enumerate(manifest["repositories"]):
+        if not repository["releases"] and not repository["candidates"]:
+            continue
+        key = f"{index:02d}"
+        project_manifest: dict[str, Any] = {
+            "window": manifest["window"],
+            "repositories": [repository],
+        }
+        if repository["project"].get("feature_flags") and manifest.get("posthog_flags"):
+            project_manifest["posthog_flags"] = manifest["posthog_flags"]
+        write_json(output / f"{key}.json", project_manifest)
+        (output / f"{key}.md").write_text(render_source(project_manifest))
+        project = repository["project"]
+        projects.append(
+            {
+                "key": key,
+                "repo": project["repo"],
+                "area": project["area"],
+                "product": project["product"],
+            }
+        )
+    write_json(output / "projects.json", projects)
+    return projects
+
+
+def fallback_fragment(project_manifest: dict[str, Any]) -> str:
+    repository = project_manifest["repositories"][0]
+    project = repository["project"]
+    lines = [f"### {project['product']}", "", "#### Release and Project Updates", ""]
+    for release in repository["releases"]:
+        lines.append(
+            f"- **{release['channel'].title()} release [{release['tag']}]({release['url']}).**"
+        )
+        for change in release["changes"]:
+            lines.append(f"  - [{change['title']}]({change['url']})")
+    for candidate in repository["candidates"]:
+        lines.append(f"- [{candidate['title']}]({candidate['url']})")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def next_dispatch_title(previous: str) -> str:
+    match = re.search(r"Entire Dispatch 0x([0-9a-fA-F]+)", previous)
+    if not match:
+        return "Entire Dispatch"
+    width = len(match.group(1))
+    return f"Entire Dispatch 0x{int(match.group(1), 16) + 1:0{width}x}"
+
+
+def assemble_draft(
+    manifest: dict[str, Any], previous: str, projects: list[dict[str, str]], fragments: Path
+) -> tuple[str, list[dict[str, str]]]:
+    products = [project["product"] for project in projects]
+    description = "Updates across " + ", ".join(products) + "."
+    lines = [
+        f"title: {next_dispatch_title(previous)}",
+        f"description: {description}",
+        "category: Dispatch",
+        "author: Marvin",
+        "",
+        "Beep, boop. Marvin here. The machines have been busy again. I have arranged their output into something humans can inspect without opening every repository themselves.",
+        "",
+        f"Here is what changed from {manifest['window']['since']} through {manifest['window']['until']}:",
+        "",
+    ]
+    for area in ("CLI", "Web", "OSS Projects"):
+        area_projects = [project for project in projects if project["area"] == area]
+        if not area_projects:
+            continue
+        lines.extend([f"## {area}", ""])
+        for project in area_projects:
+            lines.extend([(fragments / f"{project['key']}.md").read_text().strip(), ""])
+    lines.extend(
+        [
+            "That's the dispatch. The repositories have been counted, the releases have been linked, and nothing has been permitted to vanish merely because the list was inconveniently long.",
+            "",
+            "As always, bring questions, bugs, PRs, and constructive dread to [Discord](https://discord.com/invite/jZJs3Tue4S) or [GitHub issues](https://github.com/entireio/cli/issues).",
+            "",
+            "Boop.",
+            "",
+        ]
+    )
+    exclusions: list[dict[str, str]] = []
+    for project in projects:
+        path = fragments / f"{project['key']}.exclusions.json"
+        if path.exists():
+            exclusions.extend(read_json(path))
+    return "\n".join(lines), exclusions
+
+
 def coverage_items(manifest: dict[str, Any]) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
     for repo in manifest["repositories"]:
@@ -475,6 +568,26 @@ def command_combine(args: argparse.Namespace) -> None:
     args.output_source.write_text(render_source(value))
 
 
+def command_split(args: argparse.Namespace) -> None:
+    split_projects(read_json(args.manifest), args.output)
+
+
+def command_fallback(args: argparse.Namespace) -> None:
+    args.output_fragment.write_text(fallback_fragment(read_json(args.project_manifest)))
+    write_json(args.output_exclusions, [])
+
+
+def command_assemble(args: argparse.Namespace) -> None:
+    draft, exclusions = assemble_draft(
+        read_json(args.manifest),
+        args.previous.read_text(),
+        read_json(args.projects),
+        args.fragments,
+    )
+    args.output_draft.write_text(draft)
+    write_json(args.output_exclusions, exclusions)
+
+
 def command_validate(args: argparse.Namespace) -> None:
     exclusions = read_json(args.exclusions) if args.exclusions.exists() else []
     report, missing = validate(read_json(args.manifest), args.draft.read_text(), exclusions)
@@ -509,6 +622,26 @@ def parser() -> argparse.ArgumentParser:
     combine_parser.add_argument("--output-manifest", type=Path, required=True)
     combine_parser.add_argument("--output-source", type=Path, required=True)
     combine_parser.set_defaults(func=command_combine)
+
+    split_parser = subparsers.add_parser("split")
+    split_parser.add_argument("--manifest", type=Path, required=True)
+    split_parser.add_argument("--output", type=Path, required=True)
+    split_parser.set_defaults(func=command_split)
+
+    fallback_parser = subparsers.add_parser("fallback")
+    fallback_parser.add_argument("--project-manifest", type=Path, required=True)
+    fallback_parser.add_argument("--output-fragment", type=Path, required=True)
+    fallback_parser.add_argument("--output-exclusions", type=Path, required=True)
+    fallback_parser.set_defaults(func=command_fallback)
+
+    assemble_parser = subparsers.add_parser("assemble")
+    assemble_parser.add_argument("--manifest", type=Path, required=True)
+    assemble_parser.add_argument("--previous", type=Path, required=True)
+    assemble_parser.add_argument("--projects", type=Path, required=True)
+    assemble_parser.add_argument("--fragments", type=Path, required=True)
+    assemble_parser.add_argument("--output-draft", type=Path, required=True)
+    assemble_parser.add_argument("--output-exclusions", type=Path, required=True)
+    assemble_parser.set_defaults(func=command_assemble)
 
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--manifest", type=Path, required=True)

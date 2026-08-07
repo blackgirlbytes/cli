@@ -134,6 +134,63 @@ class DispatchManifestTest(unittest.TestCase):
                 ["entireio/external-agents#47"],
             )
 
+    def test_project_fallback_and_assembly_preserve_coverage(self):
+        manifest = {
+            "window": {"since": "2026-08-03", "until": "2026-08-06"},
+            "repositories": [
+                {
+                    "project": {
+                        "repo": "jdx/mise",
+                        "area": "OSS Projects",
+                        "product": "mise",
+                        "mode": "github-releases",
+                        "feature_flags": False,
+                    },
+                    "releases": [
+                        {
+                            "id": "jdx/mise@v2026.8.2",
+                            "tag": "v2026.8.2",
+                            "channel": "stable",
+                            "url": "https://github.com/jdx/mise/releases/tag/v2026.8.2",
+                            "published_at": "2026-08-05T00:00:00Z",
+                            "changes": [
+                                {
+                                    "id": "jdx/mise#125",
+                                    "title": "Upgrade all tools",
+                                    "url": "https://github.com/jdx/mise/pull/125",
+                                }
+                            ],
+                        }
+                    ],
+                    "candidates": [],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            projects = dispatch_manifest.split_projects(manifest, root / "sources")
+            fragment = dispatch_manifest.fallback_fragment(
+                dispatch_manifest.read_json(root / "sources" / "00.json")
+            )
+            fragments = root / "fragments"
+            fragments.mkdir()
+            (fragments / "00.md").write_text(fragment)
+            (fragments / "00.exclusions.json").write_text("[]")
+
+            draft, exclusions = dispatch_manifest.assemble_draft(
+                manifest,
+                "title: Entire Dispatch 0x0018\n",
+                projects,
+                fragments,
+            )
+            _, missing = dispatch_manifest.validate(manifest, draft, exclusions)
+
+            self.assertIn("title: Entire Dispatch 0x0019", draft)
+            self.assertIn("https://github.com/jdx/mise/releases/tag/v2026.8.2", draft)
+            self.assertIn("https://github.com/jdx/mise/pull/125", draft)
+            self.assertEqual(missing, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
