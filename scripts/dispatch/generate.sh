@@ -102,15 +102,21 @@ for key in $(jq -r '.[] | select(.empty | not) | .key' /tmp/project-sources/proj
 
   valid=true
   repairable=false
-  if [ ! -s "$fragment_path" ] || ! jq -e 'type == "array" and all(.[]; (.id | type == "string") and (.reason | type == "string"))' "$exclusions_path" > /dev/null 2>&1; then
+  if [ ! -s "$fragment_path" ]; then
     valid=false
-  elif ! python3 scripts/dispatch/dispatch_manifest.py validate \
-    --manifest "$manifest_path" \
-    --draft "$fragment_path" \
-    --exclusions "$exclusions_path" \
-    --output "$coverage_path"; then
-    valid=false
-    repairable=true
+  else
+    if ! jq -e 'type == "array" and all(.[]; (.id | type == "string") and (.reason | type == "string"))' "$exclusions_path" > /dev/null 2>&1; then
+      echo "Model produced a fragment without valid exclusions for ${repo}; initializing the exclusion list for coverage repair."
+      printf '%s\n' '[]' > "$exclusions_path"
+    fi
+    if ! python3 scripts/dispatch/dispatch_manifest.py validate \
+      --manifest "$manifest_path" \
+      --draft "$fragment_path" \
+      --exclusions "$exclusions_path" \
+      --output "$coverage_path"; then
+      valid=false
+      repairable=true
+    fi
   fi
 
   if [ "$repairable" = true ]; then
@@ -149,7 +155,7 @@ REPAIR_RECIPE_EOF
       "$repair_recipe_path"
 
     echo "Repairing incomplete coverage for ${repo}."
-    timeout 2m goose run --recipe "$repair_recipe_path" > "$repair_log_path" 2>&1 || true
+    timeout 4m goose run --recipe "$repair_recipe_path" > "$repair_log_path" 2>&1 || true
     cat "$repair_log_path"
     if [ -s "$fragment_path" ] \
       && jq -e 'type == "array" and all(.[]; (.id | type == "string") and (.reason | type == "string"))' "$exclusions_path" > /dev/null 2>&1 \
