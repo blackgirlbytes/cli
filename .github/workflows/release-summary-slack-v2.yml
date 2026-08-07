@@ -235,6 +235,7 @@ jobs:
   draft:
     name: Draft Dispatch
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [prepare, collect]
 
     container:
@@ -310,10 +311,6 @@ jobs:
           title: "Release Summary Dispatch V2"
           description: "Draft a Marvin dispatch from pre-collected repo data"
 
-          extensions:
-            - type: builtin
-              name: developer
-
           response:
             json_schema:
               type: object
@@ -340,16 +337,16 @@ jobs:
 
           instructions: |
             Draft a complete Entire Dispatch blog post from the deterministic source manifest.
-            Read /tmp/dispatch-source.md once for factual content and /tmp/dispatch-style.md once for voice and frontmatter style. Do not inspect /tmp/collections, /tmp/dispatch-examples, GitHub, git, curl, or any other source.
-            After those two reads, write the dispatch immediately. Do not narrate your analysis, enumerate your plan, or run further investigation commands.
+            The prompt contains the factual source and published style references in clearly marked blocks. Do not call tools or investigate any other source.
+            Write the dispatch immediately. Do not narrate your analysis or enumerate your plan.
 
             Inputs:
-            - /tmp/dispatch-source.md contains every configured repository, release, and candidate change plus feature-flag state.
-            - /tmp/dispatch-style.md contains the complete latest published dispatch posts for voice and frontmatter style.
+            - The `<dispatch-source>` block contains every configured repository, release, and candidate change plus feature-flag state.
+            - The `<dispatch-style>` block contains the complete latest published dispatch posts for voice and frontmatter style.
             - The window runs from SINCE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
 
             Requirements:
-            - Use /tmp/dispatch-source.md as the only factual source for the new dispatch.
+            - Use `<dispatch-source>` as the only factual source for the new dispatch.
             - Use the chronologically newest published dispatch example as the authority for heading hierarchy and frontmatter structure. Use older examples only for voice.
             - Do not copy, summarize, quote, rewrite, or include content from published dispatch examples in the new dispatch.
             - Do not include future-dated items after CURRENT_DATE_PLACEHOLDER.
@@ -372,8 +369,16 @@ jobs:
             - Return JSON with `markdown` and `excluded`; do not return commentary.
 
           prompt: |
-            Read the deterministic source manifest and style reference, then return the complete dispatch and explicit exclusion ledger now.
+            Return the complete dispatch and explicit exclusion ledger from the embedded source and style blocks now.
           RECIPE_EOF
+
+          {
+            printf '  <dispatch-source>\n'
+            sed 's/^/  /' /tmp/dispatch-source.md
+            printf '  </dispatch-source>\n\n  <dispatch-style>\n'
+            sed 's/^/  /' /tmp/dispatch-style.md
+            printf '  </dispatch-style>\n'
+          } >> /tmp/recipe.yaml
 
           sed -i "s|SINCE_PLACEHOLDER|${SINCE}|g" /tmp/recipe.yaml
           sed -i "s|CURRENT_DATE_PLACEHOLDER|${CURRENT_DATE}|g" /tmp/recipe.yaml
@@ -403,10 +408,6 @@ jobs:
           title: "Repair Dispatch Coverage"
           description: "Repair an incomplete dispatch without changing its factual source"
 
-          extensions:
-            - type: builtin
-              name: developer
-
           response:
             json_schema:
               type: object
@@ -431,14 +432,26 @@ jobs:
 
           instructions: |
             Repair the incomplete Entire Dispatch draft.
-            Read /tmp/dispatch-source.md, /tmp/dispatch-draft.md, /tmp/dispatch-exclusions.json, and /tmp/dispatch-coverage.md.
+            The prompt embeds the deterministic source, current draft, exclusion ledger, and coverage report in clearly marked blocks. Do not call tools or investigate any other source.
             Preserve the draft's good prose and structure while resolving every item under `## Missing` in the coverage report.
             Every release must be named and linked in the Markdown. Every other missing item must either be included with its exact source link or added to `excluded` with its exact id and a concrete editorial reason.
             Return JSON containing only `markdown` and `excluded`.
 
           prompt: |
-            Repair all missing coverage now and return the complete corrected dispatch plus exclusion ledger.
+            Repair all missing coverage now and return the complete corrected dispatch plus exclusion ledger from the embedded blocks.
           REPAIR_EOF
+
+            {
+              printf '  <dispatch-source>\n'
+              sed 's/^/  /' /tmp/dispatch-source.md
+              printf '  </dispatch-source>\n\n  <dispatch-draft>\n'
+              sed 's/^/  /' /tmp/dispatch-draft.md
+              printf '  </dispatch-draft>\n\n  <dispatch-exclusions>\n'
+              sed 's/^/  /' /tmp/dispatch-exclusions.json
+              printf '  </dispatch-exclusions>\n\n  <dispatch-coverage>\n'
+              sed 's/^/  /' /tmp/dispatch-coverage.md
+              printf '  </dispatch-coverage>\n'
+            } >> /tmp/repair-recipe.yaml
 
             goose run --recipe /tmp/repair-recipe.yaml 2>&1 | tee /tmp/goose_repair_output.log
             REPAIR_RESULT=$(awk 'NF { line = $0 } END { print line }' /tmp/goose_repair_output.log)
