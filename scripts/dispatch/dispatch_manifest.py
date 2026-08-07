@@ -17,6 +17,8 @@ PR_URL_RE = re.compile(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)")
 COMPARE_RE = re.compile(r"github\.com/[^/]+/[^/]+/compare/([^\s)]+)\.\.\.([^\s)]+)")
 CHANGES_SINCE_RE = re.compile(r"Changes since\s+([^:\s]+)", re.IGNORECASE)
 COMMIT_LINE_RE = re.compile(r"^\s*([0-9a-f]{7,40})\s+(.+?)\s*$", re.IGNORECASE)
+RELEASE_AUTHOR_RE = re.compile(r"\s+by\s+@([^\s]+)\s+in\s+", re.IGNORECASE)
+CONTRIBUTOR_CACHE: dict[tuple[str, str], bool] = {}
 
 
 def read_json(path: Path) -> Any:
@@ -92,6 +94,12 @@ def clean_release_title(line: str, url: str) -> str:
     return title.strip() or f"Pull request {url.rsplit('/', 1)[-1]}"
 
 
+def release_line_author(line: str, url: str) -> str | None:
+    segment = next((part for part in line.split(";") if url in part), line)
+    match = RELEASE_AUTHOR_RE.search(segment)
+    return match.group(1) if match else None
+
+
 def release_body_changes(repo: str, release: dict[str, Any]) -> list[dict[str, Any]]:
     body = release.get("body") or ""
     changes: list[dict[str, Any]] = []
@@ -106,15 +114,17 @@ def release_body_changes(repo: str, release: dict[str, Any]) -> list[dict[str, A
             if item_id in seen:
                 continue
             seen.add(item_id)
-            changes.append(
-                {
-                    "id": item_id,
-                    "kind": "pull_request",
-                    "number": int(number),
-                    "title": clean_release_title(line, url),
-                    "url": url,
-                }
-            )
+            change = {
+                "id": item_id,
+                "kind": "pull_request",
+                "number": int(number),
+                "title": clean_release_title(line, url),
+                "url": url,
+            }
+            author = release_line_author(line, url)
+            if author:
+                change["author"] = author
+            changes.append(change)
 
     for line in body.splitlines():
         match = COMMIT_LINE_RE.match(line)
@@ -220,6 +230,7 @@ def resolve_commit_pull_requests(repo: str, changes: list[dict[str, Any]]) -> li
                 "number": merged["number"],
                 "title": merged["title"],
                 "url": merged["html_url"],
+                "author": (merged.get("user") or {}).get("login"),
             }
         else:
             item_id = change["id"]
@@ -228,6 +239,68 @@ def resolve_commit_pull_requests(repo: str, changes: list[dict[str, Any]]) -> li
             seen.add(item_id)
             resolved.append(replacement)
     return resolved
+
+
+def pull_request_author(repo: str, number: int) -> str | None:
+    try:
+        pull = run_json(["gh", "api", f"repos/{repo}/pulls/{number}"])
+    except subprocess.CalledProcessError:
+        return None
+    return (pull.get("user") or {}).get("login")
+
+
+def is_bot(login: str) -> bool:
+    lowered = login.lower()
+    return (
+        lowered.startswith("app/")
+        or lowered.endswith("[bot]")
+        or lowered in {"dependabot", "renovate", "github-actions"}
+    )
+
+
+def is_org_member(org: str, login: str) -> bool:
+    return (
+        subprocess.run(
+            ["gh", "api", f"orgs/{org}/members/{login}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def is_external_contributor(repo: str, login: str) -> bool:
+    cache_key = (repo, login.lower())
+    if cache_key in CONTRIBUTOR_CACHE:
+        return CONTRIBUTOR_CACHE[cache_key]
+    if is_bot(login):
+        CONTRIBUTOR_CACHE[cache_key] = False
+        return False
+    if repo == "go-git/go-git":
+        CONTRIBUTOR_CACHE[cache_key] = True
+        return True
+    try:
+        profile = run_json(["gh", "api", f"users/{login}"])
+    except subprocess.CalledProcessError:
+        profile = {}
+    email = (profile.get("email") or "").lower()
+    employee = email.endswith("@entire.io") or any(
+        is_org_member(org, login) for org in ("entireio", "entirehq")
+    )
+    CONTRIBUTOR_CACHE[cache_key] = not employee
+    return not employee
+
+
+def enrich_contributors(repo: str, items: list[dict[str, Any]]) -> None:
+    for item in items:
+        login = item.get("author")
+        if not login and item.get("number"):
+            login = pull_request_author(repo, item["number"])
+        if not login:
+            continue
+        item["author"] = login
+        item["external_contributor"] = is_external_contributor(repo, login)
 
 
 def collect(config: dict[str, Any], repo: str, checkout: Path, since: str, until: str) -> dict[str, Any]:
@@ -249,6 +322,7 @@ def collect(config: dict[str, Any], repo: str, checkout: Path, since: str, until
             if not changes:
                 changes = git_range_changes(repo, checkout, release)
             changes = resolve_commit_pull_requests(repo, changes)
+            enrich_contributors(repo, changes)
             result["releases"].append(
                 {
                     "id": f"{repo}@{release['tag_name']}",
@@ -277,6 +351,7 @@ def collect(config: dict[str, Any], repo: str, checkout: Path, since: str, until
                     "labels": [label["name"] for label in pr.get("labels", [])],
                 }
             )
+        enrich_contributors(repo, result["candidates"])
 
     flags = checkout / "feature-flags.json"
     if project.get("feature_flags") and flags.exists():
@@ -298,6 +373,46 @@ def filter_previously_published(manifest: dict[str, Any], previous: str) -> None
             kept_releases.append(release)
         repo["releases"] = kept_releases
         repo["candidates"] = [candidate for candidate in repo["candidates"] if candidate["url"] not in previous]
+
+
+def compact_posthog_flags(value: Any) -> list[dict[str, Any]]:
+    flags = value.get("results", []) if isinstance(value, dict) else value
+    if not isinstance(flags, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for flag in flags:
+        if not isinstance(flag, dict):
+            continue
+        filters = flag.get("filters") or {}
+        groups = filters.get("groups") or []
+        multivariate = filters.get("multivariate") or {}
+        variants = multivariate.get("variants") or []
+        compact.append(
+            {
+                "key": flag.get("key"),
+                "name": flag.get("name"),
+                "active": flag.get("active"),
+                "status": flag.get("status"),
+                "archived": flag.get("archived"),
+                "deleted": flag.get("deleted"),
+                "rollout_percentages": sorted(
+                    {
+                        group["rollout_percentage"]
+                        for group in groups
+                        if isinstance(group, dict) and group.get("rollout_percentage") is not None
+                    }
+                ),
+                "variants": [
+                    {
+                        "key": variant.get("key"),
+                        "rollout_percentage": variant.get("rollout_percentage"),
+                    }
+                    for variant in variants
+                    if isinstance(variant, dict)
+                ],
+            }
+        )
+    return compact
 
 
 def render_source(manifest: dict[str, Any]) -> str:
@@ -331,7 +446,14 @@ def render_source(manifest: dict[str, Any]) -> str:
             if not release["changes"]:
                 lines.append("- Release published without individually linked changes; summarize the release itself.")
             for change in release["changes"]:
-                lines.append(f"- `{change['id']}` [{change['title']}]({change['url']})")
+                contributor = (
+                    f"; external contributor: @{change['author']}"
+                    if change.get("external_contributor")
+                    else ""
+                )
+                lines.append(
+                    f"- `{change['id']}` [{change['title']}]({change['url']}){contributor}"
+                )
             lines.append("")
         if repo["candidates"]:
             lines.extend(["### Public-merge candidates", ""])
@@ -340,9 +462,14 @@ def render_source(manifest: dict[str, Any]) -> str:
                 lines.append(
                     f"- `{candidate['id']}` [{candidate['title']}]({candidate['url']}) "
                     f"by @{candidate.get('author', 'unknown')}; labels: {labels}"
+                    + (
+                        f"; external contributor: @{candidate['author']}"
+                        if candidate.get("external_contributor")
+                        else ""
+                    )
                 )
                 if candidate.get("body"):
-                    summary = " ".join(candidate["body"].split())[:500]
+                    summary = " ".join(candidate["body"].split())[:180]
                     lines.append(f"  PR context: {summary}")
             lines.append("")
         if repo.get("feature_flag_definitions"):
@@ -366,7 +493,7 @@ def render_source(manifest: dict[str, Any]) -> str:
                 "Use this only to exclude Entire.io changes that are disabled, internal-only, or partially rolled out.",
                 "",
                 "```json",
-                json.dumps(manifest["posthog_flags"], separators=(",", ":")),
+                json.dumps(compact_posthog_flags(manifest["posthog_flags"]), separators=(",", ":")),
                 "```",
                 "",
             ]
@@ -387,6 +514,199 @@ def combine(collections: Path, previous_path: Path, posthog_path: Path | None) -
         manifest["posthog_flags"] = read_json(posthog_path)
     filter_previously_published(manifest, previous_path.read_text())
     return manifest
+
+
+def split_projects(manifest: dict[str, Any], output: Path) -> list[dict[str, Any]]:
+    output.mkdir(parents=True, exist_ok=True)
+    projects: list[dict[str, Any]] = []
+    for index, repository in enumerate(manifest["repositories"]):
+        empty = not repository["releases"] and not repository["candidates"]
+        if empty and not repository["project"].get("show_when_empty"):
+            continue
+        key = f"{index:02d}"
+        project_manifest: dict[str, Any] = {
+            "window": manifest["window"],
+            "repositories": [repository],
+        }
+        if repository["project"].get("feature_flags") and manifest.get("posthog_flags"):
+            project_manifest["posthog_flags"] = manifest["posthog_flags"]
+        write_json(output / f"{key}.json", project_manifest)
+        (output / f"{key}.md").write_text(render_source(project_manifest))
+        project = repository["project"]
+        projects.append(
+            {
+                "key": key,
+                "repo": project["repo"],
+                "area": project["area"],
+                "product": project["product"],
+                "empty": empty,
+            }
+        )
+    write_json(output / "projects.json", projects)
+    return projects
+
+
+def fallback_fragment(project_manifest: dict[str, Any]) -> str:
+    repository = project_manifest["repositories"][0]
+    project = repository["project"]
+    lines = [f"### {project['product']}", "", "#### Release and Project Updates", ""]
+    for release in repository["releases"]:
+        lines.append(
+            f"- **{release['channel'].title()} release [{release['tag']}]({release['url']}).**"
+        )
+        for change in release["changes"]:
+            lines.append(f"  - [{change['title']}]({change['url']})")
+    for candidate in repository["candidates"]:
+        lines.append(f"- [{candidate['title']}]({candidate['url']})")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def empty_fragment(project_manifest: dict[str, Any]) -> str:
+    repository = project_manifest["repositories"][0]
+    project = repository["project"]
+    since = project_manifest["window"]["since"]
+    until = project_manifest["window"]["until"]
+    if project["mode"] == "github-releases":
+        message = f"No stable or nightly releases shipped from {since} through {until}."
+    else:
+        message = f"No pull requests were merged from {since} through {until}."
+    return f"### {project['product']}\n\n{message}\n"
+
+
+def next_dispatch_title(previous: str) -> str:
+    match = re.search(r"Entire Dispatch 0x([0-9a-fA-F]+)", previous)
+    if not match:
+        return "Entire Dispatch"
+    width = len(match.group(1))
+    return f"Entire Dispatch 0x{int(match.group(1), 16) + 1:0{width}x}"
+
+
+def contributor_thanks(authors: list[str], indent: str = "") -> str:
+    links = [f"[@{author}](https://github.com/{author})" for author in authors]
+    if len(links) == 1:
+        return f"{indent}  - Thank you for your contribution, {links[0]}!"
+    if len(links) == 2:
+        names = f"{links[0]} and {links[1]}"
+    else:
+        names = ", ".join(links[:-1]) + f", and {links[-1]}"
+    return f"{indent}  - Thank you for your contributions, {names}!"
+
+
+def add_contributor_thanks(repository: dict[str, Any], fragment: str) -> str:
+    authors_by_url: dict[str, str] = {}
+    for release in repository["releases"]:
+        for change in release["changes"]:
+            if change.get("external_contributor") and change.get("author"):
+                authors_by_url[change["url"]] = change["author"]
+    for candidate in repository["candidates"]:
+        if candidate.get("external_contributor") and candidate.get("author"):
+            authors_by_url[candidate["url"]] = candidate["author"]
+
+    output: list[str] = []
+    for line in fragment.splitlines():
+        output.append(line)
+        if not line.lstrip().startswith("- "):
+            continue
+        authors = sorted({author for url, author in authors_by_url.items() if url in line})
+        if authors:
+            indent = line[: len(line) - len(line.lstrip())]
+            output.append(contributor_thanks(authors, indent))
+    return "\n".join(output)
+
+
+def render_intro_source(projects: list[dict[str, Any]], fragments: Path) -> str:
+    lines = ["# Dispatch highlights", ""]
+    for project in projects:
+        if project.get("empty"):
+            continue
+        fragment_lines = (fragments / f"{project['key']}.md").read_text().splitlines()
+        lines.extend([f"## {project['product']}", ""])
+        themes = 0
+        awaiting_bullet = False
+        for line in fragment_lines:
+            if line.startswith("#### ") and themes < 3:
+                lines.append(line)
+                themes += 1
+                awaiting_bullet = True
+            elif awaiting_bullet and line.lstrip().startswith("- "):
+                lines.extend([line, ""])
+                awaiting_bullet = False
+        if themes == 0:
+            first_bullet = next(
+                (line for line in fragment_lines if line.lstrip().startswith("- ")), None
+            )
+            if first_bullet:
+                lines.extend([first_bullet, ""])
+    return "\n".join(lines)
+
+
+def default_intro(products: list[str]) -> str:
+    product_list = ", ".join(products) if products else "the monitored projects"
+    return "\n\n".join(
+        [
+            "Beep, boop. Marvin here. Apparently the machines found another collection of ways to make developer workflows faster, steadier, and marginally less dramatic. I have been asked to document their enthusiasm.",
+            f"This Dispatch covers the strongest visible changes across {product_list}.",
+            "For humans and agents, details can be read (or scraped) below:",
+        ]
+    )
+
+
+def assemble_draft(
+    manifest: dict[str, Any],
+    previous: str,
+    projects: list[dict[str, Any]],
+    fragments: Path,
+    description_override: str | None = None,
+    intro_override: str | None = None,
+) -> tuple[str, list[dict[str, str]]]:
+    products = [project["product"] for project in projects if not project.get("empty")]
+    description = description_override or (
+        "Updates across " + ", ".join(products) + "."
+        if products
+        else "No releases or merged pull requests in this Dispatch window."
+    )
+    intro = intro_override or default_intro(products)
+    lines = [
+        f"title: {next_dispatch_title(previous)}",
+        f"description: {description}",
+        "category: Dispatch",
+        "author: Marvin",
+        "",
+        intro.strip(),
+        "",
+    ]
+    for area in ("CLI", "Web", "OSS Projects"):
+        area_projects = [project for project in projects if project["area"] == area]
+        if not area_projects:
+            continue
+        lines.extend([f"## {area}", ""])
+        for project in area_projects:
+            repository = next(
+                item for item in manifest["repositories"] if item["project"]["repo"] == project["repo"]
+            )
+            fragment = add_contributor_thanks(
+                repository, (fragments / f"{project['key']}.md").read_text().strip()
+            )
+            lines.extend([fragment, ""])
+    lines.extend(
+        [
+            "That’s the dispatch. As always, bring questions, bugs, PRs, and constructive dread to [Discord](https://discord.com/invite/jZJs3Tue4S) or [GitHub issues](https://github.com/entireio/cli/issues).",
+            "",
+        ]
+    )
+    valid_exclusion_ids = {item["id"] for item in coverage_items(manifest)}
+    exclusions: list[dict[str, str]] = []
+    exclusion_ids: set[str] = set()
+    for project in projects:
+        path = fragments / f"{project['key']}.exclusions.json"
+        if path.exists():
+            for exclusion in read_json(path):
+                if exclusion["id"] not in valid_exclusion_ids or exclusion["id"] in exclusion_ids:
+                    continue
+                exclusion_ids.add(exclusion["id"])
+                exclusions.append(exclusion)
+    return "\n".join(lines), exclusions
 
 
 def coverage_items(manifest: dict[str, Any]) -> list[dict[str, str]]:
@@ -475,6 +795,41 @@ def command_combine(args: argparse.Namespace) -> None:
     args.output_source.write_text(render_source(value))
 
 
+def command_split(args: argparse.Namespace) -> None:
+    split_projects(read_json(args.manifest), args.output)
+
+
+def command_fallback(args: argparse.Namespace) -> None:
+    args.output_fragment.write_text(fallback_fragment(read_json(args.project_manifest)))
+    write_json(args.output_exclusions, [])
+
+
+def command_empty(args: argparse.Namespace) -> None:
+    args.output_fragment.write_text(empty_fragment(read_json(args.project_manifest)))
+    write_json(args.output_exclusions, [])
+
+
+def command_intro_source(args: argparse.Namespace) -> None:
+    args.output.write_text(render_intro_source(read_json(args.projects), args.fragments))
+
+
+def command_assemble(args: argparse.Namespace) -> None:
+    description = None
+    if args.description and args.description.exists():
+        description = " ".join(args.description.read_text().split())
+    intro = args.intro.read_text().strip() if args.intro and args.intro.exists() else None
+    draft, exclusions = assemble_draft(
+        read_json(args.manifest),
+        args.previous.read_text(),
+        read_json(args.projects),
+        args.fragments,
+        description,
+        intro,
+    )
+    args.output_draft.write_text(draft)
+    write_json(args.output_exclusions, exclusions)
+
+
 def command_validate(args: argparse.Namespace) -> None:
     exclusions = read_json(args.exclusions) if args.exclusions.exists() else []
     report, missing = validate(read_json(args.manifest), args.draft.read_text(), exclusions)
@@ -509,6 +864,40 @@ def parser() -> argparse.ArgumentParser:
     combine_parser.add_argument("--output-manifest", type=Path, required=True)
     combine_parser.add_argument("--output-source", type=Path, required=True)
     combine_parser.set_defaults(func=command_combine)
+
+    split_parser = subparsers.add_parser("split")
+    split_parser.add_argument("--manifest", type=Path, required=True)
+    split_parser.add_argument("--output", type=Path, required=True)
+    split_parser.set_defaults(func=command_split)
+
+    fallback_parser = subparsers.add_parser("fallback")
+    fallback_parser.add_argument("--project-manifest", type=Path, required=True)
+    fallback_parser.add_argument("--output-fragment", type=Path, required=True)
+    fallback_parser.add_argument("--output-exclusions", type=Path, required=True)
+    fallback_parser.set_defaults(func=command_fallback)
+
+    empty_parser = subparsers.add_parser("empty")
+    empty_parser.add_argument("--project-manifest", type=Path, required=True)
+    empty_parser.add_argument("--output-fragment", type=Path, required=True)
+    empty_parser.add_argument("--output-exclusions", type=Path, required=True)
+    empty_parser.set_defaults(func=command_empty)
+
+    intro_source_parser = subparsers.add_parser("intro-source")
+    intro_source_parser.add_argument("--projects", type=Path, required=True)
+    intro_source_parser.add_argument("--fragments", type=Path, required=True)
+    intro_source_parser.add_argument("--output", type=Path, required=True)
+    intro_source_parser.set_defaults(func=command_intro_source)
+
+    assemble_parser = subparsers.add_parser("assemble")
+    assemble_parser.add_argument("--manifest", type=Path, required=True)
+    assemble_parser.add_argument("--previous", type=Path, required=True)
+    assemble_parser.add_argument("--projects", type=Path, required=True)
+    assemble_parser.add_argument("--fragments", type=Path, required=True)
+    assemble_parser.add_argument("--description", type=Path)
+    assemble_parser.add_argument("--intro", type=Path)
+    assemble_parser.add_argument("--output-draft", type=Path, required=True)
+    assemble_parser.add_argument("--output-exclusions", type=Path, required=True)
+    assemble_parser.set_defaults(func=command_assemble)
 
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--manifest", type=Path, required=True)

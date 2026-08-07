@@ -18,6 +18,11 @@ on:
           - entireio/forgemark
           - entireio/go-nuts
           - jdx/mise
+      post_to_slack:
+        description: "Upload the completed draft to Slack"
+        required: true
+        type: boolean
+        default: true
   schedule:
     # Canonical weekly draft: Monday at 10am PT during daylight time (17:00 UTC).
     - cron: "0 17 * * 1"
@@ -78,7 +83,7 @@ jobs:
           echo "::notice::Using latest dispatch ${FILENAME}; collecting changes from ${SINCE} through ${CURRENT_DATE}."
 
           mkdir -p /tmp/dispatch-examples
-          tail -3 /tmp/dispatch-files.txt | while read -r f; do
+          tail -4 /tmp/dispatch-files.txt | while read -r f; do
             cp "$f" /tmp/dispatch-examples/
           done
           cp "$LATEST_DISPATCH" /tmp/previous-dispatch.md
@@ -235,6 +240,7 @@ jobs:
   draft:
     name: Draft Dispatch
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [prepare, collect]
 
     container:
@@ -242,7 +248,7 @@ jobs:
       options: --user root
       env:
         GOOSE_PROVIDER: anthropic
-        GOOSE_MODEL: claude-opus-4-8
+        GOOSE_MODEL: claude-sonnet-4-6
         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         HOME: /tmp/goose-home
 
@@ -288,176 +294,7 @@ jobs:
         env:
           SINCE: ${{ needs.prepare.outputs.since }}
           CURRENT_DATE: ${{ needs.prepare.outputs.current_date }}
-        run: |
-          mkdir -p "$HOME/.local/share/goose/sessions" "$HOME/.config/goose"
-          python3 scripts/dispatch/dispatch_manifest.py combine \
-            --collections /tmp/collections \
-            --previous /tmp/previous-dispatch.md \
-            --posthog /tmp/posthog_flags.json \
-            --output-manifest /tmp/dispatch-manifest.json \
-            --output-source /tmp/dispatch-source.md
-
-          {
-            for example in /tmp/dispatch-examples/*; do
-              echo "# Style reference: $(basename "$example")"
-              cat "$example"
-              echo
-            done
-          } > /tmp/dispatch-style.md
-
-          cat > /tmp/recipe.yaml <<'RECIPE_EOF'
-          version: "1.0.0"
-          title: "Release Summary Dispatch V2"
-          description: "Draft a Marvin dispatch from pre-collected repo data"
-
-          extensions:
-            - type: builtin
-              name: developer
-
-          response:
-            json_schema:
-              type: object
-              properties:
-                markdown:
-                  type: string
-                  description: "Complete dispatch post in Markdown"
-                excluded:
-                  type: array
-                  description: "Source items intentionally omitted from the public draft"
-                  items:
-                    type: object
-                    properties:
-                      id:
-                        type: string
-                      reason:
-                        type: string
-                    required:
-                      - id
-                      - reason
-              required:
-                - markdown
-                - excluded
-
-          instructions: |
-            Draft a complete Entire Dispatch blog post from the deterministic source manifest.
-            Read /tmp/dispatch-source.md once for factual content and /tmp/dispatch-style.md once for voice and frontmatter style. Do not inspect /tmp/collections, /tmp/dispatch-examples, GitHub, git, curl, or any other source.
-            After those two reads, write the dispatch immediately. Do not narrate your analysis, enumerate your plan, or run further investigation commands.
-
-            Inputs:
-            - /tmp/dispatch-source.md contains every configured repository, release, and candidate change plus feature-flag state.
-            - /tmp/dispatch-style.md contains the complete latest published dispatch posts for voice and frontmatter style.
-            - The window runs from SINCE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
-
-            Requirements:
-            - Use /tmp/dispatch-source.md as the only factual source for the new dispatch.
-            - Use the chronologically newest published dispatch example as the authority for heading hierarchy and frontmatter structure. Use older examples only for voice.
-            - Do not copy, summarize, quote, rewrite, or include content from published dispatch examples in the new dispatch.
-            - Do not include future-dated items after CURRENT_DATE_PLACEHOLDER.
-            - Mention and link every stable and nightly release listed in the source, including releases from mise and non-Entire repositories.
-            - Cover every meaningful source item and preserve its exact PR, commit, or release link in the relevant bullet.
-            - Return every intentionally omitted source item in `excluded` using its exact source id without Markdown backticks and a concrete reason such as dependency-only, internal-only, feature-flagged, duplicate, or no user-visible effect.
-            - Never omit an entire release. Release ids cannot be placed in `excluded`.
-            - Do not omit an item merely to make the draft shorter.
-            - Prefer concrete user-facing changes over raw implementation titles.
-            - Use the dispatch examples to match Marvin: dry, mildly weary, clear, and restrained. No generic robot noise.
-            - Include frontmatter with title, description, category: Dispatch, author: Marvin.
-            - Include an intro, then organize the body using the same three-level hierarchy as the newest published dispatch:
-              - `## CLI`, `## Web`, and `## OSS Projects` are the only top-level body headings. Omit an empty platform area.
-              - Under each platform area, use the exact `###` product placement stated in the source manifest. Omit products with no included material.
-              - Under each product, use benefit-oriented `####` feature-theme headings such as `Mirroring Your Repo with the CLI` or `Mirror Performance and Reliability`.
-              - Never put a product directly at `##`, and never put a feature theme directly at `###`.
-            - Keep feature-flagged, partial-rollout, disabled, and internal-only work out of the public prose and record it in `excluded`.
-            - Preserve stable/nightly distinctions for every GitHub-release project.
-            - If a repo has no useful material, omit its section instead of announcing absence.
-            - Return JSON with `markdown` and `excluded`; do not return commentary.
-
-          prompt: |
-            Read the deterministic source manifest and style reference, then return the complete dispatch and explicit exclusion ledger now.
-          RECIPE_EOF
-
-          sed -i "s|SINCE_PLACEHOLDER|${SINCE}|g" /tmp/recipe.yaml
-          sed -i "s|CURRENT_DATE_PLACEHOLDER|${CURRENT_DATE}|g" /tmp/recipe.yaml
-          goose run --recipe /tmp/recipe.yaml 2>&1 | tee /tmp/goose_output.log
-
-          GOOSE_RESULT=$(awk 'NF { line = $0 } END { print line }' /tmp/goose_output.log)
-          printf '%s\n' "$GOOSE_RESULT" > /tmp/goose_response.json
-
-          if ! jq -e '.markdown | type == "string" and length > 0 and (.excluded | type == "array")' /tmp/goose_response.json > /dev/null; then
-            echo "::error::Goose did not return a valid markdown payload"
-            echo "::group::Goose raw output"
-            cat /tmp/goose_output.log || true
-            echo "::endgroup::"
-            exit 1
-          fi
-
-          jq -r '.markdown' /tmp/goose_response.json > /tmp/dispatch-draft.md
-          jq '.excluded' /tmp/goose_response.json > /tmp/dispatch-exclusions.json
-
-          if ! python3 scripts/dispatch/dispatch_manifest.py validate \
-            --manifest /tmp/dispatch-manifest.json \
-            --draft /tmp/dispatch-draft.md \
-            --exclusions /tmp/dispatch-exclusions.json \
-            --output /tmp/dispatch-coverage.md; then
-            cat > /tmp/repair-recipe.yaml <<'REPAIR_EOF'
-          version: "1.0.0"
-          title: "Repair Dispatch Coverage"
-          description: "Repair an incomplete dispatch without changing its factual source"
-
-          extensions:
-            - type: builtin
-              name: developer
-
-          response:
-            json_schema:
-              type: object
-              properties:
-                markdown:
-                  type: string
-                excluded:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      id:
-                        type: string
-                      reason:
-                        type: string
-                    required:
-                      - id
-                      - reason
-              required:
-                - markdown
-                - excluded
-
-          instructions: |
-            Repair the incomplete Entire Dispatch draft.
-            Read /tmp/dispatch-source.md, /tmp/dispatch-draft.md, /tmp/dispatch-exclusions.json, and /tmp/dispatch-coverage.md.
-            Preserve the draft's good prose and structure while resolving every item under `## Missing` in the coverage report.
-            Every release must be named and linked in the Markdown. Every other missing item must either be included with its exact source link or added to `excluded` with its exact id and a concrete editorial reason.
-            Return JSON containing only `markdown` and `excluded`.
-
-          prompt: |
-            Repair all missing coverage now and return the complete corrected dispatch plus exclusion ledger.
-          REPAIR_EOF
-
-            goose run --recipe /tmp/repair-recipe.yaml 2>&1 | tee /tmp/goose_repair_output.log
-            REPAIR_RESULT=$(awk 'NF { line = $0 } END { print line }' /tmp/goose_repair_output.log)
-            printf '%s\n' "$REPAIR_RESULT" > /tmp/goose_response.json
-            jq -e '.markdown | type == "string" and length > 0 and (.excluded | type == "array")' /tmp/goose_response.json > /dev/null
-            jq -r '.markdown' /tmp/goose_response.json > /tmp/dispatch-draft.md
-            jq '.excluded' /tmp/goose_response.json > /tmp/dispatch-exclusions.json
-            python3 scripts/dispatch/dispatch_manifest.py validate \
-              --manifest /tmp/dispatch-manifest.json \
-              --draft /tmp/dispatch-draft.md \
-              --exclusions /tmp/dispatch-exclusions.json \
-              --output /tmp/dispatch-coverage.md
-          fi
-
-          mkdir -p /tmp/dispatch-bundle
-          cp /tmp/dispatch-draft.md /tmp/dispatch-manifest.json \
-            /tmp/dispatch-exclusions.json /tmp/dispatch-coverage.md \
-            /tmp/dispatch-repository-audit.md \
-            /tmp/dispatch-bundle/
+        run: scripts/dispatch/generate.sh
 
       - name: Upload dispatch bundle
         uses: actions/upload-artifact@v4
@@ -470,6 +307,7 @@ jobs:
     name: Upload Slack Markdown
     runs-on: ubuntu-latest
     needs: draft
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.post_to_slack }}
 
     steps:
       - name: Download dispatch bundle

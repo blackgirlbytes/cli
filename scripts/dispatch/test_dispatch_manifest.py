@@ -48,10 +48,34 @@ class DispatchManifestTest(unittest.TestCase):
                     "number": 2277,
                     "title": "safer worktrees",
                     "url": "https://github.com/go-git/go-git/pull/2277",
+                    "author": "dev",
                 }
             ],
         )
         self.assertEqual(dispatch_manifest.previous_tag(release), "v5.19.1")
+
+    def test_release_body_attributes_grouped_pull_requests_to_their_segment_author(self):
+        release = {
+            "body": (
+                "* fixes https://github.com/jdx/mise/pull/1 by @alice in notes; "
+                "follow-up https://github.com/jdx/mise/pull/2 by @bob in notes"
+            )
+        }
+
+        changes = dispatch_manifest.release_body_changes("jdx/mise", release)
+
+        self.assertEqual(
+            [(change["number"], change["author"]) for change in changes],
+            [(1, "alice"), (2, "bob")],
+        )
+
+    def test_github_app_authors_are_not_external_contributors(self):
+        self.assertTrue(dispatch_manifest.is_bot("app/entire"))
+        self.assertFalse(
+            dispatch_manifest.is_external_contributor(
+                "entirehq/entire.io", "app/entire"
+            )
+        )
 
     def test_validation_requires_releases_and_accounts_for_exclusions(self):
         manifest = {
@@ -133,6 +157,180 @@ class DispatchManifestTest(unittest.TestCase):
                 [item["id"] for item in combined["repositories"][0]["candidates"]],
                 ["entireio/external-agents#47"],
             )
+
+    def test_project_fallback_and_assembly_preserve_coverage(self):
+        manifest = {
+            "window": {"since": "2026-08-03", "until": "2026-08-06"},
+            "repositories": [
+                {
+                    "project": {
+                        "repo": "jdx/mise",
+                        "area": "OSS Projects",
+                        "product": "mise",
+                        "mode": "github-releases",
+                        "feature_flags": False,
+                    },
+                    "releases": [
+                        {
+                            "id": "jdx/mise@v2026.8.2",
+                            "tag": "v2026.8.2",
+                            "channel": "stable",
+                            "url": "https://github.com/jdx/mise/releases/tag/v2026.8.2",
+                            "published_at": "2026-08-05T00:00:00Z",
+                            "changes": [
+                                {
+                                    "id": "jdx/mise#125",
+                                    "title": "Upgrade all tools",
+                                    "url": "https://github.com/jdx/mise/pull/125",
+                                    "author": "community-dev",
+                                    "external_contributor": True,
+                                }
+                            ],
+                        }
+                    ],
+                    "candidates": [],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            projects = dispatch_manifest.split_projects(manifest, root / "sources")
+            fragment = dispatch_manifest.fallback_fragment(
+                dispatch_manifest.read_json(root / "sources" / "00.json")
+            )
+            fragments = root / "fragments"
+            fragments.mkdir()
+            (fragments / "00.md").write_text(fragment)
+            (fragments / "00.exclusions.json").write_text(
+                '[{"id":"jdx/mise#125","reason":"duplicate"},'
+                '{"id":"jdx/mise#125","reason":"duplicate"},'
+                '{"id":"jdx/mise#999","reason":"maintenance-only"}]'
+            )
+
+            draft, exclusions = dispatch_manifest.assemble_draft(
+                manifest,
+                "title: Entire Dispatch 0x0018\n",
+                projects,
+                fragments,
+            )
+            _, missing = dispatch_manifest.validate(manifest, draft, exclusions)
+
+            self.assertIn("title: Entire Dispatch 0x0019", draft)
+            self.assertIn("https://github.com/jdx/mise/releases/tag/v2026.8.2", draft)
+            self.assertIn("https://github.com/jdx/mise/pull/125", draft)
+            self.assertIn(
+                "Thank you for your contribution, [@community-dev](https://github.com/community-dev)!",
+                draft,
+            )
+            self.assertIn(
+                "That’s the dispatch. As always, bring questions, bugs, PRs, and constructive dread",
+                draft,
+            )
+            self.assertNotIn("Boop.", draft)
+            self.assertEqual(exclusions, [{"id": "jdx/mise#125", "reason": "duplicate"}])
+            self.assertEqual(missing, 0)
+
+    def test_render_source_compacts_posthog_flags(self):
+        manifest = {
+            "window": {"since": "2026-08-03", "until": "2026-08-06"},
+            "repositories": [],
+            "posthog_flags": {
+                "count": 1,
+                "results": [
+                    {
+                        "key": "new-home",
+                        "name": "New home",
+                        "active": True,
+                        "status": "ACTIVE",
+                        "archived": False,
+                        "deleted": False,
+                        "large_irrelevant_payload": "x" * 60_000,
+                        "filters": {
+                            "groups": [{"rollout_percentage": 25, "properties": ["large"]}],
+                            "multivariate": {
+                                "variants": [{"key": "control", "rollout_percentage": 75}]
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+
+        source = dispatch_manifest.render_source(manifest)
+
+        self.assertIn('"key":"new-home"', source)
+        self.assertIn('"rollout_percentages":[25]', source)
+        self.assertIn('"variants":[{"key":"control","rollout_percentage":75}]', source)
+        self.assertNotIn("large_irrelevant_payload", source)
+        self.assertLess(len(source), 2_000)
+
+    def test_empty_oss_projects_keep_headlines_without_affecting_description(self):
+        manifest = {
+            "window": {"since": "2026-08-03", "until": "2026-08-06"},
+            "repositories": [
+                {
+                    "project": {
+                        "repo": "go-git/go-git",
+                        "area": "OSS Projects",
+                        "product": "go-git",
+                        "mode": "github-releases",
+                        "show_when_empty": True,
+                    },
+                    "releases": [],
+                    "candidates": [],
+                },
+                {
+                    "project": {
+                        "repo": "entireio/forgemark",
+                        "area": "OSS Projects",
+                        "product": "ForgeMark",
+                        "mode": "public-merges",
+                        "show_when_empty": True,
+                    },
+                    "releases": [],
+                    "candidates": [],
+                },
+                {
+                    "project": {
+                        "repo": "entireio/external-agents",
+                        "area": "CLI",
+                        "product": "Entire CLI",
+                        "mode": "public-merges",
+                    },
+                    "releases": [],
+                    "candidates": [],
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            projects = dispatch_manifest.split_projects(manifest, root / "sources")
+            fragments = root / "fragments"
+            fragments.mkdir()
+            for project in projects:
+                project_manifest = dispatch_manifest.read_json(
+                    root / "sources" / f"{project['key']}.json"
+                )
+                (fragments / f"{project['key']}.md").write_text(
+                    dispatch_manifest.empty_fragment(project_manifest)
+                )
+
+            draft, _ = dispatch_manifest.assemble_draft(
+                manifest,
+                "title: Entire Dispatch 0x0018\n",
+                projects,
+                fragments,
+            )
+
+            self.assertEqual([project["product"] for project in projects], ["go-git", "ForgeMark"])
+            self.assertIn("### go-git", draft)
+            self.assertIn("No stable or nightly releases shipped from 2026-08-03 through 2026-08-06.", draft)
+            self.assertIn("### ForgeMark", draft)
+            self.assertIn("No pull requests were merged from 2026-08-03 through 2026-08-06.", draft)
+            self.assertNotIn("Updates across go-git", draft)
+            self.assertIn("description: No releases or merged pull requests", draft)
 
 
 if __name__ == "__main__":
