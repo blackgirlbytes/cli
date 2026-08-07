@@ -251,7 +251,11 @@ def pull_request_author(repo: str, number: int) -> str | None:
 
 def is_bot(login: str) -> bool:
     lowered = login.lower()
-    return lowered.endswith("[bot]") or lowered in {"dependabot", "renovate", "github-actions"}
+    return (
+        lowered.startswith("app/")
+        or lowered.endswith("[bot]")
+        or lowered in {"dependabot", "renovate", "github-actions"}
+    )
 
 
 def is_org_member(org: str, login: str) -> bool:

@@ -69,6 +69,14 @@ class DispatchManifestTest(unittest.TestCase):
             [(1, "alice"), (2, "bob")],
         )
 
+    def test_github_app_authors_are_not_external_contributors(self):
+        self.assertTrue(dispatch_manifest.is_bot("app/entire"))
+        self.assertFalse(
+            dispatch_manifest.is_external_contributor(
+                "entirehq/entire.io", "app/entire"
+            )
+        )
+
     def test_validation_requires_releases_and_accounts_for_exclusions(self):
         manifest = {
             "window": {"since": "2026-08-01", "until": "2026-08-03"},
