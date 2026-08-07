@@ -230,6 +230,73 @@ class DispatchManifestTest(unittest.TestCase):
         self.assertNotIn("large_irrelevant_payload", source)
         self.assertLess(len(source), 2_000)
 
+    def test_empty_oss_projects_keep_headlines_without_affecting_description(self):
+        manifest = {
+            "window": {"since": "2026-08-03", "until": "2026-08-06"},
+            "repositories": [
+                {
+                    "project": {
+                        "repo": "go-git/go-git",
+                        "area": "OSS Projects",
+                        "product": "go-git",
+                        "mode": "github-releases",
+                        "show_when_empty": True,
+                    },
+                    "releases": [],
+                    "candidates": [],
+                },
+                {
+                    "project": {
+                        "repo": "entireio/forgemark",
+                        "area": "OSS Projects",
+                        "product": "ForgeMark",
+                        "mode": "public-merges",
+                        "show_when_empty": True,
+                    },
+                    "releases": [],
+                    "candidates": [],
+                },
+                {
+                    "project": {
+                        "repo": "entireio/external-agents",
+                        "area": "CLI",
+                        "product": "Entire CLI",
+                        "mode": "public-merges",
+                    },
+                    "releases": [],
+                    "candidates": [],
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            projects = dispatch_manifest.split_projects(manifest, root / "sources")
+            fragments = root / "fragments"
+            fragments.mkdir()
+            for project in projects:
+                project_manifest = dispatch_manifest.read_json(
+                    root / "sources" / f"{project['key']}.json"
+                )
+                (fragments / f"{project['key']}.md").write_text(
+                    dispatch_manifest.empty_fragment(project_manifest)
+                )
+
+            draft, _ = dispatch_manifest.assemble_draft(
+                manifest,
+                "title: Entire Dispatch 0x0018\n",
+                projects,
+                fragments,
+            )
+
+            self.assertEqual([project["product"] for project in projects], ["go-git", "ForgeMark"])
+            self.assertIn("### go-git", draft)
+            self.assertIn("No stable or nightly releases shipped from 2026-08-03 through 2026-08-06.", draft)
+            self.assertIn("### ForgeMark", draft)
+            self.assertIn("No pull requests were merged from 2026-08-03 through 2026-08-06.", draft)
+            self.assertNotIn("Updates across go-git", draft)
+            self.assertIn("description: No releases or merged pull requests", draft)
+
 
 if __name__ == "__main__":
     unittest.main()

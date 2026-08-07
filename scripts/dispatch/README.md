@@ -11,6 +11,8 @@ pipeline deliberately separates factual discovery from editorial writing:
    Goose never has to process the full cross-project inventory in one pass.
    PostHog data is reduced to flag identity, lifecycle state, and rollout
    percentages so the Entire Web inventory stays below model tool-output limits.
+   Configured OSS projects with `show_when_empty` retain their headline and get
+   a deterministic no-releases or no-merged-PRs notice without invoking Goose.
 4. Goose curates the non-empty projects in parallel into public-facing
    fragments and records an explicit ledger for intentionally excluded source
    items. Each project has its own bounded execution window.

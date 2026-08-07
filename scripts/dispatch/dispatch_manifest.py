@@ -429,11 +429,12 @@ def combine(collections: Path, previous_path: Path, posthog_path: Path | None) -
     return manifest
 
 
-def split_projects(manifest: dict[str, Any], output: Path) -> list[dict[str, str]]:
+def split_projects(manifest: dict[str, Any], output: Path) -> list[dict[str, Any]]:
     output.mkdir(parents=True, exist_ok=True)
-    projects: list[dict[str, str]] = []
+    projects: list[dict[str, Any]] = []
     for index, repository in enumerate(manifest["repositories"]):
-        if not repository["releases"] and not repository["candidates"]:
+        empty = not repository["releases"] and not repository["candidates"]
+        if empty and not repository["project"].get("show_when_empty"):
             continue
         key = f"{index:02d}"
         project_manifest: dict[str, Any] = {
@@ -451,6 +452,7 @@ def split_projects(manifest: dict[str, Any], output: Path) -> list[dict[str, str
                 "repo": project["repo"],
                 "area": project["area"],
                 "product": project["product"],
+                "empty": empty,
             }
         )
     write_json(output / "projects.json", projects)
@@ -473,6 +475,18 @@ def fallback_fragment(project_manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def empty_fragment(project_manifest: dict[str, Any]) -> str:
+    repository = project_manifest["repositories"][0]
+    project = repository["project"]
+    since = project_manifest["window"]["since"]
+    until = project_manifest["window"]["until"]
+    if project["mode"] == "github-releases":
+        message = f"No stable or nightly releases shipped from {since} through {until}."
+    else:
+        message = f"No pull requests were merged from {since} through {until}."
+    return f"### {project['product']}\n\n{message}\n"
+
+
 def next_dispatch_title(previous: str) -> str:
     match = re.search(r"Entire Dispatch 0x([0-9a-fA-F]+)", previous)
     if not match:
@@ -482,10 +496,14 @@ def next_dispatch_title(previous: str) -> str:
 
 
 def assemble_draft(
-    manifest: dict[str, Any], previous: str, projects: list[dict[str, str]], fragments: Path
+    manifest: dict[str, Any], previous: str, projects: list[dict[str, Any]], fragments: Path
 ) -> tuple[str, list[dict[str, str]]]:
-    products = [project["product"] for project in projects]
-    description = "Updates across " + ", ".join(products) + "."
+    products = [project["product"] for project in projects if not project.get("empty")]
+    description = (
+        "Updates across " + ", ".join(products) + "."
+        if products
+        else "No releases or merged pull requests in this Dispatch window."
+    )
     lines = [
         f"title: {next_dispatch_title(previous)}",
         f"description: {description}",
@@ -623,6 +641,11 @@ def command_fallback(args: argparse.Namespace) -> None:
     write_json(args.output_exclusions, [])
 
 
+def command_empty(args: argparse.Namespace) -> None:
+    args.output_fragment.write_text(empty_fragment(read_json(args.project_manifest)))
+    write_json(args.output_exclusions, [])
+
+
 def command_assemble(args: argparse.Namespace) -> None:
     draft, exclusions = assemble_draft(
         read_json(args.manifest),
@@ -679,6 +702,12 @@ def parser() -> argparse.ArgumentParser:
     fallback_parser.add_argument("--output-fragment", type=Path, required=True)
     fallback_parser.add_argument("--output-exclusions", type=Path, required=True)
     fallback_parser.set_defaults(func=command_fallback)
+
+    empty_parser = subparsers.add_parser("empty")
+    empty_parser.add_argument("--project-manifest", type=Path, required=True)
+    empty_parser.add_argument("--output-fragment", type=Path, required=True)
+    empty_parser.add_argument("--output-exclusions", type=Path, required=True)
+    empty_parser.set_defaults(func=command_empty)
 
     assemble_parser = subparsers.add_parser("assemble")
     assemble_parser.add_argument("--manifest", type=Path, required=True)

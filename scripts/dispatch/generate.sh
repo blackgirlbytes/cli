@@ -25,7 +25,14 @@ python3 scripts/dispatch/dispatch_manifest.py split \
   --manifest /tmp/dispatch-manifest.json \
   --output /tmp/project-sources
 
-for key in $(jq -r '.[].key' /tmp/project-sources/projects.json); do
+for key in $(jq -r '.[] | select(.empty) | .key' /tmp/project-sources/projects.json); do
+  python3 scripts/dispatch/dispatch_manifest.py empty \
+    --project-manifest "/tmp/project-sources/${key}.json" \
+    --output-fragment "/tmp/project-fragments/${key}.md" \
+    --output-exclusions "/tmp/project-fragments/${key}.exclusions.json"
+done
+
+for key in $(jq -r '.[] | select(.empty | not) | .key' /tmp/project-sources/projects.json); do
   repo=$(jq -r --arg key "$key" '.[] | select(.key == $key) | .repo' /tmp/project-sources/projects.json)
   area=$(jq -r --arg key "$key" '.[] | select(.key == $key) | .area' /tmp/project-sources/projects.json)
   product=$(jq -r --arg key "$key" '.[] | select(.key == $key) | .product' /tmp/project-sources/projects.json)
@@ -80,7 +87,7 @@ RECIPE_EOF
   printf '%s\n' "$model_pid" > "$pid_path"
 done
 
-for key in $(jq -r '.[].key' /tmp/project-sources/projects.json); do
+for key in $(jq -r '.[] | select(.empty | not) | .key' /tmp/project-sources/projects.json); do
   repo=$(jq -r --arg key "$key" '.[] | select(.key == $key) | .repo' /tmp/project-sources/projects.json)
   manifest_path="/tmp/project-sources/${key}.json"
   fragment_path="/tmp/project-fragments/${key}.md"
