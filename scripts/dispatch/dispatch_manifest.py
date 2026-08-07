@@ -514,13 +514,14 @@ def assemble_draft(
             "",
         ]
     )
+    valid_exclusion_ids = {item["id"] for item in coverage_items(manifest)}
     exclusions: list[dict[str, str]] = []
     exclusion_ids: set[str] = set()
     for project in projects:
         path = fragments / f"{project['key']}.exclusions.json"
         if path.exists():
             for exclusion in read_json(path):
-                if exclusion["id"] in exclusion_ids:
+                if exclusion["id"] not in valid_exclusion_ids or exclusion["id"] in exclusion_ids:
                     continue
                 exclusion_ids.add(exclusion["id"])
                 exclusions.append(exclusion)

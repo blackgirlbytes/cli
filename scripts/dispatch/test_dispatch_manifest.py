@@ -178,7 +178,8 @@ class DispatchManifestTest(unittest.TestCase):
             (fragments / "00.md").write_text(fragment)
             (fragments / "00.exclusions.json").write_text(
                 '[{"id":"jdx/mise#125","reason":"duplicate"},'
-                '{"id":"jdx/mise#125","reason":"duplicate"}]'
+                '{"id":"jdx/mise#125","reason":"duplicate"},'
+                '{"id":"jdx/mise#999","reason":"maintenance-only"}]'
             )
 
             draft, exclusions = dispatch_manifest.assemble_draft(
