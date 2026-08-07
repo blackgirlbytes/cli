@@ -9,6 +9,8 @@ pipeline deliberately separates factual discovery from editorial writing:
    manifests from GitHub releases or merged pull requests.
 3. `dispatch_manifest.py split` creates one bounded source file per project, so
    Goose never has to process the full cross-project inventory in one pass.
+   Release-note paragraphs shared by several PR links are grouped into one
+   editorial item while retaining every source URL for validation.
    PostHog data is reduced to flag identity, lifecycle state, and rollout
    percentages so the Entire Web inventory stays below model tool-output limits.
    Configured OSS projects with `show_when_empty` retain their headline and get
@@ -16,11 +18,13 @@ pipeline deliberately separates factual discovery from editorial writing:
 4. Goose curates the non-empty projects in parallel into public-facing
    fragments and records an explicit ledger for intentionally excluded source
    items. Each project has its own bounded execution window.
-5. Every fragment is validated against its project manifest. If curation times
-   out or misses an item, a targeted repair pass sees the missing-item ledger
-   and patches the curated fragment. If coverage is still incomplete, a
-   deterministic fallback includes every release and source link instead of
-   producing an incomplete artifact.
+5. Every fragment is validated for source coverage and editorial shape. If
+   curation times out, misses an item, uses a generic fallback heading, or
+   produces more than 30 top-level bullets, a targeted repair pass sees the
+   coverage and quality ledger and patches the fragment. If repair still
+   fails, a deterministic fallback preserves every release and source link in
+   the diagnostic artifact, the job fails, and the draft is not posted to
+   Slack as if it were finished.
 6. `dispatch_manifest.py assemble` builds the final Marvin-formatted draft and
    global validation requires every release and source item to be included or
    accounted for.
@@ -40,10 +44,12 @@ The resulting `dispatch-bundle` artifact contains:
 - `dispatch-exclusions.json`
 - `dispatch-coverage.md`
 - `dispatch-repository-audit.md`
+- `dispatch-generation-status.txt`
 
 Manual runs upload the bundle to Slack by default. Clear `post_to_slack` when
 testing artifact generation without posting another draft. Scheduled runs
-always upload the validated draft.
+upload the validated draft. Runs that require a deterministic project fallback
+retain a diagnostic artifact in Actions but do not post it to Slack.
 
 ## Adding a project
 

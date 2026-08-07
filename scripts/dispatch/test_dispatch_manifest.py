@@ -57,8 +57,9 @@ class DispatchManifestTest(unittest.TestCase):
     def test_release_body_attributes_grouped_pull_requests_to_their_segment_author(self):
         release = {
             "body": (
-                "* fixes https://github.com/jdx/mise/pull/1 by @alice in notes; "
-                "follow-up https://github.com/jdx/mise/pull/2 by @bob in notes"
+                "* Faster task caching "
+                "([#1](https://github.com/jdx/mise/pull/1) by @alice in notes; "
+                "[#2](https://github.com/jdx/mise/pull/2) by @bob in notes)"
             )
         }
 
@@ -68,6 +69,49 @@ class DispatchManifestTest(unittest.TestCase):
             [(change["number"], change["author"]) for change in changes],
             [(1, "alice"), (2, "bob")],
         )
+        self.assertEqual([change["title"] for change in changes], ["Faster task caching"] * 2)
+
+    def test_render_source_groups_shared_release_note_prose(self):
+        manifest = {
+            "window": {"since": "2026-08-03", "until": "2026-08-07"},
+            "repositories": [
+                {
+                    "project": {
+                        "repo": "jdx/mise",
+                        "area": "OSS Projects",
+                        "product": "mise",
+                        "mode": "github-releases",
+                    },
+                    "releases": [
+                        {
+                            "tag": "v1.0.0",
+                            "channel": "stable",
+                            "url": "https://github.com/jdx/mise/releases/tag/v1.0.0",
+                            "published_at": "2026-08-04T00:00:00Z",
+                            "changes": [
+                                {
+                                    "id": "jdx/mise#1",
+                                    "title": "Faster task caching",
+                                    "url": "https://github.com/jdx/mise/pull/1",
+                                },
+                                {
+                                    "id": "jdx/mise#2",
+                                    "title": "Faster task caching",
+                                    "url": "https://github.com/jdx/mise/pull/2",
+                                },
+                            ],
+                        }
+                    ],
+                    "candidates": [],
+                }
+            ],
+        }
+
+        source = dispatch_manifest.render_source(manifest)
+
+        self.assertEqual(source.count("- Faster task caching"), 1)
+        self.assertIn("https://github.com/jdx/mise/pull/1", source)
+        self.assertIn("https://github.com/jdx/mise/pull/2", source)
 
     def test_github_app_authors_are_not_external_contributors(self):
         self.assertTrue(dispatch_manifest.is_bot("app/entire"))
@@ -184,7 +228,14 @@ class DispatchManifestTest(unittest.TestCase):
                                     "url": "https://github.com/jdx/mise/pull/125",
                                     "author": "community-dev",
                                     "external_contributor": True,
-                                }
+                                },
+                                {
+                                    "id": "jdx/mise#126",
+                                    "title": "Upgrade all tools",
+                                    "url": "https://github.com/jdx/mise/pull/126",
+                                    "author": "internal-dev",
+                                    "external_contributor": False,
+                                },
                             ],
                         }
                     ],
@@ -219,6 +270,9 @@ class DispatchManifestTest(unittest.TestCase):
             self.assertIn("title: Entire Dispatch 0x0019", draft)
             self.assertIn("https://github.com/jdx/mise/releases/tag/v2026.8.2", draft)
             self.assertIn("https://github.com/jdx/mise/pull/125", draft)
+            self.assertIn("https://github.com/jdx/mise/pull/126", draft)
+            self.assertEqual(draft.count("Upgrade all tools"), 1)
+            self.assertNotIn("Release and Project Updates", draft)
             self.assertIn(
                 "Thank you for your contribution, [@community-dev](https://github.com/community-dev)!",
                 draft,

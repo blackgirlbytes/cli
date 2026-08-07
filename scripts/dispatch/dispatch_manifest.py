@@ -88,7 +88,16 @@ def merged_prs(repo: str, since: str, until: str) -> list[dict[str, Any]]:
 
 
 def clean_release_title(line: str, url: str) -> str:
-    title = line.replace(url, "").strip()
+    # Some projects write one release-note sentence followed by a parenthesized
+    # list of several PR links. Treat that sentence as one change rather than
+    # cloning it once per link (with a different empty Markdown link each time).
+    reference_list = re.search(
+        r"\s*\(\s*\[#\d+\]\(https://github\.com/[^/]+/[^/]+/pull/\d+\)",
+        line,
+        flags=re.IGNORECASE,
+    )
+    title = line[: reference_list.start()] if reference_list else line.replace(url, "")
+    title = title.strip()
     title = re.sub(r"^[-*+]+\s*", "", title)
     title = re.sub(r"\s+by\s+@[^\s]+\s+in\s*$", "", title, flags=re.IGNORECASE)
     return title.strip() or f"Pull request {url.rsplit('/', 1)[-1]}"
@@ -445,15 +454,22 @@ def render_source(manifest: dict[str, Any]) -> str:
             )
             if not release["changes"]:
                 lines.append("- Release published without individually linked changes; summarize the release itself.")
+            grouped_changes: dict[str, list[dict[str, Any]]] = {}
             for change in release["changes"]:
-                contributor = (
-                    f"; external contributor: @{change['author']}"
-                    if change.get("external_contributor")
-                    else ""
-                )
-                lines.append(
-                    f"- `{change['id']}` [{change['title']}]({change['url']}){contributor}"
-                )
+                grouped_changes.setdefault(change["title"], []).append(change)
+            for title, changes in grouped_changes.items():
+                sources = []
+                for change in changes:
+                    contributor = (
+                        f"; external contributor: @{change['author']}"
+                        if change.get("external_contributor")
+                        else ""
+                    )
+                    sources.append(
+                        f"`{change['id']}` [source]({change['url']}){contributor}"
+                    )
+                lines.append(f"- {title}")
+                lines.append(f"  Sources: {'; '.join(sources)}")
             lines.append("")
         if repo["candidates"]:
             lines.extend(["### Public-merge candidates", ""])
@@ -549,15 +565,28 @@ def split_projects(manifest: dict[str, Any], output: Path) -> list[dict[str, Any
 def fallback_fragment(project_manifest: dict[str, Any]) -> str:
     repository = project_manifest["repositories"][0]
     project = repository["project"]
-    lines = [f"### {project['product']}", "", "#### Release and Project Updates", ""]
+    lines = [f"### {project['product']}", ""]
     for release in repository["releases"]:
+        lines.extend([f"#### {release['channel'].title()} release {release['tag']}", ""])
         lines.append(
             f"- **{release['channel'].title()} release [{release['tag']}]({release['url']}).**"
         )
+        grouped_changes: dict[str, list[dict[str, Any]]] = {}
         for change in release["changes"]:
-            lines.append(f"  - [{change['title']}]({change['url']})")
-    for candidate in repository["candidates"]:
-        lines.append(f"- [{candidate['title']}]({candidate['url']})")
+            grouped_changes.setdefault(change["title"], []).append(change)
+        for title, changes in grouped_changes.items():
+            sources = ", ".join(
+                f"[#{change['number']}]({change['url']})"
+                if change.get("number")
+                else f"[source]({change['url']})"
+                for change in changes
+            )
+            lines.append(f"- {title} ({sources})")
+        lines.append("")
+    if repository["candidates"]:
+        lines.extend(["#### Merged changes", ""])
+        for candidate in repository["candidates"]:
+            lines.append(f"- [{candidate['title']}]({candidate['url']})")
     lines.append("")
     return "\n".join(lines)
 

@@ -4,6 +4,28 @@ set -eu
 : "${SINCE:?SINCE is required}"
 : "${CURRENT_DATE:?CURRENT_DATE is required}"
 
+fallback_used=false
+fallback_projects=""
+
+fragment_quality_ok() {
+  expected_product=$1
+  fragment=$2
+  [ "$(sed -n '1p' "$fragment")" = "### ${expected_product}" ] \
+    && grep -q '^#### ' "$fragment" \
+    && ! grep -Fqx '#### Release and Project Updates' "$fragment" \
+    && [ "$(grep -c '^- ' "$fragment")" -le 30 ]
+}
+
+append_quality_repair() {
+  coverage=$1
+  cat >> "$coverage" <<'QUALITY_EOF'
+
+## Editorial repair required
+
+- Keep the exact project heading, replace generic headings with benefit-oriented themes, group related links into no more than 30 top-level bullets, and do not emit a raw release-note or PR-title dump.
+QUALITY_EOF
+}
+
 python3 scripts/dispatch/dispatch_manifest.py combine \
   --collections /tmp/collections \
   --previous /tmp/previous-dispatch.md \
@@ -60,7 +82,9 @@ instructions: |
   Requirements:
   - Write PROJECT_FRAGMENT as Markdown beginning with exactly `### PROJECT_PRODUCT`.
   - Do not add a `##` platform heading; the assembler adds `## PROJECT_AREA`.
-  - Use benefit-oriented `####` theme headings and concise user-facing bullets.
+  - Use benefit-oriented `####` theme headings and concise user-facing bullets. Prefer three to six themes.
+  - Group related source links into one reader-facing bullet. Do not emit raw PR titles, repeat shared release-note prose, or use a generic `Release and Project Updates` heading.
+  - Keep the fragment to no more than 30 top-level bullets; use the exclusion ledger for dependency-only, internal-only, feature-flagged, duplicate, no user-visible effect, and maintenance-only items.
   - Mention and link every stable and nightly release in the source.
   - Include every meaningful change with its exact PR, commit, or release link.
   - Write PROJECT_EXCLUSIONS as a JSON array containing every omitted source id and one short reason: dependency-only, internal-only, feature-flagged, duplicate, no user-visible effect, or maintenance-only.
@@ -80,15 +104,17 @@ RECIPE_EOF
     -e "s|PROJECT_AREA|${area}|g" \
     "$recipe_path"
 
-  rm -f "$fragment_path" "$exclusions_path"
+  printf '### %s\n' "$product" > "$fragment_path"
+  printf '%s\n' '[]' > "$exclusions_path"
   echo "Starting bounded curation for ${repo}."
-  timeout 8m goose run --recipe "$recipe_path" > "$log_path" 2>&1 &
+  timeout 10m goose run --recipe "$recipe_path" > "$log_path" 2>&1 &
   model_pid=$!
   printf '%s\n' "$model_pid" > "$pid_path"
 done
 
 for key in $(jq -r '.[] | select(.empty | not) | .key' /tmp/project-sources/projects.json); do
   repo=$(jq -r --arg key "$key" '.[] | select(.key == $key) | .repo' /tmp/project-sources/projects.json)
+  product=$(jq -r --arg key "$key" '.[] | select(.key == $key) | .product' /tmp/project-sources/projects.json)
   manifest_path="/tmp/project-sources/${key}.json"
   fragment_path="/tmp/project-fragments/${key}.md"
   exclusions_path="/tmp/project-fragments/${key}.exclusions.json"
@@ -116,6 +142,10 @@ for key in $(jq -r '.[] | select(.empty | not) | .key' /tmp/project-sources/proj
       --output "$coverage_path"; then
       valid=false
       repairable=true
+    elif ! fragment_quality_ok "$product" "$fragment_path"; then
+      valid=false
+      repairable=true
+      append_quality_repair "$coverage_path"
     fi
   fi
 
@@ -139,6 +169,8 @@ instructions: |
   Requirements:
   - Preserve the existing polished themes and wording.
   - For every item under `## Missing` in REPAIR_COVERAGE, either add its exact link to the appropriate theme in REPAIR_FRAGMENT or add its exact id and one allowed reason to REPAIR_EXCLUSIONS.
+  - Resolve anything under `## Editorial repair required`: create benefit-oriented themes when absent, group related links into reader-facing bullets, remove generic headings, and keep the result to no more than 30 top-level bullets.
+  - Never emit raw PR titles or repeat shared release-note prose once per link.
   - Allowed reasons: dependency-only, internal-only, feature-flagged, duplicate, no user-visible effect, or maintenance-only.
   - Never exclude a release id.
   - Keep REPAIR_EXCLUSIONS a valid JSON array and do not remove existing entries.
@@ -155,7 +187,7 @@ REPAIR_RECIPE_EOF
       "$repair_recipe_path"
 
     echo "Repairing incomplete coverage for ${repo}."
-    timeout 4m goose run --recipe "$repair_recipe_path" > "$repair_log_path" 2>&1 || true
+    timeout 8m goose run --recipe "$repair_recipe_path" > "$repair_log_path" 2>&1 || true
     cat "$repair_log_path"
     if [ -s "$fragment_path" ] \
       && jq -e 'type == "array" and all(.[]; (.id | type == "string") and (.reason | type == "string"))' "$exclusions_path" > /dev/null 2>&1 \
@@ -163,13 +195,16 @@ REPAIR_RECIPE_EOF
         --manifest "$manifest_path" \
         --draft "$fragment_path" \
         --exclusions "$exclusions_path" \
-        --output "$coverage_path"; then
+        --output "$coverage_path" \
+      && fragment_quality_ok "$product" "$fragment_path"; then
       valid=true
     fi
   fi
 
   if [ "$valid" != true ]; then
     echo "::warning::Using deterministic fallback for ${repo}; model curation did not cover its complete manifest."
+    fallback_used=true
+    fallback_projects="${fallback_projects}${fallback_projects:+, }${repo}"
     python3 scripts/dispatch/dispatch_manifest.py fallback \
       --project-manifest "$manifest_path" \
       --output-fragment "$fragment_path" \
@@ -254,3 +289,11 @@ cp /tmp/dispatch-draft.md /tmp/dispatch-manifest.json \
   /tmp/dispatch-exclusions.json /tmp/dispatch-coverage.md \
   /tmp/dispatch-repository-audit.md \
   /tmp/dispatch-bundle/
+
+if [ "$fallback_used" = true ]; then
+  printf 'Editorial curation failed for: %s\n' "$fallback_projects" > /tmp/dispatch-bundle/dispatch-generation-status.txt
+  echo "::error::Dispatch used deterministic fallbacks for ${fallback_projects}; the diagnostic artifact was saved, but it will not be posted to Slack."
+  exit 1
+fi
+
+printf '%s\n' 'Editorial curation completed without deterministic fallbacks.' > /tmp/dispatch-bundle/dispatch-generation-status.txt
