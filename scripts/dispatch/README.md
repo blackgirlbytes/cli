@@ -9,8 +9,9 @@ pipeline deliberately separates factual discovery from editorial writing:
    manifests from GitHub releases or merged pull requests.
 3. `dispatch_manifest.py split` creates one bounded source file per project, so
    Goose never has to process the full cross-project inventory in one pass.
-4. Goose curates each project into a public-facing fragment and records an
-   explicit ledger for intentionally excluded source items.
+4. Goose curates the non-empty projects in parallel into public-facing
+   fragments and records an explicit ledger for intentionally excluded source
+   items. Each project has its own bounded execution window.
 5. Every fragment is validated against its project manifest. If curation times
    out or misses an item, a deterministic fallback includes every release and
    source link instead of producing an incomplete artifact.

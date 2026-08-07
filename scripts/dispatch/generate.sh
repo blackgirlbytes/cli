@@ -30,12 +30,13 @@ for key in $(jq -r '.[].key' /tmp/project-sources/projects.json); do
   area=$(jq -r --arg key "$key" '.[] | select(.key == $key) | .area' /tmp/project-sources/projects.json)
   product=$(jq -r --arg key "$key" '.[] | select(.key == $key) | .product' /tmp/project-sources/projects.json)
   source_path="/tmp/project-sources/${key}.md"
-  manifest_path="/tmp/project-sources/${key}.json"
   fragment_path="/tmp/project-fragments/${key}.md"
   exclusions_path="/tmp/project-fragments/${key}.exclusions.json"
-  coverage_path="/tmp/project-fragments/${key}.coverage.md"
+  recipe_path="/tmp/project-${key}-recipe.yaml"
+  log_path="/tmp/project-${key}.log"
+  pid_path="/tmp/project-${key}.pid"
 
-  cat > /tmp/project-recipe.yaml <<'RECIPE_EOF'
+  cat > "$recipe_path" <<'RECIPE_EOF'
 version: "1.0.0"
 title: "Curate Dispatch Project"
 description: "Turn one project manifest into a polished dispatch fragment"
@@ -70,11 +71,27 @@ RECIPE_EOF
     -e "s|PROJECT_EXCLUSIONS|${exclusions_path}|g" \
     -e "s|PROJECT_PRODUCT|${product}|g" \
     -e "s|PROJECT_AREA|${area}|g" \
-    /tmp/project-recipe.yaml
+    "$recipe_path"
 
   rm -f "$fragment_path" "$exclusions_path"
-  timeout 3m goose run --recipe /tmp/project-recipe.yaml > "/tmp/project-${key}.log" 2>&1 || true
-  cat "/tmp/project-${key}.log"
+  echo "Starting bounded curation for ${repo}."
+  timeout 8m goose run --recipe "$recipe_path" > "$log_path" 2>&1 &
+  model_pid=$!
+  printf '%s\n' "$model_pid" > "$pid_path"
+done
+
+for key in $(jq -r '.[].key' /tmp/project-sources/projects.json); do
+  repo=$(jq -r --arg key "$key" '.[] | select(.key == $key) | .repo' /tmp/project-sources/projects.json)
+  manifest_path="/tmp/project-sources/${key}.json"
+  fragment_path="/tmp/project-fragments/${key}.md"
+  exclusions_path="/tmp/project-fragments/${key}.exclusions.json"
+  coverage_path="/tmp/project-fragments/${key}.coverage.md"
+  log_path="/tmp/project-${key}.log"
+  pid_path="/tmp/project-${key}.pid"
+
+  model_pid=$(cat "$pid_path")
+  wait "$model_pid" || true
+  cat "$log_path"
 
   valid=true
   if [ ! -s "$fragment_path" ] || ! jq -e 'type == "array" and all(.[]; (.id | type == "string") and (.reason | type == "string"))' "$exclusions_path" > /dev/null 2>&1; then
