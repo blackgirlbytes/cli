@@ -14,7 +14,7 @@ python3 scripts/dispatch/dispatch_manifest.py combine \
 {
   for example in /tmp/dispatch-examples/*; do
     echo "# Style reference: $(basename "$example")"
-    cat "$example"
+    awk '/^## / { exit } { print }' "$example"
     echo
   done
 } > /tmp/dispatch-style.md
@@ -171,11 +171,69 @@ REPAIR_RECIPE_EOF
   fi
 done
 
+python3 scripts/dispatch/dispatch_manifest.py intro-source \
+  --projects /tmp/project-sources/projects.json \
+  --fragments /tmp/project-fragments \
+  --output /tmp/dispatch-intro-source.md
+
+cat > /tmp/dispatch-intro-recipe.yaml <<'INTRO_RECIPE_EOF'
+version: "1.0.0"
+title: "Write Dispatch Introduction"
+description: "Write frontmatter highlights and a Marvin-style Dispatch introduction"
+
+extensions:
+  - type: builtin
+    name: developer
+
+instructions: |
+  Write the introduction for an Entire Dispatch using only DISPATCH_STYLE and INTRO_SOURCE.
+  DISPATCH_STYLE contains introductions from the four most recent published Dispatches. Use them only for voice and structure; never copy their facts, links, embeds, or sentences.
+  INTRO_SOURCE contains a small set of highlights from the current Dispatch. Do not inspect any other source.
+
+  Write DESCRIPTION_FILE as one concise sentence naming the strongest reader-facing highlights, similar to the published frontmatter descriptions. Do not merely list product names.
+
+  Write INTRO_FILE as Markdown with no frontmatter or headings. It must:
+  - begin exactly with `Beep, boop. Marvin here.`
+  - open with a dry Marvin observation tied to the strongest current highlight
+  - use two or three short paragraphs that cohesively mention the major current highlights across active products
+  - never mention projects with no releases or merged pull requests
+  - never frame repositories or teams as competing, leading, quiet, or failing to ship
+  - end exactly with `For humans and agents, details can be read (or scraped) below:`
+  - contain no recap, closing, HTML, JSX, image, or video embed
+
+  Verify both files, then respond only with DONE.
+
+prompt: |
+  Read DISPATCH_STYLE and INTRO_SOURCE, write DESCRIPTION_FILE and INTRO_FILE, verify them, then respond only with DONE.
+INTRO_RECIPE_EOF
+
+sed -i \
+  -e 's|DISPATCH_STYLE|/tmp/dispatch-style.md|g' \
+  -e 's|INTRO_SOURCE|/tmp/dispatch-intro-source.md|g' \
+  -e 's|DESCRIPTION_FILE|/tmp/dispatch-description.txt|g' \
+  -e 's|INTRO_FILE|/tmp/dispatch-intro.md|g' \
+  /tmp/dispatch-intro-recipe.yaml
+
+rm -f /tmp/dispatch-description.txt /tmp/dispatch-intro.md
+timeout 2m goose run --recipe /tmp/dispatch-intro-recipe.yaml > /tmp/dispatch-intro.log 2>&1 || true
+cat /tmp/dispatch-intro.log
+
+if [ ! -s /tmp/dispatch-description.txt ] \
+  || [ ! -s /tmp/dispatch-intro.md ] \
+  || ! grep -q '^Beep, boop\. Marvin here\.' /tmp/dispatch-intro.md \
+  || [ "$(tail -1 /tmp/dispatch-intro.md)" != 'For humans and agents, details can be read (or scraped) below:' ] \
+  || grep -Eq '^#|<(div|figure|iframe)' /tmp/dispatch-intro.md; then
+  echo "::warning::Discarding an introduction that does not follow the published Dispatch opening."
+  rm -f /tmp/dispatch-description.txt /tmp/dispatch-intro.md
+fi
+
 python3 scripts/dispatch/dispatch_manifest.py assemble \
   --manifest /tmp/dispatch-manifest.json \
   --previous /tmp/previous-dispatch.md \
   --projects /tmp/project-sources/projects.json \
   --fragments /tmp/project-fragments \
+  --description /tmp/dispatch-description.txt \
+  --intro /tmp/dispatch-intro.md \
   --output-draft /tmp/dispatch-draft.md \
   --output-exclusions /tmp/dispatch-exclusions.json
 

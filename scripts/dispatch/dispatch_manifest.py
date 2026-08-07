@@ -17,6 +17,8 @@ PR_URL_RE = re.compile(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)")
 COMPARE_RE = re.compile(r"github\.com/[^/]+/[^/]+/compare/([^\s)]+)\.\.\.([^\s)]+)")
 CHANGES_SINCE_RE = re.compile(r"Changes since\s+([^:\s]+)", re.IGNORECASE)
 COMMIT_LINE_RE = re.compile(r"^\s*([0-9a-f]{7,40})\s+(.+?)\s*$", re.IGNORECASE)
+RELEASE_AUTHOR_RE = re.compile(r"\s+by\s+@([^\s]+)\s+in\s+", re.IGNORECASE)
+CONTRIBUTOR_CACHE: dict[tuple[str, str], bool] = {}
 
 
 def read_json(path: Path) -> Any:
@@ -92,6 +94,12 @@ def clean_release_title(line: str, url: str) -> str:
     return title.strip() or f"Pull request {url.rsplit('/', 1)[-1]}"
 
 
+def release_line_author(line: str, url: str) -> str | None:
+    segment = next((part for part in line.split(";") if url in part), line)
+    match = RELEASE_AUTHOR_RE.search(segment)
+    return match.group(1) if match else None
+
+
 def release_body_changes(repo: str, release: dict[str, Any]) -> list[dict[str, Any]]:
     body = release.get("body") or ""
     changes: list[dict[str, Any]] = []
@@ -106,15 +114,17 @@ def release_body_changes(repo: str, release: dict[str, Any]) -> list[dict[str, A
             if item_id in seen:
                 continue
             seen.add(item_id)
-            changes.append(
-                {
-                    "id": item_id,
-                    "kind": "pull_request",
-                    "number": int(number),
-                    "title": clean_release_title(line, url),
-                    "url": url,
-                }
-            )
+            change = {
+                "id": item_id,
+                "kind": "pull_request",
+                "number": int(number),
+                "title": clean_release_title(line, url),
+                "url": url,
+            }
+            author = release_line_author(line, url)
+            if author:
+                change["author"] = author
+            changes.append(change)
 
     for line in body.splitlines():
         match = COMMIT_LINE_RE.match(line)
@@ -220,6 +230,7 @@ def resolve_commit_pull_requests(repo: str, changes: list[dict[str, Any]]) -> li
                 "number": merged["number"],
                 "title": merged["title"],
                 "url": merged["html_url"],
+                "author": (merged.get("user") or {}).get("login"),
             }
         else:
             item_id = change["id"]
@@ -228,6 +239,64 @@ def resolve_commit_pull_requests(repo: str, changes: list[dict[str, Any]]) -> li
             seen.add(item_id)
             resolved.append(replacement)
     return resolved
+
+
+def pull_request_author(repo: str, number: int) -> str | None:
+    try:
+        pull = run_json(["gh", "api", f"repos/{repo}/pulls/{number}"])
+    except subprocess.CalledProcessError:
+        return None
+    return (pull.get("user") or {}).get("login")
+
+
+def is_bot(login: str) -> bool:
+    lowered = login.lower()
+    return lowered.endswith("[bot]") or lowered in {"dependabot", "renovate", "github-actions"}
+
+
+def is_org_member(org: str, login: str) -> bool:
+    return (
+        subprocess.run(
+            ["gh", "api", f"orgs/{org}/members/{login}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def is_external_contributor(repo: str, login: str) -> bool:
+    cache_key = (repo, login.lower())
+    if cache_key in CONTRIBUTOR_CACHE:
+        return CONTRIBUTOR_CACHE[cache_key]
+    if is_bot(login):
+        CONTRIBUTOR_CACHE[cache_key] = False
+        return False
+    if repo == "go-git/go-git":
+        CONTRIBUTOR_CACHE[cache_key] = True
+        return True
+    try:
+        profile = run_json(["gh", "api", f"users/{login}"])
+    except subprocess.CalledProcessError:
+        profile = {}
+    email = (profile.get("email") or "").lower()
+    employee = email.endswith("@entire.io") or any(
+        is_org_member(org, login) for org in ("entireio", "entirehq")
+    )
+    CONTRIBUTOR_CACHE[cache_key] = not employee
+    return not employee
+
+
+def enrich_contributors(repo: str, items: list[dict[str, Any]]) -> None:
+    for item in items:
+        login = item.get("author")
+        if not login and item.get("number"):
+            login = pull_request_author(repo, item["number"])
+        if not login:
+            continue
+        item["author"] = login
+        item["external_contributor"] = is_external_contributor(repo, login)
 
 
 def collect(config: dict[str, Any], repo: str, checkout: Path, since: str, until: str) -> dict[str, Any]:
@@ -249,6 +318,7 @@ def collect(config: dict[str, Any], repo: str, checkout: Path, since: str, until
             if not changes:
                 changes = git_range_changes(repo, checkout, release)
             changes = resolve_commit_pull_requests(repo, changes)
+            enrich_contributors(repo, changes)
             result["releases"].append(
                 {
                     "id": f"{repo}@{release['tag_name']}",
@@ -277,6 +347,7 @@ def collect(config: dict[str, Any], repo: str, checkout: Path, since: str, until
                     "labels": [label["name"] for label in pr.get("labels", [])],
                 }
             )
+        enrich_contributors(repo, result["candidates"])
 
     flags = checkout / "feature-flags.json"
     if project.get("feature_flags") and flags.exists():
@@ -371,7 +442,14 @@ def render_source(manifest: dict[str, Any]) -> str:
             if not release["changes"]:
                 lines.append("- Release published without individually linked changes; summarize the release itself.")
             for change in release["changes"]:
-                lines.append(f"- `{change['id']}` [{change['title']}]({change['url']})")
+                contributor = (
+                    f"; external contributor: @{change['author']}"
+                    if change.get("external_contributor")
+                    else ""
+                )
+                lines.append(
+                    f"- `{change['id']}` [{change['title']}]({change['url']}){contributor}"
+                )
             lines.append("")
         if repo["candidates"]:
             lines.extend(["### Public-merge candidates", ""])
@@ -380,6 +458,11 @@ def render_source(manifest: dict[str, Any]) -> str:
                 lines.append(
                     f"- `{candidate['id']}` [{candidate['title']}]({candidate['url']}) "
                     f"by @{candidate.get('author', 'unknown')}; labels: {labels}"
+                    + (
+                        f"; external contributor: @{candidate['author']}"
+                        if candidate.get("external_contributor")
+                        else ""
+                    )
                 )
                 if candidate.get("body"):
                     summary = " ".join(candidate["body"].split())[:180]
@@ -495,24 +578,98 @@ def next_dispatch_title(previous: str) -> str:
     return f"Entire Dispatch 0x{int(match.group(1), 16) + 1:0{width}x}"
 
 
+def contributor_thanks(authors: list[str], indent: str = "") -> str:
+    links = [f"[@{author}](https://github.com/{author})" for author in authors]
+    if len(links) == 1:
+        return f"{indent}  - Thank you for your contribution, {links[0]}!"
+    if len(links) == 2:
+        names = f"{links[0]} and {links[1]}"
+    else:
+        names = ", ".join(links[:-1]) + f", and {links[-1]}"
+    return f"{indent}  - Thank you for your contributions, {names}!"
+
+
+def add_contributor_thanks(repository: dict[str, Any], fragment: str) -> str:
+    authors_by_url: dict[str, str] = {}
+    for release in repository["releases"]:
+        for change in release["changes"]:
+            if change.get("external_contributor") and change.get("author"):
+                authors_by_url[change["url"]] = change["author"]
+    for candidate in repository["candidates"]:
+        if candidate.get("external_contributor") and candidate.get("author"):
+            authors_by_url[candidate["url"]] = candidate["author"]
+
+    output: list[str] = []
+    for line in fragment.splitlines():
+        output.append(line)
+        if not line.lstrip().startswith("- "):
+            continue
+        authors = sorted({author for url, author in authors_by_url.items() if url in line})
+        if authors:
+            indent = line[: len(line) - len(line.lstrip())]
+            output.append(contributor_thanks(authors, indent))
+    return "\n".join(output)
+
+
+def render_intro_source(projects: list[dict[str, Any]], fragments: Path) -> str:
+    lines = ["# Dispatch highlights", ""]
+    for project in projects:
+        if project.get("empty"):
+            continue
+        fragment_lines = (fragments / f"{project['key']}.md").read_text().splitlines()
+        lines.extend([f"## {project['product']}", ""])
+        themes = 0
+        awaiting_bullet = False
+        for line in fragment_lines:
+            if line.startswith("#### ") and themes < 3:
+                lines.append(line)
+                themes += 1
+                awaiting_bullet = True
+            elif awaiting_bullet and line.lstrip().startswith("- "):
+                lines.extend([line, ""])
+                awaiting_bullet = False
+        if themes == 0:
+            first_bullet = next(
+                (line for line in fragment_lines if line.lstrip().startswith("- ")), None
+            )
+            if first_bullet:
+                lines.extend([first_bullet, ""])
+    return "\n".join(lines)
+
+
+def default_intro(products: list[str]) -> str:
+    product_list = ", ".join(products) if products else "the monitored projects"
+    return "\n\n".join(
+        [
+            "Beep, boop. Marvin here. Apparently the machines found another collection of ways to make developer workflows faster, steadier, and marginally less dramatic. I have been asked to document their enthusiasm.",
+            f"This Dispatch covers the strongest visible changes across {product_list}.",
+            "For humans and agents, details can be read (or scraped) below:",
+        ]
+    )
+
+
 def assemble_draft(
-    manifest: dict[str, Any], previous: str, projects: list[dict[str, Any]], fragments: Path
+    manifest: dict[str, Any],
+    previous: str,
+    projects: list[dict[str, Any]],
+    fragments: Path,
+    description_override: str | None = None,
+    intro_override: str | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
     products = [project["product"] for project in projects if not project.get("empty")]
-    description = (
+    description = description_override or (
         "Updates across " + ", ".join(products) + "."
         if products
         else "No releases or merged pull requests in this Dispatch window."
     )
+    intro = intro_override or default_intro(products)
     lines = [
         f"title: {next_dispatch_title(previous)}",
         f"description: {description}",
         "category: Dispatch",
         "author: Marvin",
         "",
-        "Beep, boop. Marvin here. The machines have been busy again. I have arranged their output into something humans can inspect without opening every repository themselves.",
-        "",
-        f"Here is what changed from {manifest['window']['since']} through {manifest['window']['until']}:",
+        intro.strip(),
         "",
     ]
     for area in ("CLI", "Web", "OSS Projects"):
@@ -521,14 +678,16 @@ def assemble_draft(
             continue
         lines.extend([f"## {area}", ""])
         for project in area_projects:
-            lines.extend([(fragments / f"{project['key']}.md").read_text().strip(), ""])
+            repository = next(
+                item for item in manifest["repositories"] if item["project"]["repo"] == project["repo"]
+            )
+            fragment = add_contributor_thanks(
+                repository, (fragments / f"{project['key']}.md").read_text().strip()
+            )
+            lines.extend([fragment, ""])
     lines.extend(
         [
-            "That's the dispatch. The repositories have been counted, the releases have been linked, and nothing has been permitted to vanish merely because the list was inconveniently long.",
-            "",
-            "As always, bring questions, bugs, PRs, and constructive dread to [Discord](https://discord.com/invite/jZJs3Tue4S) or [GitHub issues](https://github.com/entireio/cli/issues).",
-            "",
-            "Boop.",
+            "That’s the dispatch. As always, bring questions, bugs, PRs, and constructive dread to [Discord](https://discord.com/invite/jZJs3Tue4S) or [GitHub issues](https://github.com/entireio/cli/issues).",
             "",
         ]
     )
@@ -646,12 +805,22 @@ def command_empty(args: argparse.Namespace) -> None:
     write_json(args.output_exclusions, [])
 
 
+def command_intro_source(args: argparse.Namespace) -> None:
+    args.output.write_text(render_intro_source(read_json(args.projects), args.fragments))
+
+
 def command_assemble(args: argparse.Namespace) -> None:
+    description = None
+    if args.description and args.description.exists():
+        description = " ".join(args.description.read_text().split())
+    intro = args.intro.read_text().strip() if args.intro and args.intro.exists() else None
     draft, exclusions = assemble_draft(
         read_json(args.manifest),
         args.previous.read_text(),
         read_json(args.projects),
         args.fragments,
+        description,
+        intro,
     )
     args.output_draft.write_text(draft)
     write_json(args.output_exclusions, exclusions)
@@ -709,11 +878,19 @@ def parser() -> argparse.ArgumentParser:
     empty_parser.add_argument("--output-exclusions", type=Path, required=True)
     empty_parser.set_defaults(func=command_empty)
 
+    intro_source_parser = subparsers.add_parser("intro-source")
+    intro_source_parser.add_argument("--projects", type=Path, required=True)
+    intro_source_parser.add_argument("--fragments", type=Path, required=True)
+    intro_source_parser.add_argument("--output", type=Path, required=True)
+    intro_source_parser.set_defaults(func=command_intro_source)
+
     assemble_parser = subparsers.add_parser("assemble")
     assemble_parser.add_argument("--manifest", type=Path, required=True)
     assemble_parser.add_argument("--previous", type=Path, required=True)
     assemble_parser.add_argument("--projects", type=Path, required=True)
     assemble_parser.add_argument("--fragments", type=Path, required=True)
+    assemble_parser.add_argument("--description", type=Path)
+    assemble_parser.add_argument("--intro", type=Path)
     assemble_parser.add_argument("--output-draft", type=Path, required=True)
     assemble_parser.add_argument("--output-exclusions", type=Path, required=True)
     assemble_parser.set_defaults(func=command_assemble)

@@ -25,6 +25,14 @@ pipeline deliberately separates factual discovery from editorial writing:
    global validation requires every release and source item to be included or
    accounted for.
 
+The assembler also adds published-style thank-you lines after bullets backed by
+external contributors. Contributor status follows the earlier Dispatch rule:
+accounts are internal when they are visible members of `entireio` or
+`entirehq`, or expose an `@entire.io` email; human go-git contributors are
+always treated as community contributors. A bounded intro-only pass uses the
+four latest published introductions for voice and structure, with a
+deterministic Marvin-formatted fallback.
+
 The resulting `dispatch-bundle` artifact contains:
 
 - `dispatch-draft.md`

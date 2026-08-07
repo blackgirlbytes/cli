@@ -48,10 +48,26 @@ class DispatchManifestTest(unittest.TestCase):
                     "number": 2277,
                     "title": "safer worktrees",
                     "url": "https://github.com/go-git/go-git/pull/2277",
+                    "author": "dev",
                 }
             ],
         )
         self.assertEqual(dispatch_manifest.previous_tag(release), "v5.19.1")
+
+    def test_release_body_attributes_grouped_pull_requests_to_their_segment_author(self):
+        release = {
+            "body": (
+                "* fixes https://github.com/jdx/mise/pull/1 by @alice in notes; "
+                "follow-up https://github.com/jdx/mise/pull/2 by @bob in notes"
+            )
+        }
+
+        changes = dispatch_manifest.release_body_changes("jdx/mise", release)
+
+        self.assertEqual(
+            [(change["number"], change["author"]) for change in changes],
+            [(1, "alice"), (2, "bob")],
+        )
 
     def test_validation_requires_releases_and_accounts_for_exclusions(self):
         manifest = {
@@ -158,6 +174,8 @@ class DispatchManifestTest(unittest.TestCase):
                                     "id": "jdx/mise#125",
                                     "title": "Upgrade all tools",
                                     "url": "https://github.com/jdx/mise/pull/125",
+                                    "author": "community-dev",
+                                    "external_contributor": True,
                                 }
                             ],
                         }
@@ -193,6 +211,15 @@ class DispatchManifestTest(unittest.TestCase):
             self.assertIn("title: Entire Dispatch 0x0019", draft)
             self.assertIn("https://github.com/jdx/mise/releases/tag/v2026.8.2", draft)
             self.assertIn("https://github.com/jdx/mise/pull/125", draft)
+            self.assertIn(
+                "Thank you for your contribution, [@community-dev](https://github.com/community-dev)!",
+                draft,
+            )
+            self.assertIn(
+                "That’s the dispatch. As always, bring questions, bugs, PRs, and constructive dread",
+                draft,
+            )
+            self.assertNotIn("Boop.", draft)
             self.assertEqual(exclusions, [{"id": "jdx/mise#125", "reason": "duplicate"}])
             self.assertEqual(missing, 0)
 
