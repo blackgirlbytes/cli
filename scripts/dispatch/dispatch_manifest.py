@@ -475,10 +475,15 @@ def assemble_draft(
         ]
     )
     exclusions: list[dict[str, str]] = []
+    exclusion_ids: set[str] = set()
     for project in projects:
         path = fragments / f"{project['key']}.exclusions.json"
         if path.exists():
-            exclusions.extend(read_json(path))
+            for exclusion in read_json(path):
+                if exclusion["id"] in exclusion_ids:
+                    continue
+                exclusion_ids.add(exclusion["id"])
+                exclusions.append(exclusion)
     return "\n".join(lines), exclusions
 
 

@@ -176,7 +176,10 @@ class DispatchManifestTest(unittest.TestCase):
             fragments = root / "fragments"
             fragments.mkdir()
             (fragments / "00.md").write_text(fragment)
-            (fragments / "00.exclusions.json").write_text("[]")
+            (fragments / "00.exclusions.json").write_text(
+                '[{"id":"jdx/mise#125","reason":"duplicate"},'
+                '{"id":"jdx/mise#125","reason":"duplicate"}]'
+            )
 
             draft, exclusions = dispatch_manifest.assemble_draft(
                 manifest,
@@ -189,6 +192,7 @@ class DispatchManifestTest(unittest.TestCase):
             self.assertIn("title: Entire Dispatch 0x0019", draft)
             self.assertIn("https://github.com/jdx/mise/releases/tag/v2026.8.2", draft)
             self.assertIn("https://github.com/jdx/mise/pull/125", draft)
+            self.assertEqual(exclusions, [{"id": "jdx/mise#125", "reason": "duplicate"}])
             self.assertEqual(missing, 0)
 
 

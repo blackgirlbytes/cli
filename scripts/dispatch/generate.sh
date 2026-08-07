@@ -94,6 +94,7 @@ for key in $(jq -r '.[].key' /tmp/project-sources/projects.json); do
   cat "$log_path"
 
   valid=true
+  repairable=false
   if [ ! -s "$fragment_path" ] || ! jq -e 'type == "array" and all(.[]; (.id | type == "string") and (.reason | type == "string"))' "$exclusions_path" > /dev/null 2>&1; then
     valid=false
   elif ! python3 scripts/dispatch/dispatch_manifest.py validate \
@@ -102,6 +103,56 @@ for key in $(jq -r '.[].key' /tmp/project-sources/projects.json); do
     --exclusions "$exclusions_path" \
     --output "$coverage_path"; then
     valid=false
+    repairable=true
+  fi
+
+  if [ "$repairable" = true ]; then
+    repair_recipe_path="/tmp/project-${key}-repair-recipe.yaml"
+    repair_log_path="/tmp/project-${key}-repair.log"
+    cat > "$repair_recipe_path" <<'REPAIR_RECIPE_EOF'
+version: "1.0.0"
+title: "Repair Dispatch Project Coverage"
+description: "Account for missing source links in a curated project fragment"
+
+extensions:
+  - type: builtin
+    name: developer
+
+instructions: |
+  Repair the coverage of an already-curated Entire Dispatch project.
+  Read REPAIR_COVERAGE, REPAIR_FRAGMENT, and REPAIR_EXCLUSIONS only.
+  Update REPAIR_FRAGMENT and REPAIR_EXCLUSIONS directly with the developer extension.
+
+  Requirements:
+  - Preserve the existing polished themes and wording.
+  - For every item under `## Missing` in REPAIR_COVERAGE, either add its exact link to the appropriate theme in REPAIR_FRAGMENT or add its exact id and one allowed reason to REPAIR_EXCLUSIONS.
+  - Allowed reasons: dependency-only, internal-only, feature-flagged, duplicate, no user-visible effect, or maintenance-only.
+  - Never exclude a release id.
+  - Keep REPAIR_EXCLUSIONS a valid JSON array and do not remove existing entries.
+  - Verify both files, then respond only with DONE.
+
+prompt: |
+  Account for every missing item now, verify both files, then respond only with DONE.
+REPAIR_RECIPE_EOF
+
+    sed -i \
+      -e "s|REPAIR_COVERAGE|${coverage_path}|g" \
+      -e "s|REPAIR_FRAGMENT|${fragment_path}|g" \
+      -e "s|REPAIR_EXCLUSIONS|${exclusions_path}|g" \
+      "$repair_recipe_path"
+
+    echo "Repairing incomplete coverage for ${repo}."
+    timeout 2m goose run --recipe "$repair_recipe_path" > "$repair_log_path" 2>&1 || true
+    cat "$repair_log_path"
+    if [ -s "$fragment_path" ] \
+      && jq -e 'type == "array" and all(.[]; (.id | type == "string") and (.reason | type == "string"))' "$exclusions_path" > /dev/null 2>&1 \
+      && python3 scripts/dispatch/dispatch_manifest.py validate \
+        --manifest "$manifest_path" \
+        --draft "$fragment_path" \
+        --exclusions "$exclusions_path" \
+        --output "$coverage_path"; then
+      valid=true
+    fi
   fi
 
   if [ "$valid" != true ]; then
