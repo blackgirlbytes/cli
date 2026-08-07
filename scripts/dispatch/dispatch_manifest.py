@@ -300,6 +300,46 @@ def filter_previously_published(manifest: dict[str, Any], previous: str) -> None
         repo["candidates"] = [candidate for candidate in repo["candidates"] if candidate["url"] not in previous]
 
 
+def compact_posthog_flags(value: Any) -> list[dict[str, Any]]:
+    flags = value.get("results", []) if isinstance(value, dict) else value
+    if not isinstance(flags, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for flag in flags:
+        if not isinstance(flag, dict):
+            continue
+        filters = flag.get("filters") or {}
+        groups = filters.get("groups") or []
+        multivariate = filters.get("multivariate") or {}
+        variants = multivariate.get("variants") or []
+        compact.append(
+            {
+                "key": flag.get("key"),
+                "name": flag.get("name"),
+                "active": flag.get("active"),
+                "status": flag.get("status"),
+                "archived": flag.get("archived"),
+                "deleted": flag.get("deleted"),
+                "rollout_percentages": sorted(
+                    {
+                        group["rollout_percentage"]
+                        for group in groups
+                        if isinstance(group, dict) and group.get("rollout_percentage") is not None
+                    }
+                ),
+                "variants": [
+                    {
+                        "key": variant.get("key"),
+                        "rollout_percentage": variant.get("rollout_percentage"),
+                    }
+                    for variant in variants
+                    if isinstance(variant, dict)
+                ],
+            }
+        )
+    return compact
+
+
 def render_source(manifest: dict[str, Any]) -> str:
     lines = [
         "# Deterministic Dispatch source manifest",
@@ -366,7 +406,7 @@ def render_source(manifest: dict[str, Any]) -> str:
                 "Use this only to exclude Entire.io changes that are disabled, internal-only, or partially rolled out.",
                 "",
                 "```json",
-                json.dumps(manifest["posthog_flags"], separators=(",", ":")),
+                json.dumps(compact_posthog_flags(manifest["posthog_flags"]), separators=(",", ":")),
                 "```",
                 "",
             ]

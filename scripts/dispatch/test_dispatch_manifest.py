@@ -195,6 +195,40 @@ class DispatchManifestTest(unittest.TestCase):
             self.assertEqual(exclusions, [{"id": "jdx/mise#125", "reason": "duplicate"}])
             self.assertEqual(missing, 0)
 
+    def test_render_source_compacts_posthog_flags(self):
+        manifest = {
+            "window": {"since": "2026-08-03", "until": "2026-08-06"},
+            "repositories": [],
+            "posthog_flags": {
+                "count": 1,
+                "results": [
+                    {
+                        "key": "new-home",
+                        "name": "New home",
+                        "active": True,
+                        "status": "ACTIVE",
+                        "archived": False,
+                        "deleted": False,
+                        "large_irrelevant_payload": "x" * 60_000,
+                        "filters": {
+                            "groups": [{"rollout_percentage": 25, "properties": ["large"]}],
+                            "multivariate": {
+                                "variants": [{"key": "control", "rollout_percentage": 75}]
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+
+        source = dispatch_manifest.render_source(manifest)
+
+        self.assertIn('"key":"new-home"', source)
+        self.assertIn('"rollout_percentages":[25]', source)
+        self.assertIn('"variants":[{"key":"control","rollout_percentage":75}]', source)
+        self.assertNotIn("large_irrelevant_payload", source)
+        self.assertLess(len(source), 2_000)
+
 
 if __name__ == "__main__":
     unittest.main()
