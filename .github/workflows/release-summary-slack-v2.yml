@@ -14,18 +14,9 @@ on:
           - go-git/go-git
           - entirehq/entiredb
           - entireio/git-sync
-          - entireio/external-agents
-          - entireio/forgemark
-          - entireio/go-nuts
-          - jdx/mise
-      post_to_slack:
-        description: "Upload the completed draft to Slack"
-        required: true
-        type: boolean
-        default: true
   schedule:
-    # Canonical weekly draft: Monday at 10am PT during daylight time (17:00 UTC).
-    - cron: "0 17 * * 1"
+    # Weekdays at 10am PT during daylight time (17:00 UTC).
+    - cron: "0 17 * * 1-5"
 
 permissions:
   contents: read
@@ -41,9 +32,6 @@ jobs:
       matrix: ${{ steps.repos.outputs.matrix }}
 
     steps:
-      - name: Checkout workflow helpers
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
       - name: Resolve dispatch window
         id: window
         env:
@@ -83,59 +71,53 @@ jobs:
           echo "::notice::Using latest dispatch ${FILENAME}; collecting changes from ${SINCE} through ${CURRENT_DATE}."
 
           mkdir -p /tmp/dispatch-examples
-          tail -4 /tmp/dispatch-files.txt | while read -r f; do
+          tail -3 /tmp/dispatch-files.txt | while read -r f; do
             cp "$f" /tmp/dispatch-examples/
           done
-          cp "$LATEST_DISPATCH" /tmp/previous-dispatch.md
 
       - name: Build repo matrix
         id: repos
         env:
-          INPUT_REPOS: ${{ inputs.repos || 'all' }}
+          INPUT_REPOS: ${{ inputs.repos }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          SELECTION="$INPUT_REPOS"
-          if [ "$EVENT_NAME" = "schedule" ]; then
-            SELECTION=all
-          fi
-          python3 scripts/dispatch/dispatch_manifest.py matrix \
-            --config .github/dispatch-projects.json \
-            --selection "$SELECTION" | tee /tmp/matrix.json
-          echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
+          build_repo_json() {
+            case "$1" in
+              "entirehq/entire.io")
+                printf '{"repo":"%s","name":"Entire Web","feature_flags":true}\n' "$1"
+                ;;
+              "entireio/cli")
+                printf '{"repo":"%s","name":"Entire CLI","feature_flags":false}\n' "$1"
+                ;;
+              "go-git/go-git")
+                printf '{"repo":"%s","name":"Go-Git","feature_flags":false}\n' "$1"
+                ;;
+              "entirehq/entiredb")
+                printf '{"repo":"%s","name":"EntireDB","feature_flags":false}\n' "$1"
+                ;;
+              "entireio/git-sync")
+                printf '{"repo":"%s","name":"Git-Sync","feature_flags":false}\n' "$1"
+                ;;
+              *)
+                echo "::error::Unsupported repo: $1"
+                exit 1
+                ;;
+            esac
+          }
 
-      - name: Audit active unconfigured public repositories
-        env:
-          GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT || github.token }}
-          SINCE: ${{ steps.window.outputs.since }}
-        run: |
-          {
-            echo "# Dispatch repository audit"
-            echo
-            echo "Public repositories updated since ${SINCE} but absent from .github/dispatch-projects.json:"
-            echo
-          } > /tmp/dispatch-repository-audit.md
+          ALL_REPOS="entirehq/entire.io entireio/cli go-git/go-git entirehq/entiredb entireio/git-sync"
+          REPOS=()
 
-          for org in entireio entirehq; do
-            gh repo list "$org" --limit 1000 \
-              --json nameWithOwner,pushedAt,isArchived,visibility \
-              > "/tmp/${org}-repositories.json"
-            jq -r --arg since "${SINCE}T00:00:00Z" \
-              --slurpfile config .github/dispatch-projects.json '
-                [$config[0].repositories[].repo] as $configured
-                | .[]
-                | select(.isArchived == false and .visibility == "PUBLIC" and .pushedAt >= $since)
-                | select((.nameWithOwner as $repo | $configured | index($repo)) == null)
-                | "- `\(.nameWithOwner)` — last pushed \(.pushedAt)"
-              ' "/tmp/${org}-repositories.json" >> /tmp/dispatch-repository-audit.md
-          done
-
-          if ! grep -q '^- `' /tmp/dispatch-repository-audit.md; then
-            echo "- None" >> /tmp/dispatch-repository-audit.md
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$INPUT_REPOS" = "all" ]; then
+            for repo in $ALL_REPOS; do
+              REPOS+=("$(build_repo_json "$repo")")
+            done
           else
-            while IFS= read -r repo; do
-              echo "::warning::Dispatch inventory does not cover ${repo}"
-            done < <(sed -n 's/^- `\([^`]*\)`.*/\1/p' /tmp/dispatch-repository-audit.md)
+            REPOS+=("$(build_repo_json "$INPUT_REPOS")")
           fi
+
+          printf '%s\n' "${REPOS[@]}" | jq -sc '{include: .}' | tee /tmp/matrix.json
+          echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload dispatch examples
         uses: actions/upload-artifact@v4
@@ -143,20 +125,6 @@ jobs:
           name: dispatch-examples
           path: /tmp/dispatch-examples
           retention-days: 7
-
-      - name: Upload previous dispatch
-        uses: actions/upload-artifact@v4
-        with:
-          name: previous-dispatch
-          path: /tmp/previous-dispatch.md
-          retention-days: 7
-
-      - name: Upload repository audit
-        uses: actions/upload-artifact@v4
-        with:
-          name: repository-audit
-          path: /tmp/dispatch-repository-audit.md
-          retention-days: 30
 
       - name: Fetch PostHog feature flags
         env:
@@ -193,12 +161,10 @@ jobs:
     needs: prepare
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
-      - name: Checkout workflow helpers
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -217,18 +183,115 @@ jobs:
         env:
           REPO: ${{ matrix.repo }}
           SINCE: ${{ needs.prepare.outputs.since }}
-          CURRENT_DATE: ${{ needs.prepare.outputs.current_date }}
+          GITHUB_SINCE: ${{ needs.prepare.outputs.github_since }}
           GH_TOKEN: ${{ secrets.ENTIRE_IO_PAT || github.token }}
         run: |
+          mkdir -p /tmp/github-data
+          gh api "repos/${REPO}/releases?per_page=50" \
+            --jq '[.[] | {name, tagName: .tag_name, isPrerelease: .prerelease, publishedAt: .published_at, url: .html_url}]' \
+            > /tmp/github-data/releases.json
+
+          gh pr list --repo "$REPO" --state merged --limit 100 \
+            --search "merged:>=${GITHUB_SINCE}" \
+            --json number,title,author,mergedAt,url,labels \
+            > /tmp/github-data/merged-prs.json
+
+          gh pr list --repo "$REPO" --state open --limit 50 \
+            --json number,title,author,updatedAt,url,labels \
+            > /tmp/github-data/open-prs.json
+
+          cd /tmp/repo
+          python3 <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          github_since = os.environ["GITHUB_SINCE"]
+          since_date = dt.date.fromisoformat(github_since)
+          releases_path = pathlib.Path("/tmp/github-data/releases.json")
+          releases = json.loads(releases_path.read_text())
+
+          dated = []
+          for release in releases:
+              published = release.get("publishedAt")
+              tag = release.get("tagName")
+              if not published or not tag:
+                  continue
+              published_date = dt.datetime.fromisoformat(published.replace("Z", "+00:00")).date()
+              dated.append((published_date, release))
+
+          dated.sort(key=lambda item: item[0])
+          result = []
+          for index, (published_date, release) in enumerate(dated):
+              if published_date < since_date:
+                  continue
+
+              tag = release["tagName"]
+              previous_tag = dated[index - 1][1]["tagName"] if index > 0 else ""
+              range_spec = f"{previous_tag}..{tag}" if previous_tag else tag
+              try:
+                  log = subprocess.check_output(
+                      ["git", "log", "--format=%s", range_spec],
+                      text=True,
+                      stderr=subprocess.DEVNULL,
+                  )
+              except subprocess.CalledProcessError:
+                  log = ""
+
+              prs = sorted({int(match) for match in re.findall(r"#(\d+)", log)})
+              result.append({
+                  "tagName": tag,
+                  "name": release.get("name"),
+                  "url": release.get("url"),
+                  "publishedAt": release.get("publishedAt"),
+                  "isPrerelease": release.get("isPrerelease"),
+                  "previousTag": previous_tag,
+                  "pullRequests": prs,
+              })
+
+          pathlib.Path("/tmp/github-data/release-prs.json").write_text(json.dumps(result, indent=2))
+          PY
+
+      - name: Collect feature flag definitions
+        if: ${{ matrix.feature_flags }}
+        run: |
+          cp /tmp/repo/feature-flags.json /tmp/github-data/feature-flags.json 2>/dev/null || echo '{}' > /tmp/github-data/feature-flags.json
+
+      - name: Write repo collection summary
+        env:
+          REPO: ${{ matrix.repo }}
+          NAME: ${{ matrix.name }}
+          FEATURE_FLAGS: ${{ matrix.feature_flags }}
+          SINCE: ${{ needs.prepare.outputs.since }}
+          CURRENT_DATE: ${{ needs.prepare.outputs.current_date }}
+        run: |
           SAFE_NAME=$(echo "$REPO" | tr '/' '-')
+          {
+            echo "# ${NAME}"
+            echo
+            echo "- Repository: ${REPO}"
+            echo "- Since: ${SINCE}"
+            echo "- Through: ${CURRENT_DATE}"
+            echo "- Feature flag review required: ${FEATURE_FLAGS}"
+            echo
+            echo "## Collected GitHub Data Files"
+            echo
+            echo "- releases.json"
+            echo "- release-prs.json"
+            echo "- merged-prs.json"
+            echo "- open-prs.json"
+            if [ "${FEATURE_FLAGS}" = "true" ]; then
+              echo "- feature-flags.json"
+              echo "- posthog_flags.json"
+            fi
+          } > "/tmp/collection-${SAFE_NAME}.md"
+
           mkdir -p "/tmp/collection-${SAFE_NAME}"
-          python3 scripts/dispatch/dispatch_manifest.py collect \
-            --config .github/dispatch-projects.json \
-            --repo "$REPO" \
-            --checkout /tmp/repo \
-            --since "$SINCE" \
-            --until "$CURRENT_DATE" \
-            --output "/tmp/collection-${SAFE_NAME}/manifest.json"
+          cp "/tmp/collection-${SAFE_NAME}.md" "/tmp/collection-${SAFE_NAME}/summary.md"
+          cp /tmp/github-data/*.json "/tmp/collection-${SAFE_NAME}/"
 
       - name: Upload repo collection
         uses: actions/upload-artifact@v4
@@ -240,7 +303,6 @@ jobs:
   draft:
     name: Draft Dispatch
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     needs: [prepare, collect]
 
     container:
@@ -248,14 +310,11 @@ jobs:
       options: --user root
       env:
         GOOSE_PROVIDER: anthropic
-        GOOSE_MODEL: claude-sonnet-4-6
+        GOOSE_MODEL: claude-opus-4-8
         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         HOME: /tmp/goose-home
 
     steps:
-      - name: Checkout workflow helpers
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
       - name: Install dependencies
         run: apt-get update && apt-get install -y jq python3
 
@@ -278,42 +337,173 @@ jobs:
           name: posthog-flags
           path: /tmp
 
-      - name: Download previous dispatch
-        uses: actions/download-artifact@v4
-        with:
-          name: previous-dispatch
-          path: /tmp
-
-      - name: Download repository audit
-        uses: actions/download-artifact@v4
-        with:
-          name: repository-audit
-          path: /tmp
-
       - name: Generate dispatch draft
         env:
           SINCE: ${{ needs.prepare.outputs.since }}
           CURRENT_DATE: ${{ needs.prepare.outputs.current_date }}
-        run: scripts/dispatch/generate.sh
+        run: |
+          mkdir -p "$HOME/.local/share/goose/sessions" "$HOME/.config/goose"
 
-      - name: Upload dispatch bundle
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          source_path = Path("/tmp/dispatch-source.md")
+          lines = ["# Dispatch source brief", ""]
+
+          for collection in sorted(Path("/tmp/collections").iterdir()):
+              if not collection.is_dir():
+                  continue
+
+              summary = collection / "summary.md"
+              if summary.exists():
+                  lines.extend([summary.read_text().strip(), ""])
+
+              release_prs = json.loads((collection / "release-prs.json").read_text())
+              lines.append("## Releases")
+              if release_prs:
+                  for release in release_prs:
+                      lines.append(
+                          f"- {release['tagName']} ({release.get('publishedAt', 'unknown date')}): "
+                          + ", ".join(f"#{number}" for number in release.get("pullRequests", []))
+                      )
+              else:
+                  lines.append("- None in this window")
+              lines.append("")
+
+              merged_prs = json.loads((collection / "merged-prs.json").read_text())
+              lines.append("## Merged pull requests")
+              for pr in merged_prs[:50]:
+                  author = pr.get("author") or {}
+                  lines.append(
+                      f"- #{pr['number']} | {pr['title']} | {pr['url']} | "
+                      f"merged {pr.get('mergedAt', 'unknown')} | by {author.get('login', 'unknown')} | "
+                      f"labels: {', '.join(label['name'] for label in pr.get('labels', [])) or 'none'}"
+                  )
+              if not merged_prs:
+                  lines.append("- None in this window")
+              lines.append("")
+
+              flags_path = collection / "feature-flags.json"
+              if flags_path.exists():
+                  flags = json.loads(flags_path.read_text())
+                  lines.append("## Repository feature flags")
+                  lines.append(json.dumps(flags, separators=(",", ":")))
+                  lines.append("")
+
+          posthog_path = Path("/tmp/posthog_flags.json")
+          if posthog_path.exists():
+              lines.extend(["## Current PostHog feature flags", posthog_path.read_text().strip(), ""])
+
+          source_path.write_text("\n".join(lines))
+          PY
+
+          {
+            for example in /tmp/dispatch-examples/*; do
+              echo "# Style reference: $(basename "$example")"
+              head -60 "$example"
+              echo
+            done
+          } > /tmp/dispatch-style.md
+
+          cat > /tmp/recipe.yaml <<'RECIPE_EOF'
+          version: "1.0.0"
+          title: "Release Summary Dispatch V2"
+          description: "Draft a Marvin dispatch from pre-collected repo data"
+
+          extensions:
+            - type: builtin
+              name: developer
+
+          response:
+            json_schema:
+              type: object
+              properties:
+                markdown:
+                  type: string
+                  description: "Complete dispatch post in Markdown"
+              required:
+                - markdown
+
+          instructions: |
+            Draft a complete Entire Dispatch blog post from the prepared source brief.
+            Read /tmp/dispatch-source.md once for factual content and /tmp/dispatch-style.md once for voice and frontmatter style. Do not inspect /tmp/collections, /tmp/dispatch-examples, GitHub, git, curl, or any other source.
+            After those two reads, write the dispatch immediately. Do not narrate your analysis, enumerate your plan, or run further investigation commands.
+
+            Inputs:
+            - /tmp/dispatch-source.md contains the release and pull-request data, plus feature-flag state.
+            - /tmp/dispatch-style.md contains excerpts of the latest published dispatch posts for voice and frontmatter style.
+            - The window runs from SINCE_PLACEHOLDER through CURRENT_DATE_PLACEHOLDER.
+
+            Product placement in the dispatch hierarchy:
+            - CLI -> Entire CLI (entireio/cli)
+            - Web -> Entire.io (entirehq/entire.io) and EntireDB (entirehq/entiredb)
+            - OSS Projects -> git-sync (entireio/git-sync) and go-git (go-git/go-git)
+
+            Categorize source material into:
+            - Released: stable release items and publicly shipped web work
+            - Nightly: prerelease/nightly items
+            - Merged: merged work that is not clearly in a stable or nightly release
+            - Feature flagged: Entire Web work that is merged but hidden, partially rolled out, internal-only, or disabled
+
+            Requirements:
+            - Use /tmp/collections as the only factual source for the new dispatch.
+            - Use the chronologically newest published dispatch example as the authority for heading hierarchy and frontmatter structure. Use older examples only for voice.
+            - Do not copy, summarize, quote, rewrite, or include content from published dispatch examples in the new dispatch.
+            - Do not include future-dated items after CURRENT_DATE_PLACEHOLDER.
+            - Include PR numbers and links whenever the collection data provides them.
+            - Prefer concrete user-facing changes over raw implementation titles.
+            - Use the dispatch examples to match Marvin: dry, mildly weary, clear, and restrained. No generic robot noise.
+            - Include frontmatter with title, description, category: Dispatch, author: Marvin.
+            - Include an intro, then organize the body using the same three-level hierarchy as the newest published dispatch:
+              - `## CLI`, `## Web`, and `## OSS Projects` are the only top-level body headings. Omit an empty platform area.
+              - Under each platform area, use `###` product headings: `Entire CLI`, `Entire.io`, `EntireDB`, `git-sync`, and `go-git`. Omit products with no useful material.
+              - Under each product, use benefit-oriented `####` feature-theme headings such as `Mirroring Your Repo with the CLI` or `Mirror Performance and Reliability`.
+              - Never put a product directly at `##`, and never put a feature theme directly at `###`.
+            - Keep feature-flagged work out of the public/released prose unless explicitly labeled as feature flagged.
+            - Preserve release/nightly distinction for Entire CLI and Git-Sync.
+            - If a repo has no useful material, omit its section instead of announcing absence.
+            - Return the complete final post as JSON with a single "markdown" field. The field must contain only the dispatch Markdown, not commentary about the task.
+
+          prompt: |
+            Read the prepared source brief and style reference, then return the complete dispatch now.
+            Keep PR numbers and links attached to the relevant items.
+          RECIPE_EOF
+
+          sed -i "s|SINCE_PLACEHOLDER|${SINCE}|g" /tmp/recipe.yaml
+          sed -i "s|CURRENT_DATE_PLACEHOLDER|${CURRENT_DATE}|g" /tmp/recipe.yaml
+          goose run --recipe /tmp/recipe.yaml 2>&1 | tee /tmp/goose_output.log
+
+          GOOSE_RESULT=$(awk 'NF { line = $0 } END { print line }' /tmp/goose_output.log)
+          printf '%s\n' "$GOOSE_RESULT" > /tmp/goose_response.json
+
+          if ! jq -e '.markdown | type == "string" and length > 0' /tmp/goose_response.json > /dev/null; then
+            echo "::error::Goose did not return a valid markdown payload"
+            echo "::group::Goose raw output"
+            cat /tmp/goose_output.log || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          jq -r '.markdown' /tmp/goose_response.json > /tmp/dispatch-draft.md
+
+      - name: Upload dispatch draft
         uses: actions/upload-artifact@v4
         with:
-          name: dispatch-bundle
-          path: /tmp/dispatch-bundle
-          retention-days: 30
+          name: dispatch-draft
+          path: /tmp/dispatch-draft.md
+          retention-days: 7
 
   post-slack:
     name: Upload Slack Markdown
     runs-on: ubuntu-latest
     needs: draft
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.post_to_slack }}
 
     steps:
-      - name: Download dispatch bundle
+      - name: Download dispatch draft
         uses: actions/download-artifact@v4
         with:
-          name: dispatch-bundle
+          name: dispatch-draft
           path: ${{ runner.temp }}
 
       - name: Upload draft markdown to Slack
